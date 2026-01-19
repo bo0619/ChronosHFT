@@ -1,0 +1,25 @@
+{
+    "api_key": "",
+    "api_secret": "",
+    "testnet": true,
+    "symbols": ["BTCUSDT"],
+    "record_data": true,
+    "backtest": {
+        "initial_capital": 10000.0,
+        "taker_fee": 0.0005,
+        "maker_fee": 0.0002,
+        "latency_base_ms": 10,
+        "latency_sigma": 0.5,
+        "cancel_base_prob": 0.3
+    },
+    "chaos": {
+        "packet_loss_rate": 0.01,
+        "order_reject_rate": 0.005,
+        "system_latency_spike_prob": 0.001
+    },
+    "risk": {
+        "max_order_volume": 1.0, 
+        "max_active_orders": 20,
+        "max_orders_per_sec": 50
+    }
+}

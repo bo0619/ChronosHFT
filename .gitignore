@@ -1,0 +1,18 @@
+# .gitignore
+
+# 1. 忽略 Python 编译缓存 (垃圾文件)
+__pycache__/
+*.py[cod]
+
+# 2. [绝对禁止上传] 配置文件 (含 API Key)
+config.json
+
+# 3. 忽略回测产生的庞大某些数据
+storage/*.csv
+!storage/.gitkeep  # 保留文件夹结构(可选)
+
+# 4. 忽略 VS Code 配置
+.vscode/
+
+# 5. 忽略虚拟环境
+.venv/
