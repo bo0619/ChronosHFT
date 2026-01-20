@@ -4,6 +4,7 @@ from queue import Queue, Empty
 from threading import Thread
 from collections import defaultdict
 from .type import Event
+from infrastructure.logger import logger
 
 class EventEngine:
     def __init__(self):
@@ -16,13 +17,13 @@ class EventEngine:
         """启动后台线程 (实盘模式)"""
         self._active = True
         self._thread.start()
-        print(">>> [EventEngine] 核心引擎已启动 (Threaded Mode)")
+        logger.info(">>> [EventEngine] 核心引擎已启动 (Threaded Mode)")
 
     def stop(self):
         self._active = False
         if self._thread.is_alive():
             self._thread.join()
-        print(">>> [EventEngine] 核心引擎已停止")
+        logger.info(">>> [EventEngine] 核心引擎已停止")
 
     def put(self, event: Event):
         self._queue.put(event)
@@ -45,7 +46,7 @@ class EventEngine:
                 try:
                     handler(event)
                 except Exception as e:
-                    print(f"[Error] 事件处理异常 {event.type}: {e}")
+                    logger.error(f"[Error] 事件处理异常 {event.type}: {e}")
 
     # [NEW] 新增：同步处理方法 (回测专用)
     def process_existing_events(self):

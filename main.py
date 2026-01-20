@@ -13,6 +13,9 @@ from risk.manager import RiskManager
 from data.recorder import DataRecorder
 from strategy.market_maker import MarketMakerStrategy
 from ui.dashboard import TUIDashboard
+from infrastructure.logger import logger
+from infrastructure.time_service import time_service
+
 
 def load_config():
     if not os.path.exists("config.json"):
@@ -25,10 +28,15 @@ def main():
     config = load_config()
     if not config: return
 
-    # 1. 初始化 UI
+    # 1. [NEW] 初始化基础设施
+    # 必须最先初始化，后续组件可能会用到
+    logger.init_logging(config)
+    time_service.start(testnet=config["testnet"])
+
+    # 2. 初始化 UI
     dashboard = TUIDashboard()
 
-    # 2. 初始化核心组件
+    # 3. 初始化核心组件
     # 实盘模式下，EventEngine 开启独立线程
     engine = EventEngine()
     
@@ -52,11 +60,11 @@ def main():
         testnet=config["testnet"]
     )
     
-    # 3. 加载策略
+    # 4. 加载策略
     # 使用最新的做市商策略，支持撤单重挂
     strategy = MarketMakerStrategy(engine, gateway, risk)
     
-    # 4. 绑定事件
+    # 5. 绑定事件
     # 行情 -> 策略 & UI
     engine.register(EVENT_ORDERBOOK, lambda e: [
         strategy.on_orderbook(e.data),
@@ -78,13 +86,13 @@ def main():
     # 逐笔成交 -> 仅录制，策略暂不处理 (可选)
     engine.register(EVENT_AGG_TRADE, lambda e: None)
 
-    # 5. 启动系统
+    # 6. 启动系统
     engine.start() # 启动事件分发线程
     gateway.connect(config["symbols"]) # 启动 WS 线程
     
     dashboard.add_log("实盘交易系统已启动...")
 
-    # 6. UI 主循环
+    # 7. UI 主循环
     try:
         with Live(dashboard.render(), refresh_per_second=4) as live:
             while True:

@@ -16,6 +16,9 @@ from event.type import Event, EVENT_LOG, EVENT_ORDERBOOK, EVENT_ORDER_UPDATE, EV
 from event.type import OrderRequest, OrderData, TradeData, AggTradeData, CancelRequest
 from event.type import Direction_LONG, Direction_SHORT, Action_OPEN, Action_CLOSE
 from data.orderbook import LocalOrderBook
+from infrastructure.logger import logger
+from infrastructure.time_service import time_service
+
 
 class BinanceFutureGateway:
     def __init__(self, event_engine, api_key, api_secret, testnet=True):
@@ -38,8 +41,6 @@ class BinanceFutureGateway:
         self.ws_user = None
         self.listen_key = ""
 
-    def log(self, msg):
-        self.event_engine.put(Event(EVENT_LOG, f"[BinanceGateway] {msg}"))
 
     # --- REST API ---
     def _sign_request(self, params: dict):
@@ -49,9 +50,12 @@ class BinanceFutureGateway:
         return params
 
     def _send_request(self, method, path, params=None, signed=True):
-        if params is None: params = {}
+        if params is None: 
+            params = {}
+        
         if signed:
-            params['timestamp'] = int(time.time() * 1000)
+            # [修改] 使用 time_service 获取精确时间
+            params['timestamp'] = time_service.now()
             params = self._sign_request(params)
         headers = {'X-MBX-APIKEY': self.api_key} if signed else {}
         url = self.rest_url + path
@@ -61,13 +65,15 @@ class BinanceFutureGateway:
             elif method == "PUT": response = requests.put(url, headers=headers, params=params)
             elif method == "DELETE": response = requests.delete(url, headers=headers, params=params)
             
-            if response.status_code == 200: return response.json()
-            if response.json().get('code') == -4059: return response.json()
-            
-            self.log(f"请求失败 [{response.status_code}]: {response.text}")
+            if response.status_code == 200: 
+                return response.json()
+            if response.json().get('code') == -4059: 
+                return response.json()
+
+            logger.error(f"请求失败 [{response.status_code}]: {response.text}")
             return None
         except Exception as e:
-            self.log(f"请求异常: {e}")
+            logger.error(f"请求异常: {e}")
             return None
 
     def send_order(self, req: OrderRequest):
@@ -82,7 +88,7 @@ class BinanceFutureGateway:
         res = self._send_request("POST", path, params)
         if res:
             order_id = str(res.get('orderId'))
-            self.log(f"下单成功: ID={order_id}")
+            logger.info(f"订单已发送, OrderID: {order_id}-{req.symbol}-{req.price}")
             return order_id
         return None
 
@@ -93,14 +99,14 @@ class BinanceFutureGateway:
             "symbol": req.symbol,
             "orderId": req.order_id
         }
-        self.log(f"正在撤单: {req.order_id}")
+        logger.info(f"正在撤单: {req.order_id}")
         self._send_request("DELETE", path, params)
 
     def cancel_all_orders(self, symbol):
         """撤销某币种所有挂单"""
         path = "/fapi/v1/allOpenOrders"
         params = {"symbol": symbol}
-        self.log(f"正在撤销 {symbol} 全部挂单")
+        logger.info(f"正在撤销 {symbol} 全部挂单")
         self._send_request("DELETE", path, params)
 
     def get_depth_snapshot(self, symbol):
@@ -174,7 +180,7 @@ class BinanceFutureGateway:
             time.sleep(3)
 
     def _on_market_open(self, ws):
-        self.log("Market WS Connected")
+        logger.info("Market WS Connected")
         # 双流订阅
         params = []
         for s in self.symbols:
@@ -211,5 +217,5 @@ class BinanceFutureGateway:
                 if self.ws_buffer[symbol]:
                     for msg in self.ws_buffer[symbol]: ob.process_delta(msg)
                 self.ws_buffer[symbol] = None
-                self.log(f"{symbol} Sync Done")
+                logger.info(f"{symbol} Sync Done")
                 self.event_engine.put(Event(EVENT_ORDERBOOK, ob.generate_event_data()))
