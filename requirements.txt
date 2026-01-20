@@ -1,0 +1,8 @@
+requests
+websocket-client
+orjson
+rich
+numpy
+pandas
+tables
+h5py

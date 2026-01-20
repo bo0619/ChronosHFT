@@ -8,7 +8,7 @@ __pycache__/
 config.json
 
 # 3. 忽略回测产生的庞大某些数据
-storage/*.csv
+storage/
 !storage/.gitkeep  # 保留文件夹结构(可选)
 
 # 4. 忽略 VS Code 配置

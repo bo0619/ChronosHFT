@@ -1,110 +1,103 @@
 # file: data/recorder.py
 
 import os
-import csv
+import pandas as pd
 from datetime import datetime
-from event.type import OrderBook, AggTradeData, Event, EVENT_ORDERBOOK, EVENT_AGG_TRADE, EVENT_LOG
+from infrastructure.logger import logger
+from event.type import OrderBook, AggTradeData, Event, EVENT_ORDERBOOK, EVENT_AGG_TRADE
 
 class DataRecorder:
     """
-    高保真行情录制器 (Step 5 V2)
-    1. Depth Recorder: 录制 Top 5 盘口
-    2. Trade Recorder: 录制逐笔成交
+    高性能录制器 (HDF5 + Buffer)
     """
     def __init__(self, engine, symbols: list):
         self.engine = engine
         self.symbols = symbols
         self.save_path = "storage"
         
-        # 文件句柄缓存
-        self.depth_files = {}
-        self.depth_writers = {}
-        self.trade_files = {}
-        self.trade_writers = {}
+        # Buffer: Symbol -> List[Dict]
+        self.depth_buffer = {s: [] for s in symbols}
+        self.trade_buffer = {s: [] for s in symbols}
+        
+        self.FLUSH_THRESHOLD = 1000 # 每1000条刷盘一次
         
         if not os.path.exists(self.save_path):
             os.makedirs(self.save_path)
             
-        self._init_files()
-        
-        # 注册监听
         self.engine.register(EVENT_ORDERBOOK, self.on_orderbook)
         self.engine.register(EVENT_AGG_TRADE, self.on_agg_trade)
         
-        self.log(f"双流录制已启动 (Top5 Depth + Trades): {self.symbols}")
-
-    def _init_files(self):
-        today = datetime.now().strftime("%Y%m%d")
-        for symbol in self.symbols:
-            # --- 1. 初始化深度文件 ---
-            f_depth_name = f"{self.save_path}/{symbol}_depth_{today}.csv"
-            exists_depth = os.path.exists(f_depth_name)
-            f_depth = open(f_depth_name, "a", newline="", encoding="utf-8")
-            w_depth = csv.writer(f_depth)
-            
-            if not exists_depth:
-                # 生成 Top 5 表头: bid1_p, bid1_v, ..., bid5_p, bid5_v, ask1...
-                header = ["datetime", "symbol"]
-                for i in range(1, 6): header.extend([f"bid{i}_p", f"bid{i}_v"])
-                for i in range(1, 6): header.extend([f"ask{i}_p", f"ask{i}_v"])
-                w_depth.writerow(header)
-                
-            self.depth_files[symbol] = f_depth
-            self.depth_writers[symbol] = w_depth
-            
-            # --- 2. 初始化成交文件 ---
-            f_trade_name = f"{self.save_path}/{symbol}_trades_{today}.csv"
-            exists_trade = os.path.exists(f_trade_name)
-            f_trade = open(f_trade_name, "a", newline="", encoding="utf-8")
-            w_trade = csv.writer(f_trade)
-            
-            if not exists_trade:
-                w_trade.writerow(["datetime", "symbol", "price", "qty", "maker_is_buyer"])
-                
-            self.trade_files[symbol] = f_trade
-            self.trade_writers[symbol] = w_trade
+        logger.info(f"HDF5 Recorder Started: {self.symbols}")
 
     def on_orderbook(self, event: Event):
         ob: OrderBook = event.data
-        if ob.symbol not in self.depth_writers: return
+        if ob.symbol not in self.depth_buffer: return
         
-        # 提取 Top 5 Bids (价格从高到低)
-        sorted_bids = sorted(ob.bids.items(), key=lambda x: x[0], reverse=True)[:5]
-        # 提取 Top 5 Asks (价格从低到高)
-        sorted_asks = sorted(ob.asks.items(), key=lambda x: x[0])[:5]
+        # 提取 Top 5
+        sb = sorted(ob.bids.items(), key=lambda x: x[0], reverse=True)[:5]
+        sa = sorted(ob.asks.items(), key=lambda x: x[0])[:5]
+        while len(sb) < 5: sb.append((0,0))
+        while len(sa) < 5: sa.append((0,0))
         
-        # 补全不足 5 档的情况 (极少见，但为了防 Crash)
-        while len(sorted_bids) < 5: sorted_bids.append((0, 0))
-        while len(sorted_asks) < 5: sorted_asks.append((0, 0))
-        
-        row = [ob.datetime.strftime("%Y-%m-%d %H:%M:%S.%f"), ob.symbol]
-        
-        # 写入 Bids
-        for price, vol in sorted_bids:
-            row.extend([price, vol])
+        row = {
+            "datetime": ob.datetime,
+            "symbol": ob.symbol
+        }
+        for i in range(5):
+            row[f"bid{i+1}_p"] = sb[i][0]
+            row[f"bid{i+1}_v"] = sb[i][1]
+            row[f"ask{i+1}_p"] = sa[i][0]
+            row[f"ask{i+1}_v"] = sa[i][1]
             
-        # 写入 Asks
-        for price, vol in sorted_asks:
-            row.extend([price, vol])
-            
-        self.depth_writers[ob.symbol].writerow(row)
+        self.depth_buffer[ob.symbol].append(row)
+        
+        if len(self.depth_buffer[ob.symbol]) >= self.FLUSH_THRESHOLD:
+            self.flush(ob.symbol, "depth")
 
     def on_agg_trade(self, event: Event):
-        trade: AggTradeData = event.data
-        if trade.symbol not in self.trade_writers: return
+        t: AggTradeData = event.data
+        if t.symbol not in self.trade_buffer: return
         
-        row = [
-            trade.datetime.strftime("%Y-%m-%d %H:%M:%S.%f"),
-            trade.symbol,
-            trade.price,
-            trade.quantity,
-            1 if trade.maker_is_buyer else 0 # 1代表卖方主动(价格跌), 0代表买方主动(价格涨)
-        ]
-        self.trade_writers[trade.symbol].writerow(row)
+        row = {
+            "datetime": t.datetime,
+            "symbol": t.symbol,
+            "price": t.price,
+            "qty": t.quantity,
+            "maker_is_buyer": t.maker_is_buyer
+        }
+        self.trade_buffer[t.symbol].append(row)
+        
+        if len(self.trade_buffer[t.symbol]) >= self.FLUSH_THRESHOLD:
+            self.flush(t.symbol, "trade")
+
+    def flush(self, symbol, data_type):
+        """将 Buffer 写入 HDF5"""
+        try:
+            today = datetime.now().strftime("%Y%m%d")
+            filename = f"{self.save_path}/{symbol}_{data_type}_{today}.h5"
+            key = data_type # HDF5 key
+            
+            if data_type == "depth":
+                buffer = self.depth_buffer[symbol]
+                self.depth_buffer[symbol] = [] # Clear buffer
+            else:
+                buffer = self.trade_buffer[symbol]
+                self.trade_buffer[symbol] = []
+                
+            if not buffer: return
+            
+            df = pd.DataFrame(buffer)
+            
+            # Append to HDF5
+            # min_itemsize 预留字符串长度，format='table' 支持追加
+            df.to_hdf(filename, key=key, mode='a', append=True, format='table', min_itemsize={'symbol': 10})
+            
+        except Exception as e:
+            logger.error(f"Flush HDF5 Failed [{symbol} {data_type}]: {e}")
 
     def close(self):
-        for f in self.depth_files.values(): f.close()
-        for f in self.trade_files.values(): f.close()
-
-    def log(self, msg):
-        self.engine.put(Event(EVENT_LOG, f"[DataRecorder] {msg}"))
+        """程序退出时强制刷盘"""
+        for symbol in self.symbols:
+            self.flush(symbol, "depth")
+            self.flush(symbol, "trade")
+        logger.info("Recorder Closed & Flushed.")

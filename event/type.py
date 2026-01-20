@@ -8,7 +8,7 @@ from typing import Dict
 EVENT_TICK = "eTick"
 EVENT_ORDERBOOK = "eOrderBook"
 EVENT_AGG_TRADE = "eAggTrade"
-EVENT_MARK_PRICE = "eMarkPrice" # [NEW] 标记价格事件
+EVENT_MARK_PRICE = "eMarkPrice"
 EVENT_LOG = "eLog"
 EVENT_ORDER_REQUEST = "eOrderRequest"
 EVENT_ORDER_UPDATE = "eOrderUpdate"
@@ -16,11 +16,10 @@ EVENT_TRADE_UPDATE = "eTradeUpdate"
 EVENT_POSITION_UPDATE = "ePositionUpdate"
 EVENT_BACKTEST_END = "eBacktestEnd"
 
-# --- 方向与状态 ---
-Direction_LONG = "LONG"
-Direction_SHORT = "SHORT"
-Action_OPEN = "OPEN"
-Action_CLOSE = "CLOSE"
+# --- 核心枚举 ---
+# 在单向持仓模式下，我们只关心买卖方向
+Side_BUY = "BUY"
+Side_SELL = "SELL"
 
 Status_SUBMITTED = "SUBMITTED"
 Status_PARTTRADED = "PARTTRADED"
@@ -28,24 +27,26 @@ Status_ALLTRADED = "ALLTRADED"
 Status_CANCELLED = "CANCELLED"
 Status_REJECTED = "REJECTED"
 
-# --- 异常类 ---
 class OrderBookGapError(Exception):
-    """当检测到行情丢失时抛出的异常"""
     pass
 
 @dataclass
 class Event:
     type: str
-    data: any = None # type: ignore
+    data: any = None
 
 @dataclass
 class OrderRequest:
     symbol: str
     price: float
     volume: float
-    direction: str
-    action: str
+    side: str       # BUY or SELL
     order_type: str = "LIMIT"
+
+@dataclass
+class CancelRequest:
+    symbol: str
+    order_id: str
 
 @dataclass
 class OrderBook:
@@ -65,14 +66,13 @@ class OrderBook:
         p = min(self.asks.keys())
         return p, self.asks[p]
 
-# [NEW] 标记价格与资金费率数据
 @dataclass
 class MarkPriceData:
     symbol: str
-    mark_price: float      # 标记价格
-    index_price: float     # 指数价格
-    funding_rate: float    # 资金费率 (如 0.0001)
-    next_funding_time: datetime # 下次结算时间
+    mark_price: float
+    index_price: float
+    funding_rate: float
+    next_funding_time: datetime
     datetime: datetime
 
 @dataclass
@@ -88,8 +88,7 @@ class AggTradeData:
 class OrderData:
     symbol: str
     order_id: str
-    direction: str
-    action: str
+    side: str       # BUY or SELL
     price: float
     volume: float
     traded: float
@@ -101,8 +100,7 @@ class TradeData:
     symbol: str
     order_id: str
     trade_id: str
-    direction: str
-    action: str
+    side: str       # BUY or SELL
     price: float
     volume: float
     datetime: datetime
@@ -110,12 +108,6 @@ class TradeData:
 @dataclass
 class PositionData:
     symbol: str
-    direction: str
-    volume: float
-    price: float
-    pnl: float = 0.0
-
-@dataclass
-class CancelRequest:
-    symbol: str
-    order_id: str
+    volume: float   # 带符号浮点数: >0 多头, <0 空头
+    price: float    # 持仓均价
+    pnl: float = 0.0 # 浮动盈亏
