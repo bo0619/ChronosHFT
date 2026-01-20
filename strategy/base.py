@@ -14,20 +14,26 @@ class StrategyTemplate:
         self.long_pos = 0.0
         self.short_pos = 0.0
         
-        # [NEW] 自动维护活跃订单字典 {order_id: original_req}
+        # 活跃订单字典 {order_id: original_req}
         self.active_orders = {} 
+        # [NEW] 正在撤单的集合 {order_id}
+        self.orders_cancelling = set()
 
     def on_orderbook(self, orderbook: OrderBook): raise NotImplementedError
     def on_trade(self, trade: TradeData): pass
     
     def on_order(self, order: OrderData):
         """
-        基础订单状态维护
+        订单状态维护
         """
-        # 如果订单结束，从活跃列表中移除
+        # 如果订单结束 (全成/撤销/拒单)
         if order.status in [Status_ALLTRADED, Status_CANCELLED, Status_REJECTED]:
             if order.order_id in self.active_orders:
                 del self.active_orders[order.order_id]
+            
+            # [NEW] 从撤单集合中移除
+            if order.order_id in self.orders_cancelling:
+                self.orders_cancelling.remove(order.order_id)
     
     def on_position(self, pos: PositionData):
         if pos.direction == Direction_LONG: self.long_pos = pos.volume
@@ -40,7 +46,7 @@ class StrategyTemplate:
         if not self.risk_manager.check_order(req): return None
         order_id = self.gateway.send_order(req)
         if order_id:
-            self.active_orders[order_id] = req # 记录
+            self.active_orders[order_id] = req 
         return order_id
 
     def buy(self, symbol, price, volume): return self.send_order_safe(OrderRequest(symbol, price, volume, Direction_LONG, Action_OPEN))
@@ -48,12 +54,18 @@ class StrategyTemplate:
     def short(self, symbol, price, volume): return self.send_order_safe(OrderRequest(symbol, price, volume, Direction_SHORT, Action_OPEN))
     def cover(self, symbol, price, volume): return self.send_order_safe(OrderRequest(symbol, price, volume, Direction_SHORT, Action_CLOSE))
 
-    # --- [NEW] 撤单 ---
+    # --- 撤单 ---
     def cancel_order(self, order_id: str):
         """撤销指定订单"""
-        # 检查是否是我们策略发出的单
         if order_id not in self.active_orders:
             return
+        
+        # [NEW] 检查是否已经在撤单流程中
+        if order_id in self.orders_cancelling:
+            return # 已经发过请求了，不要重复发
+            
+        # 标记为正在撤单
+        self.orders_cancelling.add(order_id)
         
         req = self.active_orders[order_id]
         cancel_req = CancelRequest(req.symbol, order_id)
@@ -62,7 +74,5 @@ class StrategyTemplate:
     def cancel_all(self):
         """撤销本策略所有活跃订单"""
         if not self.active_orders: return
-        
-        # 复制 keys 列表，防止遍历时字典改变
         for order_id in list(self.active_orders.keys()):
             self.cancel_order(order_id)

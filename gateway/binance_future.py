@@ -55,19 +55,37 @@ class BinanceFutureGateway:
         if signed:
             params['timestamp'] = time_service.now()
             params = self._sign_request(params)
+        
         headers = {'X-MBX-APIKEY': self.api_key} if signed else {}
         url = self.rest_url + path
+        
         try:
             if method == "GET": response = requests.get(url, headers=headers, params=params)
             elif method == "POST": response = requests.post(url, headers=headers, params=params)
             elif method == "PUT": response = requests.put(url, headers=headers, params=params)
             elif method == "DELETE": response = requests.delete(url, headers=headers, params=params)
             
-            if response.status_code == 200: return response.json()
-            if response.json().get('code') == -4059: return response.json()
+            # 1. 成功情况
+            if response.status_code == 200: 
+                return response.json()
             
+            # 2. 业务逻辑错误处理
+            res_json = response.json()
+            code = res_json.get('code')
+            msg = res_json.get('msg')
+
+            # [NEW] 忽略或降级常见 HFT 错误
+            if code == -4059: # No need to change position side
+                return res_json
+            if code == -2011: # Unknown order sent (订单已成交或已撤销)
+                # 这是一个良性错误，说明我们要撤的单已经没了，目的达到了
+                logger.info(f"Order missing when cancelling (Safe to ignore): {msg}")
+                return None
+            
+            # 其他错误才报 Error
             logger.error(f"Request Failed [{response.status_code}]: {response.text}")
             return None
+            
         except Exception as e:
             logger.error(f"Request Exception: {e}")
             return None
