@@ -1,7 +1,8 @@
 # file: strategy/base.py
 
+import time
 from event.type import OrderBook, TradeData, OrderData, PositionData, OrderRequest, CancelRequest, Event, EVENT_LOG
-from event.type import Side_BUY, Side_SELL
+from event.type import Side_BUY, Side_SELL, EVENT_ORDER_SUBMITTED, OrderSubmitted # [NEW]
 from event.type import Status_ALLTRADED, Status_CANCELLED, Status_REJECTED
 from data.ref_data import ref_data_manager
 
@@ -12,9 +13,7 @@ class StrategyTemplate:
         self.risk_manager = risk_manager
         self.name = name
         
-        # [NEW] 净持仓 (正多负空)
         self.pos = 0.0
-        
         self.active_orders = {} 
         self.orders_cancelling = set()
 
@@ -33,11 +32,12 @@ class StrategyTemplate:
 
     def log(self, msg): self.engine.put(Event(EVENT_LOG, f"[{self.name}] {msg}"))
 
-    # --- 下单 ---
     def send_order_safe(self, req: OrderRequest):
+        # 1. 规整化
         req.price = ref_data_manager.round_price(req.symbol, req.price)
         req.volume = ref_data_manager.round_qty(req.symbol, req.volume)
         
+        # 2. 最小名义价值
         info = ref_data_manager.get_info(req.symbol)
         if info:
             notional = req.price * req.volume
@@ -45,22 +45,29 @@ class StrategyTemplate:
             if notional < min_notional:
                 return None
 
+        # 3. 风控检查 (含保证金检查，由 RiskManager 代理)
         if not self.risk_manager.check_order(req): 
             return None
             
+        # 4. 发送给网关
         order_id = self.gateway.send_order(req)
+        
         if order_id:
+            # 5. [NEW] 发送成功，广播事件通知 OMS
+            # 策略不需要知道 OMS 是谁，只要广播“我下单了”即可
+            event_data = OrderSubmitted(req, order_id, time.time())
+            self.engine.put(Event(EVENT_ORDER_SUBMITTED, event_data))
+            
             self.active_orders[order_id] = req 
+            
         return order_id
 
-    # [NEW] 只有 Buy 和 Sell
     def buy(self, symbol, price, volume):
         return self.send_order_safe(OrderRequest(symbol, price, volume, Side_BUY))
 
     def sell(self, symbol, price, volume):
         return self.send_order_safe(OrderRequest(symbol, price, volume, Side_SELL))
 
-    # --- 撤单 ---
     def cancel_order(self, order_id: str):
         if order_id not in self.active_orders: return
         if order_id in self.orders_cancelling: return 

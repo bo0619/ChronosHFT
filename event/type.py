@@ -15,6 +15,8 @@ EVENT_ORDER_UPDATE = "eOrderUpdate"
 EVENT_TRADE_UPDATE = "eTradeUpdate"
 EVENT_POSITION_UPDATE = "ePositionUpdate"
 EVENT_BACKTEST_END = "eBacktestEnd"
+EVENT_ACCOUNT_UPDATE = "eAccountUpdate"
+EVENT_ORDER_SUBMITTED = "eOrderSubmitted" 
 
 # --- 核心枚举 ---
 # 在单向持仓模式下，我们只关心买卖方向
@@ -111,3 +113,19 @@ class PositionData:
     volume: float   # 带符号浮点数: >0 多头, <0 空头
     price: float    # 持仓均价
     pnl: float = 0.0 # 浮动盈亏
+
+@dataclass
+class AccountData:
+    """账户资产数据"""
+    balance: float        # 钱包余额 (Wallet Balance)
+    equity: float         # 动态权益 (Wallet Balance + Unrealized PnL)
+    available: float      # 可用下单资金 (Equity - Used Margin)
+    used_margin: float    # 已用保证金 (Position Margin + Order Margin)
+    datetime: datetime
+
+@dataclass
+class OrderSubmitted:
+    """订单已发送通知"""
+    req: OrderRequest
+    order_id: str
+    timestamp: float
