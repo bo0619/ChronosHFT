@@ -4,9 +4,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict
 
+# --- 事件常量 ---
 EVENT_TICK = "eTick"
 EVENT_ORDERBOOK = "eOrderBook"
-EVENT_AGG_TRADE = "eAggTrade" # [NEW] 归集成交事件
+EVENT_AGG_TRADE = "eAggTrade"
+EVENT_MARK_PRICE = "eMarkPrice" # [NEW] 标记价格事件
 EVENT_LOG = "eLog"
 EVENT_ORDER_REQUEST = "eOrderRequest"
 EVENT_ORDER_UPDATE = "eOrderUpdate"
@@ -14,6 +16,7 @@ EVENT_TRADE_UPDATE = "eTradeUpdate"
 EVENT_POSITION_UPDATE = "ePositionUpdate"
 EVENT_BACKTEST_END = "eBacktestEnd"
 
+# --- 方向与状态 ---
 Direction_LONG = "LONG"
 Direction_SHORT = "SHORT"
 Action_OPEN = "OPEN"
@@ -25,10 +28,15 @@ Status_ALLTRADED = "ALLTRADED"
 Status_CANCELLED = "CANCELLED"
 Status_REJECTED = "REJECTED"
 
+# --- 异常类 ---
+class OrderBookGapError(Exception):
+    """当检测到行情丢失时抛出的异常"""
+    pass
+
 @dataclass
 class Event:
     type: str
-    data: any = None
+    data: any = None # type: ignore
 
 @dataclass
 class OrderRequest:
@@ -40,16 +48,10 @@ class OrderRequest:
     order_type: str = "LIMIT"
 
 @dataclass
-class CancelRequest:
-    symbol: str
-    order_id: str
-
-@dataclass
 class OrderBook:
     symbol: str
     exchange: str
     datetime: datetime
-    # key=price, value=volume
     asks: Dict[float, float] = field(default_factory=dict)
     bids: Dict[float, float] = field(default_factory=dict)
 
@@ -63,14 +65,23 @@ class OrderBook:
         p = min(self.asks.keys())
         return p, self.asks[p]
 
-# [NEW] 市场逐笔成交数据
+# [NEW] 标记价格与资金费率数据
+@dataclass
+class MarkPriceData:
+    symbol: str
+    mark_price: float      # 标记价格
+    index_price: float     # 指数价格
+    funding_rate: float    # 资金费率 (如 0.0001)
+    next_funding_time: datetime # 下次结算时间
+    datetime: datetime
+
 @dataclass
 class AggTradeData:
     symbol: str
     trade_id: int
     price: float
     quantity: float
-    maker_is_buyer: bool # True=卖方主动吃买单(价格下跌), False=买方主动吃卖单(价格上涨)
+    maker_is_buyer: bool 
     datetime: datetime
 
 @dataclass
@@ -103,3 +114,8 @@ class PositionData:
     volume: float
     price: float
     pnl: float = 0.0
+
+@dataclass
+class CancelRequest:
+    symbol: str
+    order_id: str
