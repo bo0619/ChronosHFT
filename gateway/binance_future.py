@@ -11,14 +11,16 @@ from urllib.parse import urlencode
 from datetime import datetime
 import websocket
 
-# [修复] 这里必须导入 CancelRequest
-from event.type import Event, EVENT_LOG, EVENT_ORDERBOOK, EVENT_ORDER_UPDATE, EVENT_TRADE_UPDATE, EVENT_AGG_TRADE
-from event.type import OrderRequest, OrderData, TradeData, AggTradeData, CancelRequest
-from event.type import Direction_LONG, Direction_SHORT, Action_OPEN, Action_CLOSE
-from data.orderbook import LocalOrderBook
+# 基础设施
 from infrastructure.logger import logger
 from infrastructure.time_service import time_service
 
+# 事件定义
+from event.type import Event, EVENT_LOG, EVENT_ORDERBOOK, EVENT_ORDER_UPDATE, EVENT_TRADE_UPDATE, EVENT_AGG_TRADE, EVENT_MARK_PRICE
+from event.type import OrderRequest, OrderData, TradeData, AggTradeData, CancelRequest, MarkPriceData
+from event.type import Direction_LONG, Direction_SHORT, Action_OPEN, Action_CLOSE
+from event.type import OrderBookGapError # [NEW] 引入异常
+from data.orderbook import LocalOrderBook
 
 class BinanceFutureGateway:
     def __init__(self, event_engine, api_key, api_secret, testnet=True):
@@ -41,7 +43,6 @@ class BinanceFutureGateway:
         self.ws_user = None
         self.listen_key = ""
 
-
     # --- REST API ---
     def _sign_request(self, params: dict):
         query_string = urlencode(params)
@@ -50,11 +51,8 @@ class BinanceFutureGateway:
         return params
 
     def _send_request(self, method, path, params=None, signed=True):
-        if params is None: 
-            params = {}
-        
+        if params is None: params = {}
         if signed:
-            # [修改] 使用 time_service 获取精确时间
             params['timestamp'] = time_service.now()
             params = self._sign_request(params)
         headers = {'X-MBX-APIKEY': self.api_key} if signed else {}
@@ -65,15 +63,13 @@ class BinanceFutureGateway:
             elif method == "PUT": response = requests.put(url, headers=headers, params=params)
             elif method == "DELETE": response = requests.delete(url, headers=headers, params=params)
             
-            if response.status_code == 200: 
-                return response.json()
-            if response.json().get('code') == -4059: 
-                return response.json()
-
-            logger.error(f"请求失败 [{response.status_code}]: {response.text}")
+            if response.status_code == 200: return response.json()
+            if response.json().get('code') == -4059: return response.json()
+            
+            logger.error(f"Request Failed [{response.status_code}]: {response.text}")
             return None
         except Exception as e:
-            logger.error(f"请求异常: {e}")
+            logger.error(f"Request Exception: {e}")
             return None
 
     def send_order(self, req: OrderRequest):
@@ -88,25 +84,20 @@ class BinanceFutureGateway:
         res = self._send_request("POST", path, params)
         if res:
             order_id = str(res.get('orderId'))
-            logger.info(f"订单已发送, OrderID: {order_id}-{req.symbol}-{req.price}")
+            logger.info(f"Order Sent: ID={order_id} {req.symbol} {req.price}")
             return order_id
         return None
 
     def cancel_order(self, req: CancelRequest):
-        """撤销单个订单"""
         path = "/fapi/v1/order"
-        params = {
-            "symbol": req.symbol,
-            "orderId": req.order_id
-        }
-        logger.info(f"正在撤单: {req.order_id}")
+        params = {"symbol": req.symbol, "orderId": req.order_id}
+        logger.info(f"Cancelling Order: {req.order_id}")
         self._send_request("DELETE", path, params)
 
     def cancel_all_orders(self, symbol):
-        """撤销某币种所有挂单"""
         path = "/fapi/v1/allOpenOrders"
         params = {"symbol": symbol}
-        logger.info(f"正在撤销 {symbol} 全部挂单")
+        logger.info(f"Cancelling All Orders for {symbol}")
         self._send_request("DELETE", path, params)
 
     def get_depth_snapshot(self, symbol):
@@ -122,8 +113,8 @@ class BinanceFutureGateway:
         data = self._send_request("POST", "/fapi/v1/listenKey")
         if data and "listenKey" in data:
             self.listen_key = data["listenKey"]
-            threading.Thread(target=self._run_user_ws).start()
-            threading.Thread(target=self._keep_user_stream_alive).start()
+            threading.Thread(target=self._run_user_ws, daemon=True).start()
+            threading.Thread(target=self._keep_user_stream_alive, daemon=True).start()
 
     def _keep_user_stream_alive(self):
         while self.active:
@@ -165,57 +156,131 @@ class BinanceFutureGateway:
     def connect(self, symbols: list):
         self.symbols = [s.upper() for s in symbols]
         self.active = True
+        
         for s in self.symbols:
             self.orderbooks[s] = LocalOrderBook(s)
             self.ws_buffer[s] = []
+            
         self.set_hedge_mode()
-        threading.Thread(target=self._run_market_ws).start()
+        
+        # 启动后台线程
+        threading.Thread(target=self._run_market_ws, daemon=True).start()
         self.start_user_stream()
-        threading.Thread(target=self._init_orderbooks).start()
+        
+        # 初始快照下载
+        threading.Thread(target=self._init_all_orderbooks, daemon=True).start()
 
     def _run_market_ws(self):
         while self.active:
-            self.ws_market = websocket.WebSocketApp(self.ws_url, on_open=self._on_market_open, on_message=self._on_market_message)
+            self.ws_market = websocket.WebSocketApp(
+                self.ws_url, 
+                on_open=self._on_market_open, 
+                on_message=self._on_market_message,
+                on_error=lambda ws, err: logger.error(f"Market WS Error: {err}")
+            )
             self.ws_market.run_forever(ping_interval=30, ping_timeout=10)
             time.sleep(3)
 
     def _on_market_open(self, ws):
         logger.info("Market WS Connected")
-        # 双流订阅
         params = []
         for s in self.symbols:
+            # 订阅深度 + 归集成交 + [NEW] 标记价格
             params.append(f"{s.lower()}@depth@100ms")
             params.append(f"{s.lower()}@aggTrade")
+            params.append(f"{s.lower()}@markPrice@1s")
+            
         ws.send(json.dumps({"method": "SUBSCRIBE", "params": params, "id": 1}).decode('utf-8'))
 
     def _on_market_message(self, ws, message):
         try:
             raw = json.loads(message)
             e_type = raw.get("e")
+            symbol = raw.get("s")
+            
+            # 1. 深度处理 (含 Gap Recovery)
             if e_type == "depthUpdate":
-                s = raw["s"]
-                if self.ws_buffer[s] is not None: self.ws_buffer[s].append(raw)
+                if self.ws_buffer[symbol] is not None: 
+                    self.ws_buffer[symbol].append(raw)
                 else:
-                    ob = self.orderbooks[s]
-                    ob.process_delta(raw)
-                    self.event_engine.put(Event(EVENT_ORDERBOOK, ob.generate_event_data()))
+                    ob = self.orderbooks[symbol]
+                    try:
+                        ob.process_delta(raw)
+                        data = ob.generate_event_data()
+                        if data:
+                            self.event_engine.put(Event(EVENT_ORDERBOOK, data))
+                    except OrderBookGapError:
+                        # [重要] 捕获到 Gap，触发重连修复
+                        logger.error(f"Gap detected for {symbol}, triggering re-sync...")
+                        # 将 buffer 设为列表，标志着进入“等待快照”模式
+                        self.ws_buffer[symbol] = []
+                        # 启动线程去重新下载快照
+                        threading.Thread(target=self._re_sync_symbol, args=(symbol,), daemon=True).start()
+
+            # 2. 归集成交
             elif e_type == "aggTrade":
                 t = AggTradeData(
                     raw["s"], raw["a"], float(raw["p"]), float(raw["q"]), 
                     raw["m"], datetime.fromtimestamp(raw["T"]/1000)
                 )
                 self.event_engine.put(Event(EVENT_AGG_TRADE, t))
-        except: pass
+                
+            # 3. [NEW] 标记价格
+            elif e_type == "markPriceUpdate":
+                # {
+                #   "e": "markPriceUpdate",
+                #   "s": "BTCUSDT",
+                #   "p": "96000.00",  // Mark Price
+                #   "i": "96005.00",  // Index Price
+                #   "r": "0.000100",  // Funding Rate
+                #   "T": 169...       // Next Funding Time
+                # }
+                mp = MarkPriceData(
+                    symbol=raw["s"],
+                    mark_price=float(raw["p"]),
+                    index_price=float(raw["i"]),
+                    funding_rate=float(raw["r"]),
+                    next_funding_time=datetime.fromtimestamp(raw["T"]/1000),
+                    datetime=datetime.now()
+                )
+                self.event_engine.put(Event(EVENT_MARK_PRICE, mp))
+                
+        except Exception:
+            pass
 
-    def _init_orderbooks(self):
+    def _init_all_orderbooks(self):
+        """初始化所有币种快照"""
         time.sleep(2)
         for symbol in self.symbols:
-            snapshot = self.get_depth_snapshot(symbol)
-            if snapshot:
-                ob = self.orderbooks[symbol]
-                ob.init_snapshot(snapshot)
-                if self.ws_buffer[symbol]:
-                    for msg in self.ws_buffer[symbol]: ob.process_delta(msg)
-                self.ws_buffer[symbol] = None
-                logger.info(f"{symbol} Sync Done")
-                self.event_engine.put(Event(EVENT_ORDERBOOK, ob.generate_event_data()))
+            self._re_sync_symbol(symbol)
+
+    def _re_sync_symbol(self, symbol):
+        """
+        [NEW] 单个币种重同步逻辑
+        1. 下载快照
+        2. 应用快照
+        3. 重放 Buffer
+        """
+        logger.info(f"Syncing OrderBook for {symbol}...")
+        snapshot = self.get_depth_snapshot(symbol)
+        if snapshot:
+            ob = self.orderbooks[symbol]
+            ob.init_snapshot(snapshot)
+            
+            # 处理积压数据
+            if self.ws_buffer[symbol]:
+                for msg in self.ws_buffer[symbol]: 
+                    try:
+                        ob.process_delta(msg)
+                    except OrderBookGapError:
+                        # 如果在重放 buffer 时又遇到 gap，那只能再重试一次了
+                        # 这里简单处理：忽略本次重放错误，期待下一次 tick 修正
+                        pass
+            
+            self.ws_buffer[symbol] = None
+            logger.info(f"{symbol} Sync Done (Gap Resolved)")
+            
+            # 推送一次全量以刷新 UI
+            data = ob.generate_event_data()
+            if data:
+                self.event_engine.put(Event(EVENT_ORDERBOOK, data))
