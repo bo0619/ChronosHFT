@@ -1,0 +1,156 @@
+<!-- file: monitor/templates/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>HFT Real-time PnL Monitor</title>
+    <!-- 使用 Lightweight Charts 绘制专业金融图表 -->
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        body { background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI', monospace; margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .status-dot { height: 10px; width: 10px; background-color: #bbb; border-radius: 50%; display: inline-block; margin-right: 5px; }
+        .status-connected { background-color: #00ff00; box-shadow: 0 0 8px #00ff00; }
+        
+        .card { background: #1e1e1e; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        
+        /* 核心数据面板 */
+        .metrics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; }
+        .metric-box { background: #252525; padding: 15px; border-radius: 5px; text-align: center; }
+        .metric-label { font-size: 12px; color: #888; text-transform: uppercase; }
+        .metric-value { font-size: 24px; font-weight: bold; margin-top: 5px; }
+        .green { color: #00e676; }
+        .red { color: #ff5252; }
+        
+        /* 图表容器 */
+        #pnl-chart { width: 100%; height: 400px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h2>🚀 HFT Real-time Monitor</h2>
+            <div><span id="status-dot" class="status-dot"></span> <span id="status-text">Connecting...</span></div>
+        </div>
+
+        <!-- 实时数据卡片 -->
+        <div class="card">
+            <div class="metrics-grid">
+                <div class="metric-box">
+                    <div class="metric-label">Dynamic Equity</div>
+                    <div class="metric-value" id="val-equity">--</div>
+                </div>
+                <div class="metric-box">
+                    <div class="metric-label">Wallet Balance</div>
+                    <div class="metric-value" id="val-balance">--</div>
+                </div>
+                <div class="metric-box">
+                    <div class="metric-label">Used Margin</div>
+                    <div class="metric-value" id="val-margin">--</div>
+                </div>
+                <div class="metric-box">
+                    <div class="metric-label">Available</div>
+                    <div class="metric-value" id="val-available">--</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- PnL 曲线 -->
+        <div class="card">
+            <div id="pnl-chart"></div>
+        </div>
+    </div>
+
+    <script>
+        // --- 1. 初始化图表 ---
+        const chartContainer = document.getElementById('pnl-chart');
+        const chart = LightweightCharts.createChart(chartContainer, {
+            layout: { 
+                background: { color: '#1e1e1e' }, 
+                textColor: '#ddd',
+            },
+            grid: { 
+                vertLines: { color: '#333' }, 
+                horzLines: { color: '#333' } 
+            },
+            timeScale: {
+                timeVisible: true,
+                secondsVisible: true,
+            },
+            rightPriceScale: {
+                borderVisible: false,
+            },
+        });
+
+        // 权益曲线 (Area Series)
+        const equitySeries = chart.addAreaSeries({
+            topColor: 'rgba(33, 150, 243, 0.56)',
+            bottomColor: 'rgba(33, 150, 243, 0.04)',
+            lineColor: 'rgba(33, 150, 243, 1)',
+            lineWidth: 2,
+        });
+
+        // 自动调整大小
+        window.addEventListener('resize', () => {
+            chart.applyOptions({ width: chartContainer.clientWidth });
+        });
+
+        // --- 2. WebSocket 连接 ---
+        const statusDot = document.getElementById('status-dot');
+        const statusText = document.getElementById('status-text');
+        
+        function connect() {
+            const ws = new WebSocket(`ws://${location.host}/ws`);
+
+            ws.onopen = () => {
+                statusDot.classList.add('status-connected');
+                statusText.innerText = "Live Connected";
+                statusText.style.color = "#00ff00";
+            };
+
+            ws.onclose = () => {
+                statusDot.classList.remove('status-connected');
+                statusText.innerText = "Disconnected (Reconnecting...)";
+                statusText.style.color = "red";
+                setTimeout(connect, 3000); // 自动重连
+            };
+
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                
+                if (msg.type === 'pnl') {
+                    const d = msg.data;
+                    
+                    // 更新数字面板
+                    updateMetric('val-equity', d.equity);
+                    updateMetric('val-balance', d.balance);
+                    updateMetric('val-margin', d.margin);
+                    updateMetric('val-available', d.available);
+                    
+                    // 动态颜色 (Equity vs Balance)
+                    const elEquity = document.getElementById('val-equity');
+                    if (d.equity >= d.balance) elEquity.className = "metric-value green";
+                    else elEquity.className = "metric-value red";
+
+                    // 更新图表
+                    // Lightweight Charts 需要 {time, value}
+                    // time 必须是 unix timestamp (seconds)
+                    equitySeries.update({
+                        time: Math.floor(d.timestamp), 
+                        value: d.equity
+                    });
+                }
+            };
+        }
+
+        function updateMetric(id, val) {
+            document.getElementById(id).innerText = "$" + val.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+        }
+
+        // 启动
+        connect();
+    </script>
+</body>
+</html>

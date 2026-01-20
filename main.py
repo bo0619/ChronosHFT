@@ -18,6 +18,9 @@ from infrastructure.logger import logger
 from infrastructure.time_service import time_service
 from data.ref_data import ref_data_manager
 from data.cache import data_cache
+from ops.alert import TelegramAlerter # [NEW]
+from monitor.server import WebMonitor   # [NEW]
+
 
 def load_config():
     if not os.path.exists("config.json"): return None
@@ -37,6 +40,10 @@ def main():
     logger.set_ui_callback(dashboard.add_log)
     engine = EventEngine()
     
+    alerter = TelegramAlerter(engine, config)
+    monitor = WebMonitor(engine, config)
+
+    dashboard.add_log(f"Web Monitor running at http://localhost:{config['system']['web_port']}")
     # 3. [组件组装] Dependency Injection
     # 网关
     gateway = BinanceFutureGateway(engine, config["api_key"], config["api_secret"], testnet=config["testnet"])

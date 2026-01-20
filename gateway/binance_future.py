@@ -17,6 +17,7 @@ from infrastructure.time_service import time_service
 from event.type import Event, EVENT_LOG, EVENT_ORDERBOOK, EVENT_ORDER_UPDATE, EVENT_TRADE_UPDATE, EVENT_AGG_TRADE, EVENT_MARK_PRICE
 from event.type import OrderRequest, OrderData, TradeData, AggTradeData, CancelRequest, MarkPriceData
 from event.type import Side_BUY, Side_SELL, OrderBookGapError, TIF_GTC, TIF_GTX
+from event.type import ApiLimitData, EVENT_API_LIMIT
 from data.orderbook import LocalOrderBook
 
 class BinanceFutureGateway:
@@ -60,6 +61,17 @@ class BinanceFutureGateway:
             elif method == "PUT": response = requests.put(url, headers=headers, params=params)
             elif method == "DELETE": response = requests.delete(url, headers=headers, params=params)
             
+            # [NEW] 解析 API 权重
+            if 'x-mbx-used-weight-1m' in response.headers:
+                used = int(response.headers['x-mbx-used-weight-1m'])
+                # 推送权重事件
+                self.event_engine.put(Event(EVENT_API_LIMIT, ApiLimitData(used, time.time())))
+                
+                # 本地简单风控：如果权重超过 2000 (币安通常是2400)，打印警告
+                if used > 2000:
+                    logger.warn(f"High API Weight Usage: {used}/2400")
+
+            if response.status_code == 200: return response.json()
             if response.status_code == 200: return response.json()
             res_json = response.json()
             code = res_json.get('code')

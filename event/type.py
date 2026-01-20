@@ -17,6 +17,8 @@ EVENT_ORDER_UPDATE = "eOrderUpdate"
 EVENT_TRADE_UPDATE = "eTradeUpdate"
 EVENT_POSITION_UPDATE = "ePositionUpdate"
 EVENT_BACKTEST_END = "eBacktestEnd"
+EVENT_API_LIMIT = "eApiLimit" # [NEW] API 权重事件
+EVENT_ALERT = "eAlert"        # [NEW] 报警事件
 
 # --- 核心枚举 ---
 Side_BUY = "BUY"
@@ -135,3 +137,16 @@ class AccountData:
     available: float
     used_margin: float
     datetime: datetime
+
+@dataclass
+class ApiLimitData:
+    """API 权重消耗数据"""
+    weight_used_1m: int  # 每分钟已用权重
+    timestamp: float
+
+@dataclass
+class AlertData:
+    """报警内容"""
+    level: str # INFO, WARNING, ERROR, CRITICAL
+    msg: str
+    timestamp: float
