@@ -16,7 +16,7 @@ from infrastructure.time_service import time_service
 
 from event.type import Event, EVENT_LOG, EVENT_ORDERBOOK, EVENT_ORDER_UPDATE, EVENT_TRADE_UPDATE, EVENT_AGG_TRADE, EVENT_MARK_PRICE
 from event.type import OrderRequest, OrderData, TradeData, AggTradeData, CancelRequest, MarkPriceData
-from event.type import Side_BUY, Side_SELL, OrderBookGapError
+from event.type import Side_BUY, Side_SELL, OrderBookGapError, TIF_GTC, TIF_GTX
 from data.orderbook import LocalOrderBook
 
 class BinanceFutureGateway:
@@ -39,7 +39,6 @@ class BinanceFutureGateway:
         self.ws_buffer = {}
         self.listen_key = ""
 
-    # --- REST API ---
     def _sign_request(self, params: dict):
         query_string = urlencode(params)
         signature = hmac.new(self.api_secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
@@ -65,9 +64,8 @@ class BinanceFutureGateway:
             res_json = response.json()
             code = res_json.get('code')
             
-            # 忽略常见非关键错误
-            if code == -4059: return res_json # No need to change position side
-            if code == -2011: # Unknown order sent
+            if code == -4059: return res_json
+            if code == -2011: 
                 logger.info(f"Order missing when cancelling: {res_json.get('msg')}")
                 return None
             
@@ -79,21 +77,27 @@ class BinanceFutureGateway:
 
     def send_order(self, req: OrderRequest):
         path = "/fapi/v1/order"
-        # 单向持仓模式：只需要 side=BUY 或 SELL，不需要 positionSide
+        
+        # 处理 TIF
+        tif = req.time_in_force
+        if req.post_only:
+            tif = TIF_GTX # 币安合约用 GTX 代表 PostOnly
+            
         params = {
             "symbol": req.symbol,
             "side": req.side,
             "type": req.order_type,
             "quantity": req.volume,
         }
+        
         if req.order_type == "LIMIT":
             params["price"] = req.price
-            params["timeInForce"] = "GTC"
+            params["timeInForce"] = tif
             
         res = self._send_request("POST", path, params)
         if res:
             order_id = str(res.get('orderId'))
-            logger.info(f"Order Sent: ID={order_id} {req.symbol} {req.side} {req.price} x {req.volume}")
+            logger.info(f"Order Sent: ID={order_id} {req.symbol} {req.side} {req.price} [{tif}]")
             return order_id
         return None
 
@@ -115,8 +119,6 @@ class BinanceFutureGateway:
         return self._send_request("GET", path, params, signed=False)
 
     def set_one_way_mode(self):
-        """[修改] 强制设置为单向持仓模式"""
-        # "true": 双向, "false": 单向
         self._send_request("POST", "/fapi/v1/positionSide/dual", {"dualSidePosition": "false"})
 
     # --- User Stream ---
@@ -149,51 +151,32 @@ class BinanceFutureGateway:
     def _process_order_trade_update(self, raw):
         o = raw["o"]
         symbol, order_id = o["s"], str(o["i"])
-        side = o["S"] # BUY / SELL
+        side = o["S"]
         status = o["X"]
         last_filled = float(o["l"])
         
-        # 推送 OrderData
-        order = OrderData(
-            symbol=symbol, order_id=order_id, side=side,
-            price=float(o["p"]), volume=float(o["q"]), 
-            traded=float(o["z"]), status=status, datetime=datetime.now()
-        )
+        order = OrderData(symbol, order_id, side, float(o["p"]), float(o["q"]), float(o["z"]), status, datetime.now())
         self.event_engine.put(Event(EVENT_ORDER_UPDATE, order))
         
-        # 推送 TradeData
         if o["x"] == "TRADE" and last_filled > 0:
-            trade = TradeData(
-                symbol=symbol, order_id=order_id, trade_id=str(o["t"]),
-                side=side, price=float(o["L"]), volume=last_filled,
-                datetime=datetime.now()
-            )
+            trade = TradeData(symbol, order_id, str(o["t"]), side, float(o["L"]), last_filled, datetime.now())
             self.event_engine.put(Event(EVENT_TRADE_UPDATE, trade))
 
     # --- Market Stream ---
     def connect(self, symbols: list):
         self.symbols = [s.upper() for s in symbols]
         self.active = True
-        
         for s in self.symbols:
             self.orderbooks[s] = LocalOrderBook(s)
             self.ws_buffer[s] = []
-            
-        # [修改] 设置为单向持仓
         self.set_one_way_mode()
-        
         threading.Thread(target=self._run_market_ws, daemon=True).start()
         self.start_user_stream()
         threading.Thread(target=self._init_all_orderbooks, daemon=True).start()
 
     def _run_market_ws(self):
         while self.active:
-            self.ws_market = websocket.WebSocketApp(
-                self.ws_url, 
-                on_open=self._on_market_open, 
-                on_message=self._on_market_message,
-                on_error=lambda ws, err: logger.error(f"Market WS Error: {err}")
-            )
+            self.ws_market = websocket.WebSocketApp(self.ws_url, on_open=self._on_market_open, on_message=self._on_market_message, on_error=lambda ws, err: logger.error(f"Market WS Error: {err}"))
             self.ws_market.run_forever(ping_interval=30, ping_timeout=10)
             time.sleep(3)
 
@@ -213,8 +196,7 @@ class BinanceFutureGateway:
             symbol = raw.get("s")
             
             if e_type == "depthUpdate":
-                if self.ws_buffer[symbol] is not None: 
-                    self.ws_buffer[symbol].append(raw)
+                if self.ws_buffer[symbol] is not None: self.ws_buffer[symbol].append(raw)
                 else:
                     ob = self.orderbooks[symbol]
                     try:
@@ -225,22 +207,13 @@ class BinanceFutureGateway:
                         logger.error(f"Gap detected for {symbol}, triggering re-sync...")
                         self.ws_buffer[symbol] = []
                         threading.Thread(target=self._re_sync_symbol, args=(symbol,), daemon=True).start()
-
             elif e_type == "aggTrade":
-                t = AggTradeData(
-                    raw["s"], raw["a"], float(raw["p"]), float(raw["q"]), 
-                    raw["m"], datetime.fromtimestamp(raw["T"]/1000)
-                )
+                t = AggTradeData(raw["s"], raw["a"], float(raw["p"]), float(raw["q"]), raw["m"], datetime.fromtimestamp(raw["T"]/1000))
                 self.event_engine.put(Event(EVENT_AGG_TRADE, t))
-                
             elif e_type == "markPriceUpdate":
-                mp = MarkPriceData(
-                    symbol=raw["s"], mark_price=float(raw["p"]), index_price=float(raw["i"]),
-                    funding_rate=float(raw["r"]), next_funding_time=datetime.fromtimestamp(raw["T"]/1000),
-                    datetime=datetime.now()
-                )
+                mp = MarkPriceData(raw["s"], float(raw["p"]), float(raw["i"]), float(raw["r"]), datetime.fromtimestamp(raw["T"]/1000), datetime.now())
                 self.event_engine.put(Event(EVENT_MARK_PRICE, mp))
-        except Exception: pass
+        except: pass
 
     def _init_all_orderbooks(self):
         time.sleep(2)
@@ -253,7 +226,7 @@ class BinanceFutureGateway:
             ob = self.orderbooks[symbol]
             ob.init_snapshot(snapshot)
             if self.ws_buffer[symbol]:
-                for msg in self.ws_buffer[symbol]: 
+                for msg in self.ws_buffer[symbol]:
                     try: ob.process_delta(msg)
                     except: pass
             self.ws_buffer[symbol] = None

@@ -9,19 +9,24 @@ EVENT_TICK = "eTick"
 EVENT_ORDERBOOK = "eOrderBook"
 EVENT_AGG_TRADE = "eAggTrade"
 EVENT_MARK_PRICE = "eMarkPrice"
+EVENT_ACCOUNT_UPDATE = "eAccountUpdate"
 EVENT_LOG = "eLog"
 EVENT_ORDER_REQUEST = "eOrderRequest"
+EVENT_ORDER_SUBMITTED = "eOrderSubmitted"
 EVENT_ORDER_UPDATE = "eOrderUpdate"
 EVENT_TRADE_UPDATE = "eTradeUpdate"
 EVENT_POSITION_UPDATE = "ePositionUpdate"
 EVENT_BACKTEST_END = "eBacktestEnd"
-EVENT_ACCOUNT_UPDATE = "eAccountUpdate"
-EVENT_ORDER_SUBMITTED = "eOrderSubmitted" 
 
 # --- 核心枚举 ---
-# 在单向持仓模式下，我们只关心买卖方向
 Side_BUY = "BUY"
 Side_SELL = "SELL"
+
+# [NEW] Time In Force
+TIF_GTC = "GTC" # Good Till Cancel
+TIF_IOC = "IOC" # Immediate or Cancel
+TIF_FOK = "FOK" # Fill or Kill
+TIF_GTX = "GTX" # Post Only (Maker Only)
 
 Status_SUBMITTED = "SUBMITTED"
 Status_PARTTRADED = "PARTTRADED"
@@ -42,13 +47,22 @@ class OrderRequest:
     symbol: str
     price: float
     volume: float
-    side: str       # BUY or SELL
+    side: str       
     order_type: str = "LIMIT"
+    # [NEW] 高级参数
+    time_in_force: str = TIF_GTC 
+    post_only: bool = False      # 如果为True，强制设为 GTX
 
 @dataclass
 class CancelRequest:
     symbol: str
     order_id: str
+
+@dataclass
+class OrderSubmitted:
+    req: OrderRequest
+    order_id: str
+    timestamp: float
 
 @dataclass
 class OrderBook:
@@ -90,7 +104,7 @@ class AggTradeData:
 class OrderData:
     symbol: str
     order_id: str
-    side: str       # BUY or SELL
+    side: str
     price: float
     volume: float
     traded: float
@@ -102,7 +116,7 @@ class TradeData:
     symbol: str
     order_id: str
     trade_id: str
-    side: str       # BUY or SELL
+    side: str
     price: float
     volume: float
     datetime: datetime
@@ -110,22 +124,14 @@ class TradeData:
 @dataclass
 class PositionData:
     symbol: str
-    volume: float   # 带符号浮点数: >0 多头, <0 空头
-    price: float    # 持仓均价
-    pnl: float = 0.0 # 浮动盈亏
+    volume: float
+    price: float
+    pnl: float = 0.0
 
 @dataclass
 class AccountData:
-    """账户资产数据"""
-    balance: float        # 钱包余额 (Wallet Balance)
-    equity: float         # 动态权益 (Wallet Balance + Unrealized PnL)
-    available: float      # 可用下单资金 (Equity - Used Margin)
-    used_margin: float    # 已用保证金 (Position Margin + Order Margin)
+    balance: float
+    equity: float
+    available: float
+    used_margin: float
     datetime: datetime
-
-@dataclass
-class OrderSubmitted:
-    """订单已发送通知"""
-    req: OrderRequest
-    order_id: str
-    timestamp: float

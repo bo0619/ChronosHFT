@@ -45,7 +45,7 @@ def main():
     oms_system = OMS(engine, gateway, config)
     
     # Risk (注入 OMS 用于 Pre-trade Check)
-    risk = RiskManager(engine, config, oms=oms_system)
+    risk = RiskManager(engine, config, oms=oms_system, gateway=gateway)
     
     # Strategy (注入 Risk，但不知道 OMS)
     strategy = MarketMakerStrategy(engine, gateway, risk)
