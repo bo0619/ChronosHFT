@@ -1,6 +1,5 @@
 # file: ui/dashboard.py
 
-from rich.live import Live
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
@@ -35,6 +34,7 @@ class TUIDashboard:
         self.positions[pos.symbol] = pos
 
     def add_log(self, msg: str):
+        # 简单的去重或者截断
         time_str = datetime.now().strftime("%H:%M:%S")
         self.logs.append(f"[{time_str}] {msg}")
         if len(self.logs) > self.max_logs:
@@ -59,22 +59,30 @@ class TUIDashboard:
         return Panel(table)
 
     def _generate_position_table(self):
-        table = Table(title="持仓监控 (Positions)")
+        table = Table(title="持仓监控 (Net Positions)")
         table.add_column("Symbol")
         table.add_column("Dir")
         table.add_column("Vol")
         table.add_column("AvgPrice")
         
         for symbol, pos in self.positions.items():
-            color = "green" if pos.direction == "LONG" else "red"
-            # 过滤掉 0 持仓
+            # [修复] 根据 volume 正负判断方向
             if pos.volume > 0:
-                table.add_row(
-                    symbol,
-                    f"[{color}]{pos.direction}[/]",
-                    f"{pos.volume:.4f}",
-                    f"{pos.price:.2f}"
-                )
+                direction = "LONG"
+                color = "green"
+            elif pos.volume < 0:
+                direction = "SHORT"
+                color = "red"
+            else:
+                continue # 不显示空仓位
+
+            # 显示时使用绝对值 abs(pos.volume)
+            table.add_row(
+                symbol,
+                f"[{color}]{direction}[/]",
+                f"{abs(pos.volume):.4f}",
+                f"{pos.price:.4f}"
+            )
         return Panel(table)
 
     def _generate_log_panel(self):
@@ -83,7 +91,7 @@ class TUIDashboard:
 
     def render(self):
         """生成当前的视图布局"""
-        self.layout["header"].update(Panel("Crypto HFT System - Step 6.5 Optimized", style="bold blue"))
+        self.layout["header"].update(Panel("Crypto HFT System - Step 9 (One-Way Mode)", style="bold blue"))
         self.layout["market"].update(self._generate_market_table())
         self.layout["position"].update(self._generate_position_table())
         self.layout["log"].update(self._generate_log_panel())
