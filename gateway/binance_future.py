@@ -6,19 +6,38 @@ import time
 import hmac
 import hashlib
 import requests
+import socket
 import traceback
 from urllib.parse import urlencode
 from datetime import datetime
 import websocket
+from requests.adapters import HTTPAdapter
+from urllib3.poolmanager import PoolManager
 
 from infrastructure.logger import logger
 from infrastructure.time_service import time_service
 
-from event.type import Event, EVENT_LOG, EVENT_ORDERBOOK, EVENT_ORDER_UPDATE, EVENT_TRADE_UPDATE, EVENT_AGG_TRADE, EVENT_MARK_PRICE
-from event.type import OrderRequest, OrderData, TradeData, AggTradeData, CancelRequest, MarkPriceData
-from event.type import Side_BUY, Side_SELL, OrderBookGapError, TIF_GTC, TIF_GTX
-from event.type import ApiLimitData, EVENT_API_LIMIT
+from event.type import Event, EVENT_LOG, EVENT_ORDERBOOK, EVENT_ORDER_UPDATE, EVENT_TRADE_UPDATE, EVENT_AGG_TRADE, EVENT_MARK_PRICE, EVENT_API_LIMIT
+from event.type import OrderRequest, OrderData, TradeData, AggTradeData, CancelRequest, MarkPriceData, ApiLimitData
+# [修复] 移除了 Direction_LONG, Direction_SHORT, Action_OPEN, Action_CLOSE
+# [保留] TIF 相关常量
+from event.type import OrderBookGapError, TIF_GTC, TIF_GTX
 from data.orderbook import LocalOrderBook
+
+# 自定义 HTTP 适配器，用于底层网络优化
+class HFTAdapter(HTTPAdapter):
+    """
+    针对 HFT 优化的 HTTP 适配器
+    1. 禁用 Nagle 算法 (TCP_NODELAY) -> 降低发单延迟
+    2. 开启 Keep-Alive -> 避免 SSL 握手开销
+    """
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        # 注入 Socket 选项
+        pool_kwargs['socket_options'] = [
+            (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1), # 禁用 Nagle
+            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1), # 保持连接
+        ]
+        super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
 
 class BinanceFutureGateway:
     def __init__(self, event_engine, api_key, api_secret, testnet=True):
@@ -38,7 +57,18 @@ class BinanceFutureGateway:
         self.symbols = []
         self.orderbooks = {}
         self.ws_buffer = {}
+        self.ws_user = None
         self.listen_key = ""
+
+        # 初始化高性能 Session
+        self.session = requests.Session()
+        adapter = HFTAdapter(pool_connections=10, pool_maxsize=10)
+        # 挂载到 https 协议
+        self.session.mount('https://', adapter)
+        self.session.headers.update({
+            'Content-Type': 'application/json',
+            'User-Agent': 'HFT-Client/1.0'
+        })
 
     def _sign_request(self, params: dict):
         query_string = urlencode(params)
@@ -56,30 +86,30 @@ class BinanceFutureGateway:
         url = self.rest_url + path
         
         try:
-            if method == "GET": response = requests.get(url, headers=headers, params=params)
-            elif method == "POST": response = requests.post(url, headers=headers, params=params)
-            elif method == "PUT": response = requests.put(url, headers=headers, params=params)
-            elif method == "DELETE": response = requests.delete(url, headers=headers, params=params)
+            # 使用 self.session 发送请求 (复用 TCP 连接)
+            req = requests.Request(method, url, headers=headers, params=params)
+            prepped = self.session.prepare_request(req)
             
-            # [NEW] 解析 API 权重
+            # 发送 (timeout 设置短一点)
+            response = self.session.send(prepped, timeout=3.0)
+            
+            # 解析权重
             if 'x-mbx-used-weight-1m' in response.headers:
                 used = int(response.headers['x-mbx-used-weight-1m'])
-                # 推送权重事件
                 self.event_engine.put(Event(EVENT_API_LIMIT, ApiLimitData(used, time.time())))
-                
-                # 本地简单风控：如果权重超过 2000 (币安通常是2400)，打印警告
-                if used > 2000:
-                    logger.warn(f"High API Weight Usage: {used}/2400")
-
-            if response.status_code == 200: return response.json()
-            if response.status_code == 200: return response.json()
-            res_json = response.json()
-            code = res_json.get('code')
             
-            if code == -4059: return res_json
-            if code == -2011: 
-                logger.info(f"Order missing when cancelling: {res_json.get('msg')}")
-                return None
+            if response.status_code == 200: return response.json()
+            
+            # 错误处理
+            try:
+                res_json = response.json()
+                code = res_json.get('code')
+                msg = res_json.get('msg')
+                if code == -4059: return res_json
+                if code == -2011: 
+                    logger.info(f"Order missing when cancelling: {msg}")
+                    return None
+            except: pass
             
             logger.error(f"Request Failed [{response.status_code}]: {response.text}")
             return None
@@ -89,19 +119,15 @@ class BinanceFutureGateway:
 
     def send_order(self, req: OrderRequest):
         path = "/fapi/v1/order"
-        
-        # 处理 TIF
         tif = req.time_in_force
-        if req.post_only:
-            tif = TIF_GTX # 币安合约用 GTX 代表 PostOnly
+        if req.post_only: tif = TIF_GTX
             
         params = {
             "symbol": req.symbol,
-            "side": req.side,
+            "side": req.side, # 直接使用 side (BUY/SELL)
             "type": req.order_type,
             "quantity": req.volume,
         }
-        
         if req.order_type == "LIMIT":
             params["price"] = req.price
             params["timeInForce"] = tif
@@ -109,7 +135,7 @@ class BinanceFutureGateway:
         res = self._send_request("POST", path, params)
         if res:
             order_id = str(res.get('orderId'))
-            logger.info(f"Order Sent: ID={order_id} {req.symbol} {req.side} {req.price} [{tif}]")
+            logger.info(f"Order Sent: ID={order_id} {req.symbol} {req.side} {req.price}")
             return order_id
         return None
 
@@ -163,13 +189,12 @@ class BinanceFutureGateway:
     def _process_order_trade_update(self, raw):
         o = raw["o"]
         symbol, order_id = o["s"], str(o["i"])
-        side = o["S"]
+        side = o["S"] # BUY / SELL
         status = o["X"]
         last_filled = float(o["l"])
         
         order = OrderData(symbol, order_id, side, float(o["p"]), float(o["q"]), float(o["z"]), status, datetime.now())
         self.event_engine.put(Event(EVENT_ORDER_UPDATE, order))
-        
         if o["x"] == "TRADE" and last_filled > 0:
             trade = TradeData(symbol, order_id, str(o["t"]), side, float(o["L"]), last_filled, datetime.now())
             self.event_engine.put(Event(EVENT_TRADE_UPDATE, trade))
@@ -243,5 +268,3 @@ class BinanceFutureGateway:
                     except: pass
             self.ws_buffer[symbol] = None
             logger.info(f"{symbol} Sync Done")
-            data = ob.generate_event_data()
-            if data: self.event_engine.put(Event(EVENT_ORDERBOOK, data))
