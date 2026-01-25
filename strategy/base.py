@@ -1,8 +1,9 @@
 # file: strategy/base.py
 
 import time
+# [修复] 移除 Side_BUY, Side_SELL，改为导入 Side
 from event.type import OrderBook, TradeData, OrderData, PositionData, OrderRequest, CancelRequest, Event, EVENT_LOG
-from event.type import Side_BUY, Side_SELL, EVENT_ORDER_SUBMITTED, OrderSubmitted # [NEW]
+from event.type import Side, EVENT_ORDER_SUBMITTED, OrderSubmitted
 from event.type import Status_ALLTRADED, Status_CANCELLED, Status_REJECTED
 from data.ref_data import ref_data_manager
 
@@ -45,7 +46,7 @@ class StrategyTemplate:
             if notional < min_notional:
                 return None
 
-        # 3. 风控检查 (含保证金检查，由 RiskManager 代理)
+        # 3. 风控检查
         if not self.risk_manager.check_order(req): 
             return None
             
@@ -53,8 +54,7 @@ class StrategyTemplate:
         order_id = self.gateway.send_order(req)
         
         if order_id:
-            # 5. [NEW] 发送成功，广播事件通知 OMS
-            # 策略不需要知道 OMS 是谁，只要广播“我下单了”即可
+            # 5. 发送成功，广播通知
             event_data = OrderSubmitted(req, order_id, time.time())
             self.engine.put(Event(EVENT_ORDER_SUBMITTED, event_data))
             
@@ -62,15 +62,17 @@ class StrategyTemplate:
             
         return order_id
 
+    # [修复] 使用 Side.BUY 和 Side.SELL
     def buy(self, symbol, price, volume):
-        return self.send_order_safe(OrderRequest(symbol, price, volume, Side_BUY))
+        return self.send_order_safe(OrderRequest(symbol, price, volume, Side.BUY))
 
     def sell(self, symbol, price, volume):
-        return self.send_order_safe(OrderRequest(symbol, price, volume, Side_SELL))
+        return self.send_order_safe(OrderRequest(symbol, price, volume, Side.SELL))
 
     def cancel_order(self, order_id: str):
         if order_id not in self.active_orders: return
         if order_id in self.orders_cancelling: return 
+        
         self.orders_cancelling.add(order_id)
         
         req = self.active_orders[order_id]

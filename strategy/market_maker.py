@@ -5,12 +5,13 @@ from .base import StrategyTemplate
 from event.type import OrderBook, TradeData
 from data.ref_data import ref_data_manager
 
-# 引入 Alpha 模块
+# 引入 Alpha 模块 (如果你不需要 Alpha，可以注释掉这两行及相关调用)
 from alpha.engine import FeatureEngine
 from alpha.signal import MockSignal
 
 class MarketMakerStrategy(StrategyTemplate):
     def __init__(self, engine, gateway, risk_manager):
+        # [关键修复] 参数对应：engine, gateway, risk_manager, name
         super().__init__(engine, gateway, risk_manager, "SmartMM")
         
         self.config = self._load_strategy_config()
@@ -19,19 +20,15 @@ class MarketMakerStrategy(StrategyTemplate):
         self.skew_factor_usdt = self.config.get("skew_factor_usdt", 50.0)
         self.max_pos_usdt = self.config.get("max_pos_usdt", 2000.0)
         
-        # Alpha 组件初始化
+        # Alpha 初始化
         self.feature_engine = FeatureEngine()
         self.signal_gen = MockSignal() 
-        
-        # [修改] 信号强度改为“比例系数”
-        # 例如 0.0005 表示：信号为1时，偏移 0.05% 的价格
-        # 如果信号满格 10，则偏移 0.5%
         self.alpha_strength = 0.0005 
         
         self.target_bid_price = 0.0
         self.target_ask_price = 0.0
         
-        print(f"[{self.name}] 策略已启动 (Alpha驱动 + 相对比例版)")
+        print(f"[{self.name}] 策略已启动 (完整版)")
 
     def _load_strategy_config(self):
         try:
@@ -47,7 +44,7 @@ class MarketMakerStrategy(StrategyTemplate):
         return ref_data_manager.round_qty(symbol, target)
 
     def on_orderbook(self, ob: OrderBook):
-        # 1. 更新特征工程
+        # 1. 更新特征
         self.feature_engine.on_orderbook(ob)
         
         bid_1, _ = ob.get_best_bid()
@@ -58,45 +55,33 @@ class MarketMakerStrategy(StrategyTemplate):
         order_vol = self._calculate_safe_vol(ob.symbol, mid_price)
         if order_vol <= 0: return
 
-        # 2. 获取预测信号 (Range: -10 ~ 10)
+        # 2. 计算 Alpha 信号
         alpha_signal = self.signal_gen.predict(self.feature_engine)
         
-        # 3. 计算综合 Skew (全部改为相对比例计算)
-        
-        # A. 库存 Skew
-        # 逻辑：持仓价值每增加 1000U，Skew 偏移 50U (也就是 5%)
-        # 公式改为比例：skew_ratio = (NetPosValue / 1000) * (Factor / 1000)
+        # 3. 计算 Skew
+        # 库存 Skew
         pos_value = self.pos * mid_price
-        # 这里的 50/1000 = 0.05，即持仓1000U偏移5%。
-        inventory_skew = (pos_value / 1000.0) * (self.skew_factor_usdt / 1000.0) * mid_price
+        inventory_skew = (pos_value / 1000.0) * (self.skew_factor_usdt / 1000.0) * mid_price 
         
-        # B. Alpha Skew [修复点]
-        # 公式：Signal * Strength * Price
-        # 例：10 * 0.0005 * 134 = 0.67 USD (偏移很合理)
+        # Alpha Skew
         alpha_skew = alpha_signal * self.alpha_strength * mid_price
         
-        # 最终定价中心
+        # 综合定价
         reservation_price = mid_price - inventory_skew + alpha_skew
         
-        # [NEW] 安全钳 (Safety Clamp)
-        # 强制限制 Reservation Price 不偏离 Mid Price 超过 3%
-        # 防止极端信号或极端持仓导致价格触发交易所 Price Filter
-        upper_bound = mid_price * 1.03
-        lower_bound = mid_price * 0.97
-        reservation_price = max(lower_bound, min(upper_bound, reservation_price))
+        # 安全钳 (限制偏离)
+        upper = mid_price * 1.03
+        lower = mid_price * 0.97
+        reservation_price = max(lower, min(upper, reservation_price))
         
         spread = mid_price * self.spread_ratio
         new_bid = reservation_price - spread / 2
         new_ask = reservation_price + spread / 2
         
-        # 4. 打印调试信息 (查看修复效果)
-        if abs(alpha_signal) > 2.0:
-            # self.log(f"Sig:{alpha_signal:.1f} Skew:{alpha_skew:.2f} Prc:{reservation_price:.2f}")
-            pass
-
-        # 5. 挂单逻辑
         price_threshold = mid_price * 0.0005
         
+        # 4. 挂单执行
+        # Buy
         if abs(new_bid - self.target_bid_price) > price_threshold:
             self._cancel_side("BUY")
             if pos_value < self.max_pos_usdt:
@@ -104,6 +89,7 @@ class MarketMakerStrategy(StrategyTemplate):
                 self.buy(ob.symbol, new_bid, order_vol)
                 self.target_bid_price = new_bid
             
+        # Sell
         if abs(new_ask - self.target_ask_price) > price_threshold:
             self._cancel_side("SELL")
             if pos_value > -self.max_pos_usdt:
