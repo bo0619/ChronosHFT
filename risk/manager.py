@@ -54,7 +54,6 @@ class RiskManager:
         下单前的最后一道防线
         """
         if self.kill_switch_triggered:
-            # self._log_warn(f"拦截下单: 系统已熔断 ({self.kill_reason})")
             return False
 
         if not self.active: return True
@@ -87,9 +86,9 @@ class RiskManager:
 
         # 1.4 OMS 相关检查 (持仓与资金)
         if self.oms:
-            # [修复] 访问 oms.exposure 而不是 oms.position
-            # [修复] positions 字典现在直接存 float 数量
-            current_vol = self.oms.exposure.positions.get(req.symbol, 0.0)
+            # [关键修复] 使用 net_positions 替代 positions
+            # exposure.py 中定义的是 self.net_positions
+            current_vol = self.oms.exposure.net_positions.get(req.symbol, 0.0)
             
             # 预估持仓价值 (绝对值叠加)
             new_notional = (abs(current_vol) + req.volume) * req.price
@@ -97,8 +96,7 @@ class RiskManager:
                 self._log_warn(f"拦截下单: 预估持仓 {new_notional:.2f} > {self.max_pos_notional}")
                 return False
             
-            # [修复] 保证金检查：访问 oms.account.check_margin
-            # oms.check_risk 已经在 engine 重构中移除了，直接调用 account 组件
+            # 保证金检查
             if not self.oms.account.check_margin(notional):
                 # self._log_warn(f"拦截下单: 保证金不足")
                 return False
@@ -134,9 +132,6 @@ class RiskManager:
             self.trigger_kill_switch(f"触及日内最大亏损: -{drawdown:.2f}")
 
     def on_order_update(self, event: Event):
-        # 维护频率限制用的 active_order_count 逻辑移到了这里吗？
-        # 注意：之前的代码里 RiskManager 维护了一个 active_order_count，但新版主要依赖 OMS Exposure。
-        # 如果需要基于“订单个数”的风控，可以在这里维护。
         pass
 
     # ==========================
@@ -150,8 +145,8 @@ class RiskManager:
         logger.critical(f"🔥 KILL SWITCH TRIGGERED: {reason} 🔥")
         
         if self.gateway:
-            # 简单的全撤单
-            symbols = self.oms.exposure.positions.keys() if self.oms else []
+            # [关键修复] 获取所有持仓 Symbol 进行撤单
+            symbols = self.oms.exposure.net_positions.keys() if self.oms else []
             for s in symbols:
                 self.gateway.cancel_all_orders(s)
 
