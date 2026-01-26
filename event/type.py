@@ -24,6 +24,8 @@ EVENT_ORDER_SUBMITTED = "eOrderSubmitted" # 订单已提交 (Post-Trade)
 EVENT_ORDER_UPDATE = "eOrderUpdate"       # 订单状态更新 (OMS -> Strategy)
 EVENT_TRADE_UPDATE = "eTradeUpdate"       # 成交回报
 EVENT_POSITION_UPDATE = "ePositionUpdate" # 持仓更新
+EVENT_RPI_UPDATE = "eRpiUpdate"           # RPI 状态更新
+EVENT_EXCHANGE_ORDER_UPDATE = "eExchangeOrderUpdate" # 交易所订单更新 (Gateway -> OMS)
 
 EVENT_BACKTEST_END = "eBacktestEnd"       # 回测结束信号
 
@@ -50,11 +52,18 @@ class OrderStatus(Enum):
     REJECTED = "REJECTED"         # 交易所拒单
     EXPIRED = "EXPIRED"           # 订单过期 (FOK/IOC)
 
+# [NEW] 执行策略枚举 (推荐的做法)
+class ExecutionPolicy(Enum):
+    AGGRESSIVE = "AGGRESSIVE" # 激进吃单 (Taker)
+    PASSIVE = "PASSIVE"       # 普通挂单 (Maker)
+    RPI = "RPI"               # 零售价格优化 (Hidden Maker)
+
 # Time In Force (有效方式)
 TIF_GTC = "GTC" # Good Till Cancel
 TIF_IOC = "IOC" # Immediate or Cancel
 TIF_FOK = "FOK" # Fill or Kill
 TIF_GTX = "GTX" # Post Only (Maker Only)
+TIF_RPI = "RPI" # RPI 专用
 
 # 为了兼容旧代码的字符串状态 (Gateway 原始回报)
 Status_SUBMITTED = "SUBMITTED"
@@ -96,6 +105,9 @@ class OrderIntent:
     order_type: str = "LIMIT"
     time_in_force: str = TIF_GTC
     is_post_only: bool = False
+    # [NEW] 核心字段
+    is_rpi: bool = False 
+    policy: ExecutionPolicy = ExecutionPolicy.PASSIVE
     tag: str = "" # 策略自定义标签，方便追踪
 
 @dataclass
@@ -110,6 +122,7 @@ class OrderRequest:
     order_type: str = "LIMIT"
     time_in_force: str = TIF_GTC 
     post_only: bool = False
+    is_rpi: bool = False  # 是否为 RPI 订单
 
 @dataclass
 class CancelRequest:
@@ -137,6 +150,25 @@ class OrderBook:
     exchange: str
     datetime: datetime
     # Key: Price (float), Value: Volume (float)
+    asks: Dict[float, float] = field(default_factory=dict)
+    bids: Dict[float, float] = field(default_factory=dict)
+
+    def get_best_bid(self):
+        if not self.bids: return 0.0, 0.0
+        p = max(self.bids.keys())
+        return p, self.bids[p]
+
+    def get_best_ask(self):
+        if not self.asks: return 0.0, 0.0
+        p = min(self.asks.keys())
+        return p, self.asks[p]
+    
+@dataclass
+class RpiDepthData:
+    symbol: str
+    exchange: str
+    datetime: datetime
+    # RPI 的买卖盘通常比较稀疏，但也用 Dict 存储
     asks: Dict[float, float] = field(default_factory=dict)
     bids: Dict[float, float] = field(default_factory=dict)
 
@@ -200,6 +232,7 @@ class OrderStateSnapshot:
     filled_volume: float
     avg_price: float
     update_time: float
+    is_rpi: bool = False
 
 @dataclass
 class OrderData:

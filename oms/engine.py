@@ -93,23 +93,25 @@ class OMS:
             # 立即刷新资金占用 (因为 Exposure 里的 open_qty 变了，Account 会重算 Margin)
             self.account.calculate()
             
-        # 5. 构造 Request 并发送给网关 (IO 操作放锁外)
+        # 5. 构造 Request
         req = OrderRequest(
-            symbol=intent.symbol, price=intent.price, volume=intent.volume,
-            side=intent.side.value, order_type=intent.order_type,
-            time_in_force=intent.time_in_force, post_only=intent.is_post_only
+            symbol=intent.symbol, 
+            price=intent.price, 
+            volume=intent.volume,
+            side=intent.side.value, 
+            order_type=intent.order_type,
+            time_in_force=intent.time_in_force, 
+            post_only=intent.is_post_only,
+            is_rpi=intent.is_rpi # [NEW] 传递 RPI 标志
         )
         
         exchange_oid = self.gateway.send_order(req)
         
         if exchange_oid:
-            # 6. 发送成功：通知 OrderManager 开启掉单检测
-            # 构造 OrderSubmitted 事件结构
+            # 6. 通知 OrderManager (包含 RPI 信息)
             event_data = OrderSubmitted(req, exchange_oid, time.time())
-            # 直接调用 internal method，不走 EventBus 绕圈，提高效率
             self.order_monitor.on_order_submitted(Event(EVENT_ORDER_SUBMITTED, event_data))
             
-            # 记录映射关系
             with self.lock:
                 self.exchange_id_map[exchange_oid] = order
         else:
@@ -149,29 +151,36 @@ class OMS:
     def on_exchange_update(self, event):
         """
         [上行] Gateway 收到 WebSocket 消息后推送到这里
+        核心职责：
+        1. 状态机流转 (NEW -> FILLED/CANCELED)
+        2. 资金结算 (扣手续费)
+        3. 持仓更新 (Net Position)
+        4. 生命周期维护 (通知 OrderMonitor)
+        5. 对外广播 (通知 Strategy/UI)
         """
         update: ExchangeOrderUpdate = event.data
         
-        # 需要推送给策略的事件列表 (Batch Push)
+        # 待推送事件列表 (在锁外推送，减少锁占用时间)
         events_to_push = []
         
         with self.lock:
-            # 1. 寻找订单对象
+            # 1. 寻找订单对象 (Single Source of Truth)
+            # 优先用 client_oid (本地生成的UUID)，备用 exchange_oid (交易所ID)
             order = self.orders.get(update.client_oid)
             if not order and update.exchange_oid:
                 order = self.exchange_id_map.get(update.exchange_oid)
             
             if not order: 
-                # 可能是手动下的单，或者重启前的单，暂忽略
+                # 可能是重启前的遗留单、手动单或乱序回报，暂忽略
                 return
 
             # 2. 状态机流转
             prev_status = order.status
-            ex_status = update.status # NEW, FILLED, CANCELED...
+            ex_status = update.status # 交易所原始状态字符串
             
             if ex_status == "NEW":
                 order.mark_new(update.exchange_oid)
-                # 补录映射 (防止之前 send_order 没拿到 ID)
+                # 补录映射 (防止发单时没拿到 exchange_id 的情况)
                 if update.exchange_oid:
                     self.exchange_id_map[update.exchange_oid] = order
                     
@@ -182,26 +191,31 @@ class OMS:
                 order.mark_rejected()
                 
             elif ex_status == "FILLED" or ex_status == "PARTIALLY_FILLED":
-                # 计算本次增量成交
+                # 计算本次增量成交量
+                # Binance 推送的是 cum_filled_qty (累计成交)，需要减去内存里已知的 filled_volume
                 delta_qty = update.cum_filled_qty - order.filled_volume
                 
-                # 只有增量大于0才处理 (防止重复推送)
-                if delta_qty > 0:
-                    # A. 更新订单自身状态
+                # 只有增量 > 0 才处理 (防止重复推送导致重复扣费)
+                if delta_qty > 1e-9:
+                    # A. 更新订单自身状态 (Filled Volume, Avg Price)
                     order.add_fill(delta_qty, update.filled_price)
                     
-                    # B. 更新 Exposure (核心持仓变更)
+                    # B. 更新 Exposure (核心净持仓变更)
                     self.exposure.on_fill(
-                        order.intent.symbol, order.intent.side, 
-                        delta_qty, update.filled_price
+                        order.intent.symbol, 
+                        order.intent.side, 
+                        delta_qty, 
+                        update.filled_price
                     )
                     
-                    # C. 更新 Account (余额变更：扣除手续费 + 已结盈亏)
-                    # 简化处理：假设只扣 Taker 费率 (保守)
+                    # C. 更新 Account (余额变更：扣除手续费)
+                    # 简化估算：统一按 Taker 费率扣除。
+                    # 严谨做法：根据 update.is_maker 标志判断费率，或等待 Transaction 流
                     fee = delta_qty * update.filled_price * self.config["backtest"]["taker_fee"]
                     self.account.update_balance(0, fee) 
                     
-                    # D. 生成 Trade 事件
+                    # D. 生成成交事件 (Trade Event)
+                    # TradeID 暂时用时间戳生成，实盘建议解析回报中的 TradeId
                     trade_data = TradeData(
                         symbol=order.intent.symbol,
                         order_id=order.client_oid,
@@ -214,26 +228,35 @@ class OMS:
                     events_to_push.append(Event(EVENT_TRADE_UPDATE, trade_data))
 
             # 3. 级联更新 (Cascade Update)
-            # 订单状态变了 -> 挂单敞口变了
+            
+            # 3.1 通知 OrderManager 更新监控状态
+            # (如果订单终结，OrderManager 会移除监控；如果成交，会更新最后活跃时间)
+            if order.exchange_oid:
+                self.order_monitor.on_order_update(order.exchange_oid, order.status)
+
+            # 3.2 刷新挂单敞口 (Open Interest)
+            # 订单状态变了(比如变Filled或Canceled)，占用的挂单额度就释放了
             self.exposure.update_open_orders(self.orders)
             
-            # 敞口/持仓变了 -> 保证金变了
+            # 3.3 刷新资金占用 (Margin)
+            # 敞口或持仓变了，保证金占用就需要重算
             self.account.calculate()
             
-            # 4. 准备 Order Update 事件
-            # 只要状态变了，或者有成交，就通知策略
+            # 4. 准备对外推送
+            
+            # 只要状态变了，或者有部分成交，就通知策略
             if order.status != prev_status or ex_status == "PARTIALLY_FILLED":
                 snapshot = order.to_snapshot()
                 events_to_push.append(Event(EVENT_ORDER_UPDATE, snapshot))
                 
-                # 如果持仓变了，也推送持仓事件
-                pos_data = self.exposure.get_position_data(order.intent.symbol)
-                events_to_push.append(Event(EVENT_POSITION_UPDATE, pos_data))
+                # 如果发生了成交，持仓必然变化，推送持仓更新
+                if delta_qty > 1e-9: # 这里的 delta_qty 沿用上面的计算结果
+                    pos_data = self.exposure.get_position_data(order.intent.symbol)
+                    events_to_push.append(Event(EVENT_POSITION_UPDATE, pos_data))
 
-        # 锁外推送事件
+        # 锁外推送事件 (避免阻塞核心锁，提高并发吞吐)
         for evt in events_to_push:
             self.event_engine.put(evt)
-
     # -----------------------------------------------------------
     # 辅助接口
     # -----------------------------------------------------------

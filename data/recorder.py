@@ -5,6 +5,7 @@ import pandas as pd
 from datetime import datetime
 from infrastructure.logger import logger
 from event.type import OrderBook, AggTradeData, Event, EVENT_ORDERBOOK, EVENT_AGG_TRADE
+from event.type import RpiDepthData, EVENT_RPI_UPDATE # [NEW]
 
 class DataRecorder:
     """
@@ -18,7 +19,8 @@ class DataRecorder:
         # Buffer: Symbol -> List[Dict]
         self.depth_buffer = {s: [] for s in symbols}
         self.trade_buffer = {s: [] for s in symbols}
-        
+        self.rpi_buffer = {s: [] for s in symbols} # [NEW]
+
         self.FLUSH_THRESHOLD = 1000 # 每1000条刷盘一次
         
         if not os.path.exists(self.save_path):
@@ -26,6 +28,7 @@ class DataRecorder:
             
         self.engine.register(EVENT_ORDERBOOK, self.on_orderbook)
         self.engine.register(EVENT_AGG_TRADE, self.on_agg_trade)
+        self.engine.register(EVENT_RPI_UPDATE, self.on_rpi_update) # [NEW]
         
         logger.info(f"HDF5 Recorder Started: {self.symbols}")
 
@@ -70,6 +73,32 @@ class DataRecorder:
         if len(self.trade_buffer[t.symbol]) >= self.FLUSH_THRESHOLD:
             self.flush(t.symbol, "trade")
 
+    def on_rpi_update(self, event: Event):
+        """[NEW] 录制 RPI 深度"""
+        rpi: RpiDepthData = event.data
+        if rpi.symbol not in self.rpi_buffer: return
+        
+        # 提取 Top 5
+        sb = sorted(rpi.bids.items(), key=lambda x: x[0], reverse=True)[:5]
+        sa = sorted(rpi.asks.items(), key=lambda x: x[0])[:5]
+        while len(sb) < 5: sb.append((0,0))
+        while len(sa) < 5: sa.append((0,0))
+        
+        row = {
+            "datetime": rpi.datetime,
+            "symbol": rpi.symbol
+        }
+        for i in range(5):
+            row[f"bid{i+1}_p"] = sb[i][0]
+            row[f"bid{i+1}_v"] = sb[i][1]
+            row[f"ask{i+1}_p"] = sa[i][0]
+            row[f"ask{i+1}_v"] = sa[i][1]
+            
+        self.rpi_buffer[rpi.symbol].append(row)
+        
+        if len(self.rpi_buffer[rpi.symbol]) >= self.FLUSH_THRESHOLD:
+            self.flush(rpi.symbol, "rpi")
+
     def flush(self, symbol, data_type):
         """将 Buffer 写入 HDF5"""
         try:
@@ -80,6 +109,9 @@ class DataRecorder:
             if data_type == "depth":
                 buffer = self.depth_buffer[symbol]
                 self.depth_buffer[symbol] = [] # Clear buffer
+            elif data_type == "rpi":
+                buffer = self.rpi_buffer[symbol]
+                self.rpi_buffer[symbol] = []
             else:
                 buffer = self.trade_buffer[symbol]
                 self.trade_buffer[symbol] = []
