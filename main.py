@@ -60,18 +60,13 @@ def main():
     
     # 1. 网关
     gateway = BinanceFutureGateway(engine, config["api_key"], config["api_secret"], testnet=config["testnet"])
-    
-    # 2. OMS (核心枢纽)
-    # 现在的 OMS 内部包含了 Validator, Exposure, Account, OrderManager
     oms_system = OMS(engine, gateway, config)
     
     # 3. 风控 (注入 OMS 用于预交易资金检查)
     risk = RiskManager(engine, config, oms=oms_system, gateway=gateway)
     
-    # 4. 策略 
-    # 策略现在是“轻量级”的，它依赖 Gateway 发单，依赖 Risk 检查，
-    # 它的状态更新完全依赖 OMS 推送的 EVENT_ORDER_UPDATE
-    strategy = MarketMakerStrategy(engine, gateway, risk)
+    # [修改] Strategy 只注入 Engine 和 OMS
+    strategy = MarketMakerStrategy(engine, oms_system)
     # 如果策略需要直接调用 OMS 的某些高级接口（如 submit_order），也可以注入 oms_system
     # 但根据目前架构，策略通过 Gateway 发送 Request，Gateway 返回 ID，
     # 然后策略通过 EVENT_ORDER_SUBMITTED 通知 OMS 纳入管理。

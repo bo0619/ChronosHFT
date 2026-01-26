@@ -1,17 +1,15 @@
 # file: strategy/base.py
 
 import time
-# [修复] 移除 Side_BUY, Side_SELL，改为导入 Side
 from event.type import OrderBook, TradeData, OrderData, PositionData, OrderRequest, CancelRequest, Event, EVENT_LOG
-from event.type import Side, EVENT_ORDER_SUBMITTED, OrderSubmitted
+from event.type import Side, OrderIntent, OrderStateSnapshot, OrderStatus
 from event.type import Status_ALLTRADED, Status_CANCELLED, Status_REJECTED
-from data.ref_data import ref_data_manager
 
 class StrategyTemplate:
-    def __init__(self, engine, gateway, risk_manager, name="Strategy"):
+    # [修改] 参数变更为 engine, oms, name
+    def __init__(self, engine, oms, name="Strategy"):
         self.engine = engine
-        self.gateway = gateway
-        self.risk_manager = risk_manager
+        self.oms = oms # [核心] 现在策略只认识 OMS
         self.name = name
         
         self.pos = 0.0
@@ -22,6 +20,10 @@ class StrategyTemplate:
     def on_trade(self, trade: TradeData): pass
     
     def on_order(self, order: OrderData):
+        """
+        注意：现在的 OrderData 来自 OMS 的 standardized update
+        """
+        # 维护本地 active_orders 列表，用于撤单
         if order.status in [Status_ALLTRADED, Status_CANCELLED, Status_REJECTED]:
             if order.order_id in self.active_orders:
                 del self.active_orders[order.order_id]
@@ -33,53 +35,47 @@ class StrategyTemplate:
 
     def log(self, msg): self.engine.put(Event(EVENT_LOG, f"[{self.name}] {msg}"))
 
-    def send_order_safe(self, req: OrderRequest):
-        # 1. 规整化
-        req.price = ref_data_manager.round_price(req.symbol, req.price)
-        req.volume = ref_data_manager.round_qty(req.symbol, req.volume)
+    # --- 核心下单逻辑 (对接 OMS) ---
+    def send_order_safe(self, symbol, side, price, volume):
+        # 构造意图 Intent
+        intent = OrderIntent(
+            strategy_id=self.name,
+            symbol=symbol,
+            side=side,
+            price=price,
+            volume=volume,
+            order_type="LIMIT",
+            time_in_force="GTC"
+        )
         
-        # 2. 最小名义价值
-        info = ref_data_manager.get_info(req.symbol)
-        if info:
-            notional = req.price * req.volume
-            min_notional = max(info.min_notional, 5.0) 
-            if notional < min_notional:
-                return None
-
-        # 3. 风控检查
-        if not self.risk_manager.check_order(req): 
-            return None
-            
-        # 4. 发送给网关
-        order_id = self.gateway.send_order(req)
+        # [修改] 调用 OMS 发单
+        # OMS 内部会进行 Validator检查、Account保证金检查、Exposure敞口检查
+        client_oid = self.oms.submit_order(intent)
         
-        if order_id:
-            # 5. 发送成功，广播通知
-            event_data = OrderSubmitted(req, order_id, time.time())
-            self.engine.put(Event(EVENT_ORDER_SUBMITTED, event_data))
+        if client_oid:
+            # 记录本地映射 (client_oid -> Intent/Request)
+            # 为了兼容旧逻辑，这里存 intent
+            self.active_orders[client_oid] = intent
             
-            self.active_orders[order_id] = req 
-            
-        return order_id
+        return client_oid
 
-    # [修复] 使用 Side.BUY 和 Side.SELL
     def buy(self, symbol, price, volume):
-        return self.send_order_safe(OrderRequest(symbol, price, volume, Side.BUY))
+        return self.send_order_safe(symbol, Side.BUY, price, volume)
 
     def sell(self, symbol, price, volume):
-        return self.send_order_safe(OrderRequest(symbol, price, volume, Side.SELL))
+        return self.send_order_safe(symbol, Side.SELL, price, volume)
 
-    def cancel_order(self, order_id: str):
-        if order_id not in self.active_orders: return
-        if order_id in self.orders_cancelling: return 
+    # --- 撤单逻辑 ---
+    def cancel_order(self, client_oid: str):
+        if client_oid not in self.active_orders: return
+        if client_oid in self.orders_cancelling: return 
         
-        self.orders_cancelling.add(order_id)
+        self.orders_cancelling.add(client_oid)
         
-        req = self.active_orders[order_id]
-        cancel_req = CancelRequest(req.symbol, order_id)
-        self.gateway.cancel_order(cancel_req)
+        # [修改] 调用 OMS 撤单
+        self.oms.cancel_order(client_oid)
 
     def cancel_all(self):
-        if not self.active_orders: return
-        for order_id in list(self.active_orders.keys()):
-            self.cancel_order(order_id)
+        # 复制 keys 防止迭代时修改
+        for oid in list(self.active_orders.keys()):
+            self.cancel_order(oid)
