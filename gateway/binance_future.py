@@ -184,7 +184,7 @@ class BinanceFutureGateway:
         path = "/fapi/v2/positionRisk"
         return self._send("GET", path, signed=True)
     
-    def get_account_balance(self):
+    def get_account_info(self):
         """
         [NEW] 获取账户余额信息
         GET /fapi/v2/account
@@ -192,12 +192,13 @@ class BinanceFutureGateway:
         path = "/fapi/v2/account"
         data = self._send("GET", path, signed=True)
         
-        if data and "assets" in data:
-            for asset in data["assets"]:
-                if asset["asset"] == "USDT":
-                    # 返回钱包余额 (包含未结盈亏的 marginBalance 还是 walletBalance? 通常初始用 walletBalance)
-                    return float(asset["walletBalance"])
-        return 0.0
+        return data
+        # if data and "assets" in data:
+        #     for asset in data["assets"]:
+        #         if asset["asset"] == "USDT":
+        #             # 返回钱包余额 (包含未结盈亏的 marginBalance 还是 walletBalance? 通常初始用 walletBalance)
+        #             return float(asset["walletBalance"])
+        # return 0.0
 
     def set_one_way_mode(self):
         self._send("POST", "/fapi/v1/positionSide/dual", {"dualSidePosition": "false"})

@@ -25,6 +25,15 @@ class AccountManager:
         # 防止启动时因为 available=0 导致无法下单
         self.available = self.balance 
 
+    def force_sync(self, balance: float, used_margin: float):
+        """
+        [NEW] 强制同步账户资金状态
+        """
+        self.balance = balance
+        self.used_margin = used_margin
+        # 同步后立即重算权益和可用资金
+        self.calculate()
+
     def update_balance(self, realized_pnl, commission):
         """只更新余额 (Realized)"""
         self.balance += (realized_pnl - commission)

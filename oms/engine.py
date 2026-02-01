@@ -150,72 +150,49 @@ class OMS:
     # -----------------------------------------------------------
     def on_exchange_update(self, event):
         """
-        [上行] Gateway 收到 WebSocket 消息后推送到这里
-        核心职责：
-        1. 状态机流转 (NEW -> FILLED/CANCELED)
-        2. 资金结算 (扣手续费)
-        3. 持仓更新 (Net Position)
-        4. 生命周期维护 (通知 OrderMonitor)
-        5. 对外广播 (通知 Strategy/UI)
+        [Fixed] 处理交易所回报
+        修复了 delta_qty 未定义的问题
         """
         update: ExchangeOrderUpdate = event.data
-        
-        # 待推送事件列表 (在锁外推送，减少锁占用时间)
         events_to_push = []
         
+        # [修复] 在锁外初始化 delta_qty，确保后续判断逻辑永远可以访问该变量
+        delta_qty = 0.0
+        
         with self.lock:
-            # 1. 寻找订单对象 (Single Source of Truth)
-            # 优先用 client_oid (本地生成的UUID)，备用 exchange_oid (交易所ID)
             order = self.orders.get(update.client_oid)
             if not order and update.exchange_oid:
                 order = self.exchange_id_map.get(update.exchange_oid)
             
-            if not order: 
-                # 可能是重启前的遗留单、手动单或乱序回报，暂忽略
-                return
+            if not order: return
 
-            # 2. 状态机流转
             prev_status = order.status
-            ex_status = update.status # 交易所原始状态字符串
+            ex_status = update.status
             
             if ex_status == "NEW":
                 order.mark_new(update.exchange_oid)
-                # 补录映射 (防止发单时没拿到 exchange_id 的情况)
                 if update.exchange_oid:
                     self.exchange_id_map[update.exchange_oid] = order
-                    
-            elif ex_status == "CANCELED" or ex_status == "EXPIRED":
+            elif ex_status in ["CANCELED", "EXPIRED"]:
                 order.mark_cancelled()
-                
             elif ex_status == "REJECTED":
                 order.mark_rejected()
-                
-            elif ex_status == "FILLED" or ex_status == "PARTIALLY_FILLED":
-                # 计算本次增量成交量
-                # Binance 推送的是 cum_filled_qty (累计成交)，需要减去内存里已知的 filled_volume
+            elif ex_status in ["FILLED", "PARTIALLY_FILLED"]:
+                # 计算成交增量
                 delta_qty = update.cum_filled_qty - order.filled_volume
                 
-                # 只有增量 > 0 才处理 (防止重复推送导致重复扣费)
                 if delta_qty > 1e-9:
-                    # A. 更新订单自身状态 (Filled Volume, Avg Price)
                     order.add_fill(delta_qty, update.filled_price)
-                    
-                    # B. 更新 Exposure (核心净持仓变更)
                     self.exposure.on_fill(
                         order.intent.symbol, 
                         order.intent.side, 
                         delta_qty, 
                         update.filled_price
                     )
-                    
-                    # C. 更新 Account (余额变更：扣除手续费)
-                    # 简化估算：统一按 Taker 费率扣除。
-                    # 严谨做法：根据 update.is_maker 标志判断费率，或等待 Transaction 流
-                    fee = delta_qty * update.filled_price * self.config["backtest"]["taker_fee"]
+                    # 手续费扣除
+                    fee = delta_qty * update.filled_price * self.config["backtest"].get("taker_fee", 0.0005)
                     self.account.update_balance(0, fee) 
                     
-                    # D. 生成成交事件 (Trade Event)
-                    # TradeID 暂时用时间戳生成，实盘建议解析回报中的 TradeId
                     trade_data = TradeData(
                         symbol=order.intent.symbol,
                         order_id=order.client_oid,
@@ -225,37 +202,24 @@ class OMS:
                         volume=delta_qty,
                         datetime=datetime.now()
                     )
-                    pos_data = self.exposure.get_position_data(order.intent.symbol)
                     events_to_push.append(Event(EVENT_TRADE_UPDATE, trade_data))
 
-            # 3. 级联更新 (Cascade Update)
-            
-            # 3.1 通知 OrderManager 更新监控状态
-            # (如果订单终结，OrderManager 会移除监控；如果成交，会更新最后活跃时间)
+            # 级联刷新
             if order.exchange_oid:
                 self.order_monitor.on_order_update(order.exchange_oid, order.status)
 
-            # 3.2 刷新挂单敞口 (Open Interest)
-            # 订单状态变了(比如变Filled或Canceled)，占用的挂单额度就释放了
             self.exposure.update_open_orders(self.orders)
-            
-            # 3.3 刷新资金占用 (Margin)
-            # 敞口或持仓变了，保证金占用就需要重算
             self.account.calculate()
             
-            # 4. 准备对外推送
-            
-            # 只要状态变了，或者有部分成交，就通知策略
+            # 推送更新
             if order.status != prev_status or ex_status == "PARTIALLY_FILLED":
-                snapshot = order.to_snapshot()
-                events_to_push.append(Event(EVENT_ORDER_UPDATE, snapshot))
+                events_to_push.append(Event(EVENT_ORDER_UPDATE, order.to_snapshot()))
                 
-                # 如果发生了成交，持仓必然变化，推送持仓更新
-                if delta_qty > 1e-9: # 这里的 delta_qty 沿用上面的计算结果
+                # [修复点] 只有在 delta_qty 真的发生变化（成交）时，才推送持仓更新
+                if delta_qty > 0:
                     pos_data = self.exposure.get_position_data(order.intent.symbol)
                     events_to_push.append(Event(EVENT_POSITION_UPDATE, pos_data))
 
-        # 锁外推送事件 (避免阻塞核心锁，提高并发吞吐)
         for evt in events_to_push:
             self.event_engine.put(evt)
     # -----------------------------------------------------------
@@ -270,35 +234,36 @@ class OMS:
 
     def sync_with_exchange(self):
         """
-        [NEW] 启动时同步：从交易所拉取真实持仓，覆盖本地状态
+        [Updated] 启动时同步：从交易所拉取真实持仓和账户余额
         """
-        logger.info("OMS: Syncing positions with Exchange...")
+        logger.info("OMS: Starting Full Synchronization with Binance...")
         
-        # 1. 获取全量持仓
-        positions = self.gateway.get_all_positions()
-        if not positions:
-            logger.warn("OMS: Failed to fetch positions or empty.")
-            return
+        # 1. 同步账户资金 (Balance & Margin)
+        acc_data = self.gateway.get_account_info()
+        if acc_data:
+            total_balance = float(acc_data["totalWalletBalance"])
+            total_used_margin = float(acc_data["totalInitialMargin"])
+            self.account.force_sync(total_balance, total_used_margin)
+            logger.info(f"OMS Account Synced: Balance={total_balance} U, UsedMargin={total_used_margin} U")
+        else:
+            logger.error("OMS: Failed to sync account info.")
 
-        count = 0
-        for item in positions:
-            # 过滤掉持仓为0的数据，减少噪音
-            amt = float(item["positionAmt"])
-            if amt == 0:
-                continue
-            
-            symbol = item["symbol"]
-            entry_price = float(item["entryPrice"])
-            
-            # 2. 写入 Exposure
-            self.exposure.force_sync(symbol, amt, entry_price)
-            
-            # 3. 广播事件 (让 UI 和 Strategy 知道)
-            pos_data = self.exposure.get_position_data(symbol)
-            self.event_engine.put(Event(EVENT_POSITION_UPDATE, pos_data))
-            
-            # 打印到控制台日志
-            logger.info(f"OMS Synced: {symbol} Vol={amt} Price={entry_price}")
-            count += 1
-            
-        logger.info(f"OMS Sync Complete. Loaded {count} active positions.")
+        # 2. 同步持仓 (Positions)
+        pos_res = self.gateway.get_all_positions()
+        if pos_res:
+            count = 0
+            for item in pos_res:
+                amt = float(item["positionAmt"])
+                if amt == 0: continue
+                symbol = item["symbol"]
+                entry_price = float(item["entryPrice"])
+                self.exposure.force_sync(symbol, amt, entry_price)
+                
+                # 广播持仓事件
+                pos_data = self.exposure.get_position_data(symbol)
+                self.event_engine.put(Event(EVENT_POSITION_UPDATE, pos_data))
+                logger.info(f"OMS Position Synced: {symbol} Vol={amt} @ {entry_price}")
+                count += 1
+            logger.info(f"OMS Sync Complete. {count} positions loaded.")
+        else:
+            logger.error("OMS: Failed to sync positions.")

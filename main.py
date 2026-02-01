@@ -126,9 +126,15 @@ def main():
     engine.start() 
     gateway.connect(config["symbols"]) 
     
-    logger.info("ChronosHFT System Started. Architecture: Strategy->Risk->OMS->Gateway")
-    dashboard.add_log(f"Web Monitor: http://localhost:{config['system']['web_port']}")
-
+    # 等待 WebSocket 链路稳定 (User Data Stream 需要一点时间同步)
+    logger.info("Initializing connection, please wait 3s...")
+    time.sleep(3) 
+    
+    # [核心] 执行账户与持仓的深度同步
+    # 这会覆盖掉 config.json 里的 initial_balance
+    oms_system.sync_with_exchange()
+    
+    logger.info("ChronosHFT Engine Ready. Starting Strategy...")
     # --- G. 主循环 ---
     try:
         with Live(dashboard.render(), refresh_per_second=4) as live:
