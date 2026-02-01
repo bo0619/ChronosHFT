@@ -225,6 +225,7 @@ class OMS:
                         volume=delta_qty,
                         datetime=datetime.now()
                     )
+                    pos_data = self.exposure.get_position_data(order.intent.symbol)
                     events_to_push.append(Event(EVENT_TRADE_UPDATE, trade_data))
 
             # 3. 级联更新 (Cascade Update)

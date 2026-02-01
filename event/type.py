@@ -123,6 +123,7 @@ class OrderRequest:
     time_in_force: str = TIF_GTC 
     post_only: bool = False
     is_rpi: bool = False  # 是否为 RPI 订单
+    client_oid: str = '' # 客户端订单号
 
 @dataclass
 class CancelRequest:

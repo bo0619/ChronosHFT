@@ -113,6 +113,7 @@ def main():
     engine.register(EVENT_ORDER_UPDATE, lambda e: strategy.on_order(e.data))
     engine.register(EVENT_TRADE_UPDATE, lambda e: strategy.on_trade(e.data))
     
+    engine.register(EVENT_ACCOUNT_UPDATE, lambda e: dashboard.update_account(e.data))
     # [OMS -> Strategy/UI] 持仓更新
     engine.register(EVENT_POSITION_UPDATE, lambda e: [
         strategy.on_position(e.data),
@@ -120,8 +121,7 @@ def main():
     ])
     
     # [OMS -> UI] 资金更新
-    # WebMonitor 会自动监听 EVENT_ACCOUNT_UPDATE
-
+    engine.register(EVENT_ACCOUNT_UPDATE, lambda e: dashboard.update_account(e.data))
     # --- F. 启动系统 ---
     engine.start() 
     gateway.connect(config["symbols"]) 

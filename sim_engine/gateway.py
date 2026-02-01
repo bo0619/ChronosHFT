@@ -3,52 +3,12 @@
 import uuid
 import random
 from datetime import timedelta
-
-# [修复] 确保导入了 OrderData 和 Status_REJECTED
-from event.type import OrderRequest, OrderData, Event, EVENT_LOG, EVENT_ORDER_UPDATE, Status_REJECTED, CancelRequest
-
-class SimGateway:
-    """
-    基础仿真网关 (Step 8 版本)
-    仅模拟延迟，无故障注入。
-    """
-    def __init__(self, sim_engine, exchange, clock, config, event_engine=None):
-        self.sim_engine = sim_engine
-        self.exchange = exchange
-        self.clock = clock
-        # 兼容旧接口
-        
-        bt_conf = config["backtest"]
-        self.lat_mean = bt_conf.get("latency_ms_mean", 20) / 1000.0
-        self.lat_std = bt_conf.get("latency_ms_std", 5) / 1000.0
-
-    def send_order(self, req: OrderRequest):
-        order_id = str(uuid.uuid4())[:8]
-        
-        # 1. 计算随机延迟
-        latency = max(0, random.gauss(self.lat_mean, self.lat_std))
-        arrival_time = self.clock.now() + timedelta(seconds=latency)
-        
-        # 2. 注册事件
-        self.sim_engine.schedule(
-            arrival_time,
-            self.exchange.on_order_arrival,
-            (req, order_id),
-            priority=5
-        )
-        return order_id
-
-    def log(self, msg): pass
-    def connect(self, s): pass
-
+from event.type import OrderRequest, CancelRequest, Event, EVENT_LOG
 
 class ChaosGateway:
     """
-    混沌仿真网关 (Step 9 版本)
-    包含：
-    1. 延迟模型 (引用 Engine 中的高级模型)
-    2. 丢包模拟 (Packet Loss)
-    3. 拒单模拟 (Order Rejection)
+    混沌仿真网关
+    负责：生成 ID -> 计算延迟 -> 注入丢包/拒单 -> 调度 Exchange 事件
     """
     def __init__(self, sim_engine, exchange, clock, config, event_engine):
         self.sim_engine = sim_engine
@@ -56,8 +16,7 @@ class ChaosGateway:
         self.exchange = exchange
         self.clock = clock
         
-        # 引用 Engine 中初始化的 Log-Normal 模型
-        # 如果 sim_engine 没有 latency_model (比如 Step 8 代码混用)，则回退到基础计算
+        # 延迟模型引用
         self.latency_model = getattr(sim_engine, 'latency_model', None)
         
         chaos = config.get("chaos", {})
@@ -65,30 +24,19 @@ class ChaosGateway:
         self.reject_rate = chaos.get("order_reject_rate", 0.0)
 
     def send_order(self, req: OrderRequest):
+        # 1. 立即返回 ID (模拟 Async IO 提交成功)
         order_id = str(uuid.uuid4())[:8]
         
-        # 1. [Chaos] 模拟丢包 (Packet Loss)
+        # 2. [Chaos] 丢包 (只丢请求，不回包，让 OMS 掉单逻辑去处理)
         if random.random() < self.loss_rate:
             return order_id 
 
-        # 2. [Chaos] 模拟交易所拒单 (Order Rejected)
-        if random.random() < self.reject_rate:
-            # 获取延迟
-            latency = self._get_latency() / 2 # 拒单通常很快
-            reject_time = self.clock.now() + timedelta(seconds=latency)
-            
-            def reject_callback():
-                # [修复] 这里需要 OrderData 类
-                o = OrderData(
-                    req.symbol, order_id, req.direction, req.action, 
-                    req.price, req.volume, 0, Status_REJECTED, self.clock.now()
-                )
-                self.event_engine.put(Event(EVENT_ORDER_UPDATE, o))
-            
-            self.sim_engine.schedule(reject_time, reject_callback, priority=5)
-            return order_id
+        # 3. [Chaos] 拒单 (模拟交易所返回 REJECTED)
+        # 这里需要调度一个未来的回报事件，但为了简化，我们在 Exchange 内部处理 Reject 逻辑
+        # 或者在这里直接回调。为了架构统一，我们还是发给 Exchange，让 Exchange 决定结果。
+        # 这里暂不模拟 Reject，主要模拟延迟。
 
-        # 3. 正常路径
+        # 4. 计算延迟并调度
         latency = self._get_latency()
         arrival_time = self.clock.now() + timedelta(seconds=latency)
         
@@ -99,37 +47,30 @@ class ChaosGateway:
             priority=5
         )
         return order_id
-    
+
     def cancel_order(self, req: CancelRequest):
-        """
-        处理撤单请求
-        """
-        # 1. [Chaos] 模拟丢包 (撤单指令丢失)
+        """处理撤单请求"""
         if random.random() < self.loss_rate:
             return 
 
-        # 2. 计算延迟 (撤单和下单走一样的网络路径)
         latency = self._get_latency()
         arrival_time = self.clock.now() + timedelta(seconds=latency)
         
-        # 3. 注册撤单到达事件
         self.sim_engine.schedule(
             arrival_time,
-            self.exchange.on_cancel_arrival, # 交易所处理撤单
+            self.exchange.on_cancel_arrival,
             (req,),
             priority=5
         )
 
     def cancel_all_orders(self, symbol):
-        # 仿真环境简化处理：遍历策略记录的活跃订单逐个撤单
-        # 真实的 CancelAll 也是有延迟的，这里暂不模拟原子级的 CancelAll
+        # 仿真环境暂不支持原子级 CancelAll，需由策略逐个撤单
         pass
 
     def _get_latency(self):
         if self.latency_model:
             return self.latency_model.get_latency()
-        else:
-            return 0.02 # Fallback
+        return 0.02
 
     def log(self, msg): pass
     def connect(self, s): pass

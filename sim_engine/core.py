@@ -3,7 +3,7 @@
 import heapq
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Any
+from typing import Callable
 
 @dataclass(order=True)
 class SimEvent:
@@ -16,6 +16,7 @@ class SimulationEngine:
     def __init__(self):
         self._queue = [] 
         self.is_running = False
+        self.latency_model = None # 将在运行时注入
 
     def schedule(self, timestamp: datetime, callback: Callable, args=(), priority=10):
         heapq.heappush(self._queue, SimEvent(timestamp, priority, callback, args))
@@ -23,19 +24,17 @@ class SimulationEngine:
     def run(self, event_engine=None):
         """
         运行仿真
-        :param event_engine: 如果传入，将在每个 SimEvent 后清空 EventEngine 的队列
+        :param event_engine: 传入 EventEngine 以开启同步驱动模式 (防止多线程竞争)
         """
         self.is_running = True
         while self._queue and self.is_running:
-            # 1. 取出下一个仿真事件 (例如：行情到达)
+            # 1. 取出事件
             sim_event = heapq.heappop(self._queue)
             
-            # 2. 执行回调 (例如：更新 OrderBook -> 推送 Event)
+            # 2. 执行回调 (如交易所撮合)
             sim_event.callback(*sim_event.args)
             
-            # 3. [关键修复] 立即驱动 EventEngine 消化所有衍生事件
-            # 也就是：行情推给策略 -> 策略思考 -> 策略下达指令 -> 指令进入 Schedule
-            # 这一系列动作必须在时间轴移动到下一个 SimEvent 之前完成
+            # 3. 同步驱动：处理所有由此产生的业务逻辑事件 (Strategy/OMS)
             if event_engine:
                 event_engine.process_existing_events()
             

@@ -139,6 +139,7 @@ class BinanceFutureGateway:
             "side": req.side,
             "type": req.order_type,
             "quantity": req.volume,
+            "newClientOrderId": req.client_oid
         }
 
         if req.order_type == "LIMIT":
@@ -156,10 +157,9 @@ class BinanceFutureGateway:
 
         res = self._send("POST", path, params)
         if res:
-            oid = str(res["orderId"])
-            prefix = "[RPI]" if getattr(req, "is_rpi", False) else ""
-            logger.info(f"{prefix} Order Sent {oid} {req.symbol}")
-            return oid
+            order_id = str(res.get('orderId'))
+            logger.info(f"Order Sent: CID={req.client_oid} OID={order_id} {req.symbol} {req.side} {req.price}")
+            return order_id
         return None
 
     def cancel_order(self, req: CancelRequest):
