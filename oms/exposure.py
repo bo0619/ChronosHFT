@@ -107,3 +107,10 @@ class ExposureManager:
             price=self.avg_prices[symbol],
             pnl=0.0 # PnL 由 AccountManager 或 UI 计算，Exposure 只管量
         )
+    
+    def force_sync(self, symbol: str, volume: float, price: float):
+        """
+        [NEW] 强制同步持仓状态 (用于启动时从交易所拉取)
+        """
+        self.net_positions[symbol] = volume
+        self.avg_prices[symbol] = price

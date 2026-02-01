@@ -267,3 +267,38 @@ class OMS:
 
     def stop(self):
         self.order_monitor.stop()
+
+    def sync_with_exchange(self):
+        """
+        [NEW] 启动时同步：从交易所拉取真实持仓，覆盖本地状态
+        """
+        logger.info("OMS: Syncing positions with Exchange...")
+        
+        # 1. 获取全量持仓
+        positions = self.gateway.get_all_positions()
+        if not positions:
+            logger.warn("OMS: Failed to fetch positions or empty.")
+            return
+
+        count = 0
+        for item in positions:
+            # 过滤掉持仓为0的数据，减少噪音
+            amt = float(item["positionAmt"])
+            if amt == 0:
+                continue
+            
+            symbol = item["symbol"]
+            entry_price = float(item["entryPrice"])
+            
+            # 2. 写入 Exposure
+            self.exposure.force_sync(symbol, amt, entry_price)
+            
+            # 3. 广播事件 (让 UI 和 Strategy 知道)
+            pos_data = self.exposure.get_position_data(symbol)
+            self.event_engine.put(Event(EVENT_POSITION_UPDATE, pos_data))
+            
+            # 打印到控制台日志
+            logger.info(f"OMS Synced: {symbol} Vol={amt} Price={entry_price}")
+            count += 1
+            
+        logger.info(f"OMS Sync Complete. Loaded {count} active positions.")
