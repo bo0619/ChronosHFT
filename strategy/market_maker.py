@@ -1,6 +1,7 @@
 # file: strategy/market_maker.py
 
 import json
+import time
 from .base import StrategyTemplate
 from event.type import OrderBook, TradeData, Side
 from data.ref_data import ref_data_manager
@@ -35,10 +36,15 @@ class MarketMakerStrategy(StrategyTemplate):
         # 3. 初始化 Alpha 引擎
         self.feature_engine = FeatureEngine()
         self.signal_gen = MockSignal() 
-        
+        self.alpha_strength = 0.0005 
+
         # 4. 运行时状态
         self.target_bid_price = 0.0
         self.target_ask_price = 0.0
+
+        # 5. 频率控制
+        self.last_quote_time = 0
+        self.quote_interval = 1.0 # 1秒做一次决策
         
         mode_str = "RPI ONLY" if self.use_rpi else "NORMAL MAKER"
         print(f"[{self.name}] 策略已启动. 模式: {mode_str}, Multiplier: {self.lot_multiplier}x")
@@ -97,77 +103,66 @@ class MarketMakerStrategy(StrategyTemplate):
     # --- 核心 Tick 驱动逻辑 ---
 
     def on_orderbook(self, ob: OrderBook):
-        # 1. 更新特征工程
+        # 1. 频率控制 (1秒1次)
+        if time.time() - self.last_quote_time < self.quote_interval:
+            return
+        self.last_quote_time = time.time()
+
+        # 2. 特征更新
         self.feature_engine.on_orderbook(ob)
         
         bid_1, _ = ob.get_best_bid()
         ask_1, _ = ob.get_best_ask()
         if bid_1 == 0: return
         
-        mid_price = (bid_1 + ask_1) / 2.0
+        # 3. [规范操作] 先撤单！(清场)
+        # 无论价格变没变，我们都假设上一秒的单子已经“过期”了。
+        # 使用 Cancel All 接口，一键清除该币种所有挂单。
+        self.cancel_all(ob.symbol)
         
-        # 2. 计算下单量
+        # 4. 计算新参数
+        mid_price = (bid_1 + ask_1) / 2.0
         order_vol = self._calculate_safe_vol(ob.symbol, mid_price)
         if order_vol <= 0: return
 
-        # 3. 获取 Alpha 信号
         alpha_signal = self.signal_gen.predict(self.feature_engine)
         
-        # 4. 计算综合 Skew (偏移量)
-        # Inventory Skew: 持仓多 -> 价格下移
         pos_value = self.pos * mid_price
         inventory_skew = (pos_value / 1000.0) * (self.skew_factor_usdt / 1000.0) * mid_price 
-        
-        # Alpha Skew: 预测涨 -> 价格上移
         alpha_skew = alpha_signal * self.alpha_strength * mid_price
         
-        # 5. 计算保留价格 (Reservation Price)
         reservation_price = mid_price - inventory_skew + alpha_skew
         
-        # [安全钳] 限制偏离中价不超过 3%
-        upper_bound = mid_price * 1.03
-        lower_bound = mid_price * 0.97
-        reservation_price = max(lower_bound, min(upper_bound, reservation_price))
+        upper = mid_price * 1.03
+        lower = mid_price * 0.97
+        reservation_price = max(lower, min(upper, reservation_price))
         
-        # 6. 计算挂单价格
         spread = mid_price * self.spread_ratio
-        raw_bid = reservation_price - spread / 2
-        raw_ask = reservation_price + spread / 2
+        new_bid = reservation_price - spread / 2
+        new_ask = reservation_price + spread / 2
         
-        # 规整化价格 (重要：防止精度错误)
-        new_bid = ref_data_manager.round_price(ob.symbol, raw_bid)
-        new_ask = ref_data_manager.round_price(ob.symbol, raw_ask)
+        # 规整化
+        new_bid = ref_data_manager.round_price(ob.symbol, new_bid)
+        new_ask = ref_data_manager.round_price(ob.symbol, new_ask)
         
-        # 挂单阈值 (万分之五变动才改单，防止 Spam)
-        price_threshold = mid_price * 0.0005
+        # 5. [规范操作] 挂新单
+        # 只有在持仓允许的情况下才挂单
         
-        # --- 执行逻辑 ---
-        
-        # 买单处理 (Bid Side)
-        if abs(new_bid - self.target_bid_price) > price_threshold:
-            # 撤销所有买方向的单子 (包括 OpenLong 和 CloseShort)
-            self._cancel_side(Side.BUY)
+        # Buy Side
+        if pos_value < self.max_pos_usdt:
+            # 智能判断：如果我有空单，这是平空；如果没空单，这是开多
+            if self.pos < 0:
+                self.exit_short(ob.symbol, new_bid, order_vol)
+            else:
+                self.buy(ob.symbol, new_bid, order_vol)
             
-            # 检查最大持仓限制 (只在开仓方向限制，平仓不限制)
-            # 如果是平空(pos<0)，允许买入；如果是开多(pos>=0)，检查上限
-            is_opening_long = (self.pos >= 0)
-            if not is_opening_long or (pos_value < self.max_pos_usdt):
-                self._smart_buy(ob.symbol, new_bid, order_vol)
-                self.target_bid_price = new_bid
-            
-        # 卖单处理 (Ask Side)
-        if abs(new_ask - self.target_ask_price) > price_threshold:
-            # 撤销所有卖方向的单子
-            self._cancel_side(Side.SELL)
-            
-            # 检查最大持仓限制
-            # 如果是平多(pos>0)，允许卖出；如果是开空(pos<=0)，检查上限
-            is_opening_short = (self.pos <= 0)
-            # 注意 pos_value 此时为负或0，比较时要注意方向
-            # 这里简单用绝对值判断
-            if not is_opening_short or (abs(pos_value) < self.max_pos_usdt):
-                self._smart_sell(ob.symbol, new_ask, order_vol)
-                self.target_ask_price = new_ask
+        # Sell Side
+        if pos_value > -self.max_pos_usdt:
+            # 智能判断：如果我有多单，这是平多；如果没多单，这是开空
+            if self.pos > 0:
+                self.exit_long(ob.symbol, new_ask, order_vol)
+            else:
+                self.sell(ob.symbol, new_ask, order_vol)
 
     def _cancel_side(self, target_side: Side):
         """
@@ -181,8 +176,5 @@ class MarketMakerStrategy(StrategyTemplate):
                 self.cancel_order(oid)
 
     def on_trade(self, trade: TradeData):
-        # 更新特征工程中的 Trade 相关因子
         self.feature_engine.on_trade(trade)
-        
-        direction_str = "BUY" if trade.side == Side.BUY else "SELL"
-        self.log(f"成交 [{trade.symbol}]: {direction_str} Vol={trade.volume} Price={trade.price}")
+        self.log(f"成交 [{trade.symbol}]: {trade.side} Vol={trade.volume}")

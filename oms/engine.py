@@ -124,9 +124,7 @@ class OMS:
         return client_oid
 
     def cancel_order(self, client_oid: str):
-        """
-        [下行] 策略撤单入口
-        """
+        """[下行] 策略撤单入口"""
         req_cancel = None
         
         with self.lock:
@@ -135,15 +133,30 @@ class OMS:
             if not order or not order.is_active():
                 return
             
-            exch_oid = order.exchange_oid
+            # 使用 exchange_oid 撤单，如果没有则用 client_oid (某些交易所支持)
+            # Binance 合约必须用 exchange_oid 或 origClientOrderId
+            exch_oid = order.exchange_oid or client_oid
             symbol = order.intent.symbol
             
-            if exch_oid:
-                req_cancel = CancelRequest(symbol, exch_oid)
+            req_cancel = CancelRequest(symbol, exch_oid)
             
-        # 调用网关 (IO 放锁外)
         if req_cancel:
             self.gateway.cancel_order(req_cancel)
+
+    def cancel_all_orders(self, symbol: str):
+        """
+        [NEW] 策略调用的“一键清场”入口
+        """
+        logger.info(f"[OMS] Received Cancel All for {symbol}")
+        # 直接调用 Gateway 的原生接口
+        self.gateway.cancel_all_orders(symbol)
+        
+        # 立即更新内部状态 (可选，但推荐)
+        # 假设撤单成功，将所有该币种的活跃订单标记为 CANCELLING
+        with self.lock:
+            for order in self.orders.values():
+                if order.intent.symbol == symbol and order.is_active():
+                    order.status = OrderStatus.CANCELLING
 
     # -----------------------------------------------------------
     # 处理交易所回报 (Single Source of Truth Update Flow)
@@ -234,36 +247,42 @@ class OMS:
 
     def sync_with_exchange(self):
         """
-        [Updated] 启动时同步：从交易所拉取真实持仓和账户余额
+        [Updated] 启动时同步
         """
         logger.info("OMS: Starting Full Synchronization with Binance...")
         
-        # 1. 同步账户资金 (Balance & Margin)
+        # [关键修复] 1. 先清空本地所有状态！
+        # 必须把之前的脏数据全部抹掉，以交易所返回的 snapshot 为准
+        self.exposure.net_positions.clear()
+        self.exposure.avg_prices.clear()
+        self.exposure.open_buy_qty.clear()
+        self.exposure.open_sell_qty.clear()
+        
+        # 2. 同步账户资金
         acc_data = self.gateway.get_account_info()
         if acc_data:
             total_balance = float(acc_data["totalWalletBalance"])
             total_used_margin = float(acc_data["totalInitialMargin"])
             self.account.force_sync(total_balance, total_used_margin)
-            logger.info(f"OMS Account Synced: Balance={total_balance} U, UsedMargin={total_used_margin} U")
-        else:
-            logger.error("OMS: Failed to sync account info.")
-
-        # 2. 同步持仓 (Positions)
+            logger.info(f"OMS Account Synced: Balance={total_balance}")
+        
+        # 3. 同步持仓
         pos_res = self.gateway.get_all_positions()
         if pos_res:
             count = 0
             for item in pos_res:
                 amt = float(item["positionAmt"])
-                if amt == 0: continue
                 symbol = item["symbol"]
-                entry_price = float(item["entryPrice"])
-                self.exposure.force_sync(symbol, amt, entry_price)
                 
-                # 广播持仓事件
-                pos_data = self.exposure.get_position_data(symbol)
-                self.event_engine.put(Event(EVENT_POSITION_UPDATE, pos_data))
-                logger.info(f"OMS Position Synced: {symbol} Vol={amt} @ {entry_price}")
-                count += 1
-            logger.info(f"OMS Sync Complete. {count} positions loaded.")
-        else:
-            logger.error("OMS: Failed to sync positions.")
+                # 即使 amt 为 0，也要确保本地记录为 0 (防止残留)
+                # 但由于我们刚才 clear() 了，这里只需要处理 != 0 的
+                if amt != 0:
+                    entry_price = float(item["entryPrice"])
+                    self.exposure.force_sync(symbol, amt, entry_price)
+                    
+                    pos_data = self.exposure.get_position_data(symbol)
+                    self.event_engine.put(Event(EVENT_POSITION_UPDATE, pos_data))
+                    logger.info(f"OMS Position Synced: {symbol} Vol={amt}")
+                    count += 1
+            
+            logger.info(f"OMS Sync Complete. {count} active positions.")

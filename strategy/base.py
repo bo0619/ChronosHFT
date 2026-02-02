@@ -1,76 +1,65 @@
 # file: strategy/base.py
 
 import time
-from event.type import OrderBook, TradeData, OrderData, PositionData, OrderRequest, CancelRequest, Event, EVENT_LOG
-from event.type import Side, OrderIntent, OrderStatus, ExecutionPolicy
-from event.type import EVENT_ORDER_SUBMITTED, OrderSubmitted
-from event.type import Status_ALLTRADED, Status_CANCELLED, Status_REJECTED
+from event.type import OrderBook, TradeData, OrderStateSnapshot, PositionData, CancelRequest, Event, EVENT_LOG
+from event.type import Side, OrderIntent, OrderStatus
 from data.ref_data import ref_data_manager
 
 class StrategyTemplate:
+    """
+    [最终版] 策略基类
+    - 完全与 OMS 解耦
+    - 不再直接依赖 Gateway 或 RiskManager
+    """
     def __init__(self, engine, oms, name="Strategy"):
         self.engine = engine
-        self.oms = oms
+        self.oms = oms # [核心] 策略只与 OMS 对话
         self.name = name
         
         self.pos = 0.0
+        # client_oid -> OrderIntent
         self.active_orders = {} 
         self.orders_cancelling = set()
 
     def on_orderbook(self, orderbook: OrderBook): raise NotImplementedError
     def on_trade(self, trade: TradeData): pass
     
-    def on_order(self, order: OrderData):
-        if order.status in [Status_ALLTRADED, Status_CANCELLED, Status_REJECTED]:
-            if order.order_id in self.active_orders:
-                del self.active_orders[order.order_id]
-            if order.order_id in self.orders_cancelling:
-                self.orders_cancelling.remove(order.order_id)
+    def on_order(self, snapshot: OrderStateSnapshot):
+        """
+        处理 OMS 推送的订单状态快照
+        """
+
+        # 如果订单终结，从本地活跃列表中移除
+        if snapshot.status in [OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED]:
+            if snapshot.client_oid in self.active_orders:
+                del self.active_orders[snapshot.client_oid]
+            if snapshot.client_oid in self.orders_cancelling:
+                self.orders_cancelling.remove(snapshot.client_oid)
     
     def on_position(self, pos: PositionData):
         self.pos = pos.volume
 
     def log(self, msg): self.engine.put(Event(EVENT_LOG, f"[{self.name}] {msg}"))
 
-    # --- 核心下单逻辑 ---
-    
-    def send_order_safe(self, symbol, side, price, volume, **kwargs):
-        # 提取参数
-        is_rpi = kwargs.get("is_rpi", False)
+    # --- 核心下单逻辑 (发送意图给 OMS) ---
+    def send_intent(self, intent: OrderIntent):
+        """
+        发送交易意图给 OMS
+        """
+        # 1. 规整化 (策略层负责意图的合理性)
+        intent.price = ref_data_manager.round_price(intent.symbol, intent.price)
+        intent.volume = ref_data_manager.round_qty(intent.symbol, intent.volume)
         
-        # [修复] RPI 必须强制开启 PostOnly
-        is_post_only = kwargs.get("is_post_only", False)
-        if is_rpi:
-            is_post_only = True
-
-        # 1. 构造意图
-        intent = OrderIntent(
-            strategy_id=self.name,
-            symbol=symbol,
-            side=side,
-            price=price,
-            volume=volume,
-            order_type="LIMIT",
-            time_in_force="GTC",
-            is_rpi=is_rpi,           # 传递 RPI
-            is_post_only=is_post_only, # 传递强制后的 PostOnly
-            policy=kwargs.get("policy", ExecutionPolicy.PASSIVE)
-        )
-        
-        # 2. 规整化
-        intent.price = ref_data_manager.round_price(symbol, intent.price)
-        intent.volume = ref_data_manager.round_qty(symbol, intent.volume)
-        
-        # 3. 最小名义价值检查
-        info = ref_data_manager.get_info(symbol)
+        # 2. 检查最小名义价值 (本地快速过滤)
+        info = ref_data_manager.get_info(intent.symbol)
         if info:
             notional = intent.price * intent.volume
             min_notional = max(info.min_notional, 5.0) 
             if notional < min_notional:
+                # self.log(f"Intent Rejected (Local): Notional {notional:.2f} < {min_notional}")
                 return None
 
-        # 4. 调用 OMS 发单
-        # OMS 内部会进行 Validator检查、Account保证金检查、Exposure敞口检查
+        # 3. 提交给 OMS (OMS 会进行最终风控)
         client_oid = self.oms.submit_order(intent)
         
         if client_oid:
@@ -78,34 +67,44 @@ class StrategyTemplate:
             
         return client_oid
 
-    # 基础指令
-    def buy(self, symbol, price, volume, **kwargs):
-        return self.send_order_safe(symbol, Side.BUY, price, volume, **kwargs)
+    # --- 便捷指令 ---
+    def entry_long(self, symbol, price, volume):
+        intent = OrderIntent(self.name, symbol, Side.BUY, price, volume)
+        return self.send_intent(intent)
 
-    def sell(self, symbol, price, volume, **kwargs):
-        return self.send_order_safe(symbol, Side.SELL, price, volume, **kwargs)
+    def exit_long(self, symbol, price, volume):
+        intent = OrderIntent(self.name, symbol, Side.SELL, price, volume)
+        return self.send_intent(intent)
 
-    # 智能指令
-    def entry_long(self, symbol, price, volume, **kwargs):
-        return self.send_order_safe(symbol, Side.BUY, price, volume, **kwargs)
+    def entry_short(self, symbol, price, volume):
+        intent = OrderIntent(self.name, symbol, Side.SELL, price, volume)
+        return self.send_intent(intent)
 
-    def exit_long(self, symbol, price, volume, **kwargs):
-        return self.send_order_safe(symbol, Side.SELL, price, volume, **kwargs)
+    def exit_short(self, symbol, price, volume):
+        intent = OrderIntent(self.name, symbol, Side.BUY, price, volume)
+        return self.send_intent(intent)
+        
+    # [兼容] 旧的 buy/sell 接口
+    def buy(self, symbol, price, volume): return self.entry_long(symbol, price, volume)
+    def sell(self, symbol, price, volume): return self.entry_short(symbol, price, volume)
 
-    def entry_short(self, symbol, price, volume, **kwargs):
-        return self.send_order_safe(symbol, Side.SELL, price, volume, **kwargs)
-
-    def exit_short(self, symbol, price, volume, **kwargs):
-        return self.send_order_safe(symbol, Side.BUY, price, volume, **kwargs)
-
-    # --- 撤单逻辑 ---
+    # --- 撤单逻辑 (通过 OMS) ---
     def cancel_order(self, client_oid: str):
+        """撤销指定订单"""
         if client_oid not in self.active_orders: return
         if client_oid in self.orders_cancelling: return 
         
         self.orders_cancelling.add(client_oid)
         self.oms.cancel_order(client_oid)
 
-    def cancel_all(self):
-        for oid in list(self.active_orders.keys()):
-            self.cancel_order(oid)
+    def cancel_all(self, symbol: str):
+        """撤销该币种所有订单"""
+        # [修改] 直接调用 OMS 的 cancel_all
+        self.oms.cancel_all_orders(symbol)
+        
+        # 暴力清空本地记录
+        to_remove = [oid for oid, intent in self.active_orders.items() if intent.symbol == symbol]
+        for oid in to_remove:
+            del self.active_orders[oid]
+            if oid in self.orders_cancelling:
+                self.orders_cancelling.remove(oid)
