@@ -21,7 +21,8 @@ from gateway.binance_future import EVENT_EXCHANGE_ORDER_UPDATE # 关键事件
 from gateway.binance_future import BinanceFutureGateway
 from oms.engine import OMS # [修改] 引用新的 OMS Engine
 from risk.manager import RiskManager
-from strategy.market_maker import MarketMakerStrategy
+from strategy.avellaneda_stoikov import AvellanedaStoikovStrategy
+from strategy.glft import GLFTStrategy
 
 # 4. 数据与持久化
 from data.recorder import DataRecorder
@@ -61,7 +62,7 @@ def main():
     gateway = BinanceFutureGateway(engine, config["api_key"], config["api_secret"], testnet=config["testnet"])
     oms_system = OMS(engine, gateway, config)
     risk = RiskManager(engine, config, oms=oms_system, gateway=gateway)
-    strategy = MarketMakerStrategy(engine, oms_system)
+    strategy = GLFTStrategy(engine, oms_system)
     recorder = None
     if config.get("record_data", False):
         recorder = DataRecorder(engine, config["symbols"])
@@ -89,6 +90,7 @@ def main():
         dashboard.update_position(e.data)
     ])
     engine.register(EVENT_ACCOUNT_UPDATE, lambda e: dashboard.update_account(e.data))
+    engine.register(EVENT_AGG_TRADE, lambda e: strategy.on_market_trade(e.data))
 
     # --- F. 启动系统 ---
     engine.start() 

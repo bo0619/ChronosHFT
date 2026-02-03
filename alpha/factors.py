@@ -3,7 +3,7 @@
 import math
 from collections import deque
 import numpy as np
-from event.type import OrderBook, TradeData
+from event.type import OrderBook, TradeData, AggTradeData
 
 class FactorBase:
     def __init__(self, name):
@@ -116,3 +116,64 @@ class RealizedVolatility(FactorBase):
             returns = np.log(prices[1:] / prices[:-1])
             # 标准差 * 放大系数 (为了数值好看)
             self.value = np.std(returns) * 10000
+
+class GLFTCalibrator:
+    """
+    GLFT 在线参数校准器
+    1. 计算归一化波动率 (Volatility in bps)
+    2. 递归估计订单流参数 A 和 k (Intensity = A * exp(-k * delta))
+    """
+    def __init__(self, window=100):
+        self.window = window
+        self.mid_prices = deque(maxlen=window)
+        
+        # 初始参数 (以 bps 为单位)
+        self.sigma_bps = 0.0
+        self.A = 10.0      # 基础频率
+        self.k = 0.5       # 衰减速率
+        
+        self.learning_rate = 0.01
+        self.last_mid = 0.0
+
+    def on_orderbook(self, ob: OrderBook):
+        bid, _ = ob.get_best_bid()
+        ask, _ = ob.get_best_ask()
+        if bid == 0: return
+        
+        mid = (bid + ask) / 2
+        if self.last_mid > 0:
+            # 计算归一化收益率 (bps)
+            ret_bps = (mid / self.last_mid - 1) * 10000
+            self.mid_prices.append(ret_bps)
+            
+            if len(self.mid_prices) > 10:
+                # 更新波动率 (sigma 是 bps/second)
+                self.sigma_bps = np.std(self.mid_prices)
+        
+        self.last_mid = mid
+
+    def on_market_trade(self, trade: AggTradeData, current_mid: float):
+        """
+        核心：通过真实成交数据点在线修正 A 和 k
+        """
+        if current_mid <= 0: return
+        
+        # 1. 计算该笔成交距离当时中间价的归一化距离 (bps)
+        delta_mkt = abs(trade.price / current_mid - 1) * 10000
+        
+        # 2. 简单的递归最大似然估计 (Recursive MLE) 思想
+        # 如果成交频繁发生在远处，k 会变小（深度好）；如果只发生在近处，k 会变大（深度差）
+        # 这里使用随机梯度下降 (SGD) 思想更新参数
+        prediction = self.A * math.exp(-self.k * delta_mkt)
+        
+        # 我们观察到了一次真实的成交事件（Target = 1）
+        error = 1.0 - prediction
+        
+        # 更新 A (截距)
+        self.A += self.learning_rate * error * math.exp(-self.k * delta_mkt)
+        # 更新 k (斜率)
+        self.k -= self.learning_rate * error * (-delta_mkt) * prediction
+        
+        # 参数约束
+        self.A = max(0.1, min(100.0, self.A))
+        self.k = max(0.01, min(5.0, self.k))
