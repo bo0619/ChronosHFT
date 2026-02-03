@@ -4,7 +4,7 @@ import time
 import math
 import numpy as np
 from .base import StrategyTemplate
-from event.type import OrderBook, TradeData, OrderIntent, Side, AggTradeData
+from event.type import OrderBook, TradeData, OrderIntent, Side, AggTradeData, Event, EVENT_STRATEGY_UPDATE, StrategyData
 from alpha.factors import GLFTCalibrator
 from alpha.engine import FeatureEngine
 from alpha.signal import OnlineRidgePredictor
@@ -26,7 +26,7 @@ class GLFTStrategy(StrategyTemplate):
         
         # [NEW] 引入 ML 组件 (之前可能漏了初始化)
         self.feature_engine = FeatureEngine()
-        self.ml_model = OnlineRidgePredictor(num_features=3)
+        self.ml_model = OnlineRidgePredictor(num_features=9)
         
         self.last_run_time = 0
         
@@ -126,21 +126,6 @@ class GLFTStrategy(StrategyTemplate):
             target_bid = mid_safe - tick_size * 2
             target_ask = mid_safe + tick_size * 2
 
-        # --- [NEW] 定时打印 GLFT 参数看板 ---
-        if now - self.last_param_log_time > self.log_interval:
-            self.last_param_log_time = now
-            msg = (
-                f"\n[GLFT Stats] {ob.symbol}\n"
-                f"  Vol(bps): {sigma:.2f} | Gamma: {gamma_adaptive:.3f}\n"
-                f"  A: {A:.2f} | k: {k:.2f}\n"
-                f"  ML Pred(bps): {pred_bps:.2f}\n"
-                f"  Inventory: {self.pos:.4f} (Skew: {inventory_skew_bps:.1f} bps)\n"
-                f"  Quote: Bid -{bid_delta_bps:.1f}bps / Ask +{ask_delta_bps:.1f}bps"
-            )
-            # 使用 logger.info 会被 dashboard 捕获显示
-            # 使用 print 则只在终端显示，避免刷屏 UI
-            print(msg) 
-
         # 13. [Execution] 执行交易
         self.cancel_all(ob.symbol)
         
@@ -158,6 +143,17 @@ class GLFTStrategy(StrategyTemplate):
         
         # 14. 周期收尾
         self.feature_engine.reset_interval()
+
+        strat_data = StrategyData(
+            symbol=ob.symbol,
+            fair_value=fair_mid,
+            alpha_bps=pred_bps,
+            gamma=gamma_adaptive,
+            k=k,
+            A=A,
+            sigma=sigma
+        )
+        self.engine.put(Event(EVENT_STRATEGY_UPDATE, strat_data))
 
     def on_trade(self, trade: TradeData):
         pass

@@ -14,7 +14,7 @@ from infrastructure.time_service import time_service
 from event.engine import EventEngine
 from event.type import EVENT_LOG, EVENT_ORDERBOOK, EVENT_TRADE_UPDATE, EVENT_ORDER_UPDATE 
 from event.type import EVENT_POSITION_UPDATE, EVENT_AGG_TRADE, EVENT_MARK_PRICE, EVENT_ACCOUNT_UPDATE
-from event.type import EVENT_ORDER_SUBMITTED 
+from event.type import EVENT_ORDER_SUBMITTED, EVENT_STRATEGY_UPDATE
 from gateway.binance_future import EVENT_EXCHANGE_ORDER_UPDATE # 关键事件
 
 # 3. 核心业务模块
@@ -91,7 +91,7 @@ def main():
     ])
     engine.register(EVENT_ACCOUNT_UPDATE, lambda e: dashboard.update_account(e.data))
     engine.register(EVENT_AGG_TRADE, lambda e: strategy.on_market_trade(e.data))
-
+    engine.register(EVENT_STRATEGY_UPDATE, lambda e: dashboard.update_strategy(e.data))
     # --- F. 启动系统 ---
     engine.start() 
     gateway.connect(config["symbols"]) 

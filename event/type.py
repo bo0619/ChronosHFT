@@ -13,6 +13,7 @@ EVENT_ORDERBOOK = "eOrderBook"      # 订单簿快照
 EVENT_AGG_TRADE = "eAggTrade"       # 逐笔成交
 EVENT_MARK_PRICE = "eMarkPrice"     # 标记价格/资金费率
 EVENT_ACCOUNT_UPDATE = "eAccountUpdate" # 账户资金变动
+EVENT_STRATEGY_UPDATE = "eStrategyUpdate" # 策略决策事件
 
 EVENT_LOG = "eLog"
 EVENT_API_LIMIT = "eApiLimit"       # API 权重监控
@@ -297,3 +298,14 @@ class AlertData:
     level: str
     msg: str
     timestamp: float
+
+@dataclass
+class StrategyData:
+    """策略内部状态快照 (用于UI监控)"""
+    symbol: str
+    fair_value: float   # 公允价格
+    alpha_bps: float    # Alpha预测值 (bps)
+    gamma: float        # 当前风险厌恶系数
+    k: float            # 订单流衰减
+    A: float            # 订单流强度
+    sigma: float        # 波动率 (bps)
