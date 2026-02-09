@@ -171,6 +171,16 @@ class BinanceFutureGateway:
     def cancel_all_orders(self, symbol):
         self._send("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
 
+    def get_open_orders(self, symbol=None):
+        """
+        GET /fapi/v1/openOrders
+        """
+        path = "/fapi/v1/openOrders"
+        params = {}
+        if symbol: 
+            params['symbol'] = symbol
+        return self._send("GET", path, params, signed=True)
+
     def get_depth_snapshot(self, symbol, limit=1000):
         return self._send("GET", "/fapi/v1/depth", {"symbol": symbol, "limit": limit}, signed=False)
 

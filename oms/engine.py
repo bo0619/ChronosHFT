@@ -6,8 +6,8 @@ import time
 from datetime import datetime
 from infrastructure.logger import logger
 from event.type import Event, OrderIntent, OrderRequest, OrderStatus, ExchangeOrderUpdate, CancelRequest
-from event.type import EVENT_ORDER_UPDATE, EVENT_TRADE_UPDATE, EVENT_POSITION_UPDATE, EVENT_ORDER_SUBMITTED
-from event.type import OrderSubmitted, TradeData
+from event.type import EVENT_ORDER_UPDATE, EVENT_TRADE_UPDATE, EVENT_POSITION_UPDATE, EVENT_ORDER_SUBMITTED, EVENT_SYSTEM_HEALTH
+from event.type import OrderSubmitted, TradeData, SystemHealthData
 
 # 引入子组件
 from .order import Order
@@ -15,15 +15,12 @@ from .exposure import ExposureManager
 from .validator import OrderValidator
 from .account_manager import AccountManager
 from .order_manager import OrderManager
+from data.cache import data_cache
 
 class OMS:
     """
     OMS Core Engine (Single Source of Truth)
-    职责：
-    1. 统筹管理子模块 (Validator, Exposure, Account, OrderManager)
-    2. 维护订单主表 (Order Registry)
-    3. 处理下行指令 (Submit/Cancel)
-    4. 处理上行回报 (Exchange Update) 并同步所有状态
+    集成：状态机、资金风控、生命周期管理、健康对账
     """
     def __init__(self, event_engine, gateway, config):
         self.event_engine = event_engine
@@ -34,45 +31,39 @@ class OMS:
         self.orders = {}          # client_oid -> Order
         self.exchange_id_map = {} # exchange_oid -> Order
         
-        self.lock = threading.RLock() # 递归锁，保证状态更新原子性
+        self.lock = threading.RLock() # 递归锁
 
-        # --- 初始化子组件 ---
-        
-        # 1. 静态规则校验器
+        # --- 子组件 ---
         self.validator = OrderValidator(config)
-        
-        # 2. 仓位与敞口管理器 (真理源：持仓量 & 挂单量)
         self.exposure = ExposureManager()
-        
-        # 3. 订单生命周期管理器 (负责掉单检测线程)
         self.order_monitor = OrderManager(event_engine, gateway)
-        
-        # 4. 资金管理器 (真理源：余额 & 保证金)
-        # [修复] 适配 Step 11: AccountManager 现在只依赖 Engine, Exposure 和 Config
-        # 它不再需要 OrderManager，因为挂单占用的 Quantity 已经在 Exposure 中计算好了
         self.account = AccountManager(event_engine, self.exposure, config)
 
+        # --- [NEW] 统计计数器 (用于 Dashboard Fill Ratio) ---
+        self.total_submitted_count = 0
+        self.total_filled_count = 0
+
+        # --- [NEW] 启动对账线程 ---
+        self.active = True
+        self.reconcile_thread = threading.Thread(target=self._reconcile_loop, daemon=True)
+        self.reconcile_thread.start()
+
     def submit_order(self, intent: OrderIntent) -> str:
-        """
-        [下行] 策略发单入口
-        """
+        """[下行] 策略发单入口"""
         client_oid = str(uuid.uuid4())
         
         with self.lock:
-            # 1. 静态参数校验
+            # 1. 静态校验
             if not self.validator.validate_params(intent):
                 logger.warn(f"OMS Reject: Invalid Params {intent}")
                 return None
             
-            # 2. 资金/保证金检查 (Account Manager)
+            # 2. 资金检查
             notional = intent.price * intent.volume
             if not self.account.check_margin(notional):
-                # 资金不足
-                # logger.warning(f"OMS Reject: Insufficient Margin for {notional:.2f}")
                 return None
 
-            # 3. 仓位限额与系统敞口检查 (Exposure Manager)
-            # 这里是 "系统级" 检查：包含当前持仓 + 所有同向挂单 + 本笔新单
+            # 3. 仓位限额检查
             max_notional = self.config["risk"]["limits"].get("max_pos_notional", 20000.0)
             ok, msg = self.exposure.check_risk(
                 intent.symbol, intent.side, intent.volume, max_notional
@@ -81,41 +72,37 @@ class OMS:
                 logger.warn(f"OMS Reject: Exposure Limit - {msg}")
                 return None
 
-            # --- 通过所有检查，创建订单 ---
+            # 4. 创建订单
             order = Order(client_oid, intent)
             self.orders[client_oid] = order
             order.mark_submitting()
             
-            # 4. 立即更新内部状态 (Pessimistic Locking)
-            # 即使还没发出去，也先占用 Exposure 和 Margin，防止并发超限
+            # 5. 更新内部状态 (预占用)
             self.exposure.update_open_orders(self.orders)
+            self.account.calculate() 
             
-            # 立即刷新资金占用 (因为 Exposure 里的 open_qty 变了，Account 会重算 Margin)
-            self.account.calculate()
+            # [统计] 增加提交计数
+            self.total_submitted_count += 1
             
-        # 5. 构造 Request
+        # 6. 发送给网关
+        from event.type import OrderRequest
         req = OrderRequest(
-            symbol=intent.symbol, 
-            price=intent.price, 
-            volume=intent.volume,
-            side=intent.side.value, 
-            order_type=intent.order_type,
-            time_in_force=intent.time_in_force, 
-            post_only=intent.is_post_only,
-            is_rpi=intent.is_rpi # [NEW] 传递 RPI 标志
+            symbol=intent.symbol, price=intent.price, volume=intent.volume,
+            side=intent.side.value, order_type=intent.order_type,
+            time_in_force=intent.time_in_force, post_only=intent.is_post_only,
+            is_rpi=intent.is_rpi
         )
         
         exchange_oid = self.gateway.send_order(req)
         
         if exchange_oid:
-            # 6. 通知 OrderManager (包含 RPI 信息)
+            # 通知 OrderManager
             event_data = OrderSubmitted(req, exchange_oid, time.time())
             self.order_monitor.on_order_submitted(Event(EVENT_ORDER_SUBMITTED, event_data))
             
             with self.lock:
                 self.exchange_id_map[exchange_oid] = order
         else:
-            # 发送失败 (如网络错误)，回滚状态 (标记为 Rejected)
             with self.lock:
                 order.mark_rejected("Gateway Send Failed")
                 self.exposure.update_open_orders(self.orders)
@@ -126,59 +113,51 @@ class OMS:
     def cancel_order(self, client_oid: str):
         """[下行] 策略撤单入口"""
         req_cancel = None
-        
         with self.lock:
             order = self.orders.get(client_oid)
-            # 只有活跃订单才能撤
-            if not order or not order.is_active():
-                return
+            if not order or not order.is_active(): return
             
-            # 使用 exchange_oid 撤单，如果没有则用 client_oid (某些交易所支持)
-            # Binance 合约必须用 exchange_oid 或 origClientOrderId
             exch_oid = order.exchange_oid or client_oid
             symbol = order.intent.symbol
-            
+            from event.type import CancelRequest
             req_cancel = CancelRequest(symbol, exch_oid)
             
         if req_cancel:
             self.gateway.cancel_order(req_cancel)
 
     def cancel_all_orders(self, symbol: str):
-        """
-        [NEW] 策略调用的“一键清场”入口
-        """
-        logger.info(f"[OMS] Received Cancel All for {symbol}")
-        # 直接调用 Gateway 的原生接口
+        """[下行] 一键清场"""
+        # 1. 发送 API
         self.gateway.cancel_all_orders(symbol)
         
-        # 立即更新内部状态 (可选，但推荐)
-        # 假设撤单成功，将所有该币种的活跃订单标记为 CANCELLING
+        # 2. 乐观更新状态 (防止UI滞后)
         with self.lock:
             for order in self.orders.values():
                 if order.intent.symbol == symbol and order.is_active():
                     order.status = OrderStatus.CANCELLING
 
     # -----------------------------------------------------------
-    # 处理交易所回报 (Single Source of Truth Update Flow)
+    # 处理交易所回报 (核心逻辑)
     # -----------------------------------------------------------
     def on_exchange_update(self, event):
         """
-        [Fixed] 处理交易所回报
-        修复了 delta_qty 未定义的问题
+        [上行] Gateway 收到 WebSocket 消息后推送到这里
         """
         update: ExchangeOrderUpdate = event.data
         events_to_push = []
         
-        # [修复] 在锁外初始化 delta_qty，确保后续判断逻辑永远可以访问该变量
+        # 在锁外初始化变量
         delta_qty = 0.0
         
         with self.lock:
+            # 1. 寻找订单
             order = self.orders.get(update.client_oid)
             if not order and update.exchange_oid:
                 order = self.exchange_id_map.get(update.exchange_oid)
             
             if not order: return
 
+            # 2. 状态流转
             prev_status = order.status
             ex_status = update.status
             
@@ -186,26 +165,36 @@ class OMS:
                 order.mark_new(update.exchange_oid)
                 if update.exchange_oid:
                     self.exchange_id_map[update.exchange_oid] = order
+                    
             elif ex_status in ["CANCELED", "EXPIRED"]:
                 order.mark_cancelled()
+                
             elif ex_status == "REJECTED":
                 order.mark_rejected()
+                
             elif ex_status in ["FILLED", "PARTIALLY_FILLED"]:
-                # 计算成交增量
+                # 计算增量成交
                 delta_qty = update.cum_filled_qty - order.filled_volume
                 
                 if delta_qty > 1e-9:
+                    # [统计] 增加成交计数 (用于 Fill Ratio)
+                    self.total_filled_count += 1
+                    
+                    # A. 更新订单
                     order.add_fill(delta_qty, update.filled_price)
+                    
+                    # B. 更新 Exposure
                     self.exposure.on_fill(
-                        order.intent.symbol, 
-                        order.intent.side, 
-                        delta_qty, 
-                        update.filled_price
+                        order.intent.symbol, order.intent.side, 
+                        delta_qty, update.filled_price
                     )
-                    # 手续费扣除
-                    fee = delta_qty * update.filled_price * self.config["backtest"].get("taker_fee", 0.0005)
+                    
+                    # C. 更新 Account
+                    taker_fee = self.config["backtest"].get("taker_fee", 0.0005)
+                    fee = delta_qty * update.filled_price * taker_fee
                     self.account.update_balance(0, fee) 
                     
+                    # D. 生成 Trade 事件
                     trade_data = TradeData(
                         symbol=order.intent.symbol,
                         order_id=order.client_oid,
@@ -217,72 +206,122 @@ class OMS:
                     )
                     events_to_push.append(Event(EVENT_TRADE_UPDATE, trade_data))
 
-            # 级联刷新
+            # 3. 级联更新
             if order.exchange_oid:
                 self.order_monitor.on_order_update(order.exchange_oid, order.status)
 
             self.exposure.update_open_orders(self.orders)
             self.account.calculate()
             
-            # 推送更新
+            # 4. 推送事件
             if order.status != prev_status or ex_status == "PARTIALLY_FILLED":
-                events_to_push.append(Event(EVENT_ORDER_UPDATE, order.to_snapshot()))
+                snapshot = order.to_snapshot()
+                events_to_push.append(Event(EVENT_ORDER_UPDATE, snapshot))
                 
-                # [修复点] 只有在 delta_qty 真的发生变化（成交）时，才推送持仓更新
                 if delta_qty > 0:
                     pos_data = self.exposure.get_position_data(order.intent.symbol)
                     events_to_push.append(Event(EVENT_POSITION_UPDATE, pos_data))
 
         for evt in events_to_push:
             self.event_engine.put(evt)
-    # -----------------------------------------------------------
-    # 辅助接口
-    # -----------------------------------------------------------
-    def on_order_submitted(self, event):
-        """监听策略发出的 OrderSubmitted 事件"""
-        self.order_monitor.on_order_submitted(event)
 
-    def stop(self):
-        self.order_monitor.stop()
+    # -----------------------------------------------------------
+    # 对账循环 (Reconciliation) - 支撑 Dashboard 的核心
+    # -----------------------------------------------------------
+    def _reconcile_loop(self):
+        """
+        定期回答: 风险大不大? 系统撒谎没? 还能跑吗?
+        """
+        while self.active:
+            time.sleep(5) # 每5秒对账一次
+            
+            try:
+                # 1. IO 操作
+                remote_pos_list = self.gateway.get_all_positions()
+                remote_orders = self.gateway.get_open_orders()
+                
+                if remote_pos_list is None or remote_orders is None:
+                    continue
+
+                # 2. 内存计算 (加锁)
+                pos_diffs = {}
+                local_order_count = 0
+                cancelling_count = 0
+                total_exposure = 0.0
+                
+                with self.lock:
+                    # A. 仓位对账
+                    rem_map = {p['symbol']: float(p['positionAmt']) for p in remote_pos_list if float(p['positionAmt']) != 0}
+                    loc_map = {s: v for s, v in self.exposure.net_positions.items() if v != 0}
+                    
+                    all_syms = set(rem_map.keys()) | set(loc_map.keys())
+                    for s in all_syms:
+                        loc = loc_map.get(s, 0.0)
+                        rem = rem_map.get(s, 0.0)
+                        if abs(loc - rem) > 1e-6:
+                            pos_diffs[s] = (loc, rem, loc - rem)
+                        
+                        mp = data_cache.get_mark_price(s)
+                        total_exposure += abs(loc) * mp
+
+                    # B. 订单对账与健康检查
+                    for o in self.orders.values():
+                        if o.is_active():
+                            local_order_count += 1
+                            if o.status == OrderStatus.CANCELLING:
+                                cancelling_count += 1
+                
+                # 3. 统计指标
+                remote_order_count = len(remote_orders)
+                is_sync_error = (len(pos_diffs) > 0) or (abs(local_order_count - remote_order_count) > 2) # 允许轻微误差
+                
+                fill_ratio = 0.0
+                if self.total_submitted_count > 0:
+                    fill_ratio = self.total_filled_count / self.total_submitted_count
+                
+                # 4. 推送健康报告
+                health = SystemHealthData(
+                    total_exposure=total_exposure,
+                    margin_ratio=self.account.used_margin / self.account.equity if self.account.equity else 0,
+                    pos_diffs=pos_diffs,
+                    order_count_local=local_order_count,
+                    order_count_remote=remote_order_count,
+                    is_sync_error=is_sync_error,
+                    cancelling_count=cancelling_count,
+                    fill_ratio=fill_ratio,
+                    api_weight=0,
+                    timestamp=time.time()
+                )
+                self.event_engine.put(Event(EVENT_SYSTEM_HEALTH, health))
+                
+            except Exception as e:
+                logger.error(f"Reconcile Error: {e}")
 
     def sync_with_exchange(self):
-        """
-        [Updated] 启动时同步
-        """
-        logger.info("OMS: Starting Full Synchronization with Binance...")
-        
-        # [关键修复] 1. 先清空本地所有状态！
-        # 必须把之前的脏数据全部抹掉，以交易所返回的 snapshot 为准
+        """启动同步"""
+        logger.info("OMS: Syncing with Exchange...")
+        # 1. 清空
         self.exposure.net_positions.clear()
         self.exposure.avg_prices.clear()
         self.exposure.open_buy_qty.clear()
         self.exposure.open_sell_qty.clear()
         
-        # 2. 同步账户资金
-        acc_data = self.gateway.get_account_info()
-        if acc_data:
-            total_balance = float(acc_data["totalWalletBalance"])
-            total_used_margin = float(acc_data["totalInitialMargin"])
-            self.account.force_sync(total_balance, total_used_margin)
-            logger.info(f"OMS Account Synced: Balance={total_balance}")
-        
-        # 3. 同步持仓
-        pos_res = self.gateway.get_all_positions()
-        if pos_res:
-            count = 0
-            for item in pos_res:
-                amt = float(item["positionAmt"])
-                symbol = item["symbol"]
-                
-                # 即使 amt 为 0，也要确保本地记录为 0 (防止残留)
-                # 但由于我们刚才 clear() 了，这里只需要处理 != 0 的
-                if amt != 0:
-                    entry_price = float(item["entryPrice"])
-                    self.exposure.force_sync(symbol, amt, entry_price)
-                    
-                    pos_data = self.exposure.get_position_data(symbol)
-                    self.event_engine.put(Event(EVENT_POSITION_UPDATE, pos_data))
-                    logger.info(f"OMS Position Synced: {symbol} Vol={amt}")
-                    count += 1
+        # 2. 资金
+        acc = self.gateway.get_account_info()
+        if acc:
+            self.account.force_sync(float(acc["totalWalletBalance"]), float(acc["totalInitialMargin"]))
             
-            logger.info(f"OMS Sync Complete. {count} active positions.")
+        # 3. 持仓
+        pos = self.gateway.get_all_positions()
+        if pos:
+            for p in pos:
+                amt = float(p["positionAmt"])
+                if amt != 0:
+                    self.exposure.force_sync(p["symbol"], amt, float(p["entryPrice"]))
+                    self.event_engine.put(Event(EVENT_POSITION_UPDATE, self.exposure.get_position_data(p["symbol"])))
+        
+        logger.info("OMS: Sync Complete.")
+
+    def stop(self):
+        self.active = False
+        self.order_monitor.stop()

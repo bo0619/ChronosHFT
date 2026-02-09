@@ -30,6 +30,8 @@ EVENT_EXCHANGE_ORDER_UPDATE = "eExchangeOrderUpdate" # 交易所订单更新 (Ga
 
 EVENT_BACKTEST_END = "eBacktestEnd"       # 回测结束信号
 
+EVENT_SYSTEM_HEALTH = "eSystemHealth" # [NEW] 系统健康与对账事件
+
 # ==========================================
 # 2. 核心枚举与常量 (Enums & Constants)
 # ==========================================
@@ -309,3 +311,27 @@ class StrategyData:
     k: float            # 订单流衰减
     A: float            # 订单流强度
     sigma: float        # 波动率 (bps)
+
+@dataclass
+class SystemHealthData:
+    """
+    系统健康切片 (Snapshot)
+    回答: 风险大不大? 系统撒谎没? 还能跑吗?
+    """
+    # 模块 1: 风险
+    total_exposure: float      # 总名义敞口 (USDT)
+    margin_ratio: float        # 保证金占用率
+    
+    # 模块 2: 一致性 (Delta)
+    # Key: Symbol, Value: (Local, Remote, Delta)
+    pos_diffs: Dict[str, tuple]   # 仓位差异
+    order_count_local: int        # 本地活跃单数
+    order_count_remote: int       # 交易所挂单数
+    is_sync_error: bool           # 是否存在严重不同步
+    
+    # 模块 3: 执行健康度
+    cancelling_count: int         # 卡在 Cancelling 状态的订单数
+    fill_ratio: float             # 成交率 (Filled / Submitted)
+    api_weight: int               # API 权重
+    
+    timestamp: float
