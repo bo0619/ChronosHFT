@@ -7,26 +7,15 @@ from event.type import OrderRequest, OrderData, CancelRequest, OrderSubmitted, O
 from .order import Order
 
 class OrderManager:
-    """
-    [Updated] 订单生命周期管理器 - RPI 适配版
-    """
-    def __init__(self, engine, gateway):
+    def __init__(self, engine, gateway, dirty_callback=None): # [NEW] 传入回调
         self.engine = engine
         self.gateway = gateway
+        self.dirty_callback = dirty_callback
         
-        # 活跃订单缓存: order_id -> Order Object
-        # 注意：这里我们改为直接引用 OMS 里的 Order 对象，
-        # 或者仅维护一份轻量级的元数据。为了解耦，我们这里通过回调维护自己的清单。
-        # 实际上 OMS Engine 已经持有了 Order 对象。
-        # 为了不重复造轮子，OrderManager 主要负责“时间监控”。
-        # 我们这里维护 {client_oid: {"submit_time": float, "last_ack": float, "is_rpi": bool}}
         self.monitored_orders = {}
-        
         self.lock = threading.RLock()
         
-        # 配置阈值
-        self.ACK_TIMEOUT = 5.0       # 发单后多久没收到回报算“掉单”
-        self.STALE_TIMEOUT = 60.0    # 普通单挂多久没成交算“陈旧”(可选风控)
+        self.ACK_TIMEOUT = 5.0
         
         self.active = True
         self.check_thread = threading.Thread(target=self._check_loop, daemon=True)

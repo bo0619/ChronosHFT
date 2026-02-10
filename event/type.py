@@ -312,26 +312,23 @@ class StrategyData:
     A: float            # 订单流强度
     sigma: float        # 波动率 (bps)
 
+class SystemState(Enum):
+    CLEAN = "CLEAN"        # 健康：本地状态 = 交易所，允许交易
+    DIRTY = "DIRTY"        # 脏态：检测到不一致/超时，禁止交易
+    SYNCING = "SYNCING"    # 同步中：正在重置状态，禁止交易
+    FROZEN = "FROZEN"      # 冻结：多次同步失败，人工介入
+
+@dataclass
 @dataclass
 class SystemHealthData:
-    """
-    系统健康切片 (Snapshot)
-    回答: 风险大不大? 系统撒谎没? 还能跑吗?
-    """
-    # 模块 1: 风险
-    total_exposure: float      # 总名义敞口 (USDT)
-    margin_ratio: float        # 保证金占用率
-    
-    # 模块 2: 一致性 (Delta)
-    # Key: Symbol, Value: (Local, Remote, Delta)
-    pos_diffs: Dict[str, tuple]   # 仓位差异
-    order_count_local: int        # 本地活跃单数
-    order_count_remote: int       # 交易所挂单数
-    is_sync_error: bool           # 是否存在严重不同步
-    
-    # 模块 3: 执行健康度
-    cancelling_count: int         # 卡在 Cancelling 状态的订单数
-    fill_ratio: float             # 成交率 (Filled / Submitted)
-    api_weight: int               # API 权重
-    
+    state: SystemState            # [NEW] 当前状态
+    total_exposure: float
+    margin_ratio: float
+    pos_diffs: Dict[str, tuple]
+    order_count_local: int
+    order_count_remote: int
+    is_sync_error: bool
+    cancelling_count: int
+    fill_ratio: float
+    api_weight: int
     timestamp: float
