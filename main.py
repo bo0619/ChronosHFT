@@ -24,7 +24,7 @@ from gateway.binance_future import EVENT_EXCHANGE_ORDER_UPDATE
 from gateway.binance_future import BinanceFutureGateway
 from oms.engine import OMS
 from risk.manager import RiskManager
-from strategy.glft import GLFTStrategy 
+from strategy.predictive_glft import PredictiveGLFTStrategy
 
 # 4. 数据管理层
 from data.recorder import DataRecorder
@@ -80,7 +80,7 @@ def main():
     
     # 4. 策略层 (GLFT 算法)
     # 策略只通过事件和 OMS 意图接口工作
-    strategy = GLFTStrategy(engine, oms_system)
+    strategy = PredictiveGLFTStrategy(engine, oms_system)
     
     # 5. 辅助支持
     recorder = DataRecorder(engine, config["symbols"]) if config.get("record_data") else None
