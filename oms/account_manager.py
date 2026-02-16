@@ -5,11 +5,6 @@ from event.type import Event, EVENT_ACCOUNT_UPDATE, AccountData
 from data.cache import data_cache
 
 class AccountManager:
-    """
-    资金与保证金管理器
-    Available = Equity - Used Margin
-    Equity = Balance + Unrealized PnL (Mark Price)
-    """
     def __init__(self, engine, exposure_manager, config):
         self.engine = engine
         self.exposure = exposure_manager
@@ -20,58 +15,56 @@ class AccountManager:
         
         self.equity = self.balance
         self.used_margin = 0.0
-        
-        # [修复] 初始化时，默认可用资金 = 余额 (假设无持仓)
-        # 防止启动时因为 available=0 导致无法下单
         self.available = self.balance 
 
     def force_sync(self, balance: float, used_margin: float):
-        """
-        [NEW] 强制同步账户资金状态
-        """
+        """强制同步 (来自交易所真值)"""
         self.balance = balance
+        # 注意：这里我们暂时信任交易所的 used_margin，但在下一次 calculate 时会用本地逻辑覆盖
+        # 为了平滑，我们可以先赋值
         self.used_margin = used_margin
-        # 同步后立即重算权益和可用资金
+        self.equity = balance # 初始假设
         self.calculate()
 
     def update_balance(self, realized_pnl, commission):
-        """只更新余额 (Realized)"""
         self.balance += (realized_pnl - commission)
-        self.calculate() # 余额变了，立即重算
+        self.calculate()
 
     def calculate(self):
         """
-        全量重算
-        依赖：Exposure(Pos, OpenQty), DataCache(MarkPrice)
+        全量重算资金与保证金
         """
         unrealized_pnl = 0.0
         pos_margin = 0.0
         order_margin = 0.0
         
-        # 1. 持仓 PnL 和 保证金
+        # 1. 计算持仓 PnL 和 保证金
         for symbol, pos_vol in self.exposure.net_positions.items():
             if pos_vol == 0: continue
             
+            # 优先使用 MarkPrice，其次用 DataCache 最新盘口，最后用持仓均价
             mark_price = data_cache.get_mark_price(symbol)
-            # 如果没有标记价格，暂时用持仓均价代替，或者跳过
-            if mark_price <= 0: 
+            if mark_price <= 0:
+                mark_price, _ = data_cache.get_best_quote(symbol)
+            if mark_price <= 0:
                 mark_price = self.exposure.avg_prices[symbol]
             
             if mark_price > 0:
                 avg_price = self.exposure.avg_prices[symbol]
+                # PnL
                 u_pnl = (mark_price - avg_price) * pos_vol
                 unrealized_pnl += u_pnl
+                
+                # Margin = Notional / Leverage
                 pos_margin += (abs(pos_vol) * mark_price) / self.leverage
 
-        # 2. 挂单 保证金
+        # 2. 计算挂单保证金
         for symbol, qty in self.exposure.open_buy_qty.items():
-            mp = data_cache.get_mark_price(symbol)
-            if mp <= 0: mp = data_cache.get_best_quote(symbol)[0] # Fallback to Bid1
+            mp = self._get_price_safely(symbol)
             if mp > 0: order_margin += (qty * mp) / self.leverage
             
         for symbol, qty in self.exposure.open_sell_qty.items():
-            mp = data_cache.get_mark_price(symbol)
-            if mp <= 0: mp = data_cache.get_best_quote(symbol)[1] # Fallback to Ask1
+            mp = self._get_price_safely(symbol)
             if mp > 0: order_margin += (qty * mp) / self.leverage
 
         # 3. 汇总
@@ -89,11 +82,21 @@ class AccountManager:
         )
         self.engine.put(Event(EVENT_ACCOUNT_UPDATE, data))
 
+    def _get_price_safely(self, symbol):
+        """获取估值价格的辅助函数"""
+        p = data_cache.get_mark_price(symbol)
+        if p <= 0: p, _ = data_cache.get_best_quote(symbol)
+        return p
+
     def check_margin(self, notional_value):
-        """预风控：检查可用资金"""
         required = notional_value / self.leverage
-        # [优化] 如果可用资金为0，尝试强制刷新一次（可能是行情刚来）
-        if self.available == 0:
-            self.calculate()
-            
+        if self.available == 0: self.calculate() # 惰性重算
         return self.available >= required
+
+    def get_margin_ratio(self):
+        """
+        [NEW] 获取当前保证金率 (0.0 ~ 1.0+)
+        Used / Equity
+        """
+        if self.equity <= 0: return 0.0
+        return self.used_margin / self.equity
