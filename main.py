@@ -25,6 +25,7 @@ from gateway.binance.gateway import BinanceGateway
 from oms.engine import OMS
 from risk.manager import RiskManager
 from strategy.predictive_glft import PredictiveGLFTStrategy
+from strategy.hybrid_glft.hybrid_glft import HybridGLFTStrategy
 
 # 4. 数据管理层
 from data.recorder import DataRecorder
@@ -72,9 +73,9 @@ def main():
     # 3. 全局风控 (持有 OMS 用于预交易检查)
     risk_controller = RiskManager(engine, config, oms=oms_system, gateway=gateway)
     
-    # 4. 策略 (Predictive GLFT)
+    # 4. 策略 (Hybrid GLFT)
     # 策略只依赖 Engine (收消息) 和 OMS (发意图)
-    strategy = PredictiveGLFTStrategy(engine, oms_system)
+    strategy = HybridGLFTStrategy(engine, oms_system)
     
     # 5. 辅助模块
     recorder = DataRecorder(engine, config["symbols"]) if config.get("record_data") else None
