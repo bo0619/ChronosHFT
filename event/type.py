@@ -355,6 +355,7 @@ class LifecycleState(Enum):
     BOOTSTRAP = "BOOTSTRAP" # 启动中 (拉取快照，建立连接)
     LIVE = "LIVE"           # 运行中 (处理单调事件流)
     HALTED = "HALTED"       # 熔断 (序列错误，不可恢复，需重启)
+    RECONCILING = "RECONCILING" # [NEW] 发现异常，正在对账 (暂停交易)
 
 @dataclass
 class BootstrapEvent:
