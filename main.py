@@ -16,22 +16,22 @@ from event.type import (
     EVENT_LOG, EVENT_ORDERBOOK, EVENT_TRADE_UPDATE, EVENT_ORDER_UPDATE,
     EVENT_POSITION_UPDATE, EVENT_AGG_TRADE, EVENT_MARK_PRICE, 
     EVENT_ACCOUNT_UPDATE, EVENT_STRATEGY_UPDATE, EVENT_SYSTEM_HEALTH,
-    EVENT_ORDER_SUBMITTED
+    EVENT_ORDER_SUBMITTED,
+    EVENT_EXCHANGE_ORDER_UPDATE # [修复] 从 event.type 导入，而不是从 gateway 导入
 )
-from gateway.binance_future import EVENT_EXCHANGE_ORDER_UPDATE
 
 # 3. 核心业务模块
-from gateway.binance_future import BinanceFutureGateway
+from gateway.binance.gateway import BinanceGateway
 from oms.engine import OMS
 from risk.manager import RiskManager
-from strategy.predictive_glft import PredictiveGLFTStrategy
+from strategy.predictive_glft import PredictiveGLFTStrategy # 使用最新的预测型策略
 
 # 4. 数据管理层
 from data.recorder import DataRecorder
 from data.ref_data import ref_data_manager
 from data.cache import data_cache
 
-# 5. 监控层 (TUI Dashboard)
+# 5. 监控与运维层
 from ui.dashboard import TUIDashboard
 from monitor.server import WebMonitor
 from ops.alert import TelegramAlerter
@@ -48,14 +48,14 @@ def main():
     config = load_config()
     if not config: return
 
-    # 1. 异步日志系统 (关闭控制台输出，由 TUI 接管)
+    # 1. 异步日志系统
     config["system"]["log_console"] = False
     logger.init_logging(config)
     
-    # 2. 时间同步 (NTP)
+    # 2. 时间同步
     time_service.start(testnet=config["testnet"])
     
-    # 3. 参考数据同步 (获取 TickSize/LotSize 等硬约束)
+    # 3. 参考数据同步
     ref_data_manager.init(testnet=config["testnet"])
 
     # --- B. 初始化核心引擎与 UI ---
@@ -67,114 +67,99 @@ def main():
 
     # --- C. 组件组装 ---
     
-    # 1. 网关 (REST + WebSocket)
-    gateway = BinanceFutureGateway(engine, config["api_key"], config["api_secret"], testnet=config["testnet"])
-    
-    # 2. OMS (核心状态机，内部包含 Exposure, Account, OrderManager)
-    # OMS 默认初始状态为 SystemState.DIRTY
+    # 1. 网关
+    gateway = BinanceGateway(engine, config["api_key"], config["api_secret"], testnet=config["testnet"]) # [NEW]
+    # 2. OMS
     oms_system = OMS(engine, gateway, config)
     
-    # 3. 全局风险控制器 (Overwatch)
-    # 注入 OMS 用于资金校验，注入 Gateway 用于 Kill Switch 执行
+    # 3. 全局风控
     risk_controller = RiskManager(engine, config, oms=oms_system, gateway=gateway)
     
-    # 4. 策略层 (GLFT 算法)
-    # 策略只通过事件和 OMS 意图接口工作
+    # 4. 策略 (Predictive GLFT)
     strategy = PredictiveGLFTStrategy(engine, oms_system)
     
-    # 5. 辅助支持
+    # 5. 辅助模块
     recorder = DataRecorder(engine, config["symbols"]) if config.get("record_data") else None
     alerter = TelegramAlerter(engine, config)
-    web_server = WebMonitor(engine, config) # 同时也提供 Web 端的 PnL 监控
+    web_server = WebMonitor(engine, config)
 
-    # --- D. 事件流绑定 (Wiring) ---
+    # --- D. 核心事件流绑定 ---
     
-    # >> 1. 市场数据路径
+    # >> 1. 市场数据流
     engine.register(EVENT_ORDERBOOK, lambda e: data_cache.update_book(e.data))
     engine.register(EVENT_MARK_PRICE, lambda e: data_cache.update_mark_price(e.data))
     engine.register(EVENT_AGG_TRADE, lambda e: data_cache.update_trade(e.data))
     
-    # >> 2. 策略与 UI 驱动 (Tick-to-Trade)
+    # >> 2. 策略驱动流
     def on_tick(ob):
         main.last_tick_time = time.time()
-        # 策略根据行情进行报价计算
         strategy.on_orderbook(ob)
-        # TUI 行情看板更新
         dashboard.update_market(ob)
 
     main.last_tick_time = time.time()
     engine.register(EVENT_ORDERBOOK, lambda e: on_tick(e.data))
     
-    # 逐笔成交 -> 策略学习 (GLFT 参数在线校准)
+    # 市场成交流驱动模型学习
     engine.register(EVENT_AGG_TRADE, lambda e: strategy.on_market_trade(e.data))
     
-    # >> 3. 交易状态机路径 (The Truth Loop)
+    # >> 3. 交易闭环
     
-    # 交易所原始回报 -> 进入 OMS 状态机 (唯一修改真值的入口)
+    # 网关原始回报 -> OMS 状态机
     engine.register(EVENT_EXCHANGE_ORDER_UPDATE, oms_system.on_exchange_update)
     
-    # 订单提交 -> OMS (用于 ACK 超时/掉单监测)
+    # 订单提交 -> OMS (掉单检测)
     engine.register(EVENT_ORDER_SUBMITTED, lambda e: oms_system.on_order_submitted(e))
     
-    # OMS 状态快照 -> 策略 (通知策略订单成交/撤销)
+    # OMS 结果 -> 策略 & UI
     engine.register(EVENT_ORDER_UPDATE, lambda e: strategy.on_order(e.data))
-    
-    # OMS 持仓/资金更新 -> TUI 相应面板更新
+    engine.register(EVENT_TRADE_UPDATE, lambda e: strategy.on_trade(e.data))
     engine.register(EVENT_POSITION_UPDATE, lambda e: dashboard.update_position(e.data))
     engine.register(EVENT_ACCOUNT_UPDATE, lambda e: dashboard.update_account(e.data))
     
-    # 系统健康报告 (对账结果) -> TUI 核心面板
-    engine.register(EVENT_SYSTEM_HEALTH, lambda e: dashboard.update_health(e.data))
-    
-    # 策略 Alpha 内部参数 -> TUI 策略监控列
+    # 策略内部参数 -> UI
     engine.register(EVENT_STRATEGY_UPDATE, lambda e: dashboard.update_strategy(e.data))
-
-    # --- E. 系统启动序列 ---
     
-    # 1. 开启事件处理
+    # 系统健康报告 -> UI
+    engine.register(EVENT_SYSTEM_HEALTH, lambda e: dashboard.update_health(e.data))
+
+    # --- E. 启动流程 ---
+    logger.info("Starting Event Engine...")
     engine.start()
     
-    # 2. 建立网络连接
     logger.info(f"Connecting Gateway to symbols: {config['symbols']}...")
     gateway.connect(config["symbols"])
     
-    # 3. 等待连接稳定 (WebSocket 鉴权及订阅就绪)
-    logger.info("Initializing WebSocket streams, please wait 3s...")
+    # 预留连接时间
     time.sleep(3)
     
-    # 4. [强制对齐] 首次全量同步
-    # 此步骤会将系统从 DIRTY 变为 CLEAN
+    # 强制同步
     oms_system.sync_with_exchange()
     
-    logger.info("System fully operational. Monitoring for mismatches...")
+    logger.info("ChronosHFT Full Stack Ready.")
 
-    # --- F. TUI 实时渲染主循环 ---
+    # --- F. 主循环 ---
     try:
         with Live(dashboard.render(), refresh_per_second=4, screen=True) as live:
             while True:
                 live.update(dashboard.render())
                 time.sleep(0.1)
                 
-                # 系统存活看门狗 (Heartbeat check)
+                # 看门狗
                 if time.time() - main.last_tick_time > 60:
-                    logger.error("WATCHDOG: No market data for 60s! System may be stalled.")
-                    main.last_tick_time = time.time() # 防止重复报错
+                    logger.warn("SYSTEM WATCHDOG: No market data for 60s!")
+                    main.last_tick_time = time.time() 
                     
-                # 熔断提示 (如果 Kill Switch 触发，通过 Dashboard 加强提示)
+                # 熔断提示
                 if risk_controller.kill_switch_triggered:
                     dashboard.add_log(f"[bold red]!!! EMERGENCY STOP: {risk_controller.kill_reason} !!![/]")
 
     except KeyboardInterrupt:
-        logger.info("Shutdown signal received (Ctrl+C).")
-        
-        # 优雅停机序列
+        logger.info("Shutdown signal received.")
         if recorder: recorder.close()
-        
-        oms_system.stop()      # 关闭对账和监控线程
-        time_service.stop()    # 关闭 NTP 线程
-        engine.stop()          # 关闭事件总线
-        
-        logger.info("All subsystems stopped. Clean shutdown.")
+        time_service.stop()
+        oms_system.stop()
+        engine.stop()
+        logger.info("Clean shutdown finished.")
         sys.exit(0)
 
 if __name__ == "__main__":

@@ -318,7 +318,7 @@ class SystemState(Enum):
     SYNCING = "SYNCING"    # 同步中：正在重置状态，禁止交易
     FROZEN = "FROZEN"      # 冻结：多次同步失败，人工介入
 
-@dataclass
+
 @dataclass
 class SystemHealthData:
     state: SystemState            # [NEW] 当前状态
@@ -332,3 +332,19 @@ class SystemHealthData:
     fill_ratio: float
     api_weight: int
     timestamp: float
+
+# [NEW] 网关连接状态
+class GatewayState(Enum):
+    DISCONNECTED = "DISCONNECTED"
+    CONNECTING = "CONNECTING"
+    READY = "READY"     # 可以交易
+    ERROR = "ERROR"
+
+# [NEW] 网关错误类型
+class GatewayError(Enum):
+    NETWORK_ERROR = "NETWORK_ERROR"
+    API_ERROR = "API_ERROR"
+    RATE_LIMIT = "RATE_LIMIT"
+    AUTH_ERROR = "AUTH_ERROR"
+    SERVER_OVERLOAD = "SERVER_OVERLOAD"
+    UNKNOWN = "UNKNOWN"
