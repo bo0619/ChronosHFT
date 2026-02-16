@@ -211,15 +211,16 @@ class AggTradeData:
 @dataclass
 class ExchangeOrderUpdate:
     """
-    [NEW] 来自交易所/网关的原始回报 (Gateway -> OMS)
+    来自网关的原始回报
     """
-    client_oid: str
-    exchange_oid: str
+    seq: int          # [NEW] 严格单调递增序列号 (Gateway分配)
+    client_oid: str   # 唯一主键
+    exchange_oid: str # 仅作为属性存储，不作为索引
     symbol: str
-    status: str       # 交易所原始状态字符串 (e.g., "NEW", "CANCELED")
-    filled_qty: float # 本次成交量 (增量)
-    filled_price: float # 本次成交价
-    cum_filled_qty: float # 累计成交量
+    status: str
+    filled_qty: float
+    filled_price: float
+    cum_filled_qty: float
     update_time: float
 
 @dataclass
@@ -348,3 +349,20 @@ class GatewayError(Enum):
     AUTH_ERROR = "AUTH_ERROR"
     SERVER_OVERLOAD = "SERVER_OVERLOAD"
     UNKNOWN = "UNKNOWN"
+
+# [NEW] 顶级系统生命周期
+class LifecycleState(Enum):
+    BOOTSTRAP = "BOOTSTRAP" # 启动中 (拉取快照，建立连接)
+    LIVE = "LIVE"           # 运行中 (处理单调事件流)
+    HALTED = "HALTED"       # 熔断 (序列错误，不可恢复，需重启)
+
+@dataclass
+class BootstrapEvent:
+    """
+    用于系统启动时注入初始状态
+    """
+    timestamp: float
+    balance: float
+    used_margin: float
+    # 列表: [(symbol, net_volume, avg_price)]
+    positions: List[tuple] 
