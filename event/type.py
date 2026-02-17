@@ -304,16 +304,28 @@ class AlertData:
 
 @dataclass
 class StrategyData:
-    """策略内部状态快照 (用于UI监控)"""
+    """策略内部状态快照 (用于 UI 监控)"""
+    # ── GLFT 核心参数 ──────────────────────────────────────
     symbol: str
-    fair_value: float   # 公允价格
-    alpha_bps: float    # Alpha预测值 (bps)
-    gamma: float        # 当前风险厌恶系数
-    k: float            # 订单流衰减
-    A: float            # 订单流强度
-    sigma: float        # 波动率 (bps)
-    # [NEW] 增加训练参数展示字段
-    ml_weights: List[float] = field(default_factory=list) # 模型权重 (前几个系数)
+    fair_value: float       # 公允价格
+    alpha_bps: float        # Alpha 偏移量 (bps)
+    gamma: float            # 风险厌恶系数
+    k: float                # 订单流衰减参数
+    A: float                # 订单流强度参数
+    sigma: float            # 波动率 (bps)
+
+    # ── ML 模型状态（全部有默认值，向后兼容旧调用方）────────
+    ml_mode: str = "MARKET_MAKING"   # 当前模式: MM / MOMENTUM_BUY / MOMENTUM_SELL
+    ml_p_trend: float = 0.5          # 模型最近一次的置信概率
+    ml_trained: bool = False         # 模型是否已完成至少一次 partial_fit
+    ml_n_samples: int = 0            # scaler 已消化的训练样本数
+    ml_buffer_size: int = 0          # 等待标注的样本队列长度
+
+    # 分类器权重 [w_OFI, w_Momentum, w_DepthRatio] → "UP" 类别
+    ml_clf_weights: List[float] = field(default_factory=list)
+
+    # 回归器权重 [w_OFI, w_Momentum, w_DepthRatio] → 预测 bps
+    ml_reg_weights: List[float] = field(default_factory=list)
 
 class SystemState(Enum):
     CLEAN = "CLEAN"        # 健康：本地状态 = 交易所，允许交易
