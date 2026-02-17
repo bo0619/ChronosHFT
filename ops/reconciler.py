@@ -53,7 +53,7 @@ class AutoReconciler:
             self.first_dirty_time = 0
 
     def _trigger_force_sync(self, now):
-        logger.warn("🚨 System is DIRTY for too long. Triggering Auto-Reconciliation...")
+        logger.warning("🚨 System is DIRTY for too long. Triggering Auto-Reconciliation...")
         
         # 1. 暂停策略发单 (可选，目前通过架构解耦，同步期间发单可能会被覆盖或报错，但不会崩)
         # 2. 执行同步

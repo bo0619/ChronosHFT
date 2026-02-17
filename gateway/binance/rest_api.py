@@ -48,13 +48,11 @@ class BinanceRestApi:
         return resp.json() if resp and resp.status_code == 200 else None
 
     def get_rpi_depth_snapshot(self, symbol, limit=1000):
-        """[修复] 获取 RPI 深度快照"""
         resp = self.request("GET", EP_RPI_DEPTH_SNAPSHOT, {"symbol": symbol, "limit": limit}, signed=False)
-        # 注意：如果不支持 RPI 的币种可能会报错，需处理
         return resp.json() if resp and resp.status_code == 200 else None
 
     # --- 2. 交易模块 ---
-    def new_order(self, req: OrderRequest):
+    def new_order(self, req: OrderRequest, client_oid: str = None): # [修复] 增加 client_oid 参数
         """POST /fapi/v1/order"""
         params = {
             "symbol": req.symbol,
@@ -63,20 +61,15 @@ class BinanceRestApi:
             "quantity": req.volume,
         }
         
+        # [修复] 注入 Client ID
+        if client_oid:
+            params["newClientOrderId"] = client_oid
+        
         if req.order_type == "LIMIT":
             params["price"] = req.price
-            
-            # [修复] RPI 订单逻辑
             if getattr(req, "is_rpi", False):
-                # RPI 订单必须是 LIMIT 且 timeInForce=RPI
-                params["timeInForce"] = "GTX" # 修正：币安实盘 RPI 似乎不再使用特殊TIF，而是走 GTX 即可？
-                # 再次确认币安文档：
-                # 早期文档：timeInForce="RPI"
-                # 最新文档：可能已合并。
-                # 按照你的 System Instruction: 需设置 order_type = "LIMIT" 且 time_in_force = "RPI"
-                params["timeInForce"] = "RPI" 
+                params["timeInForce"] = TIF_RPI # 或者 "GTX" 取决于最新API，保持 TIF_RPI
             else:
-                # 普通订单
                 params["timeInForce"] = TIF_GTX if req.post_only else req.time_in_force
         
         resp = self.request("POST", EP_ORDER, params, signed=True)
@@ -109,11 +102,6 @@ class BinanceRestApi:
         except: pass
 
     # --- 4. 查询接口 ---
-    def get_account(self): 
-        return self.request("GET", EP_ACCOUNT, signed=True)
-    
-    def get_positions(self): 
-        return self.request("GET", EP_POSITION_RISK, signed=True)
-    
-    def get_open_orders(self): 
-        return self.request("GET", EP_OPEN_ORDERS, signed=True)
+    def get_account(self): return self.request("GET", EP_ACCOUNT, signed=True)
+    def get_positions(self): return self.request("GET", EP_POSITION_RISK, signed=True)
+    def get_open_orders(self): return self.request("GET", EP_OPEN_ORDERS, signed=True)

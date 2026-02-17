@@ -312,6 +312,8 @@ class StrategyData:
     k: float            # 订单流衰减
     A: float            # 订单流强度
     sigma: float        # 波动率 (bps)
+    # [NEW] 增加训练参数展示字段
+    ml_weights: List[float] = field(default_factory=list) # 模型权重 (前几个系数)
 
 class SystemState(Enum):
     CLEAN = "CLEAN"        # 健康：本地状态 = 交易所，允许交易

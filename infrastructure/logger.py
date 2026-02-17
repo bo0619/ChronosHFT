@@ -108,7 +108,7 @@ class AsyncLogger:
     def info(self, msg): self.queue.put(("INFO", msg))
     def error(self, msg): self.queue.put(("ERROR", msg))
     def debug(self, msg): self.queue.put(("DEBUG", msg))
-    def warn(self, msg): self.queue.put(("WARNING", msg))
+    def warning(self, msg): self.queue.put(("WARNING", msg))
     def critical(self, msg): self.queue.put(("CRITICAL", msg))
 
 # 全局单例

@@ -119,10 +119,6 @@ def main():
     
     # [Strategy -> UI] 内部参数可视化
     engine.register(EVENT_STRATEGY_UPDATE, lambda e: dashboard.update_strategy(e.data))
-    
-    # [OMS -> UI] 系统健康状态
-    # (新版 OMS 移除了 _reconcile_loop，如果需要健康推送需在 on_exchange_update 或定时器中触发，此处暂保留绑定)
-    engine.register(EVENT_SYSTEM_HEALTH, lambda e: dashboard.update_health(e.data))
 
     # --- E. 启动流程 ---
     logger.info("Starting Event Engine...")
@@ -151,7 +147,7 @@ def main():
                 
                 # 看门狗 (Watchdog)
                 if time.time() - main.last_tick_time > 60:
-                    logger.warn("SYSTEM WATCHDOG: No market data for 60s!")
+                    logger.warning("SYSTEM WATCHDOG: No market data for 60s!")
                     main.last_tick_time = time.time() 
                     
                 # 熔断提示

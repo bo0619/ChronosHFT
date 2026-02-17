@@ -106,42 +106,18 @@ class BinanceGateway(BaseGateway):
 
     def send_order(self, req: OrderRequest, client_oid: str = None) -> str:
         """
-        [No Compromise] 必须传递 client_oid 以便闭环追踪
+        核心修复：将 OMS 传入的 client_oid 转发给 REST API。
+        Binance REST API 接收参数为 'newClientOrderId'。
         """
-        # 我们需要手动构造 params 传给 rest，因为 rest_api.new_order 
-        # 可能不支持直接传 client_oid，或者我们需要 hack 一下
-        # 这里直接调用底层 _send_request 或者修改 rest_api
-        # 为了不修改 rest_api，我们在 req 对象上附带临时属性，
-        # 或者直接在这里构造 params 调用 rest 的 request 方法。
-        # 最佳方案：修改 rest.new_order 接受 extra_params
-        
-        # 这里演示直接调用底层逻辑 (为了绝对控制权)
-        path = "/fapi/v1/order"
-        params = {
-            "symbol": req.symbol,
-            "side": req.side,
-            "type": req.order_type,
-            "quantity": req.volume,
-        }
-        if client_oid:
-            params["newClientOrderId"] = client_oid # [Critical] 注入本地ID
-
-        if req.order_type == "LIMIT":
-            params["price"] = req.price
-            if getattr(req, "is_rpi", False):
-                params["timeInForce"] = TIF_RPI
-                if not req.post_only: 
-                    logger.error("RPI must be PostOnly")
-                    return None
-            else:
-                params["timeInForce"] = (TIF_GTX if req.post_only else req.time_in_force)
-
-        # 调用 rest 实例的 request (复用签名逻辑)
-        resp = self.rest.request("POST", path, params, signed=True)
+        # 注意：这里调用 rest_api.new_order 时必须传入 client_oid
+        resp = self.rest.new_order(req, client_oid)
         
         if resp and resp.status_code == 200:
             data = resp.json()
-            return str(data["orderId"]) # 返回交易所ID用于日志
+            # 记录日志
+            logger.info(f"[Gateway] Order Successfully Sent. ExchID: {data['orderId']}, ClientID: {client_oid}")
+            return str(data["orderId"])
+        
         return None
 
     def cancel_order(self, req: CancelRequest):
