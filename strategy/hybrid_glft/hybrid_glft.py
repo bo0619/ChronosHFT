@@ -1,57 +1,22 @@
 # file: strategy/hybrid_glft/hybrid_glft.py
-#
-# ============================================================
-# BUG FIX CHANGELOG
-#
-# [FIX-A] on_order(): 字符串 vs Enum 类型比较错误
-#   原代码: snapshot.status in ["FILLED", "CANCELLED", ...]
-#   问题:   snapshot.status 是 OrderStatus Enum，Python中 Enum != str，
-#           导致 quote_state 的 bid_oid/ask_oid 永远不会被清空。
-#           后果：每个 cycle 都对着已成交/已撤销的 oid 重复发撤单请求，
-#           日志中产生大量垃圾撤单，且可能双边重复下单。
-#   修复:   改为 OrderStatus.FILLED / OrderStatus.CANCELLED 等 Enum 比较。
-#
-# [FIX-B] _execute_mm(): self.pos 多标的污染
-#   原代码: current_pos = self.pos
-#   问题:   self.pos 是基类 StrategyTemplate 中的一个标量 float，
-#           所有 symbol 的持仓推送都会无差别覆盖它（最后一个 symbol 获胜）。
-#           多标的场景下（如同时交易 BTC/ETH），库存偏斜方向完全不可靠。
-#   修复:   直接从 OMS ExposureManager 读取 per-symbol 净持仓，
-#           与 GLFTStrategy 的正确写法保持一致。
-#
-# [FIX-C] _execute_mm(): q_norm 归一化分母错误
-#   原代码: q_norm = current_pos / order_vol
-#   问题:   order_vol 是最小下单量（如 0.001 BTC），用它做分母，
-#           持仓稍多时 q_norm 就爆炸（如 0.05 / 0.001 = 50），
-#           导致 inventory_skew_bps 极大，报价严重偏离盘口，双边报价实际失效。
-#   修复:   引入 max_pos_usdt 参数作为最大仓位容量，计算 max_pos_vol，
-#           q_norm = current_pos / max_pos_vol，确保 q_norm ∈ [-1, 1]。
-#
-# [FIX-D] on_orderbook(): 动量模式缺少仓位硬上限
-#   原代码: MOMENTUM_BUY → gamma_mult=0.5（直接削弱库存回归力）
-#   问题:   动量模式同时做两件相反的事：
-#           1. alpha 偏移使报价向有利方向移动（鼓励继续加仓）
-#           2. gamma_mult=0.5 使库存偏斜减半（削弱减仓驱动力）
-#           当 ML 连续判断同一方向时，仓位可无界单边积累。
-#   修复:   进入动量模式前，先检查当前仓位名义价值是否超过阈值（max_pos_usdt * 0.8）。
-#           超限则强制切换为保守做市（gamma_mult=2.0），不执行动量策略。
-#
-# [FIX-E] _update_quotes(): 买卖侧共享同一个 last_update 时间戳
-#   原代码: 任意一侧更新后 state["last_update"] = now，200ms内整个函数 return
-#   问题:   bid侧刚更新，ask侧急需调整时，被整体 return 拦住，
-#           ask 报价在错误位置停留最多 200ms。
-#   修复:   为买卖侧各自维护独立的 last_update 时间戳。
-# ============================================================
+# [FIX-A] on_order: Enum 比较（非字符串）
+# [FIX-B] _execute_mm: per-symbol 持仓，从 OMS 直接读取
+# [FIX-C] _execute_mm: q_norm 用 max_pos_vol 归一化，有界 [-1,1]
+# [FIX-D] on_orderbook: 动量模式仓位硬上限
+# [FIX-E] _update_quotes: 买卖侧独立冷却时间戳
+# [FIX-F] _update_quotes: is_post_only=True
+# [FIX-G] _update_quotes: cancelling 守卫消灭撤单竞态
 
-import time
+import json
 import math
+import time
 from collections import defaultdict
 from datetime import datetime
 
 from ..base import StrategyTemplate
 from event.type import (
     OrderBook, TradeData, OrderIntent, Side, AggTradeData,
-    OrderStateSnapshot, OrderStatus, Event, EVENT_STRATEGY_UPDATE, StrategyData
+    OrderStateSnapshot, OrderStatus, Event, EVENT_STRATEGY_UPDATE, StrategyData,
 )
 from .detector import TrendDetector
 from .predictor import MLTrendPredictor
@@ -67,58 +32,91 @@ class HybridGLFTStrategy(StrategyTemplate):
     def __init__(self, engine, oms):
         super().__init__(engine, oms, "HybridGLFT_Pro")
 
+        # ── 读取 config ──────────────────────────────────────
+        try:
+            with open("config.json") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+
+        sc   = cfg.get("strategy", {})
+        glft = sc.get("glft", {})
+        asym = sc.get("asymmetric_sizing", {})
+        fund = sc.get("funding", {})
+        mom  = sc.get("momentum", {})
+        exe  = sc.get("execution", {})
+
+        # ── 组件 ─────────────────────────────────────────────
         self.feature_engine  = FeatureEngine()
         self.calibrators     = {}
         self.ml_predictors   = {}
         self.trend_detectors = {}
-        self.mode_selector   = HybridModeSelector(threshold=0.55)
+        self.mode_selector   = HybridModeSelector(
+            threshold=mom.get("threshold", 0.55)
+        )
         self.last_run_times  = defaultdict(float)
 
-        # [FIX-E] 买卖侧各自独立的时间戳
+        # ── quote_state（每个 symbol 独立）───────────────────
         self.quote_state = defaultdict(lambda: {
             "bid_oid":         None,
             "ask_oid":         None,
             "bid_price":       None,
             "ask_price":       None,
-            "bid_last_update": 0.0,   # [FIX-E] 原 last_update 拆分
-            "ask_last_update": 0.0,   # [FIX-E]
+            "bid_last_update": 0.0,
+            "ask_last_update": 0.0,
+            "bid_cancelling":  False,   # [FIX-G]
+            "ask_cancelling":  False,   # [FIX-G]
         })
 
-        # per-symbol 状态，供 UI 广播读取
-        self.last_mode   = defaultdict(lambda: "MARKET_MAKING")
+        # [FIX-6] 部分成交剩余量，供下一张单继承
+        self.partial_remaining: dict = defaultdict(
+            lambda: {"bid": 0.0, "ask": 0.0}
+        )
+
+        self.last_mode    = defaultdict(lambda: "MARKET_MAKING")
         self.last_ml_pred = defaultdict(lambda: None)
 
-        # ── 策略参数 ──────────────────────────────────────────
-        self.cycle_interval      = 0.5
-        self.base_gamma          = 0.1
-        self.min_spread_bps      = 5.0
-        self.COLDSTART_GAMMA_MULT = 3.0
+        # ── GLFT 基础参数（全从 config）──────────────────────
+        self.cycle_interval       = sc.get("cycle_interval",  0.5)
+        self.base_gamma           = glft.get("base_gamma",    0.1)
+        self.min_spread_bps       = glft.get("min_spread_bps", 5.0)
+        self.COLDSTART_GAMMA_MULT = glft.get("coldstart_gamma_mult", 3.0)
+        self.max_pos_usdt         = glft.get("max_pos_usdt",  3000.0)
 
-        # [FIX-C] 最大仓位名义价值（USDT），作为 q_norm 的归一化分母容量
-        # 调整此值可控制库存偏斜的灵敏度：
-        #   值越小 → 稍有仓位偏斜就很重 → 库存回归更激进
-        #   值越大 → 需要更大仓位才触发明显偏斜 → 策略更平滑
-        self.max_pos_usdt = 3000.0
+        # ── [FIX-1] 非对称挂单量参数 ─────────────────────────
+        self.asym_enabled   = asym.get("enabled",        True)
+        self.asym_min_ratio = asym.get("min_vol_ratio",   0.1)
+        self.asym_max_ratio = asym.get("max_vol_ratio",   3.0)
 
-        # [FIX-D] 动量模式触发的仓位上限（占 max_pos_usdt 的比例）
-        # 超过此比例时，即使 ML 判断有方向，也不执行动量，转为保守做市
-        self.momentum_pos_cap_ratio = 0.8
+        # ── [FIX-2] 资金费率参数 ──────────────────────────────
+        self.fund_enabled        = fund.get("enabled",            True)
+        self.fund_max_adj_bps    = fund.get("max_adjustment_bps", 20.0)
+        self.fund_urgency_window = fund.get("urgency_window_sec", 1800.0)
+
+        # ── 动量参数 ──────────────────────────────────────────
+        self.mom_alpha_bps        = mom.get("alpha_bps",            10.0)
+        self.mom_gamma_mult       = mom.get("gamma_mult",            0.5)
+        self.mom_pos_cap_ratio    = mom.get("pos_cap_ratio",         0.8)
+        self.mom_overweight_gmult = mom.get("overweight_gamma_mult", 2.0)
+
+        # ── 执行参数 ──────────────────────────────────────────
+        self.cooldown_ms          = exe.get("cooldown_ms",              200)
+        self.cancel_guard_timeout = exe.get("cancel_guard_timeout_sec", 3.0)
 
     # ----------------------------------------------------------
     # 内部工具
     # ----------------------------------------------------------
 
     def _ensure_symbol(self, symbol: str):
-        """懒初始化：首次收到某 symbol 行情时创建相关组件"""
         if symbol not in self.calibrators:
             self.calibrators[symbol]     = GLFTCalibrator(window=1000)
             self.trend_detectors[symbol] = TrendDetector()
             self.ml_predictors[symbol]   = MLTrendPredictor(enabled=True)
-            # 用空快照热身 FeatureEngine，避免第一次计算时出现 None
-            self.feature_engine.on_orderbook(OrderBook(symbol, "INIT", datetime.now()))
+            self.feature_engine.on_orderbook(
+                OrderBook(symbol, "INIT", datetime.now())
+            )
 
     def _calculate_safe_vol(self, symbol: str, price: float) -> float:
-        """计算符合交易所最小限制的挂单量"""
         info = ref_data_manager.get_info(symbol)
         if not info:
             return 0.0
@@ -126,15 +124,69 @@ class HybridGLFTStrategy(StrategyTemplate):
         return ref_data_manager.round_qty(symbol, min_vol)
 
     # ----------------------------------------------------------
-    # 行情驱动主循环
+    # [FIX-2] 资金费率调整
+    # ----------------------------------------------------------
+
+    def _calc_funding_adj_bps(self, symbol: str, q_norm: float) -> float:
+        """
+        将 funding_rate 折算为对 fair_mid 的 bps 调整量。
+
+        多头(q_norm>0) + 正 funding → 调整为负 → fair_mid 下移
+          → ask 变便宜 → 更多人愿意买入 → 帮做市商减多头
+        urgency：距离下次结算越近，调整越强。
+        """
+        if not self.fund_enabled:
+            return 0.0
+
+        mp = data_cache.mark_prices.get(symbol)
+        if mp is None:
+            return 0.0
+
+        funding_rate    = mp.funding_rate
+        time_to_funding = max(0.0, mp.next_funding_time.timestamp() - time.time())
+        urgency = max(0.0, (self.fund_urgency_window - time_to_funding)
+                     / self.fund_urgency_window)
+
+        raw_adj = -funding_rate * 10000.0 * urgency * q_norm
+        return max(-self.fund_max_adj_bps, min(self.fund_max_adj_bps, raw_adj))
+
+    # ----------------------------------------------------------
+    # [FIX-1] 非对称挂单量
+    # ----------------------------------------------------------
+
+    def _calc_asymmetric_vols(self, symbol: str, price: float,
+                               q_norm: float) -> tuple:
+        """
+        q_norm > 0（多头偏重）：bid 量缩，ask 量扩。
+        q_norm < 0（空头偏重）：ask 量缩，bid 量扩。
+        返回 (bid_vol, ask_vol)，均满足最小名义价值。
+        """
+        base_vol = self._calculate_safe_vol(symbol, price)
+        if base_vol <= 0:
+            return 0.0, 0.0
+
+        if not self.asym_enabled:
+            return base_vol, base_vol
+
+        lo, hi = self.asym_min_ratio, self.asym_max_ratio
+
+        bid_ratio = max(lo, min(hi, 1.0 - q_norm))
+        ask_ratio = max(lo, min(hi, 1.0 + q_norm))
+
+        bid_vol = max(ref_data_manager.round_qty(symbol, base_vol * bid_ratio),
+                      base_vol)
+        ask_vol = max(ref_data_manager.round_qty(symbol, base_vol * ask_ratio),
+                      base_vol)
+        return bid_vol, ask_vol
+
+    # ----------------------------------------------------------
+    # 行情主循环
     # ----------------------------------------------------------
 
     def on_orderbook(self, ob: OrderBook):
         symbol = ob.symbol
         self._ensure_symbol(symbol)
 
-        # ── 阶段一：每 tick，无门控 ──────────────────────────────
-        # 实时更新 Calibrator / FeatureEngine / TrendDetector / ML训练
         self.calibrators[symbol].on_orderbook(ob)
         self.feature_engine.on_orderbook(ob)
         self.trend_detectors[symbol].on_orderbook(ob)
@@ -148,142 +200,122 @@ class HybridGLFTStrategy(StrategyTemplate):
         feats = self.trend_detectors[symbol].get_features()
         now   = time.time()
 
-        # 每 tick 训练 ML，最大化样本密度（不受 cycle_interval 限制）
         self.ml_predictors[symbol].add_tick(feats, mid, now)
 
-        # ── 阶段二：频率门控 0.5s ────────────────────────────────
         if now - self.last_run_times[symbol] < self.cycle_interval:
             return
         self.last_run_times[symbol] = now
 
-        # 冷启动保护：Calibrator 还没有足够样本时，用宽松参数做市
+        # 冷启动保护
         if not self.calibrators[symbol].is_warmed_up:
             self.last_mode[symbol] = "COLDSTART"
             self._execute_mm(symbol, ob, mid,
-                             alpha_bps=0.0, gamma_mult=self.COLDSTART_GAMMA_MULT)
+                             alpha_bps=0.0,
+                             gamma_mult=self.COLDSTART_GAMMA_MULT)
             return
 
-        # ── 阶段三：模式选择 ────────────────────────────────────
+        # 模式选择
         rule_sig = self.trend_detectors[symbol].compute_trend_signal()
         ml_pred  = self.ml_predictors[symbol].predict(feats, now)
-
         self.last_ml_pred[symbol] = ml_pred
         mode_obj = self.mode_selector.select_mode(rule_sig, ml_pred)
         self.last_mode[symbol] = mode_obj.mode
 
-        # ── 阶段四：模式分发 ────────────────────────────────────
+        # 模式分发
         if mode_obj.mode == "MARKET_MAKING":
             self._execute_mm(symbol, ob, mid, alpha_bps=0.0, gamma_mult=1.0)
 
         elif mode_obj.mode == "MOMENTUM_BUY":
-            # [FIX-D] 仓位硬上限检查：多头过重时不追涨，改为保守做市
-            current_pos  = self.oms.exposure.net_positions.get(symbol, 0.0)
-            pos_usdt     = current_pos * mid  # 多头为正，空头为负
-            cap          = self.max_pos_usdt * self.momentum_pos_cap_ratio
-            if pos_usdt >= cap:
-                # 已经持有足够多头，不再动量加仓，反而要用高 gamma 偏向卖出来减仓
-                self._execute_mm(symbol, ob, mid, alpha_bps=0.0, gamma_mult=2.0)
+            pos_usdt = self.oms.exposure.net_positions.get(symbol, 0.0) * mid
+            if pos_usdt >= self.max_pos_usdt * self.mom_pos_cap_ratio:
+                self._execute_mm(symbol, ob, mid,
+                                 alpha_bps=0.0,
+                                 gamma_mult=self.mom_overweight_gmult)
             else:
-                self._execute_mm(symbol, ob, mid, alpha_bps=10.0, gamma_mult=0.5)
+                self._execute_mm(symbol, ob, mid,
+                                 alpha_bps=self.mom_alpha_bps,
+                                 gamma_mult=self.mom_gamma_mult)
 
         elif mode_obj.mode == "MOMENTUM_SELL":
-            # [FIX-D] 空头过重时不追跌，改为保守做市
-            current_pos  = self.oms.exposure.net_positions.get(symbol, 0.0)
-            pos_usdt     = current_pos * mid  # 空头持仓为负
-            cap          = self.max_pos_usdt * self.momentum_pos_cap_ratio
-            if pos_usdt <= -cap:
-                self._execute_mm(symbol, ob, mid, alpha_bps=0.0, gamma_mult=2.0)
+            pos_usdt = self.oms.exposure.net_positions.get(symbol, 0.0) * mid
+            if pos_usdt <= -(self.max_pos_usdt * self.mom_pos_cap_ratio):
+                self._execute_mm(symbol, ob, mid,
+                                 alpha_bps=0.0,
+                                 gamma_mult=self.mom_overweight_gmult)
             else:
-                self._execute_mm(symbol, ob, mid, alpha_bps=-10.0, gamma_mult=0.5)
+                self._execute_mm(symbol, ob, mid,
+                                 alpha_bps=-self.mom_alpha_bps,
+                                 gamma_mult=self.mom_gamma_mult)
 
     # ----------------------------------------------------------
-    # GLFT 核心定价与报价执行
+    # GLFT 核心定价
     # ----------------------------------------------------------
 
     def _execute_mm(self, symbol: str, ob: OrderBook, mid: float,
                     alpha_bps: float = 0.0, gamma_mult: float = 1.0):
-        """
-        根据当前 Calibrator 参数、库存状态、alpha 信号，
-        计算目标 bid/ask 价格并提交给 _update_quotes。
-        """
+
         calibrator = self.calibrators[symbol]
         sigma = max(1.0, calibrator.sigma_bps)
         A     = max(0.1, calibrator.A)
         k     = max(0.1, calibrator.k)
         gamma = self.base_gamma * gamma_mult
 
-        # 公允价 = mid 加上 alpha 方向偏移
-        fair_mid  = mid * (1.0 + alpha_bps / 10000.0)
-
-        order_vol = self._calculate_safe_vol(symbol, mid)
-        if order_vol <= 0:
-            return
-
-        # ── [FIX-B] per-symbol 持仓：直接从 OMS ExposureManager 读取 ──
-        # 修复前: current_pos = self.pos
-        #   self.pos 是所有 symbol 共享的标量，多标的场景下值不可靠。
-        # 修复后: 精确读取该 symbol 的净持仓（正=多头，负=空头）
+        # [FIX-B] per-symbol 净持仓
         current_pos = self.oms.exposure.net_positions.get(symbol, 0.0)
 
-        # ── [FIX-C] q_norm 归一化：用 max_pos_vol 而不是 order_vol ──
-        # 修复前: q_norm = current_pos / order_vol
-        #   order_vol ≈ 0.001 BTC（最小下单量），持仓 0.05 BTC 时 q_norm = 50，爆炸。
-        # 修复后: max_pos_vol = max_pos_usdt / mid，使 q_norm 在 [-1, 1] 之间有意义。
-        #   当持仓达到 max_pos_usdt 时，q_norm = 1.0，偏斜最大但有界。
+        # [FIX-C] 有界 q_norm
         max_pos_vol = self.max_pos_usdt / mid if mid > 0 else 1.0
-        q_norm      = current_pos / max_pos_vol  # 有界，通常 ∈ [-1, 1]
+        q_norm      = max(-1.0, min(1.0, current_pos / max_pos_vol))
 
-        # ── GLFT 公式 ──────────────────────────────────────────
-        # base_half_spread_bps: 零库存时的理论半价差
-        # inventory_skew_bps:   库存带来的报价偏移（正持仓→ask压低/bid抬高，即偏向卖出）
+        # [FIX-2] funding 调整叠加到 alpha
+        total_alpha_bps = alpha_bps + self._calc_funding_adj_bps(symbol, q_norm)
+        fair_mid = mid * (1.0 + total_alpha_bps / 10000.0)
+
+        # GLFT 公式
         base_half_spread_bps = (1.0 / gamma) * math.log(1.0 + gamma / k)
-        inventory_skew_bps   = q_norm * (gamma * sigma ** 2) / (2 * A * k)
+        inventory_skew_bps   = q_norm * (gamma * sigma ** 2) / (2.0 * A * k)
 
         spread_price = mid * (base_half_spread_bps / 10000.0)
         skew_price   = mid * (inventory_skew_bps   / 10000.0)
 
-        # 多头持仓时 skew_price > 0:
-        #   bid 下移（不鼓励继续买）, ask 下移（鼓励对手方买入来帮我们减仓）
         target_bid = fair_mid - spread_price - skew_price
         target_ask = fair_mid + spread_price - skew_price
 
-        # ── 安全钳与价格规整 ───────────────────────────────────
+        # 安全钳
         bid_1, _ = ob.get_best_bid()
         ask_1, _ = ob.get_best_ask()
         info = ref_data_manager.get_info(symbol)
         tick = info.tick_size
 
-        # 保证最小价差不低于 min_spread_bps
         min_half = mid * (self.min_spread_bps / 20000.0)
         if (target_ask - target_bid) < min_half * 2:
-            center     = (target_bid + target_ask) / 2
+            center     = (target_bid + target_ask) / 2.0
             target_bid = center - min_half
             target_ask = center + min_half
 
-        # 四舍五入到交易所 tick
         target_bid = ref_data_manager.round_price(symbol, target_bid)
         target_ask = ref_data_manager.round_price(symbol, target_ask)
 
-        # 防止穿越盘口（bid 不得 >= ask_1，ask 不得 <= bid_1）
-        if target_bid >= ask_1:
-            target_bid = ask_1 - tick
-        if target_ask <= bid_1:
-            target_ask = bid_1 + tick
-
-        # 最终保险：bid 必须 < ask
+        if target_bid >= ask_1: target_bid = ask_1 - tick
+        if target_ask <= bid_1: target_ask = bid_1 + tick
         if target_bid >= target_ask:
             target_bid = mid - tick
             target_ask = mid + tick
 
-        # ── 状态广播到 UI ──────────────────────────────────────
+        # [FIX-1] 非对称量
+        bid_vol, ask_vol = self._calc_asymmetric_vols(symbol, mid, q_norm)
+        if bid_vol <= 0 or ask_vol <= 0:
+            return
+
+        # 状态广播
         predictor = self.ml_predictors[symbol]
         ml_stats  = predictor.get_stats()
         ml_pred   = self.last_ml_pred[symbol]
 
-        strat_data = StrategyData(
+        self.engine.put(Event(EVENT_STRATEGY_UPDATE, StrategyData(
             symbol=symbol,
             fair_value=fair_mid,
-            alpha_bps=alpha_bps,
+            alpha_bps=total_alpha_bps,
             gamma=gamma, k=k, A=A, sigma=sigma,
             ml_mode=self.last_mode[symbol],
             ml_p_trend=ml_pred.p_trend if ml_pred else 0.5,
@@ -292,56 +324,100 @@ class HybridGLFTStrategy(StrategyTemplate):
             ml_buffer_size=ml_stats["buffer_size"],
             ml_clf_weights=ml_stats["clf_weights"],
             ml_reg_weights=ml_stats["reg_weights"],
-        )
-        self.engine.put(Event(EVENT_STRATEGY_UPDATE, strat_data))
+        )))
 
-        # ── 执行报价更新 ───────────────────────────────────────
-        self._update_quotes(symbol, target_bid, target_ask, order_vol)
+        self._update_quotes(symbol, target_bid, target_ask, bid_vol, ask_vol)
 
     # ----------------------------------------------------------
-    # 报价管理（增量改单）
+    # 报价管理
     # ----------------------------------------------------------
 
-    def _update_quotes(self, symbol: str, bid: float, ask: float, volume: float):
+    def _update_quotes(self, symbol: str,
+                       bid: float, ask: float,
+                       bid_vol: float, ask_vol: float):
         """
-        对比新旧报价，只在价格变动超过 1 个 tick 时才撤旧单、挂新单。
-        [FIX-E] 买卖侧使用独立的冷却时间，互不干扰。
+        [FIX-E] 买卖侧独立冷却
+        [FIX-F] is_post_only=True
+        [FIX-G] cancelling 守卫
+        [FIX-1] bid_vol/ask_vol 由调用方非对称传入
+        [FIX-6] 挂新单时继承部分成交剩余量
         """
         state = self.quote_state[symbol]
         info  = ref_data_manager.get_info(symbol)
         tick  = info.tick_size
         now   = time.time()
-        cooldown_ms = 200  # 同侧 200ms 内不重复操作
+        cd    = self.cooldown_ms
 
         # ── Bid 侧 ────────────────────────────────────────────
-        # [FIX-E] 每侧独立判断冷却，不会因为 ask 侧刚更新而阻塞 bid 侧
-        if (now - state["bid_last_update"]) * 1000 >= cooldown_ms:
-            if state["bid_price"] is None or abs(bid - state["bid_price"]) >= tick:
-                if state["bid_oid"]:
-                    self.cancel_order(state["bid_oid"])
-                oid = self.buy(symbol, bid, volume)
-                if oid:
-                    state["bid_oid"]         = oid
-                    state["bid_price"]       = bid
-                    state["bid_last_update"] = now  # [FIX-E]
+        if (now - state["bid_last_update"]) * 1000 >= cd:
+
+            if state["bid_cancelling"]:
+                if now - state["bid_last_update"] > self.cancel_guard_timeout:
+                    self.log(f"[WARN] {symbol} bid cancel guard timeout, force reset")
+                    state["bid_cancelling"] = False
+                    state["bid_oid"]        = None
+                    state["bid_price"]      = None
+
+            if not state["bid_cancelling"]:
+                if state["bid_price"] is None or abs(bid - state["bid_price"]) >= tick:
+                    if state["bid_oid"]:
+                        self.cancel_order(state["bid_oid"])
+                        state["bid_cancelling"]  = True
+                        state["bid_last_update"] = now
+                    else:
+                        # [FIX-6] 继承部分成交剩余量
+                        rem       = self.partial_remaining[symbol]["bid"]
+                        final_vol = ref_data_manager.round_qty(
+                            symbol, max(bid_vol, rem) if rem > 0 else bid_vol
+                        )
+                        oid = self.send_intent(OrderIntent(
+                            strategy_id=self.name, symbol=symbol,
+                            side=Side.BUY, price=bid, volume=final_vol,
+                            is_post_only=True,
+                        ))
+                        if oid:
+                            state["bid_oid"]         = oid
+                            state["bid_price"]       = bid
+                            state["bid_last_update"] = now
+                            self.partial_remaining[symbol]["bid"] = 0.0
 
         # ── Ask 侧 ────────────────────────────────────────────
-        if (now - state["ask_last_update"]) * 1000 >= cooldown_ms:
-            if state["ask_price"] is None or abs(ask - state["ask_price"]) >= tick:
-                if state["ask_oid"]:
-                    self.cancel_order(state["ask_oid"])
-                oid = self.sell(symbol, ask, volume)
-                if oid:
-                    state["ask_oid"]         = oid
-                    state["ask_price"]       = ask
-                    state["ask_last_update"] = now  # [FIX-E]
+        if (now - state["ask_last_update"]) * 1000 >= cd:
+
+            if state["ask_cancelling"]:
+                if now - state["ask_last_update"] > self.cancel_guard_timeout:
+                    self.log(f"[WARN] {symbol} ask cancel guard timeout, force reset")
+                    state["ask_cancelling"] = False
+                    state["ask_oid"]        = None
+                    state["ask_price"]      = None
+
+            if not state["ask_cancelling"]:
+                if state["ask_price"] is None or abs(ask - state["ask_price"]) >= tick:
+                    if state["ask_oid"]:
+                        self.cancel_order(state["ask_oid"])
+                        state["ask_cancelling"]  = True
+                        state["ask_last_update"] = now
+                    else:
+                        rem       = self.partial_remaining[symbol]["ask"]
+                        final_vol = ref_data_manager.round_qty(
+                            symbol, max(ask_vol, rem) if rem > 0 else ask_vol
+                        )
+                        oid = self.send_intent(OrderIntent(
+                            strategy_id=self.name, symbol=symbol,
+                            side=Side.SELL, price=ask, volume=final_vol,
+                            is_post_only=True,
+                        ))
+                        if oid:
+                            state["ask_oid"]         = oid
+                            state["ask_price"]       = ask
+                            state["ask_last_update"] = now
+                            self.partial_remaining[symbol]["ask"] = 0.0
 
     # ----------------------------------------------------------
     # 事件回调
     # ----------------------------------------------------------
 
     def on_market_trade(self, trade: AggTradeData):
-        """公共成交流 → 喂给 FeatureEngine 和 Calibrator"""
         self._ensure_symbol(trade.symbol)
         self.feature_engine.on_trade(trade)
         if trade.symbol in self.calibrators:
@@ -350,39 +426,46 @@ class HybridGLFTStrategy(StrategyTemplate):
 
     def on_order(self, snapshot: OrderStateSnapshot):
         """
-        订单状态回调：清理 quote_state，防止对已终结订单重复操作。
-
-        [FIX-A] 原代码用字符串列表做 in 判断：
-            snapshot.status in ["FILLED", "CANCELLED", ...]
-        但 snapshot.status 是 OrderStatus Enum 类型，Python 中
-            OrderStatus.FILLED == "FILLED"  → False
-        导致 quote_state 的 bid_oid/ask_oid 永远不清空。
-        修复：改用 OrderStatus Enum 成员做比较。
+        [FIX-A] Enum 比较。
+        [FIX-G] 终结状态清 cancelling 标志。
+        [FIX-6] PARTIALLY_FILLED 记录剩余量。
         """
-        # 先调用基类（清理 active_orders）
         super().on_order(snapshot)
 
-        # [FIX-A] 使用 Enum 而非字符串
-        terminal_statuses = {
+        symbol = snapshot.symbol
+        state  = self.quote_state[symbol]
+
+        # [FIX-6] 部分成交：记录剩余，单子仍活跃，不清 oid
+        if snapshot.status == OrderStatus.PARTIALLY_FILLED:
+            remaining = max(0.0, snapshot.volume - snapshot.filled_volume)
+            if state["bid_oid"] == snapshot.client_oid:
+                self.partial_remaining[symbol]["bid"] = remaining
+            elif state["ask_oid"] == snapshot.client_oid:
+                self.partial_remaining[symbol]["ask"] = remaining
+            return
+
+        # [FIX-A] 终结状态用 Enum 集合比较
+        terminal = {
             OrderStatus.FILLED,
             OrderStatus.CANCELLED,
             OrderStatus.REJECTED,
             OrderStatus.EXPIRED,
         }
 
-        if snapshot.status in terminal_statuses:
-            state = self.quote_state[snapshot.symbol]
-
+        if snapshot.status in terminal:
             if state["bid_oid"] == snapshot.client_oid:
-                state["bid_oid"]   = None
-                state["bid_price"] = None
+                state["bid_oid"]        = None
+                state["bid_price"]      = None
+                state["bid_cancelling"] = False          # [FIX-G]
+                self.partial_remaining[symbol]["bid"] = 0.0
 
             if state["ask_oid"] == snapshot.client_oid:
-                state["ask_oid"]   = None
-                state["ask_price"] = None
+                state["ask_oid"]        = None
+                state["ask_price"]      = None
+                state["ask_cancelling"] = False          # [FIX-G]
+                self.partial_remaining[symbol]["ask"] = 0.0
 
     def on_trade(self, trade: TradeData):
-        """自身成交回报，记录日志"""
         self.log(
             f"FILL: {trade.symbol} {trade.side} "
             f"{trade.volume} @ {trade.price}"
