@@ -312,20 +312,25 @@ class HybridGLFTStrategy(StrategyTemplate):
         ml_stats  = predictor.get_stats()
         ml_pred   = self.last_ml_pred[symbol]
 
+        dynamic_params = {
+            "γ": f"{gamma:.2f}",
+            "k": f"{k:.2f}",
+            "A": f"{A:.2f}",
+            "σ": f"{sigma:.1f}",
+            "Mode": self.last_mode[symbol],
+            "P_Trd": f"{ml_pred.p_trend:.2f}" if ml_pred else "0.5",
+            "N": ml_stats["n_samples"],
+            "Clf_Weights": ml_stats["clf_weights"], # 这是一个 list，Dashboard 会自动美化
+            "Reg_Weights": ml_stats["reg_weights"]  # 这是一个 list
+        }
+
+        # 发送通用数据包
         self.engine.put(Event(EVENT_STRATEGY_UPDATE, StrategyData(
             symbol=symbol,
             fair_value=fair_mid,
             alpha_bps=total_alpha_bps,
-            gamma=gamma, k=k, A=A, sigma=sigma,
-            ml_mode=self.last_mode[symbol],
-            ml_p_trend=ml_pred.p_trend if ml_pred else 0.5,
-            ml_trained=ml_stats["trained"],
-            ml_n_samples=ml_stats["n_samples"],
-            ml_buffer_size=ml_stats["buffer_size"],
-            ml_clf_weights=ml_stats["clf_weights"],
-            ml_reg_weights=ml_stats["reg_weights"],
+            params=dynamic_params  # 所有的特有参数都塞进这里
         )))
-
         self._update_quotes(symbol, target_bid, target_ask, bid_vol, ask_vol)
 
     # ----------------------------------------------------------
