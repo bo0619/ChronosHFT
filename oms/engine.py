@@ -240,7 +240,6 @@ class OMS:
             order_type=intent.order_type,
             time_in_force=intent.time_in_force,
             post_only=intent.is_post_only,
-            is_rpi=intent.is_rpi,
         )
 
         exchange_oid = self.gateway.send_order(req, client_oid)

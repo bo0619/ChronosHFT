@@ -65,7 +65,6 @@ def main():
     oms_system = OMS(engine, gateway, config)
     
     # 3. 全局风控 (持有 OMS)
-    # 虽然 RiskManager 不再直接拦截 strategy.buy，但它作为全局守卫仍在运行
     risk_controller = RiskManager(engine, config, oms=oms_system, gateway=gateway)
     
     # 4. 策略 (Hybrid GLFT)

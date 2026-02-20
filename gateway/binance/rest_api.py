@@ -7,7 +7,7 @@ import hashlib
 from urllib.parse import urlencode
 from infrastructure.logger import logger
 from infrastructure.time_service import time_service
-from event.type import OrderRequest, CancelRequest, TIF_GTX, TIF_RPI
+from event.type import OrderRequest, CancelRequest, TIF_GTX
 from .constants import *
 
 class BinanceRestApi:
@@ -47,12 +47,8 @@ class BinanceRestApi:
         resp = self.request("GET", EP_DEPTH_SNAPSHOT, {"symbol": symbol, "limit": limit}, signed=False)
         return resp.json() if resp and resp.status_code == 200 else None
 
-    def get_rpi_depth_snapshot(self, symbol, limit=1000):
-        resp = self.request("GET", EP_RPI_DEPTH_SNAPSHOT, {"symbol": symbol, "limit": limit}, signed=False)
-        return resp.json() if resp and resp.status_code == 200 else None
-
     # --- 2. 交易模块 ---
-    def new_order(self, req: OrderRequest, client_oid: str = None): # [修复] 增加 client_oid 参数
+    def new_order(self, req: OrderRequest, client_oid: str = None):
         """POST /fapi/v1/order"""
         params = {
             "symbol": req.symbol,
@@ -61,16 +57,13 @@ class BinanceRestApi:
             "quantity": req.volume,
         }
         
-        # [修复] 注入 Client ID
         if client_oid:
             params["newClientOrderId"] = client_oid
         
         if req.order_type == "LIMIT":
             params["price"] = req.price
-            if getattr(req, "is_rpi", False):
-                params["timeInForce"] = TIF_RPI # 或者 "GTX" 取决于最新API，保持 TIF_RPI
-            else:
-                params["timeInForce"] = TIF_GTX if req.post_only else req.time_in_force
+            # [Removed] RPI TIF Logic
+            params["timeInForce"] = TIF_GTX if req.post_only else req.time_in_force
         
         resp = self.request("POST", EP_ORDER, params, signed=True)
         return resp

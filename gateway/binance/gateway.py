@@ -5,18 +5,16 @@ import threading
 import time
 import requests
 import socket
-import traceback
 from datetime import datetime
 from requests.adapters import HTTPAdapter
 
 from gateway.base_gateway import BaseGateway
 from event.type import (
     Event, EVENT_API_LIMIT, EVENT_AGG_TRADE, EVENT_MARK_PRICE, 
-    EVENT_ORDERBOOK, EVENT_RPI_UPDATE, EVENT_EXCHANGE_ORDER_UPDATE,
-    EVENT_SYSTEM_HEALTH, # [NEW] 用于通知致命错误
+    EVENT_ORDERBOOK, EVENT_EXCHANGE_ORDER_UPDATE, EVENT_SYSTEM_HEALTH,
     OrderRequest, CancelRequest, ApiLimitData, ExchangeOrderUpdate, 
-    AggTradeData, MarkPriceData, RpiDepthData, 
-    OrderBookGapError, TIF_GTX, TIF_RPI, GatewayState
+    AggTradeData, MarkPriceData, GatewayState,
+    OrderBookGapError, TIF_GTX
 )
 from data.orderbook import LocalOrderBook
 from infrastructure.logger import logger
@@ -40,27 +38,20 @@ class BinanceGateway(BaseGateway):
         self.api_secret = api_secret
         self.testnet = testnet
         
-        # 1. 建立 Session
         self.session = requests.Session()
         adapter = HFTAdapter(pool_connections=20, pool_maxsize=20)
         self.session.mount("https://", adapter)
         self.session.headers.update({"Content-Type": "application/json"})
         
-        # 2. 模块初始化
         self.rest = BinanceRestApi(api_key, api_secret, self.session, testnet)
         self.ws = BinanceWsApi(self.on_ws_message, self.on_ws_error, testnet)
         
-        # 3. 状态与缓存
         self.symbols = []
         self.orderbooks = {}
         self.ws_buffer = {}
-        self.rpi_books = {}
-        self.rpi_buffer = {}
         self.active = False
         self.listen_key = ""
 
-        # 4. [CORE] 本地定序器 (Sequencer)
-        # 负责把无序/并发的外部世界，转化为有序的内部事件流
         self.global_sequence_id = 0
         self.seq_lock = threading.Lock()
 
@@ -68,8 +59,6 @@ class BinanceGateway(BaseGateway):
         with self.seq_lock:
             self.global_sequence_id += 1
             return self.global_sequence_id
-
-    # --- 接口实现 ---
 
     def connect(self, symbols: list):
         self.set_state(GatewayState.CONNECTING)
@@ -79,14 +68,10 @@ class BinanceGateway(BaseGateway):
         for s in self.symbols:
             self.orderbooks[s] = LocalOrderBook(s)
             self.ws_buffer[s] = []
-            self.rpi_books[s] = LocalOrderBook(s)
-            self.rpi_buffer[s] = []
 
-        # Init settings
         for s in self.symbols:
             self.rest.set_margin_type(s, "CROSSED")
 
-        # Start Streams
         self.ws.start_market_stream(self.symbols)
         
         listen_key = self.rest.create_listen_key()
@@ -105,19 +90,11 @@ class BinanceGateway(BaseGateway):
         logger.info(f"[{self.gateway_name}] Closed.")
 
     def send_order(self, req: OrderRequest, client_oid: str = None) -> str:
-        """
-        核心修复：将 OMS 传入的 client_oid 转发给 REST API。
-        Binance REST API 接收参数为 'newClientOrderId'。
-        """
-        # 注意：这里调用 rest_api.new_order 时必须传入 client_oid
         resp = self.rest.new_order(req, client_oid)
-        
         if resp and resp.status_code == 200:
             data = resp.json()
-            # 记录日志
-            logger.info(f"[Gateway] Order Successfully Sent. ExchID: {data['orderId']}, ClientID: {client_oid}")
+            logger.info(f"[Gateway] Order Sent. ExchID: {data['orderId']}")
             return str(data["orderId"])
-        
         return None
 
     def cancel_order(self, req: CancelRequest):
@@ -141,7 +118,6 @@ class BinanceGateway(BaseGateway):
     def get_depth_snapshot(self, symbol):
         return self.rest.get_depth_snapshot(symbol)
 
-    # --- Internal ---
     def _keep_alive_loop(self):
         while self.active:
             time.sleep(1800)
@@ -161,19 +137,10 @@ class BinanceGateway(BaseGateway):
         self.on_log(err_msg, "ERROR")
 
     def _handle_user_update(self, msg):
-        """
-        [CORE] 生成带序列号的原子事件
-        """
         o = msg["o"]
-        
-        # 严格检查：如果没有 client_oid，这就是脏数据 (可能是手动下的单)
         client_oid = o.get("c", "")
-        # 在 No Compromise 模式下，我们也应该允许处理外部订单吗？
-        # 顶级 OMS 通常只处理自己发的单。如果不是系统的 UUID 格式，可以标记或忽略。
-        # 这里我们全部透传，由 OMS 决定是否丢弃。
-
         update = ExchangeOrderUpdate(
-            seq=self._next_seq(), # [Critical] 分配单调序列号
+            seq=self._next_seq(),
             client_oid=client_oid,
             exchange_oid=str(o["i"]),
             symbol=o["s"],
@@ -183,7 +150,6 @@ class BinanceGateway(BaseGateway):
             cum_filled_qty=float(o["z"]),
             update_time=float(o["T"])/1000.0
         )
-        # 推送给 OMS (EVENT_EXCHANGE_ORDER_UPDATE)
         self.on_order_update(update)
 
     def _handle_market_update(self, msg):
@@ -196,16 +162,11 @@ class BinanceGateway(BaseGateway):
         elif "@markPrice" in stream:
             self.on_market_data(EVENT_MARK_PRICE, MarkPriceData(symbol, float(data["p"]), float(data["i"]), float(data["r"]), datetime.fromtimestamp(data["T"]/1000), datetime.now()))
         elif "@depth" in stream:
-            self._process_book(symbol, data, False)
-        elif "@rpiDepth" in stream:
-            self._process_book(symbol, data, True)
+            self._process_book(symbol, data)
 
-    def _process_book(self, symbol, raw, is_rpi):
-        """
-        [No Compromise] 发现 Gap 直接自杀，不尝试修复
-        """
-        book = self.rpi_books[symbol] if is_rpi else self.orderbooks[symbol]
-        buf = self.rpi_buffer[symbol] if is_rpi else self.ws_buffer[symbol]
+    def _process_book(self, symbol, raw):
+        book = self.orderbooks[symbol]
+        buf = self.ws_buffer[symbol]
 
         if buf is not None:
             buf.append(raw)
@@ -213,29 +174,21 @@ class BinanceGateway(BaseGateway):
 
         try:
             book.process_delta(raw)
-            if is_rpi:
-                self.on_market_data(EVENT_RPI_UPDATE, RpiDepthData(symbol, "BINANCE", datetime.now(), book.bids.copy(), book.asks.copy()))
-            else:
-                data = book.generate_event_data()
-                if data: self.on_market_data(EVENT_ORDERBOOK, data)
-                
+            data = book.generate_event_data()
+            if data: self.on_market_data(EVENT_ORDERBOOK, data)
         except OrderBookGapError:
-            # [FATAL] 数据不连续，系统不可信，立即熔断
-            logger.critical(f"[{symbol}] FATAL: OrderBook Gap Detected! Terminating Gateway.")
+            logger.critical(f"[{symbol}] FATAL: OrderBook Gap! Terminating Gateway.")
             self.event_engine.put(Event(EVENT_SYSTEM_HEALTH, "FATAL_GAP"))
-            self.close() # 断开连接
-            # 这里的哲学是：与其用修补过的数据继续交易，不如停止交易。
+            self.close()
 
     def _init_books(self):
         time.sleep(2)
         for s in self.symbols: self._resync_book(s)
 
     def _resync_book(self, symbol):
-        # 仅在启动时允许 Sync
         snap = self.rest.get_depth_snapshot(symbol)
         if snap:
             self.orderbooks[symbol].init_snapshot(snap)
-            # 处理启动期间积压的数据
             if self.ws_buffer[symbol]:
                 try:
                     for m in self.ws_buffer[symbol]: self.orderbooks[symbol].process_delta(m)
@@ -244,14 +197,4 @@ class BinanceGateway(BaseGateway):
                     logger.critical(f"[{symbol}] Gap during init. Failed.")
                     self.close()
                     return
-
-        rpi_snap = self.rest.get_rpi_depth_snapshot(symbol)
-        if rpi_snap:
-            self.rpi_books[symbol].init_snapshot(rpi_snap)
-            if self.rpi_buffer[symbol]:
-                try:
-                    for m in self.rpi_buffer[symbol]: self.rpi_books[symbol].process_delta(m)
-                    self.rpi_buffer[symbol] = None
-                except: pass
-        
         logger.info(f"[{symbol}] Initial Sync Done.")

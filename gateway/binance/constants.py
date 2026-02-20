@@ -10,7 +10,6 @@ WS_URL_TEST = "wss://stream.binancefuture.com/ws"
 
 # Endpoints
 EP_DEPTH_SNAPSHOT = "/fapi/v1/depth"
-EP_RPI_DEPTH_SNAPSHOT = "/fapi/v1/rpiDepth" # [NEW] 明确命名
 EP_ORDER = "/fapi/v1/order"
 EP_LISTEN_KEY = "/fapi/v1/listenKey"
 EP_TIME = "/fapi/v1/time"
