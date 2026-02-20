@@ -34,8 +34,6 @@ from data.cache import data_cache
 
 # 5. 监控与运维层
 from ui.dashboard import TUIDashboard
-from monitor.server import WebMonitor
-from ops.alert import TelegramAlerter
 
 def load_config():
     if not os.path.exists("config.json"):
@@ -79,9 +77,6 @@ def main():
     
     # 5. 辅助模块
     recorder = DataRecorder(engine, config["symbols"]) if config.get("record_data") else None
-    alerter = TelegramAlerter(engine, config)
-    web_server = WebMonitor(engine, config)
-
     # --- D. 核心事件流绑定 (Wiring) ---
     
     # >> 1. 市场数据流
