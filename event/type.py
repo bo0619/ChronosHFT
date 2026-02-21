@@ -297,12 +297,6 @@ class StrategyData:
     fair_value: float
     alpha_bps: float
     
-    # 兼容旧代码的显式字段 (可选，若策略不发则为默认值)
-    gamma: float = 0.0
-    k: float = 0.0
-    A: float = 0.0
-    sigma: float = 0.0
-    
     # [关键修复] 动态参数字典 (Dashboard 解耦核心)
     params: Dict[str, Any] = field(default_factory=dict)
     
