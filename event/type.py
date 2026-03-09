@@ -26,6 +26,7 @@ EVENT_ORDER_UPDATE = "eOrderUpdate"
 EVENT_TRADE_UPDATE = "eTradeUpdate"       
 EVENT_POSITION_UPDATE = "ePositionUpdate" 
 EVENT_EXCHANGE_ORDER_UPDATE = "eExchangeOrderUpdate" 
+EVENT_EXCHANGE_ACCOUNT_UPDATE = "eExchangeAccountUpdate"
 EVENT_STRATEGY_UPDATE = "eStrategyUpdate"
 
 EVENT_BACKTEST_END = "eBacktestEnd"       
@@ -199,12 +200,16 @@ class ExchangeOrderUpdate:
     client_oid: str
     exchange_oid: str
     symbol: str
-    status: str       
-    filled_qty: float 
-    filled_price: float 
-    cum_filled_qty: float 
+    status: str
+    filled_qty: float
+    filled_price: float
+    cum_filled_qty: float
     update_time: float
     seq: int = 0
+    commission: Optional[float] = None
+    commission_asset: str = ""
+    realized_pnl: Optional[float] = None
+    is_maker: Optional[bool] = None
 
 @dataclass
 class OrderStateSnapshot:
@@ -235,14 +240,19 @@ class TradeData:
     symbol: str
     order_id: str
     trade_id: str
-    side: str       
+    side: str
     price: float
     volume: float
     datetime: datetime
 
-# ==========================================
-# 8. 账户与持仓
-# ==========================================
+@dataclass
+class ExchangeAccountUpdate:
+    asset: str
+    wallet_balance: float
+    available_balance: Optional[float] = None
+    positions: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    reason: str = ""
+    event_time: float = 0.0
 
 @dataclass
 class PositionData:

@@ -9,6 +9,7 @@ from infrastructure.logger import logger
 from event.type import (
     CancelRequest,
     Event,
+    ExchangeAccountUpdate,
     ExchangeOrderUpdate,
     LifecycleState,
     OrderIntent,
@@ -217,9 +218,11 @@ class OMS:
                     symbol = pos["symbol"]
                     self.exposure.force_sync(symbol, amount, float(pos["entryPrice"]))
 
+                available_balance = account.get("availableBalance")
                 self.account.force_sync(
                     float(account["totalWalletBalance"]),
                     float(account["totalInitialMargin"]),
+                    float(available_balance) if available_balance is not None else None,
                 )
                 self.order_monitor.monitored_orders.clear()
 
@@ -377,6 +380,32 @@ class OMS:
     def on_exchange_update(self, event):
         self._append_and_process(event)
 
+    def on_exchange_account_update(self, event):
+        update: ExchangeAccountUpdate = event.data
+        tracked_symbols = set(self.config.get("symbols", []))
+        tracked_positions = {
+            symbol: payload
+            for symbol, payload in update.positions.items()
+            if not tracked_symbols or symbol in tracked_symbols
+        }
+
+        with self.lock:
+            self.account.sync_exchange_balance(
+                update.wallet_balance,
+                available=update.available_balance,
+            )
+            position_drift = self._collect_exchange_position_drift_locked(tracked_positions)
+            has_active_orders = self._has_active_orders_locked(tracked_positions.keys())
+
+        if position_drift:
+            self._audit(
+                "exchange_account_position_drift",
+                reason=update.reason,
+                positions=position_drift,
+            )
+            if not has_active_orders and self.state != LifecycleState.HALTED:
+                logger.warning(f"[OMS] Exchange position drift detected: {position_drift}")
+
     def _append_and_process(self, event):
         if self.state == LifecycleState.HALTED:
             return
@@ -504,13 +533,19 @@ class OMS:
                             seq=update.seq,
                             exchange_status=update.status,
                         )
-                        realized_pnl = self.exposure.on_fill(
+                        local_realized_pnl = self.exposure.on_fill(
                             order.intent.symbol,
                             order.intent.side,
                             delta,
                             update.filled_price,
                         )
-                        fee = delta * update.filled_price * self._get_fee_rate(order)
+                        realized_pnl = (
+                            update.realized_pnl
+                            if update.realized_pnl is not None
+                            else local_realized_pnl
+                        )
+                        fill_notional = delta * update.filled_price
+                        fee = self._get_fill_commission(update, order, fill_notional)
                         self.account.update_balance(realized_pnl, fee)
 
                         trade_data = TradeData(
@@ -684,8 +719,54 @@ class OMS:
         normalized.sort(key=lambda item: (item["symbol"], item["identifiers"], item["side"]))
         return normalized
 
-    def _get_fee_rate(self, order: Order) -> float:
+    def _collect_exchange_position_drift_locked(self, exchange_positions):
+        drift = {}
+        for symbol, payload in exchange_positions.items():
+            local_pos = self.exposure.net_positions.get(symbol, 0.0)
+            exchange_pos = float(payload.get("volume", 0.0))
+            if abs(local_pos - exchange_pos) > 1e-6:
+                drift[symbol] = {
+                    "local": local_pos,
+                    "exchange": exchange_pos,
+                    "entry_price": float(payload.get("entry_price", 0.0)),
+                }
+        return drift
+
+    def _has_active_orders_locked(self, symbols=None):
+        tracked_symbols = set(symbols or [])
+        for order in self.orders.values():
+            if not order.is_active():
+                continue
+            if tracked_symbols and order.intent.symbol not in tracked_symbols:
+                continue
+            return True
+        return False
+
+    def _extract_quote_asset(self, symbol: str) -> str:
+        for suffix in ("USDT", "USDC", "BUSD", "FDUSD", "BTC", "ETH", "BNB"):
+            if symbol.endswith(suffix):
+                return suffix
+        return ""
+
+    def _get_fill_commission(self, update: ExchangeOrderUpdate, order: Order, fill_notional: float) -> float:
+        if update.commission is None:
+            return fill_notional * self._get_fee_rate(order, is_maker=update.is_maker)
+
+        asset = (update.commission_asset or self._extract_quote_asset(order.intent.symbol)).upper()
+        if asset in {"", "USDT", "USDC", "BUSD", "FDUSD"}:
+            return update.commission
+
+        logger.warning(
+            f"[OMS] Unsupported commission asset {asset}; falling back to configured fee model"
+        )
+        return fill_notional * self._get_fee_rate(order, is_maker=update.is_maker)
+
+    def _get_fee_rate(self, order: Order, is_maker: bool = None) -> float:
         fee_config = self.config.get("backtest", {})
+        if is_maker is True:
+            return fee_config.get("maker_fee", 0.0)
+        if is_maker is False:
+            return fee_config.get("taker_fee", 0.0005)
         if order.intent.is_post_only:
             return fee_config.get("maker_fee", 0.0)
         return fee_config.get("taker_fee", 0.0005)

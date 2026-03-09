@@ -1,51 +1,59 @@
-# file: gateway/binance/gateway.py
-
 import json
+import socket
 import threading
 import time
-import requests
-import socket
 from datetime import datetime
+
+import requests
 from requests.adapters import HTTPAdapter
 
-from gateway.base_gateway import BaseGateway
 from event.type import (
-    Event, EVENT_API_LIMIT, EVENT_AGG_TRADE, EVENT_MARK_PRICE, 
-    EVENT_ORDERBOOK, EVENT_EXCHANGE_ORDER_UPDATE, EVENT_SYSTEM_HEALTH,
-    OrderRequest, CancelRequest, ApiLimitData, ExchangeOrderUpdate, 
-    AggTradeData, MarkPriceData, GatewayState,
-    OrderBookGapError, TIF_GTX
+    AggTradeData,
+    CancelRequest,
+    Event,
+    ExchangeAccountUpdate,
+    ExchangeOrderUpdate,
+    GatewayState,
+    MarkPriceData,
+    OrderBookGapError,
+    OrderRequest,
+    EVENT_AGG_TRADE,
+    EVENT_MARK_PRICE,
+    EVENT_ORDERBOOK,
+    EVENT_SYSTEM_HEALTH,
 )
-from data.orderbook import LocalOrderBook
+from gateway.base_gateway import BaseGateway
 from infrastructure.logger import logger
-from infrastructure.time_service import time_service
+from data.orderbook import LocalOrderBook
+
 from .rest_api import BinanceRestApi
 from .ws_api import BinanceWsApi
 
+
 class HFTAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
-        pool_kwargs['socket_options'] = [
+        pool_kwargs["socket_options"] = [
             (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
             (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
         ]
         super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
 
+
 class BinanceGateway(BaseGateway):
     def __init__(self, event_engine, api_key, api_secret, testnet=True):
         super().__init__(event_engine, "BINANCE")
-        
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
-        
+
         self.session = requests.Session()
         adapter = HFTAdapter(pool_connections=20, pool_maxsize=20)
         self.session.mount("https://", adapter)
         self.session.headers.update({"Content-Type": "application/json"})
-        
+
         self.rest = BinanceRestApi(api_key, api_secret, self.session, testnet)
         self.ws = BinanceWsApi(self.on_ws_message, self.on_ws_error, testnet)
-        
+
         self.symbols = []
         self.orderbooks = {}
         self.ws_buffer = {}
@@ -64,40 +72,39 @@ class BinanceGateway(BaseGateway):
         self.set_state(GatewayState.CONNECTING)
         self.symbols = [s.upper() for s in symbols]
         self.active = True
-        
-        for s in self.symbols:
-            self.orderbooks[s] = LocalOrderBook(s)
-            self.ws_buffer[s] = []
 
-        for s in self.symbols:
-            self.rest.set_margin_type(s, "CROSSED")
+        for symbol in self.symbols:
+            self.orderbooks[symbol] = LocalOrderBook(symbol)
+            self.ws_buffer[symbol] = []
+
+        for symbol in self.symbols:
+            self.rest.set_margin_type(symbol, "CROSSED")
 
         self.ws.start_market_stream(self.symbols)
-        
+
         listen_key = self.rest.create_listen_key()
         if listen_key:
             self.listen_key = listen_key
             self.ws.start_user_stream(listen_key)
             threading.Thread(target=self._keep_alive_loop, daemon=True).start()
-            
+
         threading.Thread(target=self._init_books, daemon=True).start()
         self.set_state(GatewayState.READY)
 
     def close(self):
         self.active = False
         self.set_state(GatewayState.DISCONNECTED)
-        if self.session: self.session.close()
+        if self.session:
+            self.session.close()
         logger.info(f"[{self.gateway_name}] Closed.")
 
     def send_order(self, req: OrderRequest, client_oid: str = None) -> str:
         resp = self.rest.new_order(req, client_oid)
         if resp and resp.status_code == 200:
             data = resp.json()
-
-            # ── 可读日志 ─────────────────────────────────────
-            sym      = req.symbol.replace("USDC", "").replace("USDT", "").lower()
+            sym = req.symbol.replace("USDC", "").replace("USDT", "").lower()
             side_str = "long" if req.side == "BUY" else "short"
-            tif_str  = "GTX" if req.post_only else "IOC"
+            tif_str = "GTX" if req.post_only else "IOC"
 
             if client_oid and client_oid.startswith("EXIT_"):
                 action = "exit "
@@ -120,17 +127,17 @@ class BinanceGateway(BaseGateway):
         self.rest.cancel_all_orders(symbol)
 
     def get_account_info(self):
-        r = self.rest.get_account()
-        return r.json() if r and r.status_code == 200 else None
+        resp = self.rest.get_account()
+        return resp.json() if resp and resp.status_code == 200 else None
 
     def get_all_positions(self):
-        r = self.rest.get_positions()
-        return r.json() if r and r.status_code == 200 else None
-        
+        resp = self.rest.get_positions()
+        return resp.json() if resp and resp.status_code == 200 else None
+
     def get_open_orders(self):
-        r = self.rest.get_open_orders()
-        return r.json() if r and r.status_code == 200 else None
-        
+        resp = self.rest.get_open_orders()
+        return resp.json() if resp and resp.status_code == 200 else None
+
     def get_depth_snapshot(self, symbol):
         return self.rest.get_depth_snapshot(symbol)
 
@@ -142,31 +149,68 @@ class BinanceGateway(BaseGateway):
     def on_ws_message(self, raw_msg):
         try:
             msg = json.loads(raw_msg)
-            if "e" in msg and msg["e"] == "ORDER_TRADE_UPDATE":
+            event_type = msg.get("e")
+            if event_type == "ORDER_TRADE_UPDATE":
                 self._handle_user_update(msg)
+                return
+            if event_type == "ACCOUNT_UPDATE":
+                self._handle_account_update(msg)
                 return
             if "stream" in msg:
                 self._handle_market_update(msg)
-        except: pass
+        except Exception:
+            pass
 
     def on_ws_error(self, err_msg):
         self.on_log(err_msg, "ERROR")
 
     def _handle_user_update(self, msg):
-        o = msg["o"]
-        client_oid = o.get("c", "")
+        order = msg.get("o", {})
+        update_time_ms = order.get("T") or msg.get("T") or msg.get("E") or 0
         update = ExchangeOrderUpdate(
             seq=self._next_seq(),
-            client_oid=client_oid,
-            exchange_oid=str(o["i"]),
-            symbol=o["s"],
-            status=o["X"],
-            filled_qty=float(o["l"]),
-            filled_price=float(o["L"]),
-            cum_filled_qty=float(o["z"]),
-            update_time=float(o["T"])/1000.0
+            client_oid=order.get("c", ""),
+            exchange_oid=str(order.get("i", "")),
+            symbol=order.get("s", ""),
+            status=order.get("X", ""),
+            filled_qty=float(order.get("l", 0.0) or 0.0),
+            filled_price=float(order.get("L", 0.0) or 0.0),
+            cum_filled_qty=float(order.get("z", 0.0) or 0.0),
+            update_time=float(update_time_ms) / 1000.0 if update_time_ms else time.time(),
+            commission=self._parse_optional_float(order.get("n")),
+            commission_asset=order.get("N") or "",
+            realized_pnl=self._parse_optional_float(order.get("rp")),
+            is_maker=bool(order.get("m")) if "m" in order else None,
         )
         self.on_order_update(update)
+
+    def _handle_account_update(self, msg):
+        payload = msg.get("a", {})
+        balance_entry = self._select_balance_entry(payload.get("B", []))
+        if not balance_entry:
+            return
+
+        positions = {}
+        for raw_position in payload.get("P", []):
+            symbol = raw_position.get("s")
+            if not symbol:
+                continue
+            positions[symbol] = {
+                "volume": float(raw_position.get("pa", 0.0) or 0.0),
+                "entry_price": float(raw_position.get("ep", 0.0) or 0.0),
+                "unrealized_pnl": float(raw_position.get("up", 0.0) or 0.0),
+            }
+
+        event_time_ms = msg.get("E") or msg.get("T") or 0
+        update = ExchangeAccountUpdate(
+            asset=balance_entry.get("a", ""),
+            wallet_balance=float(balance_entry.get("wb", 0.0) or 0.0),
+            available_balance=self._parse_optional_float(balance_entry.get("cw")),
+            positions=positions,
+            reason=payload.get("m", ""),
+            event_time=float(event_time_ms) / 1000.0 if event_time_ms else time.time(),
+        )
+        self.on_account_update(update)
 
     def _handle_market_update(self, msg):
         stream = msg["stream"]
@@ -174,9 +218,29 @@ class BinanceGateway(BaseGateway):
         symbol = data.get("s")
 
         if "@aggTrade" in stream:
-            self.on_market_data(EVENT_AGG_TRADE, AggTradeData(symbol, data["a"], float(data["p"]), float(data["q"]), data["m"], datetime.fromtimestamp(data["T"]/1000)))
+            self.on_market_data(
+                EVENT_AGG_TRADE,
+                AggTradeData(
+                    symbol,
+                    data["a"],
+                    float(data["p"]),
+                    float(data["q"]),
+                    data["m"],
+                    datetime.fromtimestamp(data["T"] / 1000),
+                ),
+            )
         elif "@markPrice" in stream:
-            self.on_market_data(EVENT_MARK_PRICE, MarkPriceData(symbol, float(data["p"]), float(data["i"]), float(data["r"]), datetime.fromtimestamp(data["T"]/1000), datetime.now()))
+            self.on_market_data(
+                EVENT_MARK_PRICE,
+                MarkPriceData(
+                    symbol,
+                    float(data["p"]),
+                    float(data["i"]),
+                    float(data["r"]),
+                    datetime.fromtimestamp(data["T"] / 1000),
+                    datetime.now(),
+                ),
+            )
         elif "@depth" in stream:
             self._process_book(symbol, data)
 
@@ -191,7 +255,8 @@ class BinanceGateway(BaseGateway):
         try:
             book.process_delta(raw)
             data = book.generate_event_data()
-            if data: self.on_market_data(EVENT_ORDERBOOK, data)
+            if data:
+                self.on_market_data(EVENT_ORDERBOOK, data)
         except OrderBookGapError:
             logger.critical(f"[{symbol}] FATAL: OrderBook Gap! Terminating Gateway.")
             self.event_engine.put(Event(EVENT_SYSTEM_HEALTH, "FATAL_GAP"))
@@ -199,18 +264,52 @@ class BinanceGateway(BaseGateway):
 
     def _init_books(self):
         time.sleep(2)
-        for s in self.symbols: self._resync_book(s)
+        for symbol in self.symbols:
+            self._resync_book(symbol)
 
     def _resync_book(self, symbol):
-        snap = self.rest.get_depth_snapshot(symbol)
-        if snap:
-            self.orderbooks[symbol].init_snapshot(snap)
+        snapshot = self.rest.get_depth_snapshot(symbol)
+        if snapshot:
+            self.orderbooks[symbol].init_snapshot(snapshot)
             if self.ws_buffer[symbol]:
                 try:
-                    for m in self.ws_buffer[symbol]: self.orderbooks[symbol].process_delta(m)
+                    for message in self.ws_buffer[symbol]:
+                        self.orderbooks[symbol].process_delta(message)
                     self.ws_buffer[symbol] = None
                 except OrderBookGapError:
                     logger.critical(f"[{symbol}] Gap during init. Failed.")
                     self.close()
                     return
         logger.info(f"[{symbol}] Initial Sync Done.")
+
+    def _parse_optional_float(self, value):
+        if value in (None, ""):
+            return None
+        return float(value)
+
+    def _select_balance_entry(self, balances):
+        if not balances:
+            return None
+
+        tracked_assets = []
+        for symbol in self.symbols:
+            asset = self._extract_quote_asset(symbol)
+            if asset and asset not in tracked_assets:
+                tracked_assets.append(asset)
+
+        for asset in tracked_assets:
+            for entry in balances:
+                if entry.get("a") == asset:
+                    return entry
+
+        for entry in balances:
+            if entry.get("a") in {"USDT", "USDC", "BUSD", "FDUSD"}:
+                return entry
+
+        return balances[0]
+
+    def _extract_quote_asset(self, symbol: str) -> str:
+        for suffix in ("USDT", "USDC", "BUSD", "FDUSD", "BTC", "ETH", "BNB"):
+            if symbol.endswith(suffix):
+                return suffix
+        return ""
