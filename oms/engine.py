@@ -1,4 +1,4 @@
-﻿import threading
+import threading
 import time
 import uuid
 from collections import deque
@@ -123,7 +123,6 @@ class OMS:
                 self.halt_system("Reconcile API unreachable")
                 return
 
-            is_pos_mismatch = False
             with self.lock:
                 remote_map = {
                     pos["symbol"]: float(pos["positionAmt"])
@@ -135,27 +134,35 @@ class OMS:
                     for symbol, volume in self.exposure.net_positions.items()
                     if volume != 0
                 }
+                local_active_orders = self._collect_local_active_orders_locked()
 
             for symbol in set(remote_map) | set(local_map):
                 if abs(local_map.get(symbol, 0.0) - remote_map.get(symbol, 0.0)) > 1e-6:
-                    is_pos_mismatch = True
                     logger.error(
                         f"[Reconcile] Position mismatch {symbol}: "
                         f"Local={local_map.get(symbol, 0.0)}, Exch={remote_map.get(symbol, 0.0)}"
                     )
-                    break
+                    self._audit("reconcile_reset", case="position_mismatch", symbol=symbol)
+                    self._perform_full_reset()
+                    return
 
-            if is_pos_mismatch:
-                self._audit("reconcile_reset", case="position_mismatch")
+            remote_active_orders = self._normalize_remote_open_orders(remote_orders)
+            if local_active_orders != remote_active_orders:
+                self._audit(
+                    "reconcile_reset",
+                    case="open_order_mismatch",
+                    local_active_orders=local_active_orders,
+                    remote_active_orders=remote_active_orders,
+                    suspicious_oid=suspicious_oid,
+                )
                 self._perform_full_reset()
                 return
 
             remote_has_suspicious = False
             if suspicious_oid:
                 remote_has_suspicious = any(
-                    str(order.get("orderId")) == suspicious_oid
-                    or order.get("clientOrderId") == suspicious_oid
-                    for order in remote_orders
+                    suspicious_oid in order["identifiers"]
+                    for order in remote_active_orders
                 )
 
             if remote_has_suspicious:
@@ -181,10 +188,17 @@ class OMS:
                 self.gateway.cancel_all_orders(symbol)
             time.sleep(1.0)
 
+            remote_orders = self.gateway.get_open_orders()
             account = self.gateway.get_account_info()
             positions = self.gateway.get_all_positions()
-            if not account or not positions:
+            if remote_orders is None or not account or positions is None:
                 raise RuntimeError("API failed during reset")
+
+            residual_orders = self._normalize_remote_open_orders(remote_orders)
+            if residual_orders:
+                raise RuntimeError(
+                    f"remote open orders still present after cancel-all: {residual_orders}"
+                )
 
             with self.lock:
                 self.orders.clear()
@@ -490,16 +504,14 @@ class OMS:
                             seq=update.seq,
                             exchange_status=update.status,
                         )
-                        self.exposure.on_fill(
+                        realized_pnl = self.exposure.on_fill(
                             order.intent.symbol,
                             order.intent.side,
                             delta,
                             update.filled_price,
                         )
-                        fee = delta * update.filled_price * self.config.get(
-                            "backtest", {}
-                        ).get("taker_fee", 0.0005)
-                        self.account.update_balance(0, fee)
+                        fee = delta * update.filled_price * self._get_fee_rate(order)
+                        self.account.update_balance(realized_pnl, fee)
 
                         trade_data = TradeData(
                             symbol=order.intent.symbol,
@@ -619,6 +631,64 @@ class OMS:
     # -----------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------
+
+    def _normalize_remote_open_orders(self, remote_orders):
+        tracked_symbols = set(self.config.get("symbols", []))
+        normalized = []
+        for order in remote_orders:
+            symbol = order.get("symbol")
+            if tracked_symbols and symbol not in tracked_symbols:
+                continue
+            identifiers = tuple(
+                sorted(
+                    oid
+                    for oid in [
+                        str(order.get("orderId")) if order.get("orderId") is not None else "",
+                        order.get("clientOrderId") or "",
+                    ]
+                    if oid
+                )
+            )
+            normalized.append(
+                {
+                    "symbol": symbol,
+                    "identifiers": identifiers,
+                    "side": order.get("side", ""),
+                }
+            )
+        normalized.sort(key=lambda item: (item["symbol"], item["identifiers"], item["side"]))
+        return normalized
+
+    def _collect_local_active_orders_locked(self):
+        tracked_symbols = set(self.config.get("symbols", []))
+        normalized = []
+        for order in self.orders.values():
+            if not order.is_active():
+                continue
+            if tracked_symbols and order.intent.symbol not in tracked_symbols:
+                continue
+            identifiers = tuple(
+                sorted(
+                    oid
+                    for oid in [order.client_oid, order.exchange_oid]
+                    if oid
+                )
+            )
+            normalized.append(
+                {
+                    "symbol": order.intent.symbol,
+                    "identifiers": identifiers,
+                    "side": order.intent.side.value,
+                }
+            )
+        normalized.sort(key=lambda item: (item["symbol"], item["identifiers"], item["side"]))
+        return normalized
+
+    def _get_fee_rate(self, order: Order) -> float:
+        fee_config = self.config.get("backtest", {})
+        if order.intent.is_post_only:
+            return fee_config.get("maker_fee", 0.0)
+        return fee_config.get("taker_fee", 0.0005)
 
     def _serialize_intent(self, intent: OrderIntent) -> dict:
         return {

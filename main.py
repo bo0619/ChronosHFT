@@ -8,6 +8,7 @@ from rich.live import Live
 
 # 1. 基础设施层
 from infrastructure.logger import logger
+from infrastructure.system_health import handle_system_health_event
 from infrastructure.time_service import time_service
 
 # 2. 事件总线与数据类型
@@ -16,7 +17,7 @@ from event.type import (
     EVENT_LOG, EVENT_ORDERBOOK, EVENT_TRADE_UPDATE, EVENT_ORDER_UPDATE,
     EVENT_POSITION_UPDATE, EVENT_AGG_TRADE, EVENT_MARK_PRICE, 
     EVENT_ACCOUNT_UPDATE, EVENT_STRATEGY_UPDATE,
-    EVENT_ORDER_SUBMITTED, EVENT_EXCHANGE_ORDER_UPDATE
+    EVENT_ORDER_SUBMITTED, EVENT_EXCHANGE_ORDER_UPDATE, EVENT_SYSTEM_HEALTH
 )
 
 # 3. 核心业务模块
@@ -107,6 +108,7 @@ def main():
     ])
     engine.register(EVENT_ACCOUNT_UPDATE, lambda e: dashboard.update_account(e.data))
     engine.register(EVENT_STRATEGY_UPDATE, lambda e: dashboard.update_strategy(e.data))
+    engine.register(EVENT_SYSTEM_HEALTH, lambda e: handle_system_health_event(e, risk_controller))
 
     # --- E. 启动流程 ---
     engine.start()
