@@ -151,6 +151,13 @@ class OrderSubmitted:
     order_id: str
     timestamp: float
 
+@dataclass
+class OrderSubmitResult:
+    accepted: bool
+    client_oid: str = ""
+    reason: str = ""
+    state: str = ""
+
 # ==========================================
 # 6. 行情数据结构
 # ==========================================
@@ -222,6 +229,7 @@ class OrderStateSnapshot:
     filled_volume: float
     avg_price: float
     update_time: float
+    error_msg: str = ""
     # [Removed] is_rpi
 
 @dataclass

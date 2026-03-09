@@ -82,9 +82,9 @@ def main():
     engine.register(EVENT_ORDER_UPDATE, lambda e: strategy.on_order(e.data))
     engine.register(EVENT_TRADE_UPDATE, lambda e: strategy.on_trade(e.data))
     engine.register(EVENT_POSITION_UPDATE, lambda e: [strategy.on_position(e.data), dashboard.update_position(e.data)])
-    engine.register(EVENT_ACCOUNT_UPDATE, lambda e: dashboard.update_account(e.data))
+    engine.register(EVENT_ACCOUNT_UPDATE, lambda e: [strategy.on_account_update(e.data), dashboard.update_account(e.data)])
     engine.register(EVENT_STRATEGY_UPDATE, lambda e: dashboard.update_strategy(e.data))
-    engine.register(EVENT_SYSTEM_HEALTH, lambda e: handle_system_health_event(e, risk_controller))
+    engine.register(EVENT_SYSTEM_HEALTH, lambda e: [strategy.on_system_health(e.data), handle_system_health_event(e, risk_controller)])
 
     engine.start()
     gateway.connect(config["symbols"])

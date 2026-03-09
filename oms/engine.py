@@ -15,6 +15,7 @@ from event.type import (
     OrderIntent,
     OrderRequest,
     OrderStatus,
+    OrderSubmitResult,
     OrderSubmitted,
     Side,
     TradeData,
@@ -246,34 +247,29 @@ class OMS:
     # Downstream requests
     # -----------------------------------------------------------
 
-    def submit_order(self, intent: OrderIntent) -> str:
+    def submit_order(self, intent: OrderIntent) -> OrderSubmitResult:
+        client_oid = str(uuid.uuid4())
+
         if self.state != LifecycleState.LIVE:
-            self._audit(
-                "intent_rejected",
-                reason=f"oms_not_live:{self.state.value}",
-                intent=self._serialize_intent(intent),
+            return self._reject_intent_locally(
+                intent,
+                client_oid,
+                f"oms_not_live:{self.state.value}",
             )
-            return None
 
         valid, validation_reason = self.validator.validate_params(intent)
         if not valid:
-            self._audit(
-                "intent_rejected",
-                reason=validation_reason,
-                intent=self._serialize_intent(intent),
-            )
-            return None
+            return self._reject_intent_locally(intent, client_oid, validation_reason)
 
         notional = intent.price * intent.volume
         if not self.account.check_margin(notional):
-            self._audit(
-                "intent_rejected",
-                reason="insufficient_margin",
-                intent=self._serialize_intent(intent),
+            return self._reject_intent_locally(
+                intent,
+                client_oid,
+                "insufficient_margin",
                 notional=notional,
                 available=self.account.available,
             )
-            return None
 
         ok, risk_reason = self.exposure.check_risk(
             intent.symbol,
@@ -283,14 +279,12 @@ class OMS:
         )
         if not ok:
             logger.warning(f"[OMS] Risk rejected: {risk_reason}")
-            self._audit(
-                "intent_rejected",
-                reason=f"exposure_limit:{risk_reason}",
-                intent=self._serialize_intent(intent),
+            return self._reject_intent_locally(
+                intent,
+                client_oid,
+                f"exposure_limit:{risk_reason}",
             )
-            return None
 
-        client_oid = str(uuid.uuid4())
         order = Order(client_oid, intent)
 
         with self.lock:
@@ -330,11 +324,16 @@ class OMS:
                 price=intent.price,
                 volume=intent.volume,
             )
-            return client_oid
+            return OrderSubmitResult(
+                accepted=True,
+                client_oid=client_oid,
+                state=self.state.value,
+            )
 
         with self.lock:
             order.mark_rejected_locally("gateway_send_failed")
             self._record_order_snapshot(order, "send_failed")
+            self._emit_order_update(order)
             self.orders.pop(client_oid, None)
             self.exposure.update_open_orders(self.orders)
             self.account.calculate()
@@ -345,7 +344,33 @@ class OMS:
             symbol=intent.symbol,
             reason="gateway_send_failed",
         )
-        return None
+        return OrderSubmitResult(
+            accepted=False,
+            client_oid=client_oid,
+            reason="gateway_send_failed",
+            state=self.state.value,
+        )
+
+    def _reject_intent_locally(self, intent: OrderIntent, client_oid: str, reason: str, **extra):
+        order = Order(client_oid, intent)
+        order.mark_rejected_locally(reason)
+        with self.lock:
+            self._record_order_snapshot(order, "intent_rejected", **extra)
+            self._emit_order_update(order)
+        self._write_tombstone(order)
+        audit_payload = {
+            "reason": reason,
+            "intent": self._serialize_intent(intent),
+            "client_oid": client_oid,
+        }
+        audit_payload.update(extra)
+        self._audit("intent_rejected", **audit_payload)
+        return OrderSubmitResult(
+            accepted=False,
+            client_oid=client_oid,
+            reason=reason,
+            state=self.state.value,
+        )
 
     def cancel_order(self, client_oid: str):
         with self.lock:

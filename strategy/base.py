@@ -1,6 +1,8 @@
-﻿from event.type import (
+from event.type import (
+    AccountData,
     CancelRequest,
     Event,
+    LifecycleState,
     OrderBook,
     OrderIntent,
     OrderStateSnapshot,
@@ -26,6 +28,11 @@ class StrategyTemplate:
         self.pos = 0.0
         self.active_orders = {}
         self.orders_cancelling = set()
+        self.latest_account = None
+        self.last_system_health = ""
+        self.last_submit_reject_reason = ""
+        self.last_submit_reject_oid = ""
+        self.last_submit_reject_by_symbol = {}
 
     def on_orderbook(self, orderbook: OrderBook):
         raise NotImplementedError
@@ -41,12 +48,33 @@ class StrategyTemplate:
             OrderStatus.REJECTED_LOCALLY,
             OrderStatus.EXPIRED,
         }
+        if snapshot.status in {OrderStatus.REJECTED, OrderStatus.REJECTED_LOCALLY}:
+            reason = snapshot.error_msg or snapshot.status.value.lower()
+            self.last_submit_reject_reason = reason
+            self.last_submit_reject_oid = snapshot.client_oid
+            self.last_submit_reject_by_symbol[snapshot.symbol] = reason
         if snapshot.status in terminal_statuses:
             self.active_orders.pop(snapshot.client_oid, None)
             self.orders_cancelling.discard(snapshot.client_oid)
 
     def on_position(self, pos: PositionData):
         self.pos = pos.volume
+
+    def on_account_update(self, account: AccountData):
+        self.latest_account = account
+
+    def on_system_health(self, message):
+        if not isinstance(message, str):
+            message = str(message)
+        self.last_system_health = message
+
+    def on_submit_rejected(self, intent: OrderIntent, reason: str, client_oid: str = ""):
+        self.last_submit_reject_reason = reason
+        self.last_submit_reject_oid = client_oid or ""
+        self.last_submit_reject_by_symbol[intent.symbol] = reason
+
+    def can_submit_orders(self) -> bool:
+        return getattr(self.oms, "state", None) == LifecycleState.LIVE
 
     def log(self, msg):
         self.engine.put(Event(EVENT_LOG, f"[{self.name}] {msg}"))
@@ -60,12 +88,25 @@ class StrategyTemplate:
             notional = intent.price * intent.volume
             min_notional = max(info.min_notional, 5.0)
             if notional < min_notional:
+                self.on_submit_rejected(intent, "min_notional")
                 return None
 
-        client_oid = self.oms.submit_order(intent)
-        if client_oid:
+        submit_result = self.oms.submit_order(intent)
+        if isinstance(submit_result, str):
+            client_oid = submit_result
+            if client_oid:
+                self.active_orders[client_oid] = intent
+            return client_oid
+
+        client_oid = getattr(submit_result, "client_oid", "") if submit_result else ""
+        accepted = bool(getattr(submit_result, "accepted", False)) if submit_result else False
+        if accepted and client_oid:
             self.active_orders[client_oid] = intent
-        return client_oid
+            return client_oid
+
+        reject_reason = getattr(submit_result, "reason", "submit_rejected") if submit_result else "submit_rejected"
+        self.on_submit_rejected(intent, reject_reason, client_oid)
+        return None
 
     def entry_long(self, symbol, price, volume):
         intent = OrderIntent(self.name, symbol, Side.BUY, price, volume)

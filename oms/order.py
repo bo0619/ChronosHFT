@@ -1,4 +1,4 @@
-﻿import time
+import time
 from typing import Dict, Set
 
 from event.type import (
@@ -104,6 +104,7 @@ class Order:
             filled_volume=self.filled_volume,
             avg_price=self.avg_price,
             update_time=self.updated_at,
+            error_msg=self.error_msg,
         )
 
     def to_record(self) -> dict:
