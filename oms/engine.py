@@ -51,7 +51,7 @@ class OMS:
         self.max_pos_notional = (
             config.get("risk", {})
             .get("limits", {})
-            .get("max_pos_notional_oms", 5000.0)
+            .get("max_pos_notional", 2000.0)   # [RISK-1] 统一字段名，与 config.json 一致
         )
 
         self.sequence = SequenceValidator()
