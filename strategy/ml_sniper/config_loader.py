@@ -4,7 +4,7 @@ import json
 
 def load_sniper_config():
     try:
-        with open("config.json", "r") as f:
+        with open("config.json", "r", encoding="utf-8") as f:
             cfg = json.load(f)
             return cfg.get("strategy", {}).get("ml_sniper", {})
     except:

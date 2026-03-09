@@ -93,7 +93,23 @@ class BinanceGateway(BaseGateway):
         resp = self.rest.new_order(req, client_oid)
         if resp and resp.status_code == 200:
             data = resp.json()
-            logger.info(f"[Gateway] Order Sent. ExchID: {data['orderId']}")
+
+            # ── 可读日志 ─────────────────────────────────────
+            sym      = req.symbol.replace("USDC", "").replace("USDT", "").lower()
+            side_str = "long" if req.side == "BUY" else "short"
+            tif_str  = "GTX" if req.post_only else "IOC"
+
+            if client_oid and client_oid.startswith("EXIT_"):
+                action = "exit "
+            elif client_oid and client_oid.startswith("ENTRY_"):
+                action = "enter"
+            else:
+                action = "order"
+
+            logger.info(
+                f"{sym} {action} {side_str} @ {req.price:.6g}"
+                f"  ({tif_str}, vol={req.volume})"
+            )
             return str(data["orderId"])
         return None
 

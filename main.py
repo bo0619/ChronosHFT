@@ -38,7 +38,7 @@ def load_config():
     if not os.path.exists("config.json"):
         print("Error: config.json not found.")
         return None
-    with open("config.json", "r") as f:
+    with open("config.json", "r", encoding="utf-8") as f:
         return json.load(f)
 
 def main():

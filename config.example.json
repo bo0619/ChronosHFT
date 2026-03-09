@@ -1,4 +1,4 @@
-{
+﻿{
     "testnet": true,
     "api_key": "BhluoNoQGdkMMganGvAtvunZXhqEDjRSqoiinlg4BFoBxOizNgMuTfFoTJjJEqzW",
     "api_secret": "rjKqzfsmoMd7pA8XukdtDZ7qYFapl39eRu073pcliZFPf5jinoMAs580TQS358X0",
@@ -20,6 +20,13 @@
         "leverage": 10,
         "initial_balance_usdt": 10000.0
     },
+    "oms": {
+        "journal_enabled": true,
+        "replay_journal_on_startup": true,
+        "journal_path": "storage/oms/oms_journal.jsonl",
+        "tombstone_max": 2000
+    },
+
     "risk": {
         "active": true,
         "limits": {

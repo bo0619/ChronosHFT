@@ -1,97 +1,112 @@
-# file: oms/engine.py
-
-import uuid
-import threading
+﻿import threading
 import time
+import uuid
+from collections import deque
 from datetime import datetime
+
 from infrastructure.logger import logger
 
 from event.type import (
-    Event, OrderIntent, OrderRequest, OrderStatus,
-    ExchangeOrderUpdate, CancelRequest,
-    EVENT_ORDER_UPDATE, EVENT_TRADE_UPDATE, EVENT_POSITION_UPDATE,
-    EVENT_ORDER_SUBMITTED, EVENT_SYSTEM_HEALTH,
-    OrderSubmitted, TradeData, LifecycleState, Side,
+    CancelRequest,
+    Event,
+    ExchangeOrderUpdate,
+    LifecycleState,
+    OrderIntent,
+    OrderRequest,
+    OrderStatus,
+    OrderSubmitted,
+    Side,
+    TradeData,
+    EVENT_ORDER_SUBMITTED,
+    EVENT_ORDER_UPDATE,
+    EVENT_POSITION_UPDATE,
+    EVENT_SYSTEM_HEALTH,
+    EVENT_TRADE_UPDATE,
 )
 
-from .order import Order
-from .exposure import ExposureManager
-from .validator import OrderValidator
 from .account_manager import AccountManager
+from .exposure import ExposureManager
+from .journal import OMSJournal
+from .order import Order, TERMINAL_STATUSES
 from .order_manager import OrderManager
 from .sequence import SequenceValidator
+from .validator import OrderValidator
 
 
 class OMS:
-    """
-    Deterministic & Self-Healing OMS Engine
-    """
+    """Deterministic OMS for a single Binance perpetual account."""
 
     def __init__(self, event_engine, gateway, config):
         self.event_engine = event_engine
-        self.gateway      = gateway
-        self.config       = config
+        self.gateway = gateway
+        self.config = config
 
         self.state = LifecycleState.BOOTSTRAP
 
-        # [Immutable History]
         self.event_log = []
-
-        # [State]
-        self.orders          = {}   # client_oid  -> Order
-        self.exchange_id_map = {}   # exchange_oid -> Order
-
+        self.orders = {}
+        self.exchange_id_map = {}
         self.lock = threading.RLock()
 
-        # ── OMS 层持仓限额（从 config 读取，不再硬编码）──────────
-        # 三层梯度：strategy(3000) < oms(5000) < risk(10000)
-        self.max_pos_notional: float = (
-            config
-            .get("risk", {})
+        self.max_pos_notional = (
+            config.get("risk", {})
             .get("limits", {})
-            .get("max_pos_notional_oms", 5000.0)   # ← 读 config
+            .get("max_pos_notional_oms", 5000.0)
         )
 
-        # [Components]
-        self.sequence     = SequenceValidator()
-        self.validator    = OrderValidator(config)
-        self.exposure     = ExposureManager()
-        self.account      = AccountManager(event_engine, self.exposure, config)
+        self.sequence = SequenceValidator()
+        self.validator = OrderValidator(config)
+        self.exposure = ExposureManager()
+        self.account = AccountManager(event_engine, self.exposure, config)
         self.order_monitor = OrderManager(event_engine, gateway, self.trigger_reconcile)
 
+        self.journal = OMSJournal(config)
+        self.TOMBSTONE_MAX = config.get("oms", {}).get("tombstone_max", 2000)
+        self.terminated_oids = set()
+        self.terminated_oid_queue = deque()
+        self.rebuild_summary = self.rebuild_from_log()
+
     # -----------------------------------------------------------
-    # 生命周期
+    # Lifecycle
     # -----------------------------------------------------------
 
     def bootstrap(self):
-        """[Phase 1] 启动引导：拉取真值快照，建立初始状态"""
-        logger.info("OMS: Bootstrapping State...")
+        logger.info("OMS: Bootstrapping state...")
+        self._audit("bootstrap_requested", recovered=self.rebuild_summary)
         self._perform_full_reset()
 
     def halt_system(self, reason: str):
         if self.state == LifecycleState.HALTED:
             return
         self.state = LifecycleState.HALTED
-        logger.critical(f"🛑 OMS HALTED: {reason}")
+        logger.critical(f"OMS HALTED: {reason}")
+        self._audit("lifecycle", state=self.state.value, reason=reason)
         self.event_engine.put(Event(EVENT_SYSTEM_HEALTH, f"HALT:{reason}"))
         try:
-            for s in self.config["symbols"]:
-                self.gateway.cancel_all_orders(s)
+            for symbol in self.config["symbols"]:
+                self.gateway.cancel_all_orders(symbol)
         except Exception:
             pass
 
     def stop(self):
+        self._audit("oms_stopped", state=self.state.value)
         self.order_monitor.stop()
 
     # -----------------------------------------------------------
-    # 自愈逻辑
+    # Recovery and reconcile
     # -----------------------------------------------------------
 
     def trigger_reconcile(self, reason: str, suspicious_oid: str = None):
         if self.state in [LifecycleState.RECONCILING, LifecycleState.HALTED]:
             return
-        logger.warning(f"⚠️  OMS Dirty: {reason}. State -> RECONCILING.")
+        logger.warning(f"OMS dirty: {reason}. State -> RECONCILING")
         self.state = LifecycleState.RECONCILING
+        self._audit(
+            "reconcile_requested",
+            state=self.state.value,
+            reason=reason,
+            suspicious_oid=suspicious_oid,
+        )
         threading.Thread(
             target=self._execute_reconcile,
             args=(suspicious_oid,),
@@ -99,140 +114,176 @@ class OMS:
         ).start()
 
     def _execute_reconcile(self, suspicious_oid: str):
-        logger.info("[Reconcile] Investigating inconsistency...")
+        self._audit("reconcile_started", suspicious_oid=suspicious_oid)
         try:
-            rem_pos  = self.gateway.get_all_positions()
-            rem_ords = self.gateway.get_open_orders()
+            remote_positions = self.gateway.get_all_positions()
+            remote_orders = self.gateway.get_open_orders()
 
-            if rem_pos is None or rem_ords is None:
+            if remote_positions is None or remote_orders is None:
                 self.halt_system("Reconcile API unreachable")
                 return
 
-            # A. 检查持仓
             is_pos_mismatch = False
             with self.lock:
-                rem_map = {
-                    p["symbol"]: float(p["positionAmt"])
-                    for p in rem_pos
-                    if float(p["positionAmt"]) != 0
+                remote_map = {
+                    pos["symbol"]: float(pos["positionAmt"])
+                    for pos in remote_positions
+                    if float(pos["positionAmt"]) != 0
                 }
-                loc_map = {
-                    s: v for s, v in self.exposure.net_positions.items() if v != 0
+                local_map = {
+                    symbol: volume
+                    for symbol, volume in self.exposure.net_positions.items()
+                    if volume != 0
                 }
-                for s in set(rem_map) | set(loc_map):
-                    if abs(loc_map.get(s, 0) - rem_map.get(s, 0)) > 1e-6:
-                        is_pos_mismatch = True
-                        logger.error(
-                            f"[Reconcile] Position Mismatch {s}: "
-                            f"Local={loc_map.get(s,0)}, Exch={rem_map.get(s,0)}"
-                        )
-                        break
+
+            for symbol in set(remote_map) | set(local_map):
+                if abs(local_map.get(symbol, 0.0) - remote_map.get(symbol, 0.0)) > 1e-6:
+                    is_pos_mismatch = True
+                    logger.error(
+                        f"[Reconcile] Position mismatch {symbol}: "
+                        f"Local={local_map.get(symbol, 0.0)}, Exch={remote_map.get(symbol, 0.0)}"
+                    )
+                    break
 
             if is_pos_mismatch:
-                logger.warning("[Reconcile] Case C (Pos Mismatch). Resetting.")
+                self._audit("reconcile_reset", case="position_mismatch")
                 self._perform_full_reset()
                 return
 
-            # B. 检查挂单
-            is_missing_order = False
+            remote_has_suspicious = False
             if suspicious_oid:
-                found = any(
-                    str(o["orderId"]) == suspicious_oid
-                    or o["clientOrderId"] == suspicious_oid
-                    for o in rem_ords
+                remote_has_suspicious = any(
+                    str(order.get("orderId")) == suspicious_oid
+                    or order.get("clientOrderId") == suspicious_oid
+                    for order in remote_orders
                 )
-                if found:
-                    is_missing_order = True
 
-            if is_missing_order:
-                logger.warning("[Reconcile] Case B (Missing Order). Resetting.")
+            if remote_has_suspicious:
+                self._audit(
+                    "reconcile_reset",
+                    case="missing_local_order",
+                    suspicious_oid=suspicious_oid,
+                )
                 self._perform_full_reset()
             else:
-                logger.info("[Reconcile] Case A: False alarm. Resuming LIVE.")
                 self.state = LifecycleState.LIVE
+                self._audit("reconcile_cleared", state=self.state.value)
+                logger.info("[Reconcile] False alarm. Resuming LIVE.")
 
-        except Exception as e:
-            self.halt_system(f"Reconcile Critical Error: {e}")
+        except Exception as exc:
+            self.halt_system(f"Reconcile critical error: {exc}")
 
     def _perform_full_reset(self):
-        logger.info("[OMS] Performing Full State Reset...")
+        logger.info("[OMS] Performing full state reset...")
+        self._audit("full_reset_started", symbols=self.config.get("symbols", []))
         try:
-            for s in self.config["symbols"]:
-                self.gateway.cancel_all_orders(s)
+            for symbol in self.config["symbols"]:
+                self.gateway.cancel_all_orders(symbol)
             time.sleep(1.0)
 
-            acc = self.gateway.get_account_info()
-            pos = self.gateway.get_all_positions()
-
-            if not acc or not pos:
-                raise Exception("API failed during reset")
+            account = self.gateway.get_account_info()
+            positions = self.gateway.get_all_positions()
+            if not account or not positions:
+                raise RuntimeError("API failed during reset")
 
             with self.lock:
                 self.orders.clear()
                 self.exchange_id_map.clear()
+                self.sequence.reset()
 
                 self.exposure.net_positions.clear()
                 self.exposure.avg_prices.clear()
                 self.exposure.open_buy_qty.clear()
                 self.exposure.open_sell_qty.clear()
 
-                for p in pos:
-                    amt = float(p["positionAmt"])
-                    if amt != 0:
-                        sym = p["symbol"]
-                        self.exposure.net_positions[sym] = amt
-                        self.exposure.avg_prices[sym]    = float(p["entryPrice"])
+                for pos in positions:
+                    amount = float(pos["positionAmt"])
+                    if amount == 0:
+                        continue
+                    symbol = pos["symbol"]
+                    self.exposure.force_sync(symbol, amount, float(pos["entryPrice"]))
 
                 self.account.force_sync(
-                    float(acc["totalWalletBalance"]),
-                    float(acc["totalInitialMargin"]),
+                    float(account["totalWalletBalance"]),
+                    float(account["totalInitialMargin"]),
                 )
                 self.order_monitor.monitored_orders.clear()
 
-            self.state = LifecycleState.LIVE
-            logger.info("OMS: Reset complete. System is CLEAN & LIVE.")
+            for symbol in self.config.get("symbols", []):
+                self._emit_position_update(symbol)
 
-        except Exception as e:
-            self.halt_system(f"Reset Failed: {e}")
+            self.state = LifecycleState.LIVE
+            self._audit(
+                "full_reset_completed",
+                state=self.state.value,
+                balance=self.account.balance,
+                equity=self.account.equity,
+                positions=dict(self.exposure.net_positions),
+            )
+            logger.info("OMS: Reset complete. System is CLEAN and LIVE.")
+
+        except Exception as exc:
+            self.halt_system(f"Reset failed: {exc}")
 
     # -----------------------------------------------------------
-    # 下行指令
+    # Downstream requests
     # -----------------------------------------------------------
 
     def submit_order(self, intent: OrderIntent) -> str:
         if self.state != LifecycleState.LIVE:
+            self._audit(
+                "intent_rejected",
+                reason=f"oms_not_live:{self.state.value}",
+                intent=self._serialize_intent(intent),
+            )
+            return None
+
+        valid, validation_reason = self.validator.validate_params(intent)
+        if not valid:
+            self._audit(
+                "intent_rejected",
+                reason=validation_reason,
+                intent=self._serialize_intent(intent),
+            )
+            return None
+
+        notional = intent.price * intent.volume
+        if not self.account.check_margin(notional):
+            self._audit(
+                "intent_rejected",
+                reason="insufficient_margin",
+                intent=self._serialize_intent(intent),
+                notional=notional,
+                available=self.account.available,
+            )
+            return None
+
+        ok, risk_reason = self.exposure.check_risk(
+            intent.symbol,
+            intent.side,
+            intent.volume,
+            self.max_pos_notional,
+        )
+        if not ok:
+            logger.warning(f"[OMS] Risk rejected: {risk_reason}")
+            self._audit(
+                "intent_rejected",
+                reason=f"exposure_limit:{risk_reason}",
+                intent=self._serialize_intent(intent),
+            )
             return None
 
         client_oid = str(uuid.uuid4())
+        order = Order(client_oid, intent)
 
         with self.lock:
-            if not self.validator.validate_params(intent):
-                return None
-
-            notional = intent.price * intent.volume
-            if not self.account.check_margin(notional):
-                return None
-
-            # ── 从 config 读取的 OMS 层限额（非硬编码）──────────
-            ok, msg = self.exposure.check_risk(
-                intent.symbol,
-                intent.side,
-                intent.volume,
-                self.max_pos_notional,          # ← 修复点
-            )
-            if not ok:
-                logger.warning(f"[OMS] Risk rejected: {msg}")
-                return None
-
-            order = Order(client_oid, intent)
             self.orders[client_oid] = order
             order.mark_submitting()
-
             self.exposure.update_open_orders(self.orders)
             self.account.calculate()
+            self._record_order_snapshot(order, "accepted")
 
-        # IO: 发送至 Gateway
-        req = OrderRequest(
+        request = OrderRequest(
             symbol=intent.symbol,
             price=intent.price,
             volume=intent.volume,
@@ -242,22 +293,42 @@ class OMS:
             post_only=intent.is_post_only,
         )
 
-        exchange_oid = self.gateway.send_order(req, client_oid)
+        exchange_oid = self.gateway.send_order(request, client_oid)
 
         if exchange_oid:
-            event_data = OrderSubmitted(req, client_oid, time.time())
-            self.order_monitor.on_order_submitted(
-                Event(EVENT_ORDER_SUBMITTED, event_data)
-            )
             with self.lock:
+                order.mark_pending_ack(exchange_oid)
                 self.exchange_id_map[exchange_oid] = order
-        else:
-            with self.lock:
-                order.mark_rejected("Gateway Error")
-                self.exposure.update_open_orders(self.orders)
-                self.account.calculate()
+                self._record_order_snapshot(order, "rest_ack")
+                self._emit_order_update(order)
 
-        return client_oid
+            event_data = OrderSubmitted(request, client_oid, time.time())
+            self.event_engine.put(Event(EVENT_ORDER_SUBMITTED, event_data))
+            self._audit(
+                "order_submitted",
+                client_oid=client_oid,
+                exchange_oid=exchange_oid,
+                symbol=intent.symbol,
+                side=intent.side.value,
+                price=intent.price,
+                volume=intent.volume,
+            )
+            return client_oid
+
+        with self.lock:
+            order.mark_rejected_locally("gateway_send_failed")
+            self._record_order_snapshot(order, "send_failed")
+            self.orders.pop(client_oid, None)
+            self.exposure.update_open_orders(self.orders)
+            self.account.calculate()
+        self._write_tombstone(order)
+        self._audit(
+            "order_rejected_locally",
+            client_oid=client_oid,
+            symbol=intent.symbol,
+            reason="gateway_send_failed",
+        )
+        return None
 
     def cancel_order(self, client_oid: str):
         with self.lock:
@@ -265,14 +336,28 @@ class OMS:
             if not order or not order.is_active():
                 return
             target_id = order.exchange_oid if order.exchange_oid else client_oid
-            req = CancelRequest(order.intent.symbol, target_id)
-        self.gateway.cancel_order(req)
+            try:
+                order.mark_cancelling()
+                self._record_order_snapshot(order, "cancel_requested")
+                self._emit_order_update(order)
+            except ValueError:
+                pass
+            request = CancelRequest(order.intent.symbol, target_id)
+
+        self.gateway.cancel_order(request)
+        self._audit(
+            "cancel_submitted",
+            client_oid=client_oid,
+            target_id=target_id,
+            symbol=request.symbol,
+        )
 
     def cancel_all_orders(self, symbol: str):
+        self._audit("cancel_all_submitted", symbol=symbol)
         self.gateway.cancel_all_orders(symbol)
 
     # -----------------------------------------------------------
-    # 上行回报
+    # Upstream exchange updates
     # -----------------------------------------------------------
 
     def on_exchange_update(self, event):
@@ -285,49 +370,126 @@ class OMS:
         if event.type == "eExchangeOrderUpdate":
             update: ExchangeOrderUpdate = event.data
             if not self.sequence.check(update.seq):
-                self.trigger_reconcile(f"Seq Gap {update.seq}")
+                self._audit("sequence_gap", seq=update.seq)
+                self.trigger_reconcile(f"Seq gap {update.seq}")
                 return
 
         self.event_log.append(event)
         self._apply_event(event)
 
     def _apply_event(self, event):
+        if event.type != "eExchangeOrderUpdate":
+            return
+
+        update: ExchangeOrderUpdate = event.data
         with self.lock:
-            if event.type == "eBootstrap":
-                pass
+            order = self.orders.get(update.client_oid)
+            if not order and update.exchange_oid:
+                order = self.exchange_id_map.get(update.exchange_oid)
 
-            if event.type == "eExchangeOrderUpdate":
-                update: ExchangeOrderUpdate = event.data
-
-                order = self.orders.get(update.client_oid)
-                if not order and update.exchange_oid:
-                    order = self.exchange_id_map.get(update.exchange_oid)
-
-                if not order:
-                    suspicious = update.client_oid or update.exchange_oid
-                    threading.Thread(
-                        target=self.trigger_reconcile,
-                        args=(f"Unknown Order {suspicious}", suspicious),
-                    ).start()
+            if not order:
+                suspicious = update.client_oid or update.exchange_oid
+                if suspicious in self.terminated_oids:
+                    self._audit(
+                        "late_duplicate_ignored",
+                        suspicious_oid=suspicious,
+                        exchange_status=update.status,
+                    )
                     return
+                self._audit(
+                    "unknown_order_update",
+                    client_oid=update.client_oid,
+                    exchange_oid=update.exchange_oid,
+                    status=update.status,
+                )
+                threading.Thread(
+                    target=self.trigger_reconcile,
+                    args=(f"Unknown Order {suspicious}", suspicious),
+                    daemon=True,
+                ).start()
+                return
 
-                prev_status = order.status
+            if update.exchange_oid and order.exchange_oid and order.exchange_oid != update.exchange_oid:
+                self._audit(
+                    "exchange_oid_mismatch",
+                    client_oid=order.client_oid,
+                    local_exchange_oid=order.exchange_oid,
+                    incoming_exchange_oid=update.exchange_oid,
+                )
+                threading.Thread(
+                    target=self.trigger_reconcile,
+                    args=(f"Exchange OID mismatch {order.client_oid}", order.client_oid),
+                    daemon=True,
+                ).start()
+                return
 
+            if update.seq and update.seq <= order.last_update_seq:
+                self._audit(
+                    "stale_update_ignored",
+                    client_oid=order.client_oid,
+                    seq=update.seq,
+                    last_seq=order.last_update_seq,
+                )
+                return
+
+            if update.cum_filled_qty + 1e-9 < order.filled_volume:
+                self._audit(
+                    "cum_fill_regression",
+                    client_oid=order.client_oid,
+                    incoming_cum=update.cum_filled_qty,
+                    local_cum=order.filled_volume,
+                )
+                threading.Thread(
+                    target=self.trigger_reconcile,
+                    args=(f"Cum fill regression {order.client_oid}", order.client_oid),
+                    daemon=True,
+                ).start()
+                return
+
+            previous_status = order.status
+            had_fill = False
+
+            try:
                 if update.status == "NEW":
-                    order.mark_new(update.exchange_oid)
+                    order.mark_new(
+                        exchange_oid=update.exchange_oid,
+                        update_time=update.update_time,
+                        seq=update.seq,
+                    )
                     if update.exchange_oid:
                         self.exchange_id_map[update.exchange_oid] = order
 
-                elif update.status in ["CANCELED", "EXPIRED"]:
-                    order.mark_cancelled()
+                elif update.status == "CANCELED":
+                    order.mark_cancelled(
+                        update_time=update.update_time,
+                        seq=update.seq,
+                        exchange_status=update.status,
+                    )
+                    self._write_tombstone(order)
+
+                elif update.status == "EXPIRED":
+                    order.mark_expired(update_time=update.update_time, seq=update.seq)
+                    self._write_tombstone(order)
 
                 elif update.status == "REJECTED":
-                    order.mark_rejected()
+                    order.mark_rejected(
+                        reason="exchange_rejected",
+                        update_time=update.update_time,
+                        seq=update.seq,
+                        exchange_status=update.status,
+                    )
+                    self._write_tombstone(order)
 
                 elif update.status in ["FILLED", "PARTIALLY_FILLED"]:
                     delta = update.cum_filled_qty - order.filled_volume
                     if delta > 1e-9:
-                        order.add_fill(delta, update.filled_price)
+                        had_fill = order.add_fill(
+                            delta,
+                            update.filled_price,
+                            update_time=update.update_time,
+                            seq=update.seq,
+                            exchange_status=update.status,
+                        )
                         self.exposure.on_fill(
                             order.intent.symbol,
                             order.intent.side,
@@ -349,22 +511,157 @@ class OMS:
                             datetime=datetime.now(),
                         )
                         self.event_engine.put(Event(EVENT_TRADE_UPDATE, trade_data))
+                    else:
+                        order.note_exchange_update(
+                            exchange_status=update.status,
+                            update_time=update.update_time,
+                            seq=update.seq,
+                            exchange_oid=update.exchange_oid,
+                        )
 
-                self.order_monitor.on_order_update(order.client_oid, order.status)
-                self.exposure.update_open_orders(self.orders)
-                self.account.calculate()
+                    if update.status == "FILLED":
+                        order.mark_filled(update_time=update.update_time, seq=update.seq)
+                        self._write_tombstone(order)
 
-                if order.status != prev_status or update.status == "PARTIALLY_FILLED":
-                    self.event_engine.put(
-                        Event(EVENT_ORDER_UPDATE, order.to_snapshot())
+                else:
+                    self._audit(
+                        "unhandled_exchange_status",
+                        client_oid=order.client_oid,
+                        status=update.status,
                     )
-                    if update.status in ["FILLED", "PARTIALLY_FILLED"]:
-                        pos_data = self.exposure.get_position_data(
-                            order.intent.symbol
-                        )
-                        self.event_engine.put(
-                            Event(EVENT_POSITION_UPDATE, pos_data)
-                        )
+                    order.note_exchange_update(
+                        exchange_status=update.status,
+                        update_time=update.update_time,
+                        seq=update.seq,
+                        exchange_oid=update.exchange_oid,
+                    )
+                    return
+
+            except ValueError as exc:
+                self._audit(
+                    "invalid_transition",
+                    client_oid=order.client_oid,
+                    current_status=order.status.value,
+                    incoming_status=update.status,
+                    error=str(exc),
+                )
+                threading.Thread(
+                    target=self.trigger_reconcile,
+                    args=(f"Invalid transition {order.client_oid}", order.client_oid),
+                    daemon=True,
+                ).start()
+                return
+
+            self.order_monitor.on_order_update(order.client_oid, order.status)
+            self.exposure.update_open_orders(self.orders)
+            self.account.calculate()
+
+            if order.status != previous_status or had_fill:
+                self._record_order_snapshot(
+                    order,
+                    "exchange_update",
+                    exchange_status=update.status,
+                    seq=update.seq,
+                    cum_filled_qty=update.cum_filled_qty,
+                )
+                self._emit_order_update(order)
+                if had_fill:
+                    self._emit_position_update(order.intent.symbol)
 
     def rebuild_from_log(self):
-        pass
+        records = self.journal.load()
+        if not records:
+            return {
+                "records": 0,
+                "recovered_orders": 0,
+                "recovered_terminal_ids": 0,
+            }
+
+        latest_order_records = {}
+        last_lifecycle = None
+        for record in records:
+            payload = record.get("payload", {})
+            if record.get("kind") == "order_snapshot":
+                client_oid = payload.get("client_oid")
+                if client_oid:
+                    latest_order_records[client_oid] = payload
+            elif record.get("kind") == "lifecycle":
+                last_lifecycle = payload.get("state")
+
+        with self.lock:
+            self.terminated_oids.clear()
+            self.terminated_oid_queue.clear()
+            recovered_terminal_ids = 0
+            for payload in latest_order_records.values():
+                status = payload.get("status")
+                if status in {state.value for state in TERMINAL_STATUSES}:
+                    client_oid = payload.get("client_oid")
+                    exchange_oid = payload.get("exchange_oid")
+                    if client_oid:
+                        self._remember_terminated_oid(client_oid)
+                        recovered_terminal_ids += 1
+                    if exchange_oid:
+                        self._remember_terminated_oid(exchange_oid)
+                        recovered_terminal_ids += 1
+
+        summary = {
+            "records": len(records),
+            "recovered_orders": len(latest_order_records),
+            "recovered_terminal_ids": recovered_terminal_ids,
+            "last_lifecycle": last_lifecycle,
+        }
+        if recovered_terminal_ids:
+            logger.info(
+                f"[OMS] Recovered {recovered_terminal_ids} terminal IDs from journal"
+            )
+        return summary
+
+    # -----------------------------------------------------------
+    # Internal helpers
+    # -----------------------------------------------------------
+
+    def _serialize_intent(self, intent: OrderIntent) -> dict:
+        return {
+            "strategy_id": intent.strategy_id,
+            "symbol": intent.symbol,
+            "side": intent.side.value,
+            "price": intent.price,
+            "volume": intent.volume,
+            "order_type": intent.order_type,
+            "time_in_force": intent.time_in_force,
+            "is_post_only": intent.is_post_only,
+            "policy": intent.policy.value,
+            "tag": intent.tag,
+        }
+
+    def _audit(self, kind: str, **payload):
+        payload.setdefault("state", self.state.value)
+        self.journal.append(kind, payload)
+
+    def _record_order_snapshot(self, order: Order, source: str, **extra):
+        payload = order.to_record()
+        payload["source"] = source
+        if extra:
+            payload["extra"] = extra
+        self.journal.append("order_snapshot", payload)
+
+    def _emit_order_update(self, order: Order):
+        self.event_engine.put(Event(EVENT_ORDER_UPDATE, order.to_snapshot()))
+
+    def _emit_position_update(self, symbol: str):
+        self.event_engine.put(
+            Event(EVENT_POSITION_UPDATE, self.exposure.get_position_data(symbol))
+        )
+
+    def _remember_terminated_oid(self, oid: str):
+        if not oid or oid in self.terminated_oids:
+            return
+        if len(self.terminated_oid_queue) >= self.TOMBSTONE_MAX:
+            stale = self.terminated_oid_queue.popleft()
+            self.terminated_oids.discard(stale)
+        self.terminated_oid_queue.append(oid)
+        self.terminated_oids.add(oid)
+
+    def _write_tombstone(self, order: Order):
+        self._remember_terminated_oid(order.client_oid)
+        self._remember_terminated_oid(order.exchange_oid)

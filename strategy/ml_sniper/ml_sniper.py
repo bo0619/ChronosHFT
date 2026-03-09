@@ -1,5 +1,6 @@
 # file: strategy/ml_sniper/ml_sniper.py
 #
+# ============================================================
 # 修复记录（相对于原版）：
 #
 # [FIX-A] 信号权重翻转
@@ -7,40 +8,81 @@
 #   修复：1s:0.1, 10s:0.5, 30s:0.4 → 10s/30s 主导方向，1s 只做时机微调
 #
 # [FIX-B] 费率覆盖：止盈目标与入场阈值必须覆盖往返成本
-#   原版：taker_threshold=4.0bps, profit_target=3.0bps
-#         IOC 入场往返成本约 10bps（单边 5bps），止盈 3bps 必亏
-#   修复：taker_threshold=8.0bps, profit_target=8.0bps
-#         确保 Taker 路径的期望收益 > 往返成本
-#         GTX（Maker）路径零费率，profit_target 保持同值保持一致性
+#   原版：taker_threshold=4.0bps, profit_target=3.0bps，必亏
+#   修复：见下方 [USDC-1]
 #
 # [FIX-C] 强制平仓 slippage 从固定 50bps 改为 ATR 自适应
-#   原版：bid_1 * 0.995（固定 -50bps），在低波动品种极度激进
-#   修复：bid_1 × (1 - atr_bps × 1.5 / 10000)，与当前市场波动匹配
 #
 # [FIX-D] feature_engine.reset_interval 移到正确位置
-#   原版：每 0.1s tick 都调用 reset_interval，成交流特征几乎不累积
-#   修复：仅在 cycle_interval（1.0s）周期末调用，让特征有足够的累积窗口
-#         tick 级别的特征更新继续保持 0.1s 频率
 #
 # [FIX-E] 冷启动保护从时间预热改为卡尔曼训练次数预热
-#   原版：固定等待 warmup_duration_sec（默认 300s）
-#   修复：等待 predictor.is_warmed_up（三个 horizon 各至少训练一次）
-#         + 最短 min_warmup_sec 秒（保证数据量），两者同时满足才开始交易
-#         避免刚启动时随机权重驱动真实下单
 #
 # [FIX-F] ENTERING 状态：入场单被拒后正确回退到 FLAT
-#   原版：GTX 被拒时 state 停在 ENTERING，永远无法开仓
-#   修复：on_order 里 REJECTED 时若 state==ENTERING 显式回退到 FLAT
 #
 # [FIX-G] 止盈单价格逻辑修正
-#   原版 多仓：max(target, ask_1) → 止盈价至少等于 ask，可能挂在 ask 以上（永远不成交）
-#   修复 多仓：max(target, bid_1 + tick_size) → 止盈价至少比 bid 高一个 tick，
-#              是合理的 Maker 止盈位置
-#   原版 空仓：min(target, bid_1) → 止盈价至多等于 bid，但对空仓来说需要买回
-#   修复 空仓：min(target, ask_1 - tick_size) → 止盈价至多比 ask 低一个 tick
+#
+# ─────────────────────────────────────────────────────────
+# [USDC 专项优化] 针对 Binance USDC 永续合约（Maker 费率 = 0）：
+#
+# [USDC-1] 入场阈值重构：GTX 为主路径，IOC 仅在信号加速时触发
+#
+#   USDC 合约费率结构：
+#     Maker: 0 bps（甚至负）
+#     Taker: ~5 bps 单边，往返 ~10 bps
+#
+#   原版设计：signal > 8bps → IOC，signal > 3bps → GTX
+#   问题：对于 10s/30s 主导的中长期卡尔曼信号，主动吃单往往是
+#         在中间价已经移动后才触发，此时支付 10bps 往返成本却
+#         只获得已经部分衰减的信号，期望收益极低。
+#
+#   修复：
+#     - GTX 为绝对主路径（maker_threshold 触发，零费率入场）
+#     - IOC 仅在"信号 AND 信号速度均超过阈值"时触发
+#       即：信号强 + 信号正在加速 → 动量明确，时间窗口极短，
+#           GTX 挂单可能排不到队，此时才值得付 Taker 费
+#     - taker_threshold 大幅提升至 20bps，远超往返成本，
+#       确保 IOC 入场有足够的 Alpha 覆盖滑点和手续费
+#
+# [USDC-2] GTX 挂单价格优化
+#
+#   原版：BUY 挂 bid_1（排在最优买价队尾）
+#   问题：加密货币 L2 深度往往 bid_1 挂单量极大，排队等到成交
+#         时市场可能已反向移动（队列风险）。
+#
+#   修复：BUY 挂 bid_1 + 1 tick，优先排在现有最优买价前面，
+#         在 PostOnly 约束下这仍然是 Maker 单（不穿越 ask），
+#         但队列位置大幅靠前，成交速度更快，信号衰减更少。
+#         SELL 对称处理：挂 ask_1 - 1 tick。
+#
+# [USDC-3] ENTERING 状态信号衰减撤单阈值调整
+#
+#   原版：abs(signal) < maker_threshold * 0.5 时撤单
+#   问题：maker_threshold 现在更低（1.5bps），0.5 倍 = 0.75bps，
+#         过于敏感，噪音就会触发撤单。
+#   修复：撤单阈值改为固定 cancel_threshold_bps（默认 1.0bps），
+#         与 maker_threshold 解耦，单独配置。
+#
+# [USDC-4] 止盈目标重构
+#
+#   USDC Maker 出场费率 = 0，止盈目标可以设得更小（不需要覆盖费率）。
+#   止盈目标的下界应为"逆向选择成本 + 噪音 buffer"，约 3~5bps。
+#   原版 profit_target=8bps 是为了覆盖 USDT Taker 出场费，
+#   在 USDC Maker 出场下可以降低至 4bps，提高止盈命中率。
+#
+# [USDC-5] 信号速度（Signal Velocity）计算
+#
+#   使用固定长度滑动窗口（默认 3 帧）计算信号一阶差分的 EWMA。
+#   velocity > velocity_threshold 时，表示信号正在加速，
+#   结合 signal > taker_threshold，才触发 IOC 入场。
+#
+#   信号速度计算：
+#     velocity = signal_now - signal_{n frames ago}
+#   正值表示多头动量加速，负值表示空头动量加速。
+#
+# ============================================================
 
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 
 from event.type import (
@@ -50,7 +92,7 @@ from event.type import (
 )
 from ..base import StrategyTemplate
 from alpha.engine import FeatureEngine
-from alpha.factors import GLFTCalibrator      # 用于 ATR（强制平仓 slippage 自适应）
+from alpha.factors import GLFTCalibrator
 from data.ref_data import ref_data_manager
 
 from .predictor import TimeHorizonPredictor
@@ -62,27 +104,29 @@ FEATURE_LABELS = ["Imb", "Dep", "Mic", "Trd", "Arr", "Vwp", "dIm", "dSp", "Mom"]
 
 class MLSniperStrategy(StrategyTemplate):
     """
-    ML Sniper：三时间尺度卡尔曼滤波趋势跟踪策略。
+    ML Sniper（USDC 优化版）：三时间尺度卡尔曼滤波趋势跟踪策略。
 
     FSM 状态机：
       FLAT → ENTERING → HOLDING → EXITING → FLAT
 
-    入场模式：
-      信号 > taker_threshold → IOC 入场（Taker，快速确认方向）
-      信号 > maker_threshold → GTX 入场（PostOnly Maker，零手续费）
+    入场模式（USDC 费率结构优化）：
+      [主路径] GTX Maker：signal > maker_threshold → 挂 bid+1tick / ask-1tick
+               零手续费，队列靠前，覆盖中长期卡尔曼信号
+      [辅路径] IOC Taker：signal > taker_threshold AND velocity > velocity_threshold
+               仅在信号强且正在加速时触发，确保 Alpha 覆盖 ~10bps 往返成本
 
     出场模式：
-      止盈单（GTX Maker）：在目标价挂单，等待被动成交
-      强制平仓（IOC）：持仓超时 or 信号反转，立即市价出场
+      止盈单（GTX Maker）：在目标价挂单，零手续费等待被动成交
+      强制平仓（IOC）：持仓超时 or 信号反转，立即出场
     """
 
     def __init__(self, engine, oms):
-        super().__init__(engine, oms, "ML_Sniper_KF")
+        super().__init__(engine, oms, "ML_Sniper_USDC")
 
         # ── 配置 ──────────────────────────────────────────────
         self.strat_conf = load_sniper_config()
 
-        # [FIX-A] 默认权重翻转：10s/30s 主导
+        # [FIX-A] 默认权重：10s/30s 主导
         raw_weights = self.strat_conf.get(
             "weights", {"1s": 0.1, "10s": 0.5, "30s": 0.4}
         )
@@ -94,18 +138,23 @@ class MLSniperStrategy(StrategyTemplate):
         self.lot_multiplier = self.strat_conf.get("lot_multiplier", 1.0)
 
         entry_cfg = self.strat_conf.get("entry", {})
-        # [FIX-B] 默认阈值提高，覆盖往返 Taker 成本
-        self.taker_entry_threshold = entry_cfg.get("taker_entry_threshold_bps", 8.0)
-        self.maker_entry_threshold = entry_cfg.get("maker_entry_threshold_bps", 3.0)
+        # [USDC-1] Taker 阈值大幅提升，GTX 阈值保持低敏感
+        self.taker_entry_threshold  = entry_cfg.get("taker_entry_threshold_bps", 20.0)
+        self.maker_entry_threshold  = entry_cfg.get("maker_entry_threshold_bps", 1.5)
+        # [USDC-5] 信号速度阈值：触发 IOC 的额外条件
+        self.velocity_threshold     = entry_cfg.get("velocity_threshold_bps",    3.0)
+        # [USDC-3] 撤单阈值与 maker_threshold 解耦
+        self.cancel_threshold       = entry_cfg.get("cancel_threshold_bps",      1.0)
+        # [USDC-5] 计算 velocity 使用的历史帧数
+        self.velocity_window        = entry_cfg.get("velocity_window_frames",    3)
 
         exit_cfg = self.strat_conf.get("exit", {})
-        # [FIX-B] 止盈默认值提高
-        self.profit_target  = exit_cfg.get("profit_target_bps",  8.0)
+        # [USDC-4] USDC Maker 出场零费率，止盈目标降低
+        self.profit_target  = exit_cfg.get("profit_target_bps",  4.0)
         self.max_hold_sec   = exit_cfg.get("max_holding_sec",    10.0)
 
         exe_cfg = self.strat_conf.get("execution", {})
         self.tick_interval  = exe_cfg.get("tick_interval_sec",   0.1)
-        # [FIX-D] cycle_interval 控制 reset_interval 的调用频率
         self.cycle_interval = exe_cfg.get("cycle_interval_sec",  1.0)
 
         # [FIX-E] 冷启动：时间 + 卡尔曼训练次数双重保护
@@ -115,8 +164,8 @@ class MLSniperStrategy(StrategyTemplate):
 
         # ── 组件 ──────────────────────────────────────────────
         self.feature_engine = FeatureEngine()
-        self.predictors:  dict = {}   # symbol → TimeHorizonPredictor
-        self.calibrators: dict = {}   # symbol → GLFTCalibrator（提供 ATR）
+        self.predictors:  dict = {}
+        self.calibrators: dict = {}
 
         # ── 运行时状态 ────────────────────────────────────────
         self.state         = defaultdict(lambda: "FLAT")
@@ -125,7 +174,11 @@ class MLSniperStrategy(StrategyTemplate):
         self.entry_oid     = defaultdict(lambda: None)
         self.exit_oid      = defaultdict(lambda: None)
         self.last_tick_ts  = defaultdict(float)
-        self.last_cycle_ts = defaultdict(float)   # [FIX-D] 控制 reset_interval
+        self.last_cycle_ts = defaultdict(float)
+
+        # [USDC-5] 信号历史队列（每个 symbol 独立），用于计算 velocity
+        # deque 存储 (timestamp, signal) 元组
+        self.signal_history: dict = defaultdict(lambda: deque(maxlen=20))
 
     # ── 延迟初始化 ────────────────────────────────────────────
     def _get_predictor(self, symbol: str) -> TimeHorizonPredictor:
@@ -165,10 +218,32 @@ class MLSniperStrategy(StrategyTemplate):
 
     # ── [FIX-C] ATR 自适应 slippage ──────────────────────────
     def _force_exit_slippage(self, symbol: str) -> float:
-        """强制平仓的价格偏移比例。基于 ATR，最小 10bps，最大 80bps"""
+        """强制平仓的价格偏移比例，基于 ATR，最小 10bps，最大 80bps"""
         atr = getattr(self.calibrators.get(symbol), "sigma_bps", 20.0)
         slippage_bps = float(max(10.0, min(80.0, atr * 1.5)))
         return slippage_bps / 10000.0
+
+    # ── [USDC-5] 信号速度计算 ─────────────────────────────────
+    def _compute_signal_velocity(self, symbol: str, signal: float, now: float) -> float:
+        """
+        计算信号速度（一阶差分）。
+
+        将当前 (ts, signal) 推入历史队列，然后取
+        velocity_window 帧前的信号做差，得到信号变化速率。
+
+        返回值：正数表示多头动量加速，负数表示空头动量加速。
+        当历史帧数不足时返回 0.0（保守处理，不触发 IOC）。
+        """
+        hist = self.signal_history[symbol]
+        hist.append((now, signal))
+
+        if len(hist) < self.velocity_window + 1:
+            # 帧数不足，不能计算速度，保守返回 0
+            return 0.0
+
+        # 取 velocity_window 帧前的信号
+        past_signal = hist[-(self.velocity_window + 1)][1]
+        return signal - past_signal
 
     # ─────────────────────────────────────────────────────────
     # 行情事件
@@ -178,7 +253,7 @@ class MLSniperStrategy(StrategyTemplate):
         now = time.time()
         sym = ob.symbol
 
-        # tick 频率限制（特征更新 + 预测仍然保持 0.1s 精度）
+        # tick 频率限制
         if now - self.last_tick_ts[sym] < self.tick_interval:
             return
         self.last_tick_ts[sym] = now
@@ -189,7 +264,7 @@ class MLSniperStrategy(StrategyTemplate):
             return
         mid = (bid_1 + ask_1) / 2.0
 
-        # ── 每 tick 更新特征 + 卡尔曼学习 ────────────────────
+        # ── 每 tick：特征更新 + 卡尔曼学习 ──────────────────
         self.feature_engine.on_orderbook(ob)
         predictor = self._get_predictor(sym)
         self.calibrators[sym].on_orderbook(ob)
@@ -212,17 +287,20 @@ class MLSniperStrategy(StrategyTemplate):
         except Exception:
             signal = 0.0
 
+        # ── [USDC-5] 计算信号速度 ─────────────────────────────
+        velocity = self._compute_signal_velocity(sym, signal, now)
+
         # ── 冷启动处理 ────────────────────────────────────────
         if not self._check_warmup(sym):
-            self._publish_warmup(sym, mid, signal, preds, predictor)
+            self._publish_warmup(sym, mid, signal, velocity, preds, predictor)
             return
 
         # ── 正常运行 ──────────────────────────────────────────
-        self._publish_state(sym, mid, signal, preds, predictor)
-        self._run_fsm(sym, mid, bid_1, ask_1, signal, now)
+        self._publish_state(sym, mid, signal, velocity, preds, predictor)
+        self._run_fsm(sym, mid, bid_1, ask_1, signal, velocity, now)
 
     def on_market_trade(self, trade: AggTradeData):
-        """驱动 FeatureEngine 的成交特征（trade_imbalance / arrival / vwap_drift）"""
+        """驱动 FeatureEngine 的成交特征"""
         self.feature_engine.on_trade(trade)
 
     # ─────────────────────────────────────────────────────────
@@ -231,9 +309,10 @@ class MLSniperStrategy(StrategyTemplate):
 
     def _run_fsm(self, sym: str, mid: float,
                  bid_1: float, ask_1: float,
-                 signal: float, now: float):
+                 signal: float, velocity: float, now: float):
         curr_state = self.state[sym]
         net_pos    = self.oms.exposure.net_positions.get(sym, 0.0)
+        tick       = self._tick_size(sym, mid)
 
         # ── FLAT：评估入场 ────────────────────────────────────
         if curr_state == "FLAT":
@@ -246,50 +325,64 @@ class MLSniperStrategy(StrategyTemplate):
             if vol <= 0:
                 return
 
+            # ── 多头入场判断 ──────────────────────────────────
             if signal > self.maker_entry_threshold:
-                if signal > self.taker_entry_threshold:
-                    # IOC 入场：价格略高于 ask，确保吃单成交
+
+                # [USDC-1] IOC 辅路径：信号强 AND 速度加速
+                # 语义：行情在快速移动，GTX 排队可能错过，此时才值得付 Taker 费
+                if (signal > self.taker_entry_threshold
+                        and velocity > self.velocity_threshold):
                     slippage = self._force_exit_slippage(sym)
-                    price = ref_data_manager.round_price(sym, ask_1 * (1 + slippage))
+                    price = ref_data_manager.round_price(
+                        sym, ask_1 * (1 + slippage)
+                    )
                     self._entry(sym, Side.BUY, price, vol, "IOC")
+
                 else:
-                    # GTX（PostOnly）入场：挂在 bid，等待被动成交
-                    price = ref_data_manager.round_price(sym, bid_1)
+                    # [USDC-2] GTX 主路径：挂 bid + 1 tick，抢队列靠前位置
+                    # bid+1tick 仍低于 ask，满足 PostOnly 约束（不穿越盘口）
+                    price = ref_data_manager.round_price(sym, bid_1 + tick)
                     self._entry(sym, Side.BUY, price, vol, "GTX")
 
+            # ── 空头入场判断 ──────────────────────────────────
             elif signal < -self.maker_entry_threshold:
-                if signal < -self.taker_entry_threshold:
+
+                # [USDC-1] IOC 辅路径：信号强 AND 速度加速（空头方向）
+                if (signal < -self.taker_entry_threshold
+                        and velocity < -self.velocity_threshold):
                     slippage = self._force_exit_slippage(sym)
-                    price = ref_data_manager.round_price(sym, bid_1 * (1 - slippage))
+                    price = ref_data_manager.round_price(
+                        sym, bid_1 * (1 - slippage)
+                    )
                     self._entry(sym, Side.SELL, price, vol, "IOC")
+
                 else:
-                    price = ref_data_manager.round_price(sym, ask_1)
+                    # [USDC-2] GTX 主路径：挂 ask - 1 tick，抢队列靠前位置
+                    price = ref_data_manager.round_price(sym, ask_1 - tick)
                     self._entry(sym, Side.SELL, price, vol, "GTX")
 
-        # ── ENTERING：等待入场单成交，信号消失则撤单 ────────
+        # ── ENTERING：等待入场单成交 ──────────────────────────
         elif curr_state == "ENTERING":
             oid = self.entry_oid[sym]
             if oid and oid in self.active_orders:
-                # 信号强度跌破阈值的一半 → 撤单，回到 FLAT
-                if abs(signal) < self.maker_entry_threshold * 0.5:
+                # [USDC-3] 撤单阈值与 maker_threshold 解耦，避免噪音触发
+                if abs(signal) < self.cancel_threshold:
                     self.cancel_order(oid)
-                    # 注：状态回退在 on_order 里处理（CANCELLED → FLAT）
 
         # ── HOLDING：持仓管理 ─────────────────────────────────
         elif curr_state == "HOLDING":
-            # OMS 已无持仓（可能被外部平掉）→ 回 FLAT
             if abs(net_pos) < 1e-6:
                 self.state[sym] = "FLAT"
                 self._clear_oids(sym)
                 return
 
             holding_time = now - self.pos_entry_ts[sym]
-            tick         = self._tick_size(sym, mid)
 
             # 强制平仓条件
             force_exit = False
             if holding_time > self.max_hold_sec:
                 force_exit = True
+            # 信号强反转（使用 taker_threshold，确保是真正的趋势反转）
             if net_pos > 0 and signal < -self.taker_entry_threshold:
                 force_exit = True
             if net_pos < 0 and signal > self.taker_entry_threshold:
@@ -300,20 +393,23 @@ class MLSniperStrategy(StrategyTemplate):
                 self.state[sym] = "EXITING"
                 slippage = self._force_exit_slippage(sym)
                 if net_pos > 0:
-                    # [FIX-C] ATR 自适应 slippage
-                    price = ref_data_manager.round_price(sym, bid_1 * (1 - slippage))
+                    price = ref_data_manager.round_price(
+                        sym, bid_1 * (1 - slippage)
+                    )
                     self.exit_long(sym, price, abs(net_pos))
                 else:
-                    price = ref_data_manager.round_price(sym, ask_1 * (1 + slippage))
+                    price = ref_data_manager.round_price(
+                        sym, ask_1 * (1 + slippage)
+                    )
                     self.exit_short(sym, price, abs(net_pos))
                 return
 
-            # 挂止盈 Maker 单（仅在没有在途出场单时）
+            # [USDC-4] 挂止盈 Maker 单（零费率，目标更小）
             if not self.exit_oid[sym]:
                 entry_px = self.entry_price[sym]
                 if net_pos > 0:
                     target = entry_px * (1 + self.profit_target / 10000.0)
-                    # [FIX-G] 止盈价至少比 bid 高一个 tick（才能做 Maker）
+                    # [FIX-G] 止盈价至少比 bid 高一个 tick
                     price = ref_data_manager.round_price(
                         sym, max(target, bid_1 + tick)
                     )
@@ -338,11 +434,11 @@ class MLSniperStrategy(StrategyTemplate):
 
     def _entry(self, sym: str, side: Side,
                price: float, vol: float, mode: str):
-        """发入场单。mode = "IOC"（Taker）或 "GTX"（PostOnly Maker）"""
+        """发入场单。mode = 'IOC'（Taker）或 'GTX'（PostOnly Maker）"""
         if self.entry_oid[sym]:
             self.cancel_order(self.entry_oid[sym])
 
-        is_ioc      = (mode == "IOC")
+        is_ioc = (mode == "IOC")
         intent = OrderIntent(
             self.name, sym, side, price, vol,
             time_in_force = "IOC" if is_ioc else "GTC",
@@ -352,6 +448,10 @@ class MLSniperStrategy(StrategyTemplate):
         if oid:
             self.entry_oid[sym] = oid
             self.state[sym]     = "ENTERING"
+            # ── 策略层入场意图日志 ────────────────────────────
+            sym_clean = sym.replace("USDC", "").replace("USDT", "").lower()
+            side_str  = "long" if side == Side.BUY else "short"
+            self.log(f"{sym_clean} enter {side_str} @ {price:.6g}  ({mode}, vol={vol})")
 
     def _place_exit(self, sym: str, side: Side, price: float, vol: float):
         """挂止盈 Maker 单（PostOnly）"""
@@ -362,6 +462,11 @@ class MLSniperStrategy(StrategyTemplate):
         oid = self.send_intent(intent)
         if oid:
             self.exit_oid[sym] = oid
+            # ── 策略层出场意图日志 ────────────────────────────
+            sym_clean = sym.replace("USDC", "").replace("USDT", "").lower()
+            # side 是平仓方向（BUY=平空，SELL=平多），日志反映持仓方向
+            pos_str = "short" if side == Side.BUY else "long"
+            self.log(f"{sym_clean} exit  {pos_str} @ {price:.6g}  (GTX TP, vol={vol})")
 
     def _clear_oids(self, sym: str):
         self.entry_oid[sym] = None
@@ -372,7 +477,7 @@ class MLSniperStrategy(StrategyTemplate):
     # ─────────────────────────────────────────────────────────
 
     def on_order(self, snapshot: OrderStateSnapshot):
-        super().on_order(snapshot)   # 基类维护 active_orders
+        super().on_order(snapshot)
 
         sym    = snapshot.symbol
         oid    = snapshot.client_oid
@@ -391,9 +496,8 @@ class MLSniperStrategy(StrategyTemplate):
                 self.state[sym]        = "HOLDING"
                 self.pos_entry_ts[sym] = time.time()
                 self.entry_price[sym]  = snapshot.avg_price
-                if status == OrderStatus.FILLED:
-                    self.entry_oid[sym] = None
-
+            if status == OrderStatus.FILLED:
+                self.entry_oid[sym] = None
             elif status in terminal:
                 self.entry_oid[sym] = None
                 # [FIX-F] ENTERING 被拒 / 取消 → 显式回退 FLAT
@@ -404,7 +508,6 @@ class MLSniperStrategy(StrategyTemplate):
         if oid == self.exit_oid[sym]:
             if status in terminal:
                 self.exit_oid[sym] = None
-                # 止盈单成交 → 等待 EXITING/HOLDING 里的 net_pos 检查回 FLAT
 
     def on_trade(self, trade: TradeData):
         pass
@@ -414,23 +517,35 @@ class MLSniperStrategy(StrategyTemplate):
     # ─────────────────────────────────────────────────────────
 
     def _publish_state(self, sym: str, mid: float, signal: float,
-                       preds: dict, predictor: TimeHorizonPredictor):
-        weights_1s    = predictor.get_model_weights("1s")
-        labeled_w     = {
+                       velocity: float, preds: dict,
+                       predictor: TimeHorizonPredictor):
+        weights_1s  = predictor.get_model_weights("1s")
+        labeled_w   = {
             FEATURE_LABELS[i]: round(w, 4)
             for i, w in enumerate(weights_1s)
             if i < len(FEATURE_LABELS)
         }
-        warmup_prog   = predictor.warmup_progress()
+        warmup_prog = predictor.warmup_progress()
+
+        # 判断入场模式用于 UI 提示
+        if (abs(signal) > self.taker_entry_threshold
+                and abs(velocity) > self.velocity_threshold):
+            entry_mode = "IOC(accel)"
+        elif abs(signal) > self.maker_entry_threshold:
+            entry_mode = "GTX"
+        else:
+            entry_mode = "-"
 
         params = {
-            "State":   self.state[sym],
-            "Sig":     f"{signal:+.2f}",
-            "1s":      f"{preds.get('1s',  0):+.1f}",
-            "10s":     f"{preds.get('10s', 0):+.1f}",
-            "30s":     f"{preds.get('30s', 0):+.1f}",
+            "State":  self.state[sym],
+            "Sig":    f"{signal:+.2f}",
+            "Vel":    f"{velocity:+.2f}",    # 新增：信号速度展示
+            "Mode":   entry_mode,            # 新增：当前会触发哪种入场模式
+            "1s":     f"{preds.get('1s',  0):+.1f}",
+            "10s":    f"{preds.get('10s', 0):+.1f}",
+            "30s":    f"{preds.get('30s', 0):+.1f}",
             "Weights": labeled_w,
-            "Train":   warmup_prog,
+            "Train":  warmup_prog,
         }
         self.engine.put(Event(
             EVENT_STRATEGY_UPDATE,
@@ -438,7 +553,8 @@ class MLSniperStrategy(StrategyTemplate):
         ))
 
     def _publish_warmup(self, sym: str, mid: float, signal: float,
-                        preds: dict, predictor: TimeHorizonPredictor):
+                        velocity: float, preds: dict,
+                        predictor: TimeHorizonPredictor):
         elapsed      = time.time() - self.start_time
         warmup_prog  = predictor.warmup_progress()
         progress_pct = min(100.0, elapsed / self.min_warmup_sec * 100)
@@ -446,6 +562,7 @@ class MLSniperStrategy(StrategyTemplate):
         params = {
             "State":  f"WARMUP {progress_pct:.0f}%",
             "Sig":    f"{signal:+.2f}",
+            "Vel":    f"{velocity:+.2f}",
             "Train":  warmup_prog,
             "Weights": {
                 FEATURE_LABELS[i]: round(w, 4)
