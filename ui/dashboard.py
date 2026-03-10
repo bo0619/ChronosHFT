@@ -88,14 +88,26 @@ class TUIDashboard:
         prec = info.price_precision if info else 4
         return f"{price:.{prec}f}"
 
+    def _fmt_asset_balance(self, asset: str) -> str:
+        if not self.account_data:
+            return f"{asset}: -/-"
+        wallet = self.account_data.balances.get(asset)
+        available = self.account_data.available_balances.get(asset)
+        wallet_s = "-" if wallet is None else f"{wallet:.2f}"
+        available_s = "-" if available is None else f"{available:.2f}"
+        return f"{asset}: {wallet_s}/{available_s}"
+
     def _render_header(self):
         if not self.account_data: return Panel("Loading...", style="bold white")
         acc = self.account_data
         m_ratio = (acc.used_margin / acc.equity * 100) if acc.equity > 0 else 0
         c_eq = "green" if acc.equity >= acc.balance else "red"
-        txt = (f"Equity: [{c_eq}]{acc.equity:.2f}[/] | Balance: {acc.balance:.2f} | "
-               f"Margin: {acc.used_margin:.2f} ({m_ratio:.1f}%) | Avail: {acc.available:.2f}")
-        return Panel(Align.center(txt), title="Account", border_style="blue")
+        top_line = (
+            f"Equity: [{c_eq}]{acc.equity:.2f}[/] | Balance: {acc.balance:.2f} | "
+            f"Margin: {acc.used_margin:.2f} ({m_ratio:.1f}%) | Avail: {acc.available:.2f}"
+        )
+        quote_line = f"{self._fmt_asset_balance('USDT')} | {self._fmt_asset_balance('USDC')}"
+        return Panel(Align.center(f"{top_line}\n{quote_line}"), title="Account", border_style="blue")
 
     def _render_market(self):
         table = Table(show_header=True, header_style="bold cyan", expand=True, box=SIMPLE_HEAD)

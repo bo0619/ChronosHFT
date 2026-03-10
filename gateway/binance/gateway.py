@@ -186,10 +186,12 @@ class BinanceGateway(BaseGateway):
 
     def _handle_account_update(self, msg):
         payload = msg.get("a", {})
-        balance_entry = self._select_balance_entry(payload.get("B", []))
+        balances = payload.get("B", [])
+        balance_entry = self._select_balance_entry(balances)
         if not balance_entry:
             return
 
+        balance_snapshot = self._extract_balance_snapshot(balances)
         positions = {}
         for raw_position in payload.get("P", []):
             symbol = raw_position.get("s")
@@ -206,6 +208,7 @@ class BinanceGateway(BaseGateway):
             asset=balance_entry.get("a", ""),
             wallet_balance=float(balance_entry.get("wb", 0.0) or 0.0),
             available_balance=self._parse_optional_float(balance_entry.get("cw")),
+            balances=balance_snapshot,
             positions=positions,
             reason=payload.get("m", ""),
             event_time=float(event_time_ms) / 1000.0 if event_time_ms else time.time(),
@@ -286,6 +289,18 @@ class BinanceGateway(BaseGateway):
         if value in (None, ""):
             return None
         return float(value)
+
+    def _extract_balance_snapshot(self, balances):
+        snapshot = {}
+        for entry in balances or []:
+            asset = entry.get("a")
+            if not asset:
+                continue
+            snapshot[asset] = {
+                "wallet_balance": float(entry.get("wb", 0.0) or 0.0),
+                "available_balance": self._parse_optional_float(entry.get("cw")),
+            }
+        return snapshot
 
     def _select_balance_entry(self, balances):
         if not balances:

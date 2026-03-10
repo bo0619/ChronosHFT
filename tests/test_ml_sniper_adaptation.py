@@ -78,7 +78,7 @@ class MLSniperAdaptationTests(unittest.TestCase):
                 mid=100.0,
                 bid_1=99.9,
                 ask_1=100.1,
-                signal=4.0,
+                signal=1.2,
                 velocity=0.0,
                 now=1.0,
             )
@@ -215,6 +215,69 @@ class MLSniperAdaptationTests(unittest.TestCase):
         self.assertLess(feedback["win_rate_ewma"], 0.5)
         self.assertEqual(feedback["closed_trades"], 1)
         self.assertGreater(tightened_threshold, base_threshold)
+
+
+    @patch("strategy.ml_sniper.ml_sniper.ref_data_manager.round_price", side_effect=lambda symbol, price: price)
+    def test_low_confidence_regime_blocks_entry(self, _round_price):
+        sym = "BTCUSDT"
+        self.strategy.base_velocity_threshold = 10.0
+        self.strategy.base_taker_entry_threshold = 50.0
+        self.strategy.base_maker_entry_threshold = 1.0
+        self.strategy.net_edge_buffer_bps = 0.0
+        self.strategy.maker_spread_weight = 0.0
+        self.strategy.maker_fee_bps = 0.0
+        self.strategy.taker_fee_bps = 0.0
+        self.strategy.latest_preds[sym] = {"1s": 1.0, "10s": 3.0, "30s": 2.0}
+
+        with patch.object(self.strategy, "_calc_vol", return_value=1.0), patch.object(
+            self.strategy, "_tick_size", return_value=0.1
+        ), patch.object(self.strategy, "send_intent", return_value="entry-blocked"):
+            self.strategy._run_fsm(
+                sym,
+                mid=100.0,
+                bid_1=99.9,
+                ask_1=100.1,
+                signal=1.2,
+                velocity=0.0,
+                confidence=0.05,
+                now=1.0,
+            )
+
+        self.assertIsNone(self.strategy.entry_oid[sym])
+        self.assertEqual(self.strategy.state[sym], "FLAT")
+        self.assertEqual(self.strategy.latest_regime[sym], "low_conf")
+
+    @patch("strategy.ml_sniper.ml_sniper.ref_data_manager.round_price", side_effect=lambda symbol, price: price)
+    def test_holding_requotes_stale_exit_order(self, _round_price):
+        sym = "BTCUSDT"
+        self.oms.exposure.net_positions[sym] = 1.0
+        self.strategy.state[sym] = "HOLDING"
+        self.strategy.entry_price[sym] = 100.0
+        self.strategy.pos_entry_ts[sym] = 1.0
+        self.strategy.exit_oid[sym] = "exit-1"
+        self.strategy.active_orders["exit-1"] = object()
+        self.strategy.order_context["exit-1"] = {
+            "limit_price": 101.0,
+            "submit_ts": 0.0,
+            "role": "exit",
+            "entry_price": 100.0,
+        }
+
+        with patch.object(self.strategy, "_tick_size", return_value=0.1), patch.object(
+            self.strategy, "cancel_order"
+        ) as cancel_order:
+            self.strategy._run_fsm(
+                sym,
+                mid=100.0,
+                bid_1=99.9,
+                ask_1=100.1,
+                signal=0.0,
+                velocity=0.0,
+                confidence=1.0,
+                now=5.0,
+            )
+
+        cancel_order.assert_called_once_with("exit-1")
 
 
 if __name__ == "__main__":

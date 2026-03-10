@@ -418,6 +418,8 @@ class OMS:
             self.account.sync_exchange_balance(
                 update.wallet_balance,
                 available=update.available_balance,
+                asset=update.asset,
+                balances=update.balances,
             )
             position_drift = self._collect_exchange_position_drift_locked(tracked_positions)
             has_active_orders = self._has_active_orders_locked(tracked_positions.keys())

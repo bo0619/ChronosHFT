@@ -258,6 +258,7 @@ class ExchangeAccountUpdate:
     asset: str
     wallet_balance: float
     available_balance: Optional[float] = None
+    balances: Dict[str, Dict[str, Optional[float]]] = field(default_factory=dict)
     positions: Dict[str, Dict[str, float]] = field(default_factory=dict)
     reason: str = ""
     event_time: float = 0.0
@@ -276,6 +277,8 @@ class AccountData:
     available: float      
     used_margin: float    
     datetime: datetime
+    balances: Dict[str, float] = field(default_factory=dict)
+    available_balances: Dict[str, float] = field(default_factory=dict)
 
 # ==========================================
 # 9. 系统监控与策略状态

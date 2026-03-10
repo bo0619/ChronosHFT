@@ -16,13 +16,30 @@ class AccountManager:
         self.equity = self.balance
         self.used_margin = 0.0
         self.available = self.balance
+        self.balances = {}
+        self.available_balances = {}
 
-    def force_sync(self, balance: float, used_margin: float, available: float = None):
+    def force_sync(
+        self,
+        balance: float,
+        used_margin: float,
+        available: float = None,
+        asset: str = "",
+        balances: dict = None,
+    ):
         self.balance = balance
+        self._sync_balance_maps(asset=asset, balance=balance, available=available, balances=balances)
         self.calculate(used_margin_override=used_margin, available_override=available)
 
-    def sync_exchange_balance(self, balance: float, available: float = None):
+    def sync_exchange_balance(
+        self,
+        balance: float,
+        available: float = None,
+        asset: str = "",
+        balances: dict = None,
+    ):
         self.balance = balance
+        self._sync_balance_maps(asset=asset, balance=balance, available=available, balances=balances)
         self.calculate(available_override=available)
 
     def update_balance(self, realized_pnl, commission):
@@ -76,8 +93,28 @@ class AccountManager:
             available=self.available,
             used_margin=self.used_margin,
             datetime=datetime.now(),
+            balances=dict(self.balances),
+            available_balances=dict(self.available_balances),
         )
         self.engine.put(Event(EVENT_ACCOUNT_UPDATE, data))
+
+    def _sync_balance_maps(self, asset: str = "", balance: float = None, available: float = None, balances: dict = None):
+        if balances:
+            self.balances = {
+                key: float((payload or {}).get("wallet_balance", 0.0) or 0.0)
+                for key, payload in balances.items()
+            }
+            self.available_balances = {
+                key: float(payload.get("available_balance", 0.0) or 0.0)
+                for key, payload in balances.items()
+                if payload.get("available_balance") is not None
+            }
+            return
+
+        if asset:
+            self.balances[asset] = float(balance or 0.0)
+            if available is not None:
+                self.available_balances[asset] = float(available)
 
     def _get_price_safely(self, symbol):
         price = data_cache.get_mark_price(symbol)

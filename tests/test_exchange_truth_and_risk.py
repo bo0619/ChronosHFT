@@ -187,6 +187,10 @@ class ExchangeTruthTests(unittest.TestCase):
                 asset="USDT",
                 wallet_balance=950.0,
                 available_balance=900.0,
+                balances={
+                    "USDT": {"wallet_balance": 950.0, "available_balance": 900.0},
+                    "USDC": {"wallet_balance": 125.0, "available_balance": 100.0},
+                },
                 positions={},
                 reason="ORDER",
                 event_time=1.0,
@@ -195,6 +199,9 @@ class ExchangeTruthTests(unittest.TestCase):
 
             self.assertAlmostEqual(oms.account.balance, 950.0)
             self.assertAlmostEqual(oms.account.available, 900.0)
+            self.assertEqual(oms.account.balances["USDT"], 950.0)
+            self.assertEqual(oms.account.balances["USDC"], 125.0)
+            self.assertEqual(oms.account.available_balances["USDC"], 100.0)
             self.assertTrue(any(event.type == EVENT_ACCOUNT_UPDATE for event in engine.events))
         finally:
             oms.stop()
@@ -233,7 +240,7 @@ class ExchangeTruthTests(unittest.TestCase):
                 "E": 2000,
                 "a": {
                     "m": "ORDER",
-                    "B": [{"a": "USDT", "wb": "980.5", "cw": "950.0"}],
+                    "B": [{"a": "USDT", "wb": "980.5", "cw": "950.0"}, {"a": "USDC", "wb": "210.0", "cw": "205.5"}],
                     "P": [{"s": "BTCUSDT", "pa": "0.1", "ep": "101.5", "up": "1.23"}],
                 },
             }
@@ -246,6 +253,8 @@ class ExchangeTruthTests(unittest.TestCase):
         self.assertTrue(order_event.data.is_maker)
         self.assertEqual(account_event.data.wallet_balance, 980.5)
         self.assertEqual(account_event.data.available_balance, 950.0)
+        self.assertEqual(account_event.data.balances["USDT"]["wallet_balance"], 980.5)
+        self.assertEqual(account_event.data.balances["USDC"]["available_balance"], 205.5)
         self.assertIn("BTCUSDT", account_event.data.positions)
 
 class RiskExecutionTests(unittest.TestCase):

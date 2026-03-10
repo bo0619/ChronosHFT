@@ -38,16 +38,8 @@ class MLSniperStrategy(StrategyTemplate):
         super().__init__(engine, oms, "ML_Sniper_USDC")
 
         self.strat_conf = load_sniper_config()
-
-        raw_weights = self.strat_conf.get(
-            "weights", {"1s": 0.1, "10s": 0.5, "30s": 0.4}
-        )
-        self.weights = (
-            raw_weights
-            if isinstance(raw_weights, dict)
-            else {"1s": 0.1, "10s": 0.5, "30s": 0.4}
-        )
-
+        raw_weights = self.strat_conf.get("weights", {"1s": 0.1, "10s": 0.5, "30s": 0.4})
+        self.weights = raw_weights if isinstance(raw_weights, dict) else {"1s": 0.1, "10s": 0.5, "30s": 0.4}
         self.lot_multiplier = self.strat_conf.get("lot_multiplier", 1.0)
 
         entry_cfg = self.strat_conf.get("entry", {})
@@ -59,9 +51,7 @@ class MLSniperStrategy(StrategyTemplate):
         self.max_entry_wait_sec = entry_cfg.get("max_entry_wait_sec", 2.0)
         self.require_horizon_consensus = entry_cfg.get("require_horizon_consensus", True)
         self.consensus_min_abs_bps = entry_cfg.get("consensus_min_abs_bps", 0.5)
-        self.ioc_requires_short_horizon_confirmation = entry_cfg.get(
-            "ioc_requires_short_horizon_confirmation", True
-        )
+        self.ioc_requires_short_horizon_confirmation = entry_cfg.get("ioc_requires_short_horizon_confirmation", True)
         self.net_edge_buffer_bps = entry_cfg.get("net_edge_buffer_bps", 1.0)
         self.maker_spread_weight = entry_cfg.get("maker_spread_weight", 0.25)
         self.taker_spread_weight = entry_cfg.get("taker_spread_weight", 0.5)
@@ -69,6 +59,15 @@ class MLSniperStrategy(StrategyTemplate):
         exit_cfg = self.strat_conf.get("exit", {})
         self.profit_target = exit_cfg.get("profit_target_bps", 4.0)
         self.max_hold_sec = exit_cfg.get("max_holding_sec", 10.0)
+        self.min_profit_target_bps = exit_cfg.get("min_profit_target_bps", 1.5)
+        self.max_profit_target_bps = exit_cfg.get("max_profit_target_bps", 9.0)
+        self.alpha_decay_exit_threshold_bps = exit_cfg.get("alpha_decay_exit_threshold_bps", 0.35)
+        self.alpha_flip_exit_threshold_bps = exit_cfg.get("alpha_flip_exit_threshold_bps", 6.0)
+        self.min_decay_hold_sec = exit_cfg.get("min_decay_hold_sec", 1.0)
+        self.exit_requote_sec = exit_cfg.get("exit_requote_sec", 1.5)
+        self.exit_signal_profit_weight = exit_cfg.get("signal_profit_target_weight", 0.12)
+        self.exit_sigma_profit_weight = exit_cfg.get("sigma_profit_target_weight", 0.08)
+        self.exit_confidence_profit_weight = exit_cfg.get("confidence_profit_target_weight", 1.25)
 
         exe_cfg = self.strat_conf.get("execution", {})
         self.tick_interval = exe_cfg.get("tick_interval_sec", 0.1)
@@ -81,9 +80,26 @@ class MLSniperStrategy(StrategyTemplate):
         self.win_rate_target = feedback_cfg.get("win_rate_target", 0.55)
         self.win_rate_penalty_scale = feedback_cfg.get("win_rate_penalty_scale", 40.0)
         self.max_threshold_adjust_bps = feedback_cfg.get("max_threshold_adjust_bps", 8.0)
-        self.min_closed_trades_for_adaptation = int(
-            feedback_cfg.get("min_closed_trades_for_adaptation", 3)
-        )
+        self.min_closed_trades_for_adaptation = int(feedback_cfg.get("min_closed_trades_for_adaptation", 3))
+
+        regime_cfg = self.strat_conf.get("regime", {})
+        self.max_entry_spread_bps = regime_cfg.get("max_entry_spread_bps", 25.0)
+        self.max_entry_sigma_bps = regime_cfg.get("max_entry_sigma_bps", 45.0)
+        self.max_spread_sigma_ratio = regime_cfg.get("max_spread_sigma_ratio", 3.0)
+        self.confidence_floor = regime_cfg.get("confidence_floor", 0.18)
+        self.high_edge_confidence_relaxation = regime_cfg.get("high_edge_confidence_relaxation", 1.6)
+
+        sizing_cfg = self.strat_conf.get("sizing", {})
+        self.min_size_scale = sizing_cfg.get("min_scale", 1.0)
+        self.max_size_scale = sizing_cfg.get("max_scale", 3.0)
+        self.edge_size_exponent = sizing_cfg.get("edge_exponent", 1.2)
+        self.confidence_size_weight = sizing_cfg.get("confidence_weight", 0.75)
+        self.spread_size_penalty = sizing_cfg.get("spread_penalty", 0.04)
+        self.sigma_size_penalty = sizing_cfg.get("sigma_penalty", 0.01)
+
+        self.labeling_cfg = self.strat_conf.get("labeling", {})
+        self.predict_net_edge = self.labeling_cfg.get("predict_net_edge", True)
+        self.live_cost_weight = float(self.labeling_cfg.get("live_cost_weight", 0.35))
 
         self.min_warmup_sec = self.strat_conf.get("min_warmup_sec", 60.0)
         self.start_time = time.time()
@@ -113,6 +129,11 @@ class MLSniperStrategy(StrategyTemplate):
         self.latest_signal = defaultdict(float)
         self.latest_velocity = defaultdict(float)
         self.latest_preds = defaultdict(dict)
+        self.latest_confidence = defaultdict(float)
+        self.latest_size_scale = defaultdict(lambda: 1.0)
+        self.latest_regime = defaultdict(lambda: "OK")
+        self.latest_spread_bps = defaultdict(float)
+        self.latest_sigma_bps = defaultdict(float)
         self.order_context = {}
         self.execution_feedback = defaultdict(self._new_execution_feedback)
 
@@ -131,9 +152,15 @@ class MLSniperStrategy(StrategyTemplate):
         alpha = self.feedback_alpha
         return (1.0 - alpha) * previous + alpha * value
 
+    def _clamp(self, value: float, low: float, high: float) -> float:
+        return max(low, min(high, value))
+
     def _get_predictor(self, symbol: str) -> TimeHorizonPredictor:
         if symbol not in self.predictors:
-            self.predictors[symbol] = TimeHorizonPredictor(num_features=9)
+            label_cfg = dict(self.labeling_cfg)
+            label_cfg.setdefault("maker_fee_bps", self.maker_fee_bps)
+            label_cfg.setdefault("taker_fee_bps", self.taker_fee_bps)
+            self.predictors[symbol] = TimeHorizonPredictor(num_features=9, label_config=label_cfg)
             self.calibrators[symbol] = GLFTCalibrator(window=500)
         return self.predictors[symbol]
 
@@ -184,6 +211,7 @@ class MLSniperStrategy(StrategyTemplate):
         if spread >= 2 * tick:
             return bid_1 + tick if side == Side.BUY else ask_1 - tick
         return bid_1 if side == Side.BUY else ask_1
+
     def _consensus_direction(self, preds: dict) -> int:
         votes = []
         for horizon in CORE_HORIZONS:
@@ -222,26 +250,15 @@ class MLSniperStrategy(StrategyTemplate):
         if feedback["closed_trades"] >= self.min_closed_trades_for_adaptation:
             adjustment += max(0.0, -feedback["exit_pnl_ewma"]) * self.pnl_penalty_weight
             if feedback["win_rate_ewma"] < self.win_rate_target:
-                adjustment += (
-                    self.win_rate_target - feedback["win_rate_ewma"]
-                ) * self.win_rate_penalty_scale
+                adjustment += (self.win_rate_target - feedback["win_rate_ewma"]) * self.win_rate_penalty_scale
 
         return min(self.max_threshold_adjust_bps, adjustment)
 
     def _adaptive_entry_threshold(self, symbol: str, mode: str) -> float:
-        base = (
-            self.base_taker_entry_threshold if mode == "IOC" else self.base_maker_entry_threshold
-        )
+        base = self.base_taker_entry_threshold if mode == "IOC" else self.base_maker_entry_threshold
         return base + self._adaptive_threshold_adjustment(symbol, mode)
 
-    def _estimate_entry_cost_bps(
-        self,
-        symbol: str,
-        mid: float,
-        bid_1: float,
-        ask_1: float,
-        mode: str,
-    ) -> float:
+    def _estimate_entry_cost_bps(self, symbol: str, mid: float, bid_1: float, ask_1: float, mode: str) -> float:
         if mid <= 0:
             return float("inf")
 
@@ -253,46 +270,98 @@ class MLSniperStrategy(StrategyTemplate):
             slippage_bps = max(0.5, min(20.0, sigma_bps * 0.35))
             exit_fee_bps = max(self.maker_fee_bps, self.taker_fee_bps * 0.5)
             quality_penalty = max(0.0, -feedback["taker_edge_ewma"])
-            return (
-                self.taker_spread_weight * spread_bps
-                + self.taker_fee_bps
-                + exit_fee_bps
-                + slippage_bps
-                + quality_penalty
-            )
+            return self.taker_spread_weight * spread_bps + self.taker_fee_bps + exit_fee_bps + slippage_bps + quality_penalty
 
         adverse_bps = max(0.25, min(6.0, sigma_bps * 0.10))
         exit_fee_bps = max(self.maker_fee_bps, self.taker_fee_bps * 0.35)
         quality_penalty = max(0.0, -feedback["maker_edge_ewma"])
-        return (
-            self.maker_spread_weight * spread_bps
-            + self.maker_fee_bps
-            + exit_fee_bps
-            + adverse_bps
-            + quality_penalty
-        )
+        return self.maker_spread_weight * spread_bps + self.maker_fee_bps + exit_fee_bps + adverse_bps + quality_penalty
 
-    def _required_signal_bps(
-        self,
-        symbol: str,
-        mid: float,
-        bid_1: float,
-        ask_1: float,
-        mode: str,
-    ) -> tuple[float, float]:
+    def _required_signal_bps(self, symbol: str, mid: float, bid_1: float, ask_1: float, mode: str) -> tuple[float, float]:
         cost_bps = self._estimate_entry_cost_bps(symbol, mid, bid_1, ask_1, mode)
         threshold_bps = self._adaptive_entry_threshold(symbol, mode)
-        return max(threshold_bps, cost_bps + self.net_edge_buffer_bps), cost_bps
+        effective_cost_bps = cost_bps * (self.live_cost_weight if self.predict_net_edge else 1.0)
+        return max(threshold_bps, effective_cost_bps + self.net_edge_buffer_bps), cost_bps
 
-    def _track_order_context(
-        self,
-        oid: str,
-        sym: str,
-        side: Side,
-        mode: str,
-        role: str,
-        limit_price: float,
-    ):
+    def _prediction_confidence(self, predictor: TimeHorizonPredictor, preds: dict) -> float:
+        diagnostics = predictor.get_last_diagnostics()
+        weighted = 0.0
+        total_weight = 0.0
+        for horizon, weight in self.weights.items():
+            weighted += float(diagnostics.get(horizon, {}).get("confidence", 0.0)) * weight
+            total_weight += weight
+        if total_weight <= 0:
+            return 0.0
+
+        values = [float(preds.get(h, 0.0)) for h in self.weights]
+        dispersion = (max(values) - min(values)) if values else 0.0
+        consensus_bonus = 0.1 if self._consensus_direction(preds) != 0 else 0.0
+        dispersion_penalty = min(0.35, dispersion / 40.0)
+        return self._clamp(weighted / total_weight - dispersion_penalty + consensus_bonus, 0.0, 1.0)
+
+    def _regime_status(self, symbol: str, mid: float, bid_1: float, ask_1: float, signal: float, required_signal: float, confidence: float) -> tuple[bool, str, float, float]:
+        if mid <= 0:
+            return False, "bad_mid", 0.0, 0.0
+
+        spread_bps = max(0.0, (ask_1 - bid_1) / mid * 10000.0)
+        sigma_bps = float(max(0.0, getattr(self.calibrators.get(symbol), "sigma_bps", 10.0)))
+        strong_edge = abs(signal) >= max(required_signal, 1.0) * self.high_edge_confidence_relaxation
+
+        if spread_bps > self.max_entry_spread_bps:
+            return False, "spread", spread_bps, sigma_bps
+        if sigma_bps > self.max_entry_sigma_bps:
+            return False, "sigma", spread_bps, sigma_bps
+        if sigma_bps > 0 and spread_bps / max(sigma_bps, 1e-6) > self.max_spread_sigma_ratio:
+            return False, "spread_sigma", spread_bps, sigma_bps
+        if confidence < self.confidence_floor and not strong_edge:
+            return False, "low_conf", spread_bps, sigma_bps
+        return True, "OK", spread_bps, sigma_bps
+
+    def _size_scale(self, signal: float, required_signal: float, confidence: float, spread_bps: float, sigma_bps: float) -> float:
+        edge_ratio = abs(signal) / max(required_signal, 1e-6)
+        scale = max(1.0, edge_ratio) ** self.edge_size_exponent
+        scale *= 1.0 + confidence * self.confidence_size_weight
+        scale -= spread_bps * self.spread_size_penalty
+        scale -= sigma_bps * self.sigma_size_penalty
+        return self._clamp(scale, self.min_size_scale, self.max_size_scale)
+
+    def _sized_volume(self, symbol: str, mid: float, signal: float, required_signal: float, confidence: float, spread_bps: float, sigma_bps: float) -> tuple[float, float]:
+        base_vol = self._calc_vol(symbol, mid)
+        if base_vol <= 0:
+            return 0.0, 1.0
+
+        scale = self._size_scale(signal, required_signal, confidence, spread_bps, sigma_bps)
+        vol = ref_data_manager.round_qty(symbol, base_vol * scale)
+        return vol, scale
+
+    def _directional_signal(self, side: Side, signal: float) -> float:
+        direction = 1.0 if side == Side.BUY else -1.0
+        return direction * signal
+
+    def _dynamic_profit_target_bps(self, symbol: str, side: Side, signal: float, confidence: float, holding_time: float) -> float:
+        aligned_signal = max(0.0, self._directional_signal(side, signal))
+        sigma_bps = float(max(0.0, getattr(self.calibrators.get(symbol), "sigma_bps", 10.0)))
+        decay = self._clamp(holding_time / max(self.max_hold_sec, 1.0), 0.0, 1.0)
+
+        target = self.profit_target + aligned_signal * self.exit_signal_profit_weight + sigma_bps * self.exit_sigma_profit_weight + confidence * self.exit_confidence_profit_weight
+        target *= 1.0 - 0.45 * decay
+        return self._clamp(target, self.min_profit_target_bps, self.max_profit_target_bps)
+
+    def _desired_exit_price(self, symbol: str, net_pos: float, entry_px: float, bid_1: float, ask_1: float, tick: float, signal: float, confidence: float, holding_time: float) -> tuple[Side, float, float]:
+        if net_pos > 0:
+            side = Side.SELL
+            target_bps = self._dynamic_profit_target_bps(symbol, Side.BUY, signal, confidence, holding_time)
+            target_px = entry_px * (1 + target_bps / 10000.0)
+            price = ref_data_manager.round_price(symbol, max(target_px, bid_1 + tick))
+            return side, price, target_bps
+
+        side = Side.BUY
+        target_bps = self._dynamic_profit_target_bps(symbol, Side.SELL, signal, confidence, holding_time)
+        target_px = entry_px * (1 - target_bps / 10000.0)
+        price = ref_data_manager.round_price(symbol, min(target_px, ask_1 - tick))
+        return side, price, target_bps
+
+    def _track_order_context(self, oid: str, sym: str, side: Side, mode: str, role: str, limit_price: float):
         self.order_context[oid] = {
             "symbol": sym,
             "side": side,
@@ -302,6 +371,7 @@ class MLSniperStrategy(StrategyTemplate):
             "mid": self.latest_mid[sym],
             "signal": self.latest_signal[sym],
             "velocity": self.latest_velocity[sym],
+            "confidence": self.latest_confidence[sym],
             "entry_price": self.entry_price[sym],
             "submit_ts": time.time(),
             "exit_pnl_sum": 0.0,
@@ -344,50 +414,52 @@ class MLSniperStrategy(StrategyTemplate):
         self.calibrators[sym].on_orderbook(ob)
 
         feats = self.feature_engine.get_features(sym)
-        preds = predictor.update_and_predict(feats, mid, now)
+        spread_bps = max(0.0, (ask_1 - bid_1) / mid * 10000.0)
+        sigma_bps = float(max(0.0, getattr(self.calibrators.get(sym), "sigma_bps", 10.0)))
+        preds = predictor.update_and_predict(feats, mid, now, spread_bps=spread_bps, sigma_bps=sigma_bps)
 
         if now - self.last_cycle_ts[sym] >= self.cycle_interval:
             self.last_cycle_ts[sym] = now
             self.feature_engine.reset_interval(sym)
 
         try:
-            signal = (
-                float(preds.get("1s", 0.0)) * self.weights.get("1s", 0.1)
-                + float(preds.get("10s", 0.0)) * self.weights.get("10s", 0.5)
-                + float(preds.get("30s", 0.0)) * self.weights.get("30s", 0.4)
-            )
+            signal = float(preds.get("1s", 0.0)) * self.weights.get("1s", 0.1) + float(preds.get("10s", 0.0)) * self.weights.get("10s", 0.5) + float(preds.get("30s", 0.0)) * self.weights.get("30s", 0.4)
         except Exception:
             signal = 0.0
 
         velocity = self._compute_signal_velocity(sym, signal, now)
+        confidence = self._prediction_confidence(predictor, preds)
+
         self.latest_signal[sym] = signal
         self.latest_velocity[sym] = velocity
         self.latest_preds[sym] = {horizon: float(preds.get(horizon, 0.0)) for horizon in self.weights}
+        self.latest_confidence[sym] = confidence
+        self.latest_spread_bps[sym] = spread_bps
+        self.latest_sigma_bps[sym] = sigma_bps
 
         if not self._check_warmup(sym):
-            self._publish_warmup(sym, mid, signal, velocity, preds, predictor)
+            self._publish_warmup(sym, mid, signal, velocity, preds, predictor, confidence)
             return
 
-        self._publish_state(sym, mid, bid_1, ask_1, signal, velocity, preds, predictor)
-        self._run_fsm(sym, mid, bid_1, ask_1, signal, velocity, now)
+        self._publish_state(sym, mid, bid_1, ask_1, signal, velocity, preds, predictor, confidence)
+        self._run_fsm(sym, mid, bid_1, ask_1, signal, velocity, confidence, now)
 
     def on_market_trade(self, trade: AggTradeData):
         self.feature_engine.on_trade(trade)
-    def _run_fsm(
-        self,
-        sym: str,
-        mid: float,
-        bid_1: float,
-        ask_1: float,
-        signal: float,
-        velocity: float,
-        now: float,
-    ):
+        current_mid = self.latest_mid.get(trade.symbol, 0.0)
+        calibrator = self.calibrators.get(trade.symbol)
+        if calibrator and current_mid > 0:
+            calibrator.on_market_trade(trade, current_mid)
+
+    def _run_fsm(self, sym: str, mid: float, bid_1: float, ask_1: float, signal: float, velocity: float, confidence: float = 0.0, now: float = 0.0):
         curr_state = self.state[sym]
         preds = self.latest_preds[sym]
         net_pos = self.oms.exposure.net_positions.get(sym, 0.0)
         tick = self._tick_size(sym, mid)
         can_submit = self.can_submit_orders()
+        if confidence <= 0.0:
+            confidence = self.latest_confidence[sym] if self.latest_confidence[sym] > 0.0 else 1.0
+
 
         if curr_state == "FLAT":
             if not can_submit:
@@ -396,38 +468,43 @@ class MLSniperStrategy(StrategyTemplate):
                 self.state[sym] = "HOLDING"
                 return
 
-            vol = self._calc_vol(sym, mid)
-            if vol <= 0:
-                return
-
             maker_required, _ = self._required_signal_bps(sym, mid, bid_1, ask_1, "GTX")
             taker_required, _ = self._required_signal_bps(sym, mid, bid_1, ask_1, "IOC")
+            regime_ok, regime_reason, spread_bps, sigma_bps = self._regime_status(sym, mid, bid_1, ask_1, signal, min(maker_required, taker_required), confidence)
+            self.latest_regime[sym] = regime_reason
+            if not regime_ok:
+                self.latest_size_scale[sym] = 1.0
+                return
 
-            if (
-                signal > taker_required
-                and velocity > self.base_velocity_threshold
-                and self._has_consensus(preds, Side.BUY, "IOC")
-            ):
+            if signal > taker_required and velocity > self.base_velocity_threshold and self._has_consensus(preds, Side.BUY, "IOC"):
+                vol, scale = self._sized_volume(sym, mid, signal, taker_required, confidence, spread_bps, sigma_bps)
+                if vol <= 0:
+                    return
+                self.latest_size_scale[sym] = scale
                 slippage = self._force_exit_slippage(sym)
                 price = ref_data_manager.round_price(sym, ask_1 * (1 + slippage))
                 self._entry(sym, Side.BUY, price, vol, "IOC")
             elif signal > maker_required and self._has_consensus(preds, Side.BUY, "GTX"):
-                price = ref_data_manager.round_price(
-                    sym, self._maker_entry_price(Side.BUY, bid_1, ask_1, tick)
-                )
+                vol, scale = self._sized_volume(sym, mid, signal, maker_required, confidence, spread_bps, sigma_bps)
+                if vol <= 0:
+                    return
+                self.latest_size_scale[sym] = scale
+                price = ref_data_manager.round_price(sym, self._maker_entry_price(Side.BUY, bid_1, ask_1, tick))
                 self._entry(sym, Side.BUY, price, vol, "GTX")
-            elif (
-                signal < -taker_required
-                and velocity < -self.base_velocity_threshold
-                and self._has_consensus(preds, Side.SELL, "IOC")
-            ):
+            elif signal < -taker_required and velocity < -self.base_velocity_threshold and self._has_consensus(preds, Side.SELL, "IOC"):
+                vol, scale = self._sized_volume(sym, mid, signal, taker_required, confidence, spread_bps, sigma_bps)
+                if vol <= 0:
+                    return
+                self.latest_size_scale[sym] = scale
                 slippage = self._force_exit_slippage(sym)
                 price = ref_data_manager.round_price(sym, bid_1 * (1 - slippage))
                 self._entry(sym, Side.SELL, price, vol, "IOC")
             elif signal < -maker_required and self._has_consensus(preds, Side.SELL, "GTX"):
-                price = ref_data_manager.round_price(
-                    sym, self._maker_entry_price(Side.SELL, bid_1, ask_1, tick)
-                )
+                vol, scale = self._sized_volume(sym, mid, signal, maker_required, confidence, spread_bps, sigma_bps)
+                if vol <= 0:
+                    return
+                self.latest_size_scale[sym] = scale
+                price = ref_data_manager.round_price(sym, self._maker_entry_price(Side.SELL, bid_1, ask_1, tick))
                 self._entry(sym, Side.SELL, price, vol, "GTX")
 
         elif curr_state in {"ENTERING", "ENTERING_PARTIAL"}:
@@ -437,20 +514,14 @@ class MLSniperStrategy(StrategyTemplate):
 
             if has_working_entry:
                 signal_faded = abs(signal) < self.cancel_threshold
-                stale_maker = (
-                    self.entry_mode[sym] == "GTX"
-                    and (now - self.entry_submit_ts[sym]) > self.max_entry_wait_sec
-                )
+                stale_maker = self.entry_mode[sym] == "GTX" and (now - self.entry_submit_ts[sym]) > self.max_entry_wait_sec
                 partial_cleanup = curr_state == "ENTERING_PARTIAL"
 
                 if signal_faded or stale_maker or partial_cleanup:
                     self.cancel_order(oid)
                 return
 
-            if has_position:
-                self.state[sym] = "HOLDING"
-            else:
-                self.state[sym] = "FLAT"
+            self.state[sym] = "HOLDING" if has_position else "FLAT"
 
         elif curr_state == "HOLDING":
             if abs(net_pos) < 1e-6:
@@ -459,12 +530,9 @@ class MLSniperStrategy(StrategyTemplate):
                 return
 
             holding_time = now - self.pos_entry_ts[sym]
-            force_exit = False
-            if holding_time > self.max_hold_sec:
-                force_exit = True
-            if net_pos > 0 and signal < -self.base_taker_entry_threshold:
-                force_exit = True
-            if net_pos < 0 and signal > self.base_taker_entry_threshold:
+            aligned_signal = self._directional_signal(Side.BUY if net_pos > 0 else Side.SELL, signal)
+            force_exit = holding_time > self.max_hold_sec or aligned_signal < -self.alpha_flip_exit_threshold_bps
+            if holding_time > self.min_decay_hold_sec and aligned_signal < self.alpha_decay_exit_threshold_bps and confidence < self.confidence_floor:
                 force_exit = True
 
             if force_exit:
@@ -486,18 +554,21 @@ class MLSniperStrategy(StrategyTemplate):
                     self._track_order_context(oid, sym, exit_side, "IOC", "exit", price)
                 return
 
-            if not self.exit_oid[sym]:
-                if not can_submit:
-                    return
-                entry_px = self.entry_price[sym]
-                if net_pos > 0:
-                    target = entry_px * (1 + self.profit_target / 10000.0)
-                    price = ref_data_manager.round_price(sym, max(target, bid_1 + tick))
-                    self._place_exit(sym, Side.SELL, price, abs(net_pos))
-                else:
-                    target = entry_px * (1 - self.profit_target / 10000.0)
-                    price = ref_data_manager.round_price(sym, min(target, ask_1 - tick))
-                    self._place_exit(sym, Side.BUY, price, abs(net_pos))
+            if not can_submit:
+                return
+
+            entry_px = self.entry_price[sym]
+            exit_side, desired_price, _ = self._desired_exit_price(sym, net_pos, entry_px, bid_1, ask_1, tick, signal, confidence, holding_time)
+            if self.exit_oid[sym]:
+                meta = self.order_context.get(self.exit_oid[sym], {})
+                current_price = float(meta.get("limit_price", desired_price))
+                stale = (now - float(meta.get("submit_ts", now))) > self.exit_requote_sec
+                price_gap = abs(current_price - desired_price) >= tick
+                if stale and price_gap and self.exit_oid[sym] in self.active_orders:
+                    self.cancel_order(self.exit_oid[sym])
+                return
+
+            self._place_exit(sym, exit_side, desired_price, abs(net_pos))
 
         elif curr_state == "EXITING":
             if abs(net_pos) < 1e-6:
@@ -511,15 +582,7 @@ class MLSniperStrategy(StrategyTemplate):
             self.cancel_order(self.entry_oid[sym])
 
         is_ioc = mode == "IOC"
-        intent = OrderIntent(
-            self.name,
-            sym,
-            side,
-            price,
-            vol,
-            time_in_force="IOC" if is_ioc else "GTC",
-            is_post_only=not is_ioc,
-        )
+        intent = OrderIntent(self.name, sym, side, price, vol, time_in_force="IOC" if is_ioc else "GTC", is_post_only=not is_ioc)
         oid = self.send_intent(intent)
         if oid:
             self.entry_oid[sym] = oid
@@ -529,7 +592,7 @@ class MLSniperStrategy(StrategyTemplate):
             self._track_order_context(oid, sym, side, mode, "entry", price)
             sym_clean = sym.replace("USDC", "").replace("USDT", "").lower()
             side_str = "long" if side == Side.BUY else "short"
-            self.log(f"{sym_clean} enter {side_str} @ {price:.6g}  ({mode}, vol={vol})")
+            self.log(f"{sym_clean} enter {side_str} @ {price:.6g} ({mode}, vol={vol})")
 
     def _place_exit(self, sym: str, side: Side, price: float, vol: float):
         intent = OrderIntent(self.name, sym, side, price, vol, is_post_only=True)
@@ -539,7 +602,7 @@ class MLSniperStrategy(StrategyTemplate):
             self._track_order_context(oid, sym, side, "GTX", "exit", price)
             sym_clean = sym.replace("USDC", "").replace("USDT", "").lower()
             pos_str = "short" if side == Side.BUY else "long"
-            self.log(f"{sym_clean} exit  {pos_str} @ {price:.6g}  (GTX TP, vol={vol})")
+            self.log(f"{sym_clean} exit {pos_str} @ {price:.6g} (GTX TP, vol={vol})")
 
     def _clear_oids(self, sym: str):
         if self.entry_oid[sym]:
@@ -559,14 +622,7 @@ class MLSniperStrategy(StrategyTemplate):
         sym = snapshot.symbol
         oid = snapshot.client_oid
         status = snapshot.status
-
-        terminal = {
-            OrderStatus.FILLED,
-            OrderStatus.CANCELLED,
-            OrderStatus.REJECTED,
-            OrderStatus.REJECTED_LOCALLY,
-            OrderStatus.EXPIRED,
-        }
+        terminal = {OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.REJECTED_LOCALLY, OrderStatus.EXPIRED}
 
         if oid == self.entry_oid[sym]:
             if status == OrderStatus.PARTIALLY_FILLED:
@@ -599,6 +655,7 @@ class MLSniperStrategy(StrategyTemplate):
         if status in terminal:
             self._finalize_exit_feedback(sym, oid)
             self.order_context.pop(oid, None)
+
     def on_trade(self, trade: TradeData):
         meta = self.order_context.get(trade.order_id)
         if not meta:
@@ -638,52 +695,32 @@ class MLSniperStrategy(StrategyTemplate):
         avg_exit_pnl_bps = meta.get("exit_pnl_sum", 0.0) / exit_qty
         feedback = self.execution_feedback[sym]
         feedback["exit_pnl_ewma"] = self._ema(feedback["exit_pnl_ewma"], avg_exit_pnl_bps)
-        feedback["win_rate_ewma"] = self._ema(
-            feedback["win_rate_ewma"], 1.0 if avg_exit_pnl_bps > 0 else 0.0
-        )
+        feedback["win_rate_ewma"] = self._ema(feedback["win_rate_ewma"], 1.0 if avg_exit_pnl_bps > 0 else 0.0)
         feedback["closed_trades"] += 1
 
-    def _publish_state(
-        self,
-        sym: str,
-        mid: float,
-        bid_1: float,
-        ask_1: float,
-        signal: float,
-        velocity: float,
-        preds: dict,
-        predictor: TimeHorizonPredictor,
-    ):
+    def _publish_state(self, sym: str, mid: float, bid_1: float, ask_1: float, signal: float, velocity: float, preds: dict, predictor: TimeHorizonPredictor, confidence: float = 0.0):
         weights_1s = predictor.get_model_weights("1s")
-        labeled_w = {
-            FEATURE_LABELS[i]: round(weight, 4)
-            for i, weight in enumerate(weights_1s)
-            if i < len(FEATURE_LABELS)
-        }
+        labeled_w = {FEATURE_LABELS[i]: round(weight, 4) for i, weight in enumerate(weights_1s) if i < len(FEATURE_LABELS)}
         warmup_prog = predictor.warmup_progress()
         maker_required, maker_cost = self._required_signal_bps(sym, mid, bid_1, ask_1, "GTX")
         taker_required, taker_cost = self._required_signal_bps(sym, mid, bid_1, ask_1, "IOC")
         consensus = self._consensus_direction(preds)
         feedback = self.execution_feedback[sym]
         health = self.last_system_health or getattr(self.oms.state, "value", str(self.oms.state))
-        account_available = (
-            f"{self.latest_account.available:.1f}" if self.latest_account is not None else "-"
-        )
+        account_available = f"{self.latest_account.available:.1f}" if self.latest_account is not None else "-"
         reject_reason = self.last_submit_reject_by_symbol.get(sym, "-")
+        regime_ok, regime_reason, spread_bps, sigma_bps = self._regime_status(sym, mid, bid_1, ask_1, signal, min(maker_required, taker_required), confidence)
+        self.latest_regime[sym] = regime_reason
+        self.latest_spread_bps[sym] = spread_bps
+        self.latest_sigma_bps[sym] = sigma_bps
 
         if not self.can_submit_orders():
             entry_mode = "PAUSED"
-        elif (
-            signal > taker_required
-            and velocity > self.base_velocity_threshold
-            and self._has_consensus(preds, Side.BUY, "IOC")
-        ):
+        elif not regime_ok:
+            entry_mode = f"BLOCKED:{regime_reason}"
+        elif signal > taker_required and velocity > self.base_velocity_threshold and self._has_consensus(preds, Side.BUY, "IOC"):
             entry_mode = "IOC(accel)"
-        elif (
-            signal < -taker_required
-            and velocity < -self.base_velocity_threshold
-            and self._has_consensus(preds, Side.SELL, "IOC")
-        ):
+        elif signal < -taker_required and velocity < -self.base_velocity_threshold and self._has_consensus(preds, Side.SELL, "IOC"):
             entry_mode = "IOC(accel)"
         elif signal > maker_required and self._has_consensus(preds, Side.BUY, "GTX"):
             entry_mode = "GTX"
@@ -696,11 +733,16 @@ class MLSniperStrategy(StrategyTemplate):
             "State": self.state[sym],
             "Sig": f"{signal:+.2f}",
             "Vel": f"{velocity:+.2f}",
+            "Conf": f"{confidence:.2f}",
             "Mode": entry_mode,
             "1s": f"{preds.get('1s', 0):+.1f}",
             "10s": f"{preds.get('10s', 0):+.1f}",
             "30s": f"{preds.get('30s', 0):+.1f}",
             "Consensus": "UP" if consensus > 0 else "DOWN" if consensus < 0 else "MIXED",
+            "Regime": regime_reason,
+            "Spread": f"{spread_bps:.1f}",
+            "Sigma": f"{sigma_bps:.1f}",
+            "Size": f"{self.latest_size_scale[sym]:.2f}x",
             "MakerReq": f"{maker_required:.1f}",
             "TakerReq": f"{taker_required:.1f}",
             "MakerCost": f"{maker_cost:.1f}",
@@ -716,22 +758,9 @@ class MLSniperStrategy(StrategyTemplate):
             "Weights": labeled_w,
             "Train": warmup_prog,
         }
-        self.engine.put(
-            Event(
-                EVENT_STRATEGY_UPDATE,
-                StrategyData(symbol=sym, fair_value=mid, alpha_bps=signal, params=params),
-            )
-        )
+        self.engine.put(Event(EVENT_STRATEGY_UPDATE, StrategyData(symbol=sym, fair_value=mid, alpha_bps=signal, params=params)))
 
-    def _publish_warmup(
-        self,
-        sym: str,
-        mid: float,
-        signal: float,
-        velocity: float,
-        preds: dict,
-        predictor: TimeHorizonPredictor,
-    ):
+    def _publish_warmup(self, sym: str, mid: float, signal: float, velocity: float, preds: dict, predictor: TimeHorizonPredictor, confidence: float = 0.0):
         started_at = self.symbol_start_ts[sym] or self.start_time
         elapsed = time.time() - started_at
         warmup_prog = predictor.warmup_progress()
@@ -741,24 +770,12 @@ class MLSniperStrategy(StrategyTemplate):
             "State": f"WARMUP {progress_pct:.0f}%",
             "Sig": f"{signal:+.2f}",
             "Vel": f"{velocity:+.2f}",
-            "Consensus": "UP"
-            if self._consensus_direction(preds) > 0
-            else "DOWN"
-            if self._consensus_direction(preds) < 0
-            else "MIXED",
+            "Conf": f"{confidence:.2f}",
+            "Consensus": "UP" if self._consensus_direction(preds) > 0 else "DOWN" if self._consensus_direction(preds) < 0 else "MIXED",
             "Avail": f"{self.latest_account.available:.1f}" if self.latest_account is not None else "-",
             "Health": self.last_system_health or getattr(self.oms.state, "value", str(self.oms.state)),
             "Reject": self.last_submit_reject_by_symbol.get(sym, "-")[:32],
             "Train": warmup_prog,
-            "Weights": {
-                FEATURE_LABELS[i]: round(weight, 4)
-                for i, weight in enumerate(predictor.get_model_weights("1s"))
-                if i < len(FEATURE_LABELS)
-            },
+            "Weights": {FEATURE_LABELS[i]: round(weight, 4) for i, weight in enumerate(predictor.get_model_weights("1s")) if i < len(FEATURE_LABELS)},
         }
-        self.engine.put(
-            Event(
-                EVENT_STRATEGY_UPDATE,
-                StrategyData(symbol=sym, fair_value=mid, alpha_bps=0, params=params),
-            )
-        )
+        self.engine.put(Event(EVENT_STRATEGY_UPDATE, StrategyData(symbol=sym, fair_value=mid, alpha_bps=0, params=params)))
