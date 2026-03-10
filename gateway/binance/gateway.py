@@ -59,6 +59,7 @@ class BinanceGateway(BaseGateway):
         self.ws_buffer = {}
         self.active = False
         self.listen_key = ""
+        self.target_leverage = 0
 
         self.global_sequence_id = 0
         self.seq_lock = threading.Lock()
@@ -77,8 +78,11 @@ class BinanceGateway(BaseGateway):
             self.orderbooks[symbol] = LocalOrderBook(symbol)
             self.ws_buffer[symbol] = []
 
+        target_leverage = int(getattr(self, "target_leverage", 0) or 0)
         for symbol in self.symbols:
             self.rest.set_margin_type(symbol, "CROSSED")
+            if target_leverage > 0:
+                self.rest.set_leverage(symbol, target_leverage)
 
         self.ws.start_market_stream(self.symbols)
 

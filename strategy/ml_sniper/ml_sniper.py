@@ -38,9 +38,18 @@ class MLSniperStrategy(StrategyTemplate):
         super().__init__(engine, oms, "ML_Sniper_USDC")
 
         self.strat_conf = load_sniper_config()
-        raw_weights = self.strat_conf.get("weights", {"1s": 0.1, "10s": 0.5, "30s": 0.4})
-        self.weights = raw_weights if isinstance(raw_weights, dict) else {"1s": 0.1, "10s": 0.5, "30s": 0.4}
-        self.lot_multiplier = self.strat_conf.get("lot_multiplier", 1.0)
+        default_weights = {"1s": 0.1, "10s": 0.5, "30s": 0.4}
+        raw_weights = self.strat_conf.get("weights", default_weights)
+        if isinstance(raw_weights, dict):
+            self.weights = {}
+            for horizon, fallback in default_weights.items():
+                try:
+                    self.weights[horizon] = float(raw_weights.get(horizon, fallback))
+                except (TypeError, ValueError):
+                    self.weights[horizon] = fallback
+        else:
+            self.weights = dict(default_weights)
+        self.lot_multiplier = float(self.strat_conf.get("lot_multiplier", 1.0) or 1.0)
 
         entry_cfg = self.strat_conf.get("entry", {})
         self.base_taker_entry_threshold = entry_cfg.get("taker_entry_threshold_bps", 20.0)
@@ -104,7 +113,13 @@ class MLSniperStrategy(StrategyTemplate):
         self.min_warmup_sec = self.strat_conf.get("min_warmup_sec", 60.0)
         self.start_time = time.time()
 
-        backtest_cfg = getattr(self.oms, "config", {}).get("backtest", {})
+        oms_config = getattr(self.oms, "config", {})
+        account_cfg = oms_config.get("account", {})
+        risk_limits = oms_config.get("risk", {}).get("limits", {})
+        self.account_leverage = max(1.0, float(account_cfg.get("leverage", 1.0) or 1.0))
+        self.max_order_notional = float(risk_limits.get("max_order_notional", 0.0) or 0.0)
+
+        backtest_cfg = oms_config.get("backtest", {})
         self.maker_fee_bps = float(backtest_cfg.get("maker_fee", 0.0)) * 10000.0
         self.taker_fee_bps = float(backtest_cfg.get("taker_fee", 0.0005)) * 10000.0
 
@@ -182,10 +197,16 @@ class MLSniperStrategy(StrategyTemplate):
 
     def _calc_vol(self, symbol: str, price: float) -> float:
         info = ref_data_manager.get_info(symbol)
-        if not info:
+        if not info or price <= 0:
             return 0.0
-        min_vol = max(info.min_qty, (info.min_notional * 1.1) / price)
-        return ref_data_manager.round_qty(symbol, min_vol * self.lot_multiplier)
+
+        min_notional = max(info.min_notional * 1.1, info.min_qty * price)
+        target_notional = min_notional * max(self.lot_multiplier, 0.0) * self.account_leverage
+        if self.max_order_notional > 0:
+            target_notional = min(target_notional, self.max_order_notional * 0.95)
+
+        target_qty = max(info.min_qty, target_notional / price)
+        return ref_data_manager.round_qty(symbol, target_qty)
 
     def _tick_size(self, symbol: str, mid: float) -> float:
         info = ref_data_manager.get_info(symbol)
@@ -755,6 +776,7 @@ class MLSniperStrategy(StrategyTemplate):
             "Avail": account_available,
             "Health": health,
             "Reject": reject_reason[:32],
+            "Blend": {horizon: round(self.weights.get(horizon, 0.0), 2) for horizon in ("1s", "10s", "30s")},
             "Weights": labeled_w,
             "Train": warmup_prog,
         }
@@ -775,6 +797,7 @@ class MLSniperStrategy(StrategyTemplate):
             "Avail": f"{self.latest_account.available:.1f}" if self.latest_account is not None else "-",
             "Health": self.last_system_health or getattr(self.oms.state, "value", str(self.oms.state)),
             "Reject": self.last_submit_reject_by_symbol.get(sym, "-")[:32],
+            "Blend": {horizon: round(self.weights.get(horizon, 0.0), 2) for horizon in ("1s", "10s", "30s")},
             "Train": warmup_prog,
             "Weights": {FEATURE_LABELS[i]: round(weight, 4) for i, weight in enumerate(predictor.get_model_weights("1s")) if i < len(FEATURE_LABELS)},
         }

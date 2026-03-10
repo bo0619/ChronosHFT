@@ -50,27 +50,32 @@ class OMS:
         self.exchange_id_map = {}
         self.lock = threading.RLock()
 
+        target_leverage = int(config.get("account", {}).get("leverage", 0) or 0)
+        if target_leverage > 0:
+            self.gateway.target_leverage = target_leverage
+
         self.max_pos_notional = (
             config.get("risk", {})
             .get("limits", {})
-            .get("max_pos_notional", 2000.0)   # [RISK-1] 统一字段名，与 config.json 一致
+            .get("max_pos_notional", 2000.0)
         )
 
         self.sequence = SequenceValidator()
         self.validator = OrderValidator(config)
         self.exposure = ExposureManager()
         self.account = AccountManager(event_engine, self.exposure, config)
-        self.order_monitor = OrderManager(event_engine, gateway, self.trigger_reconcile)
+        self.order_monitor = OrderManager(
+            event_engine,
+            gateway,
+            self.trigger_reconcile,
+            config.get("oms", {}),
+        )
 
         self.journal = OMSJournal(config)
         self.TOMBSTONE_MAX = config.get("oms", {}).get("tombstone_max", 2000)
         self.terminated_oids = set()
         self.terminated_oid_queue = deque()
         self.rebuild_summary = self.rebuild_from_log()
-
-    # -----------------------------------------------------------
-    # Lifecycle
-    # -----------------------------------------------------------
 
     def bootstrap(self):
         logger.info("OMS: Bootstrapping state...")
@@ -93,10 +98,6 @@ class OMS:
     def stop(self):
         self._audit("oms_stopped", state=self.state.value)
         self.order_monitor.stop()
-
-    # -----------------------------------------------------------
-    # Recovery and reconcile
-    # -----------------------------------------------------------
 
     def trigger_reconcile(self, reason: str, suspicious_oid: str = None):
         if self.state in [LifecycleState.RECONCILING, LifecycleState.HALTED]:
@@ -161,13 +162,18 @@ class OMS:
                 return
 
             remote_has_suspicious = False
+            local_has_suspicious = False
             if suspicious_oid:
                 remote_has_suspicious = any(
                     suspicious_oid in order["identifiers"]
                     for order in remote_active_orders
                 )
+                local_has_suspicious = any(
+                    suspicious_oid in order["identifiers"]
+                    for order in local_active_orders
+                )
 
-            if remote_has_suspicious:
+            if remote_has_suspicious and not local_has_suspicious:
                 self._audit(
                     "reconcile_reset",
                     case="missing_local_order",
@@ -242,10 +248,6 @@ class OMS:
 
         except Exception as exc:
             self.halt_system(f"Reset failed: {exc}")
-
-    # -----------------------------------------------------------
-    # Downstream requests
-    # -----------------------------------------------------------
 
     def submit_order(self, intent: OrderIntent) -> OrderSubmitResult:
         client_oid = str(uuid.uuid4())
@@ -397,10 +399,6 @@ class OMS:
     def cancel_all_orders(self, symbol: str):
         self._audit("cancel_all_submitted", symbol=symbol)
         self.gateway.cancel_all_orders(symbol)
-
-    # -----------------------------------------------------------
-    # Upstream exchange updates
-    # -----------------------------------------------------------
 
     def on_exchange_update(self, event):
         self._append_and_process(event)
@@ -689,10 +687,6 @@ class OMS:
                 f"[OMS] Recovered {recovered_terminal_ids} terminal IDs from journal"
             )
         return summary
-
-    # -----------------------------------------------------------
-    # Internal helpers
-    # -----------------------------------------------------------
 
     def _normalize_remote_open_orders(self, remote_orders):
         tracked_symbols = set(self.config.get("symbols", []))

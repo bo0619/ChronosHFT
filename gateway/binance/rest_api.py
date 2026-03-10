@@ -1,14 +1,18 @@
 # file: gateway/binance/rest_api.py
 
-import requests
-import time
-import hmac
 import hashlib
+import hmac
+import threading
+import time
 from urllib.parse import urlencode
+
+import requests
+
 from infrastructure.logger import logger
 from infrastructure.time_service import time_service
-from event.type import OrderRequest, CancelRequest, TIF_GTX
+from event.type import CancelRequest, OrderRequest, TIF_GTX
 from .constants import *
+
 
 class BinanceRestApi:
     def __init__(self, api_key, api_secret, session, testnet=False):
@@ -17,69 +21,108 @@ class BinanceRestApi:
         self.session = session
         self.base_url = REST_URL_TEST if testnet else REST_URL_MAIN
 
+        self.request_lock = threading.Lock()
+        self.last_request_ts = 0.0
+        self.endpoint_last_request_ts = {}
+        self.min_signed_interval_sec = 0.15
+        self.min_public_interval_sec = 0.05
+        self.endpoint_intervals = {
+            EP_ACCOUNT: 0.50,
+            EP_POSITION_RISK: 0.75,
+            EP_OPEN_ORDERS: 0.50,
+            EP_ORDER: 0.10,
+            EP_ALL_OPEN_ORDERS: 0.20,
+            EP_LEVERAGE: 0.20,
+            EP_MARGIN_TYPE: 0.20,
+            EP_LISTEN_KEY: 0.20,
+        }
+        self.max_retries = 2
+        self.retry_backoff_sec = 0.25
+
     def _sign(self, params: dict):
         query = urlencode(params)
         signature = hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
         params["signature"] = signature
         return params
 
+    def _throttle(self, endpoint: str, signed: bool):
+        min_interval = self.min_signed_interval_sec if signed else self.min_public_interval_sec
+        endpoint_interval = max(min_interval, self.endpoint_intervals.get(endpoint, min_interval))
+
+        with self.request_lock:
+            now = time.monotonic()
+            global_wait = max(0.0, min_interval - (now - self.last_request_ts))
+            endpoint_wait = max(0.0, endpoint_interval - (now - self.endpoint_last_request_ts.get(endpoint, 0.0)))
+            wait_time = max(global_wait, endpoint_wait)
+            if wait_time > 0:
+                time.sleep(wait_time)
+            stamp = time.monotonic()
+            self.last_request_ts = stamp
+            self.endpoint_last_request_ts[endpoint] = stamp
+
     def request(self, method, endpoint, params=None, signed=True):
         url = self.base_url + endpoint
-        params = params or {}
-        
-        if signed:
-            params["timestamp"] = time_service.now()
-            self._sign(params)
-        
+        base_params = dict(params or {})
         headers = {"X-MBX-APIKEY": self.api_key} if signed else {}
-        
-        try:
-            req = requests.Request(method, url, params=params, headers=headers)
-            prepped = self.session.prepare_request(req)
-            resp = self.session.send(prepped, timeout=3.0) 
-            return resp
-        except Exception as e:
-            logger.error(f"REST Exception [{endpoint}]: {e}")
-            return None
 
-    # --- 1. 行情模块 ---
+        for attempt in range(1, self.max_retries + 1):
+            self._throttle(endpoint, signed)
+            req_params = dict(base_params)
+
+            if signed:
+                req_params["timestamp"] = time_service.now()
+                self._sign(req_params)
+
+            try:
+                req = requests.Request(method, url, params=req_params, headers=headers)
+                prepped = self.session.prepare_request(req)
+                return self.session.send(prepped, timeout=3.0)
+            except Exception as exc:
+                if attempt >= self.max_retries:
+                    logger.error(f"REST Exception [{endpoint}]: {exc}")
+                    return None
+                backoff = self.retry_backoff_sec * attempt
+                logger.warning(
+                    f"REST retry [{endpoint}] attempt {attempt}/{self.max_retries} after {backoff:.2f}s: {exc}"
+                )
+                time.sleep(backoff)
+
+        return None
+
     def get_depth_snapshot(self, symbol, limit=1000):
         resp = self.request("GET", EP_DEPTH_SNAPSHOT, {"symbol": symbol, "limit": limit}, signed=False)
         return resp.json() if resp and resp.status_code == 200 else None
 
-    # --- 2. 交易模块 ---
     def new_order(self, req: OrderRequest, client_oid: str = None):
-        """POST /fapi/v1/order"""
         params = {
             "symbol": req.symbol,
             "side": req.side,
             "type": req.order_type,
             "quantity": req.volume,
         }
-        
+
         if client_oid:
             params["newClientOrderId"] = client_oid
-        
+
         if req.order_type == "LIMIT":
             params["price"] = req.price
-            # [Removed] RPI TIF Logic
             params["timeInForce"] = TIF_GTX if req.post_only else req.time_in_force
-        
-        resp = self.request("POST", EP_ORDER, params, signed=True)
-        return resp
+
+        return self.request("POST", EP_ORDER, params, signed=True)
 
     def cancel_order(self, req: CancelRequest):
         params = {"symbol": req.symbol}
-        if req.order_id.isdigit(): params["orderId"] = req.order_id
-        else: params["origClientOrderId"] = req.order_id
+        if req.order_id.isdigit():
+            params["orderId"] = req.order_id
+        else:
+            params["origClientOrderId"] = req.order_id
         return self.request("DELETE", EP_ORDER, params, signed=True)
 
     def cancel_all_orders(self, symbol):
         return self.request("DELETE", EP_ALL_OPEN_ORDERS, {"symbol": symbol}, signed=True)
 
-    # --- 3. 账户与基础模块 ---
     def create_listen_key(self):
-        resp = self.request("POST", EP_LISTEN_KEY, signed=True) 
+        resp = self.request("POST", EP_LISTEN_KEY, signed=True)
         return resp.json().get("listenKey") if resp and resp.status_code == 200 else None
 
     def keep_alive_listen_key(self):
@@ -91,10 +134,16 @@ class BinanceRestApi:
 
     def set_margin_type(self, symbol, margin_type="CROSSED"):
         params = {"symbol": symbol, "marginType": margin_type}
-        try: self.request("POST", EP_MARGIN_TYPE, params, signed=True)
-        except: pass
+        try:
+            self.request("POST", EP_MARGIN_TYPE, params, signed=True)
+        except Exception:
+            pass
 
-    # --- 4. 查询接口 ---
-    def get_account(self): return self.request("GET", EP_ACCOUNT, signed=True)
-    def get_positions(self): return self.request("GET", EP_POSITION_RISK, signed=True)
-    def get_open_orders(self): return self.request("GET", EP_OPEN_ORDERS, signed=True)
+    def get_account(self):
+        return self.request("GET", EP_ACCOUNT, signed=True)
+
+    def get_positions(self):
+        return self.request("GET", EP_POSITION_RISK, signed=True)
+
+    def get_open_orders(self):
+        return self.request("GET", EP_OPEN_ORDERS, signed=True)

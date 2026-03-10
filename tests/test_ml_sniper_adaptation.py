@@ -58,6 +58,10 @@ class MLSniperAdaptationTests(unittest.TestCase):
         self.assertTrue(self.strategy.symbol_warmup_ready["BTCUSDT"])
         self.assertFalse(self.strategy.symbol_warmup_ready["ETHUSDT"])
 
+    def test_comment_entries_are_filtered_out_of_weights(self):
+        self.assertEqual(set(self.strategy.weights.keys()), {"1s", "10s", "30s"})
+        self.assertTrue(all(isinstance(weight, float) for weight in self.strategy.weights.values()))
+
     @patch("strategy.ml_sniper.ml_sniper.ref_data_manager.round_price", side_effect=lambda symbol, price: price)
     def test_consensus_filter_blocks_conflicts_and_allows_alignment(self, _round_price):
         sym = "BTCUSDT"
