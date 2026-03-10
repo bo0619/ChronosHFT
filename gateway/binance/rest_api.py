@@ -1,5 +1,3 @@
-# file: gateway/binance/rest_api.py
-
 import hashlib
 import hmac
 import threading
@@ -24,20 +22,24 @@ class BinanceRestApi:
         self.request_lock = threading.Lock()
         self.last_request_ts = 0.0
         self.endpoint_last_request_ts = {}
-        self.min_signed_interval_sec = 0.15
+        self.endpoint_cooldown_until = {}
+        self.min_signed_interval_sec = 0.20
         self.min_public_interval_sec = 0.05
         self.endpoint_intervals = {
-            EP_ACCOUNT: 0.50,
-            EP_POSITION_RISK: 0.75,
-            EP_OPEN_ORDERS: 0.50,
+            EP_ACCOUNT: 1.00,
+            EP_POSITION_RISK: 1.50,
+            EP_OPEN_ORDERS: 1.00,
             EP_ORDER: 0.10,
-            EP_ALL_OPEN_ORDERS: 0.20,
-            EP_LEVERAGE: 0.20,
-            EP_MARGIN_TYPE: 0.20,
-            EP_LISTEN_KEY: 0.20,
+            EP_ALL_OPEN_ORDERS: 0.30,
+            EP_LEVERAGE: 0.30,
+            EP_MARGIN_TYPE: 0.30,
+            EP_LISTEN_KEY: 0.30,
         }
         self.max_retries = 2
-        self.retry_backoff_sec = 0.25
+        self.retry_backoff_sec = 0.50
+        self.failure_backoff_multiplier = 2.0
+        self.max_endpoint_cooldown_sec = 10.0
+        self.timeout_sec = 3.0
 
     def _sign(self, params: dict):
         query = urlencode(params)
@@ -52,13 +54,26 @@ class BinanceRestApi:
         with self.request_lock:
             now = time.monotonic()
             global_wait = max(0.0, min_interval - (now - self.last_request_ts))
-            endpoint_wait = max(0.0, endpoint_interval - (now - self.endpoint_last_request_ts.get(endpoint, 0.0)))
-            wait_time = max(global_wait, endpoint_wait)
+            endpoint_wait = max(
+                0.0,
+                endpoint_interval - (now - self.endpoint_last_request_ts.get(endpoint, 0.0)),
+            )
+            cooldown_wait = max(0.0, self.endpoint_cooldown_until.get(endpoint, 0.0) - now)
+            wait_time = max(global_wait, endpoint_wait, cooldown_wait)
             if wait_time > 0:
                 time.sleep(wait_time)
             stamp = time.monotonic()
             self.last_request_ts = stamp
             self.endpoint_last_request_ts[endpoint] = stamp
+
+    def _mark_failure_cooldown(self, endpoint: str, attempt: int):
+        endpoint_interval = self.endpoint_intervals.get(endpoint, self.min_signed_interval_sec)
+        cooldown_sec = min(
+            self.max_endpoint_cooldown_sec,
+            max(self.retry_backoff_sec * attempt, endpoint_interval * self.failure_backoff_multiplier),
+        )
+        self.endpoint_cooldown_until[endpoint] = time.monotonic() + cooldown_sec
+        return cooldown_sec
 
     def request(self, method, endpoint, params=None, signed=True):
         url = self.base_url + endpoint
@@ -76,16 +91,17 @@ class BinanceRestApi:
             try:
                 req = requests.Request(method, url, params=req_params, headers=headers)
                 prepped = self.session.prepare_request(req)
-                return self.session.send(prepped, timeout=3.0)
+                response = self.session.send(prepped, timeout=self.timeout_sec)
+                self.endpoint_cooldown_until[endpoint] = 0.0
+                return response
             except Exception as exc:
+                cooldown_sec = self._mark_failure_cooldown(endpoint, attempt)
                 if attempt >= self.max_retries:
                     logger.error(f"REST Exception [{endpoint}]: {exc}")
                     return None
-                backoff = self.retry_backoff_sec * attempt
                 logger.warning(
-                    f"REST retry [{endpoint}] attempt {attempt}/{self.max_retries} after {backoff:.2f}s: {exc}"
+                    f"REST retry [{endpoint}] attempt {attempt}/{self.max_retries} after {cooldown_sec:.2f}s: {exc}"
                 )
-                time.sleep(backoff)
 
         return None
 

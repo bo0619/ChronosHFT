@@ -77,6 +77,14 @@ class OMS:
         self.terminated_oid_queue = deque()
         self.rebuild_summary = self.rebuild_from_log()
 
+        oms_cfg = config.get("oms", {})
+        self.reconcile_min_interval_sec = float(oms_cfg.get("reconcile_min_interval_sec", 5.0))
+        self.reconcile_api_failure_threshold = int(oms_cfg.get("reconcile_api_failure_threshold", 3))
+        self.reconcile_api_cooldown_sec = float(oms_cfg.get("reconcile_api_cooldown_sec", 10.0))
+        self.last_reconcile_request_ts = 0.0
+        self.last_reconcile_failure_ts = 0.0
+        self.consecutive_reconcile_api_failures = 0
+
     def bootstrap(self):
         logger.info("OMS: Bootstrapping state...")
         self._audit("bootstrap_requested", recovered=self.rebuild_summary)
@@ -102,6 +110,29 @@ class OMS:
     def trigger_reconcile(self, reason: str, suspicious_oid: str = None):
         if self.state in [LifecycleState.RECONCILING, LifecycleState.HALTED]:
             return
+
+        now = time.monotonic()
+        if self.last_reconcile_failure_ts and now - self.last_reconcile_failure_ts < self.reconcile_api_cooldown_sec:
+            logger.warning(f"[OMS] Reconcile suppressed during API cooldown: {reason}")
+            self._audit(
+                "reconcile_suppressed",
+                reason=reason,
+                suspicious_oid=suspicious_oid,
+                cooldown="api_failure",
+            )
+            return
+
+        if now - self.last_reconcile_request_ts < self.reconcile_min_interval_sec:
+            logger.warning(f"[OMS] Reconcile suppressed by min interval: {reason}")
+            self._audit(
+                "reconcile_suppressed",
+                reason=reason,
+                suspicious_oid=suspicious_oid,
+                cooldown="min_interval",
+            )
+            return
+
+        self.last_reconcile_request_ts = now
         logger.warning(f"OMS dirty: {reason}. State -> RECONCILING")
         self.state = LifecycleState.RECONCILING
         self._audit(
@@ -123,8 +154,26 @@ class OMS:
             remote_orders = self.gateway.get_open_orders()
 
             if remote_positions is None or remote_orders is None:
-                self.halt_system("Reconcile API unreachable")
+                self.consecutive_reconcile_api_failures += 1
+                self.last_reconcile_failure_ts = time.monotonic()
+                attempt = self.consecutive_reconcile_api_failures
+                self._audit(
+                    "reconcile_api_unreachable",
+                    failures=attempt,
+                    suspicious_oid=suspicious_oid,
+                )
+                if attempt >= self.reconcile_api_failure_threshold:
+                    self.halt_system("Reconcile API unreachable")
+                else:
+                    logger.error(
+                        f"[Reconcile] API unreachable ({attempt}/{self.reconcile_api_failure_threshold}); "
+                        "keeping LIVE and backing off."
+                    )
+                    self.state = LifecycleState.LIVE
                 return
+
+            self.consecutive_reconcile_api_failures = 0
+            self.last_reconcile_failure_ts = 0.0
 
             with self.lock:
                 remote_map = {
