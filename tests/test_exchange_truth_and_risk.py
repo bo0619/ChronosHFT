@@ -42,6 +42,7 @@ from event.type import (
     ExchangeAccountUpdate,
     ExchangeOrderUpdate,
     ExecutionPolicy,
+    GatewayState,
     MarkPriceData,
     OrderBook,
     OrderIntent,
@@ -49,6 +50,7 @@ from event.type import (
     EVENT_ACCOUNT_UPDATE,
     EVENT_EXCHANGE_ACCOUNT_UPDATE,
     EVENT_EXCHANGE_ORDER_UPDATE,
+    EVENT_SYSTEM_HEALTH,
 )
 from gateway.binance.gateway import BinanceGateway
 from oms.engine import OMS
@@ -257,6 +259,42 @@ class ExchangeTruthTests(unittest.TestCase):
         self.assertEqual(account_event.data.balances["USDC"]["available_balance"], 205.5)
         self.assertIn("BTCUSDT", account_event.data.positions)
 
+    def test_gateway_ws_parse_failure_emits_system_health_event(self):
+        engine = DummyEngine()
+        gateway = BinanceGateway.__new__(BinanceGateway)
+        gateway.event_engine = engine
+        gateway.gateway_name = "BINANCE"
+        gateway.state = GatewayState.READY
+
+        gateway.on_ws_message("{bad-json")
+
+        self.assertEqual(engine.events[-1].type, EVENT_SYSTEM_HEALTH)
+        self.assertIn("WS_PARSE_ERROR", engine.events[-1].data)
+
+    def test_exchange_account_position_drift_triggers_reconcile_without_active_orders(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = OMS(engine, gateway, self.make_config())
+        try:
+            oms.exposure.force_sync("BTCUSDT", 1.0, 100.0)
+            called = []
+            oms.trigger_reconcile = lambda reason, suspicious_oid=None: called.append((reason, suspicious_oid))
+
+            update = ExchangeAccountUpdate(
+                asset="USDT",
+                wallet_balance=1000.0,
+                available_balance=1000.0,
+                balances={"USDT": {"wallet_balance": 1000.0, "available_balance": 1000.0}},
+                positions={},
+                reason="ORDER",
+                event_time=1.0,
+            )
+            oms.on_exchange_account_update(Event(EVENT_EXCHANGE_ACCOUNT_UPDATE, update))
+
+            self.assertEqual(called, [("Exchange account position drift", None)])
+        finally:
+            oms.stop()
+
 class RiskExecutionTests(unittest.TestCase):
     def make_risk_config(self):
         return {
@@ -336,6 +374,25 @@ class RiskExecutionTests(unittest.TestCase):
         self.assertTrue(risk.kill_switch_triggered)
         self.assertIn("divergence", risk.kill_reason)
 
+
+    def test_latency_limit_uses_exchange_timestamp_over_local_datetime(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        risk = RiskManager(engine, self.make_risk_config(), oms=oms, gateway=gateway)
+
+        fresh_local_time = datetime.now()
+        exchange_ts = (fresh_local_time - timedelta(milliseconds=250)).timestamp()
+        stale_book = OrderBook(
+            symbol="BTCUSDT",
+            exchange="BINANCE",
+            datetime=fresh_local_time,
+            exchange_timestamp=exchange_ts,
+        )
+        risk.on_orderbook(Event("eOrderBook", stale_book))
+        risk.on_orderbook(Event("eOrderBook", stale_book))
+
+        self.assertTrue(risk.kill_switch_triggered)
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,8 @@ import unittest
 if "requests" not in sys.modules:
     requests_stub = types.ModuleType("requests")
     requests_stub.get = lambda *args, **kwargs: None
+    requests_stub.Session = lambda *args, **kwargs: None
+    requests_stub.Request = object
     sys.modules["requests"] = requests_stub
 
 from event.type import (

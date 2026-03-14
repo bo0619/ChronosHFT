@@ -1,3 +1,17 @@
+﻿function Write-Utf8NoBom([string]$Path, [string]$Content) {
+    if ([System.IO.Path]::IsPathRooted($Path)) {
+        $fullPath = $Path
+    } else {
+        $fullPath = Join-Path (Get-Location) $Path
+    }
+    $dir = Split-Path -Parent $fullPath
+    if ($dir -and -not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    [System.IO.File]::WriteAllText($fullPath, $Content, [System.Text.UTF8Encoding]::new($false))
+}
+
+Write-Utf8NoBom 'event/type.py' @"
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -311,3 +325,37 @@ class StrategyData:
     alpha_bps: float
     params: Dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=lambda: datetime.now().timestamp())
+"@
+
+Write-Utf8NoBom 'tests/test_exchange_truth_and_risk.py' ((Get-Content 'tests/test_exchange_truth_and_risk.py' -Raw).Replace(@"
+from event.type import (
+    AccountData,
+    Event,
+    ExchangeAccountUpdate,
+    ExchangeOrderUpdate,
+    ExecutionPolicy,
+    MarkPriceData,
+    OrderBook,
+    OrderIntent,
+    Side,
+    EVENT_ACCOUNT_UPDATE,
+    EVENT_EXCHANGE_ACCOUNT_UPDATE,
+    EVENT_EXCHANGE_ORDER_UPDATE,`r`n    EVENT_SYSTEM_HEALTH,`r`n    GatewayState,`r`n)
+"@, @"
+from event.type import (
+    AccountData,
+    Event,
+    ExchangeAccountUpdate,
+    ExchangeOrderUpdate,
+    ExecutionPolicy,
+    GatewayState,
+    MarkPriceData,
+    OrderBook,
+    OrderIntent,
+    Side,
+    EVENT_ACCOUNT_UPDATE,
+    EVENT_EXCHANGE_ACCOUNT_UPDATE,
+    EVENT_EXCHANGE_ORDER_UPDATE,
+    EVENT_SYSTEM_HEALTH,
+)
+"@))

@@ -468,17 +468,30 @@ class OMS:
                 asset=update.asset,
                 balances=update.balances,
             )
-            position_drift = self._collect_exchange_position_drift_locked(tracked_positions)
-            has_active_orders = self._has_active_orders_locked(tracked_positions.keys())
-
-        if position_drift:
-            self._audit(
-                "exchange_account_position_drift",
-                reason=update.reason,
-                positions=position_drift,
+            position_drift = self._collect_exchange_position_drift_locked(
+                tracked_positions,
+                tracked_symbols,
             )
-            if not has_active_orders and self.state != LifecycleState.HALTED:
-                logger.warning(f"[OMS] Exchange position drift detected: {position_drift}")
+            has_active_orders = self._has_active_orders_locked(tracked_symbols)
+
+        if not position_drift:
+            return
+
+        self._audit(
+            "exchange_account_position_drift",
+            reason=update.reason,
+            positions=position_drift,
+        )
+
+        if self.state in {LifecycleState.HALTED, LifecycleState.RECONCILING}:
+            return
+
+        if has_active_orders:
+            logger.warning(f"[OMS] Exchange position drift detected while orders are active: {position_drift}")
+            return
+
+        logger.error(f"[OMS] Exchange position drift detected without active orders: {position_drift}")
+        self.trigger_reconcile("Exchange account position drift")
 
     def _append_and_process(self, event):
         if self.state == LifecycleState.HALTED:
@@ -789,10 +802,19 @@ class OMS:
         normalized.sort(key=lambda item: (item["symbol"], item["identifiers"], item["side"]))
         return normalized
 
-    def _collect_exchange_position_drift_locked(self, exchange_positions):
+    def _collect_exchange_position_drift_locked(self, exchange_positions, tracked_symbols=None):
         drift = {}
-        for symbol, payload in exchange_positions.items():
+        symbols = set(tracked_symbols or [])
+        symbols.update(exchange_positions.keys())
+        symbols.update(
+            symbol
+            for symbol, volume in self.exposure.net_positions.items()
+            if abs(volume) > 1e-6 and (not symbols or symbol in symbols)
+        )
+
+        for symbol in symbols:
             local_pos = self.exposure.net_positions.get(symbol, 0.0)
+            payload = exchange_positions.get(symbol, {})
             exchange_pos = float(payload.get("volume", 0.0))
             if abs(local_pos - exchange_pos) > 1e-6:
                 drift[symbol] = {

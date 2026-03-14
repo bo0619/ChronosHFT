@@ -27,6 +27,7 @@ from gateway.binance.gateway import BinanceGateway
 from infrastructure.logger import logger
 from infrastructure.system_health import handle_system_health_event
 from infrastructure.time_service import time_service
+from infrastructure.watchdog import emit_market_data_stale_if_needed
 from oms.engine import OMS
 from risk.manager import RiskManager
 from strategy.ml_sniper.ml_sniper import MLSniperStrategy
@@ -66,9 +67,11 @@ def main():
     engine.register(EVENT_AGG_TRADE, lambda e: data_cache.update_trade(e.data))
 
     main.last_tick_time = time.time()
+    main.stale_watchdog_triggered = False
 
     def on_tick(orderbook):
         main.last_tick_time = time.time()
+        main.stale_watchdog_triggered = False
         strategy.on_orderbook(orderbook)
         dashboard.update_market(orderbook)
 
@@ -99,9 +102,11 @@ def main():
             while True:
                 live.update(dashboard.render())
                 time.sleep(0.1)
-                if time.time() - main.last_tick_time > 60:
-                    logger.warning("SYSTEM WATCHDOG: Data stream unresponsive for 60s.")
-                    main.last_tick_time = time.time()
+                main.stale_watchdog_triggered = emit_market_data_stale_if_needed(
+                    engine,
+                    main.last_tick_time,
+                    main.stale_watchdog_triggered,
+                )
     except KeyboardInterrupt:
         logger.info("Shutdown signal received.")
         if recorder:

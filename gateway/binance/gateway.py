@@ -98,6 +98,8 @@ class BinanceGateway(BaseGateway):
     def close(self):
         self.active = False
         self.set_state(GatewayState.DISCONNECTED)
+        if self.ws:
+            self.ws.close()
         if self.session:
             self.session.close()
         logger.info(f"[{self.gateway_name}] Closed.")
@@ -153,6 +155,11 @@ class BinanceGateway(BaseGateway):
     def on_ws_message(self, raw_msg):
         try:
             msg = json.loads(raw_msg)
+        except Exception as exc:
+            self._emit_ws_fault("WS_PARSE_ERROR", str(exc), raw_msg)
+            return
+
+        try:
             event_type = msg.get("e")
             if event_type == "ORDER_TRADE_UPDATE":
                 self._handle_user_update(msg)
@@ -160,13 +167,42 @@ class BinanceGateway(BaseGateway):
             if event_type == "ACCOUNT_UPDATE":
                 self._handle_account_update(msg)
                 return
+            if event_type == "listenKeyExpired":
+                self._emit_ws_fault("USER_STREAM_EXPIRED", "listen key expired", msg)
+                return
             if "stream" in msg:
                 self._handle_market_update(msg)
-        except Exception:
-            pass
+                return
+            if self._is_control_message(msg):
+                return
+            logger.warning(f"[{self.gateway_name}] Ignoring unsupported WS payload: {msg}")
+        except Exception as exc:
+            self._emit_ws_fault("WS_HANDLER_FAILURE", str(exc), msg)
 
     def on_ws_error(self, err_msg):
+        logger.error(f"[{self.gateway_name}] {err_msg}")
         self.on_log(err_msg, "ERROR")
+
+    def _is_control_message(self, msg):
+        return isinstance(msg, dict) and "result" in msg and "id" in msg
+
+    def _emit_ws_fault(self, code: str, detail: str = "", payload=None):
+        message = f"{code}: {detail}" if detail else code
+        if payload is not None:
+            payload_preview = str(payload)
+            if len(payload_preview) > 240:
+                payload_preview = payload_preview[:237] + "..."
+            logger.error(f"[{self.gateway_name}] {message} payload={payload_preview}")
+        else:
+            logger.error(f"[{self.gateway_name}] {message}")
+
+        self.active = False
+        ws_client = getattr(self, "ws", None)
+        if ws_client:
+            ws_client.close()
+        if self.state != GatewayState.ERROR:
+            self.set_state(GatewayState.ERROR)
+        self.event_engine.put(Event(EVENT_SYSTEM_HEALTH, message))
 
     def _handle_user_update(self, msg):
         order = msg.get("o", {})

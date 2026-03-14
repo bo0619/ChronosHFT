@@ -113,7 +113,10 @@ class RiskManager:
             return
 
         orderbook = event.data
-        latency_ms = max(0.0, (time.time() - orderbook.datetime.timestamp()) * 1000.0)
+        exchange_ts = float(getattr(orderbook, "exchange_timestamp", 0.0) or 0.0)
+        received_ts = float(getattr(orderbook, "received_timestamp", 0.0) or 0.0)
+        reference_ts = exchange_ts or received_ts or orderbook.datetime.timestamp()
+        latency_ms = max(0.0, (time.time() - reference_ts) * 1000.0)
         if latency_ms > self.max_latency_ms:
             self.latency_breach_count += 1
             self._log_warn(
