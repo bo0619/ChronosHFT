@@ -176,6 +176,19 @@ class VenueSupervisorTests(unittest.TestCase):
         self.assertTrue(recovered)
         self.assertEqual(supervisor.gateway.calls, 1)
 
+    def test_supervisor_recovers_on_transport_drop_venue_freeze(self):
+        supervisor = VenueSupervisor(
+            DummyOms("system_health:WS_TRANSPORT_DROP:UserWS:Connection to remote host was lost."),
+            DummyGateway(recover_result=True),
+            self.make_config(),
+            start_thread=False,
+        )
+
+        recovered = supervisor.poll_once()
+
+        self.assertTrue(recovered)
+        self.assertEqual(supervisor.gateway.calls, 1)
+
     def test_supervisor_ignores_non_recoverable_venue_freeze(self):
         supervisor = VenueSupervisor(
             DummyOms("truth_plane:api_unreachable:2"),
@@ -191,6 +204,40 @@ class VenueSupervisorTests(unittest.TestCase):
 
 
 class GatewayRecoveryTests(unittest.TestCase):
+    def test_transport_drop_fault_freezes_venue(self):
+        engine = DummyEngine()
+        gateway = BinanceGateway.__new__(BinanceGateway)
+        gateway.event_engine = engine
+        gateway.gateway_name = "BINANCE"
+        gateway.testnet = True
+        gateway.symbols = ["BTCUSDT"]
+        gateway.orderbooks = {}
+        gateway.ws_buffer = {}
+        gateway.book_resyncing = set()
+        gateway.active = True
+        gateway.listen_key = ""
+        gateway.target_leverage = 0
+        gateway.recovery_lock = threading.Lock()
+        gateway.keep_alive_generation = 0
+        gateway.state = GatewayState.READY
+        gateway.ws = SimpleNamespace(close=lambda: None)
+        gateway.set_state = lambda state: setattr(gateway, "state", state)
+
+        gateway.on_ws_error(
+            {
+                "stream": "UserWS",
+                "kind": "transport_drop",
+                "detail": "Connection to remote host was lost.",
+            }
+        )
+
+        self.assertEqual(gateway.state, GatewayState.ERROR)
+        self.assertEqual(engine.events[-1].type, EVENT_SYSTEM_HEALTH)
+        self.assertEqual(
+            engine.events[-1].data,
+            "FREEZE_VENUE:BINANCE:WS_TRANSPORT_DROP: UserWS:Connection to remote host was lost.",
+        )
+
     @patch("gateway.binance.gateway.time.sleep", return_value=None)
     def test_recover_connectivity_emits_clear_venue(self, _sleep):
         engine = DummyEngine()

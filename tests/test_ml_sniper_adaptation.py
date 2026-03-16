@@ -79,6 +79,8 @@ class FakeAlphaProcess:
         unhealthy_symbols=None,
         recovering_symbols=None,
         restart_events=None,
+        quarantined_symbols=None,
+        quarantine_events=None,
     ):
         self.enabled = True
         self.snapshots = list(snapshots or [])
@@ -86,6 +88,8 @@ class FakeAlphaProcess:
         self.unhealthy_symbols = set(unhealthy_symbols or [])
         self.recovering_symbols = set(recovering_symbols or [])
         self.restart_events = set(restart_events or [])
+        self.quarantined_symbols = set(quarantined_symbols or [])
+        self.quarantine_events = set(quarantine_events or [])
         self.orderbooks = []
         self.trades = []
         self.stopped = False
@@ -121,9 +125,17 @@ class FakeAlphaProcess:
     def get_recovering_symbols(self):
         return set(self.recovering_symbols)
 
+    def get_quarantined_symbols(self):
+        return set(self.quarantined_symbols)
+
     def drain_restart_events(self):
         pending = set(self.restart_events)
         self.restart_events.clear()
+        return pending
+
+    def drain_quarantine_events(self):
+        pending = set(self.quarantine_events)
+        self.quarantine_events.clear()
         return pending
 
     def mark_symbol_recovered(self, symbol):
@@ -488,6 +500,25 @@ class MLSniperAdaptationTests(unittest.TestCase):
             "system_health:manual",
         )
         self.assertIn(sym, self.strategy.alpha_rewarming_symbols)
+
+    def test_alpha_quarantine_freezes_symbol_with_quarantine_reason(self):
+        sym = "BTCUSDT"
+        self.strategy.alpha_process = FakeAlphaProcess(
+            healthy=False,
+            unhealthy_symbols={sym},
+            quarantined_symbols={sym},
+            quarantine_events={sym},
+        )
+        self.strategy.alpha_process.enabled = True
+
+        self.strategy.poll_async_workers()
+
+        self.assertEqual(self.oms.frozen_strategies[-1][1], "alpha_process_quarantined")
+        self.assertEqual(self.oms.frozen_strategies[-1][2], sym)
+        self.assertEqual(
+            self.oms.get_strategy_freeze_reason(self.strategy.name, symbol=sym),
+            "alpha_process_quarantined",
+        )
 
 
 if __name__ == "__main__":

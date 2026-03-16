@@ -55,7 +55,13 @@ def handle_system_health_event(event, risk_controller, oms=None):
         return
 
     if oms is not None and message.startswith(
-        ("WS_PARSE_ERROR", "WS_HANDLER_FAILURE", "USER_STREAM_EXPIRED", "MARKET_DATA_STALE")
+        (
+            "WS_TRANSPORT_DROP",
+            "WS_PARSE_ERROR",
+            "WS_HANDLER_FAILURE",
+            "USER_STREAM_EXPIRED",
+            "MARKET_DATA_STALE",
+        )
     ):
         venue = getattr(getattr(oms, "gateway", None), "gateway_name", "UNKNOWN")
         oms.freeze_venue(venue, f"system_health:{message}", cancel_active_orders=True)

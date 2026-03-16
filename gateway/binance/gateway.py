@@ -210,6 +210,19 @@ class BinanceGateway(BaseGateway):
             self._emit_ws_fault("WS_HANDLER_FAILURE", str(exc), msg)
 
     def on_ws_error(self, err_msg):
+        if isinstance(err_msg, dict):
+            stream = str(err_msg.get("stream", "WS") or "WS")
+            kind = str(err_msg.get("kind", "error") or "error").lower()
+            detail = str(err_msg.get("detail", "") or "")
+            if kind in {"transport_drop", "remote_close"}:
+                reason = f"{stream}:{detail}" if detail else stream
+                self._emit_ws_fault("WS_TRANSPORT_DROP", reason)
+                return
+            rendered = f"[{stream}] {kind}: {detail}" if detail else f"[{stream}] {kind}"
+            logger.error(f"[{self.gateway_name}] {rendered}")
+            self.on_log(rendered, "ERROR")
+            return
+
         logger.error(f"[{self.gateway_name}] {err_msg}")
         self.on_log(err_msg, "ERROR")
 

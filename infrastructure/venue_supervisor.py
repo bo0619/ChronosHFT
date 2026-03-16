@@ -17,6 +17,7 @@ class VenueSupervisor:
             cfg.get(
                 "recoverable_prefixes",
                 [
+                    "system_health:WS_TRANSPORT_DROP",
                     "system_health:WS_PARSE_ERROR",
                     "system_health:WS_HANDLER_FAILURE",
                     "system_health:USER_STREAM_EXPIRED",

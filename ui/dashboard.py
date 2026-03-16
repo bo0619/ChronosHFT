@@ -228,6 +228,12 @@ class TUIDashboard:
                 recovering = int(async_worker.get("recovering_symbols", 0))
                 if recovering:
                     strategy_bits.append(f"RW {recovering}")
+                quarantined = int(async_worker.get("quarantined_symbols", 0))
+                if quarantined:
+                    strategy_bits.append(f"Q {quarantined}")
+                standby_workers = int(async_worker.get("standby_workers", 0))
+                if standby_workers:
+                    strategy_bits.append(f"SB {standby_workers}")
 
         return " | ".join(part for part in (" ".join(engine_bits), " ".join(strategy_bits)) if part).strip() or "-"
 

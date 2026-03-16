@@ -69,7 +69,14 @@
                 "queue_size": 256,
                 "processes": 2,
                 "auto_restart": true,
-                "restart_cooldown_sec": 2.0
+                "restart_cooldown_sec": 2.0,
+                "max_restart_burst": 3,
+                "restart_window_sec": 30.0,
+                "quarantine_sec": 30.0,
+                "standby_profile": {
+                    "tick_interval_sec": 0.25,
+                    "cycle_interval_sec": 2.0
+                }
             }
         }
     },

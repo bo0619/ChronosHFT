@@ -1,4 +1,5 @@
 from collections import defaultdict
+from collections import deque
 from datetime import datetime
 from multiprocessing import get_context
 from queue import Empty, Full
@@ -166,12 +167,23 @@ class MLSniperAlphaProcess:
             0.5,
             float(self.config.get("restart_cooldown_sec", 2.0) or 2.0),
         )
+        self.max_restart_burst = max(1, int(self.config.get("max_restart_burst", 3)))
+        self.restart_window_sec = max(
+            self.restart_cooldown_sec,
+            float(self.config.get("restart_window_sec", 30.0) or 30.0),
+        )
+        self.quarantine_sec = max(
+            self.restart_cooldown_sec,
+            float(self.config.get("quarantine_sec", 30.0) or 30.0),
+        )
         self._context = get_context("spawn")
         self._workers = []
         self._symbol_worker = {}
         self._worker_symbols = defaultdict(set)
         self._recovering_symbols = set()
         self._restart_events = set()
+        self._quarantined_symbols = set()
+        self._quarantine_events = set()
         self._stopping = False
         self._stats = {
             "submitted": 0,
@@ -191,19 +203,16 @@ class MLSniperAlphaProcess:
             return True
 
         self._stopping = False
-        worker_config = {
-            "tick_interval_sec": float(self.config.get("tick_interval_sec", 0.1)),
-            "cycle_interval_sec": float(self.config.get("cycle_interval_sec", 1.0)),
-            "labeling": dict(self.config.get("labeling", {}) or {}),
-        }
         self._workers = []
         self._recovering_symbols.clear()
         self._restart_events.clear()
+        self._quarantined_symbols.clear()
+        self._quarantine_events.clear()
         started_workers = 0
         for worker_id in range(self.worker_count):
             worker = self._new_worker_state(worker_id)
             try:
-                self._start_worker(worker, worker_config)
+                self._start_worker(worker, self._worker_config("primary"), profile_name="primary")
                 self._workers.append(worker)
                 started_workers += 1
             except Exception as exc:
@@ -237,6 +246,8 @@ class MLSniperAlphaProcess:
         self._stats["alive_workers"] = 0
         self._recovering_symbols.clear()
         self._restart_events.clear()
+        self._quarantined_symbols.clear()
+        self._quarantine_events.clear()
         logger.info("[MLSniperAlphaProcess] stopped")
 
     def submit_orderbook(self, orderbook: OrderBook):
@@ -292,6 +303,10 @@ class MLSniperAlphaProcess:
         snapshot["alive"] = self.is_healthy()
         snapshot["deferred_depth"] = sum(len(worker["deferred"]) for worker in self._workers)
         snapshot["recovering_symbols"] = len(self._recovering_symbols)
+        snapshot["quarantined_symbols"] = len(self._quarantined_symbols)
+        snapshot["standby_workers"] = sum(
+            1 for worker in self._workers if worker.get("profile_name") == "standby"
+        )
         snapshot["workers"] = [
             {
                 "worker_id": worker["worker_id"],
@@ -300,6 +315,8 @@ class MLSniperAlphaProcess:
                 "deferred_depth": len(worker["deferred"]),
                 "symbol_count": len(self._worker_symbols.get(worker["worker_id"], set())),
                 "generation": int(worker.get("generation", 0)),
+                "profile_name": str(worker.get("profile_name", "primary")),
+                "quarantined": bool(worker.get("quarantined_until", 0.0) > time.time()),
             }
             for worker in self._workers
         ]
@@ -315,10 +332,18 @@ class MLSniperAlphaProcess:
     def get_recovering_symbols(self):
         return set(self._recovering_symbols)
 
+    def get_quarantined_symbols(self):
+        return set(self._quarantined_symbols)
+
     def drain_restart_events(self):
         restarted = set(self._restart_events)
         self._restart_events.clear()
         return restarted
+
+    def drain_quarantine_events(self):
+        quarantined = set(self._quarantine_events)
+        self._quarantine_events.clear()
+        return quarantined
 
     def mark_symbol_recovered(self, symbol: str):
         symbol = (symbol or "").upper()
@@ -379,9 +404,13 @@ class MLSniperAlphaProcess:
             "generation": 0,
             "last_restart_attempt_ts": 0.0,
             "last_restart_ts": 0.0,
+            "restart_history": deque(),
+            "quarantined_until": 0.0,
+            "profile_name": "primary",
+            "next_profile_name": "primary",
         }
 
-    def _start_worker(self, worker: dict, worker_config: dict):
+    def _start_worker(self, worker: dict, worker_config: dict, profile_name: str = "primary"):
         in_queue = self._context.Queue(maxsize=self.queue_size)
         out_queue = self._context.Queue(maxsize=self.queue_size)
         process = self._context.Process(
@@ -396,6 +425,7 @@ class MLSniperAlphaProcess:
         worker["process"] = process
         worker["generation"] = int(worker.get("generation", 0)) + 1
         worker["last_restart_attempt_ts"] = time.time()
+        worker["profile_name"] = profile_name
 
     def _restart_dead_workers(self):
         for worker in self._workers:
@@ -413,17 +443,22 @@ class MLSniperAlphaProcess:
             return True
 
         now = time.time()
+        if self._is_worker_quarantined(worker, now):
+            return False
+
         last_attempt = float(worker.get("last_restart_attempt_ts", 0.0) or 0.0)
         if last_attempt and now - last_attempt < self.restart_cooldown_sec:
             return False
 
-        worker_config = {
-            "tick_interval_sec": float(self.config.get("tick_interval_sec", 0.1)),
-            "cycle_interval_sec": float(self.config.get("cycle_interval_sec", 1.0)),
-            "labeling": dict(self.config.get("labeling", {}) or {}),
-        }
+        restart_history = self._trim_restart_history(worker, now)
+        if len(restart_history) >= self.max_restart_burst:
+            self._enter_quarantine(worker, now, reason="restart_burst")
+            return False
+
+        profile_name = str(worker.get("next_profile_name", "") or worker.get("profile_name", "primary"))
+        worker_config = self._worker_config(profile_name)
         try:
-            self._start_worker(worker, worker_config)
+            self._start_worker(worker, worker_config, profile_name=profile_name)
         except Exception as exc:
             worker["last_restart_attempt_ts"] = now
             self._stats["restart_failures"] += 1
@@ -433,12 +468,74 @@ class MLSniperAlphaProcess:
             return False
 
         worker["last_restart_ts"] = now
+        restart_history.append(now)
         recovered_symbols = set(self._worker_symbols.get(worker["worker_id"], set()))
         if recovered_symbols:
+            self._quarantined_symbols.difference_update(recovered_symbols)
             self._recovering_symbols.update(recovered_symbols)
             self._restart_events.update(recovered_symbols)
         self._stats["restarts"] += 1
         logger.warning(
-            f"[MLSniperAlphaProcess] worker {worker['worker_id']} restarted, recovering={sorted(recovered_symbols)}"
+            f"[MLSniperAlphaProcess] worker {worker['worker_id']} restarted profile={profile_name}, recovering={sorted(recovered_symbols)}"
         )
         return True
+
+    def _worker_config(self, profile_name: str = "primary") -> dict:
+        base_config = {
+            "tick_interval_sec": float(self.config.get("tick_interval_sec", 0.1)),
+            "cycle_interval_sec": float(self.config.get("cycle_interval_sec", 1.0)),
+            "labeling": dict(self.config.get("labeling", {}) or {}),
+        }
+        if profile_name != "standby":
+            return base_config
+
+        standby_config = dict(self.config.get("standby_profile", {}) or {})
+        labeling = dict(base_config["labeling"])
+        labeling.update(dict(standby_config.get("labeling", {}) or {}))
+        return {
+            "tick_interval_sec": float(
+                standby_config.get(
+                    "tick_interval_sec",
+                    max(base_config["tick_interval_sec"] * 2.0, base_config["tick_interval_sec"], 0.25),
+                )
+            ),
+            "cycle_interval_sec": float(
+                standby_config.get(
+                    "cycle_interval_sec",
+                    max(base_config["cycle_interval_sec"] * 2.0, base_config["cycle_interval_sec"]),
+                )
+            ),
+            "labeling": labeling,
+        }
+
+    def _trim_restart_history(self, worker: dict, now: float):
+        history = worker.setdefault("restart_history", deque())
+        cutoff = now - self.restart_window_sec
+        while history and history[0] < cutoff:
+            history.popleft()
+        return history
+
+    def _is_worker_quarantined(self, worker: dict, now: float) -> bool:
+        quarantined_until = float(worker.get("quarantined_until", 0.0) or 0.0)
+        if quarantined_until <= now:
+            if quarantined_until > 0.0:
+                worker["quarantined_until"] = 0.0
+            return False
+        return True
+
+    def _enter_quarantine(self, worker: dict, now: float, reason: str):
+        worker["quarantined_until"] = max(
+            float(worker.get("quarantined_until", 0.0) or 0.0),
+            now + self.quarantine_sec,
+        )
+        worker["next_profile_name"] = "standby"
+        worker["last_restart_attempt_ts"] = now
+        worker["restart_history"] = deque()
+        affected_symbols = set(self._worker_symbols.get(worker["worker_id"], set()))
+        if affected_symbols:
+            self._recovering_symbols.difference_update(affected_symbols)
+            self._quarantined_symbols.update(affected_symbols)
+            self._quarantine_events.update(affected_symbols)
+        logger.error(
+            f"[MLSniperAlphaProcess] worker {worker['worker_id']} quarantined reason={reason}, symbols={sorted(affected_symbols)}"
+        )

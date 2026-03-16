@@ -582,6 +582,20 @@ class MLSniperStrategy(StrategyTemplate):
             return
 
         snapshots = list(self.alpha_process.poll())
+        quarantined_symbols = set()
+        if hasattr(self.alpha_process, "drain_quarantine_events"):
+            quarantined_symbols = set(self.alpha_process.drain_quarantine_events())
+        for symbol in quarantined_symbols:
+            self._begin_alpha_symbol_recovery(symbol, reset_model_state=True)
+            self._freeze_alpha_symbol(symbol, "alpha_process_quarantined")
+
+        current_quarantined_symbols = set()
+        if hasattr(self.alpha_process, "get_quarantined_symbols"):
+            current_quarantined_symbols = set(self.alpha_process.get_quarantined_symbols())
+        for symbol in current_quarantined_symbols:
+            self._begin_alpha_symbol_recovery(symbol, reset_model_state=False)
+            self._freeze_alpha_symbol(symbol, "alpha_process_quarantined")
+
         restarted_symbols = set()
         if hasattr(self.alpha_process, "drain_restart_events"):
             restarted_symbols = set(self.alpha_process.drain_restart_events())
@@ -604,11 +618,12 @@ class MLSniperStrategy(StrategyTemplate):
             unhealthy_symbols = set()
             if hasattr(self.alpha_process, "get_unhealthy_symbols"):
                 unhealthy_symbols = set(self.alpha_process.get_unhealthy_symbols())
+            unhealthy_symbols.difference_update(current_quarantined_symbols)
             if unhealthy_symbols:
                 for symbol in unhealthy_symbols:
                     self._begin_alpha_symbol_recovery(symbol, reset_model_state=False)
                     self._freeze_alpha_symbol(symbol, "alpha_process_unhealthy")
-            else:
+            elif not current_quarantined_symbols:
                 self.oms.freeze_strategy(self.name, "alpha_process_unhealthy", cancel_active_orders=True)
 
     def stop_async_workers(self):
