@@ -95,6 +95,63 @@ def emit_event_engine_backlog_if_needed(
     return state
 
 
+def emit_strategy_runtime_backlog_if_needed(
+    strategy_runtime,
+    oms,
+    strategy_id: str,
+    state: dict = None,
+    config: dict = None,
+):
+    if strategy_runtime is None or oms is None or not hasattr(strategy_runtime, "get_metrics_snapshot"):
+        return state or {}
+
+    strategy_id = (strategy_id or "").strip()
+    if not strategy_id:
+        return state or {}
+
+    state = dict(state or {})
+    config = config or {}
+    snapshot = strategy_runtime.get_metrics_snapshot()
+    severity, reason = _strategy_runtime_severity(snapshot, config)
+    previous_severity = int(state.get("severity", 0))
+    recovery_checks = max(1, int(config.get("recovery_checks", 20)))
+
+    if severity <= 0:
+        healthy_checks = int(state.get("healthy_checks", 0)) + 1
+        state["healthy_checks"] = healthy_checks
+        if previous_severity > 0 and healthy_checks >= recovery_checks:
+            previous_reason = getattr(oms, "get_strategy_freeze_reason", lambda *_args, **_kwargs: "")(strategy_id)
+            if previous_reason.startswith("strategy_runtime_backlog:") and hasattr(oms, "clear_strategy_freeze"):
+                oms.clear_strategy_freeze(strategy_id, reason="strategy runtime backlog recovered")
+                logger.info(f"[Watchdog] Strategy runtime backlog recovered for {strategy_id}")
+            return {
+                "severity": 0,
+                "healthy_checks": 0,
+                "reason": "",
+            }
+        return state
+
+    state["healthy_checks"] = 0
+    if severity == previous_severity and reason == state.get("reason"):
+        return state
+
+    state.update(
+        {
+            "severity": severity,
+            "healthy_checks": 0,
+            "reason": reason,
+        }
+    )
+
+    if severity >= 2:
+        logger.error(f"[Watchdog] Strategy runtime freeze {strategy_id}: {reason}")
+        oms.freeze_strategy(strategy_id, reason, cancel_active_orders=True)
+        return state
+
+    logger.warning(f"[Watchdog] Strategy runtime warning {strategy_id}: {reason}")
+    return state
+
+
 def _event_engine_severity(lanes: dict, config: dict):
     hottest_lane = ""
     hottest_reason = ""
@@ -112,6 +169,29 @@ def _event_engine_severity(lanes: dict, config: dict):
         hottest_reason = reason
 
     return hottest_severity, hottest_lane, hottest_reason
+
+
+def _strategy_runtime_severity(metrics: dict, config: dict):
+    control_depth = int(metrics.get("control_depth", 0) or 0)
+    market_depth = int(metrics.get("market_depth", 0) or 0)
+    total_depth = control_depth + market_depth
+    backlog_ms = max(
+        float(metrics.get("oldest_control_wait_ms", 0.0) or 0.0),
+        float(metrics.get("oldest_market_wait_ms", 0.0) or 0.0),
+        float(metrics.get("inflight_wait_ms", 0.0) or 0.0),
+        float(metrics.get("inflight_ms", 0.0) or 0.0),
+    )
+    kind = metrics.get("inflight_kind") or metrics.get("last_kind") or "-"
+    reason = (
+        f"strategy_runtime_backlog:kind={kind}:control={control_depth}:market={market_depth}:"
+        f"backlog={backlog_ms:.1f}ms"
+    )
+
+    if _metric_trip(total_depth, backlog_ms, config, "freeze_queue_depth", "freeze_backlog_ms", 80, 1500.0):
+        return 2, reason
+    if _metric_trip(total_depth, backlog_ms, config, "warn_queue_depth", "warn_backlog_ms", 20, 400.0):
+        return 1, reason
+    return 0, reason
 
 
 def _lane_severity(lane: str, lane_stats: dict, config: dict):
@@ -176,3 +256,9 @@ def _lane_config_value(raw_value, lane: str, default):
     raw_value = raw_value or {}
     fallback = raw_value.get("hot", default) if lane in {"market", "execution"} else raw_value.get("cold", default)
     return raw_value.get(lane, fallback)
+
+
+def _metric_trip(depth: int, backlog_ms: float, config: dict, depth_key: str, backlog_key: str, default_depth: int, default_backlog_ms: float):
+    depth_threshold = int(config.get(depth_key, default_depth))
+    backlog_threshold = float(config.get(backlog_key, default_backlog_ms))
+    return depth >= depth_threshold or backlog_ms >= backlog_threshold

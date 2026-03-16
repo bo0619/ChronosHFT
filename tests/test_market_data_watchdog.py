@@ -4,6 +4,7 @@ from event.type import OMSCapabilityMode
 from infrastructure.watchdog import (
     emit_event_engine_backlog_if_needed,
     emit_market_data_stale_if_needed,
+    emit_strategy_runtime_backlog_if_needed,
 )
 
 
@@ -47,6 +48,9 @@ class DummyOMS:
         self.frozen = []
         self.unfrozen = []
         self.venue_reason = ""
+        self.strategy_frozen = []
+        self.strategy_unfrozen = []
+        self.strategy_reason = ""
 
     def set_trading_mode(self, mode, reason):
         self.modes.append((mode, reason))
@@ -66,6 +70,35 @@ class DummyOMS:
 
     def get_venue_freeze_reason(self, _venue):
         return self.venue_reason
+
+    def freeze_strategy(self, strategy_id, reason, symbol="", cancel_active_orders=True):
+        self.strategy_reason = reason
+        self.strategy_frozen.append((strategy_id, reason, symbol, cancel_active_orders))
+
+    def clear_strategy_freeze(self, strategy_id, symbol="", reason=""):
+        self.strategy_reason = ""
+        self.strategy_unfrozen.append((strategy_id, symbol, reason))
+        return True
+
+    def get_strategy_freeze_reason(self, _strategy_id, symbol=""):
+        return self.strategy_reason
+
+
+class DummyStrategyRuntime:
+    def __init__(self):
+        self.metrics = {
+            "control_depth": 0,
+            "market_depth": 0,
+            "oldest_control_wait_ms": 0.0,
+            "oldest_market_wait_ms": 0.0,
+            "inflight_wait_ms": 0.0,
+            "inflight_ms": 0.0,
+            "inflight_kind": "",
+            "last_kind": "",
+        }
+
+    def get_metrics_snapshot(self):
+        return dict(self.metrics)
 
 
 class MarketDataWatchdogTests(unittest.TestCase):
@@ -154,6 +187,46 @@ class MarketDataWatchdogTests(unittest.TestCase):
         self.assertEqual(state["severity"], 3)
         self.assertEqual(oms.frozen[-1][0], "BINANCE")
         self.assertTrue(oms.frozen[-1][1].startswith("event_engine_backlog:execution"))
+
+    def test_strategy_runtime_backlog_freezes_then_recovers(self):
+        runtime = DummyStrategyRuntime()
+        oms = DummyOMS()
+        runtime.metrics.update(
+            {
+                "market_depth": 90,
+                "last_kind": "orderbook",
+            }
+        )
+
+        state = emit_strategy_runtime_backlog_if_needed(
+            runtime,
+            oms,
+            "ML_Sniper_USDC",
+            {},
+            {"freeze_queue_depth": 80, "recovery_checks": 2},
+        )
+        self.assertEqual(state["severity"], 2)
+        self.assertEqual(oms.strategy_frozen[-1][0], "ML_Sniper_USDC")
+        self.assertTrue(oms.strategy_reason.startswith("strategy_runtime_backlog:"))
+
+        runtime.metrics.update({"market_depth": 0, "last_kind": ""})
+        state = emit_strategy_runtime_backlog_if_needed(
+            runtime,
+            oms,
+            "ML_Sniper_USDC",
+            state,
+            {"freeze_queue_depth": 80, "recovery_checks": 2},
+        )
+        self.assertEqual(state["healthy_checks"], 1)
+        state = emit_strategy_runtime_backlog_if_needed(
+            runtime,
+            oms,
+            "ML_Sniper_USDC",
+            state,
+            {"freeze_queue_depth": 80, "recovery_checks": 2},
+        )
+        self.assertEqual(state["severity"], 0)
+        self.assertEqual(oms.strategy_unfrozen[-1][0], "ML_Sniper_USDC")
 
 
 if __name__ == "__main__":

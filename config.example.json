@@ -52,6 +52,16 @@
             },
             "recovery_checks": 20,
             "alert_interval_sec": 5
+        },
+        "strategy_runtime": {
+            "queue_warn_depth": 100,
+            "warn_queue_depth": 20,
+            "freeze_queue_depth": 80,
+            "warn_backlog_ms": 400,
+            "freeze_backlog_ms": 1500,
+            "recovery_checks": 20,
+            "slow_handler_ms": 100,
+            "alert_interval_sec": 5
         }
     },
     "alert": {

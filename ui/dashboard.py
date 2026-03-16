@@ -43,6 +43,7 @@ class TUIDashboard:
         self.market_cache = {}
         self.position_cache = {}
         self.strategy_cache = {}
+        self.runtime_metrics = {}
         self.logs = []
         self.max_logs = 8
 
@@ -59,6 +60,9 @@ class TUIDashboard:
 
     def update_strategy(self, data: StrategyData):
         self.strategy_cache[data.symbol] = data
+
+    def update_runtime_metrics(self, metrics: Dict[str, Any]):
+        self.runtime_metrics = metrics or {}
 
     def add_log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -182,6 +186,40 @@ class TUIDashboard:
                 return health
         return "LIVE" if self.account_data else "-"
 
+    def _runtime_summary(self) -> str:
+        engine = self.runtime_metrics.get("event_engine", {})
+        strategy = self.runtime_metrics.get("strategy_runtime", {})
+        if not engine and not strategy:
+            return "-"
+
+        engine_bits = []
+        queues = engine.get("queues", {})
+        if queues:
+            engine_bits.append(
+                f"EV M{int(queues.get('market_depth', 0))}/X{int(queues.get('execution_depth', 0))}/C{int(queues.get('cold_depth', 0))}"
+            )
+        market_lane = engine.get("lanes", {}).get("market", {})
+        execution_lane = engine.get("lanes", {}).get("execution", {})
+        market_backlog = float(market_lane.get("oldest_queued_ms", 0.0) or 0.0)
+        execution_backlog = float(execution_lane.get("oldest_queued_ms", 0.0) or 0.0)
+        if market_backlog or execution_backlog:
+            engine_bits.append(f"Q {market_backlog:.0f}/{execution_backlog:.0f}ms")
+
+        strategy_bits = []
+        if strategy:
+            strategy_bits.append(
+                f"ST C{int(strategy.get('control_depth', 0))}/M{int(strategy.get('market_depth', 0))}"
+            )
+            strategy_wait = max(
+                float(strategy.get("oldest_market_wait_ms", 0.0) or 0.0),
+                float(strategy.get("oldest_control_wait_ms", 0.0) or 0.0),
+                float(strategy.get("inflight_wait_ms", 0.0) or 0.0),
+            )
+            if strategy_wait:
+                strategy_bits.append(f"W {strategy_wait:.0f}ms")
+
+        return " | ".join(part for part in (" ".join(engine_bits), " ".join(strategy_bits)) if part).strip() or "-"
+
     def _smart_dict(self, value: Any) -> str:
         if not isinstance(value, dict) or not value:
             return "-"
@@ -235,7 +273,8 @@ class TUIDashboard:
         )
         bottom_line = (
             f"[{health_style}]System: {health}[/] | "
-            f"{self._fmt_asset_balance('USDT')} | {self._fmt_asset_balance('USDC')}"
+            f"{self._fmt_asset_balance('USDT')} | {self._fmt_asset_balance('USDC')} | "
+            f"Runtime: {self._runtime_summary()}"
         )
         return Panel(Align.center(f"{top_line}\n{bottom_line}"), title="Account", border_style="blue")
 

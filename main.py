@@ -33,10 +33,12 @@ from infrastructure.venue_supervisor import VenueSupervisor
 from infrastructure.watchdog import (
     emit_event_engine_backlog_if_needed,
     emit_market_data_stale_if_needed,
+    emit_strategy_runtime_backlog_if_needed,
 )
 from oms.engine import OMS
 from risk.manager import RiskManager
 from strategy.ml_sniper.ml_sniper import MLSniperStrategy
+from strategy.runtime import StrategyRuntime
 from ui.dashboard import TUIDashboard
 
 
@@ -70,6 +72,11 @@ def main():
     oms_system = OMS(engine, gateway, config)
     risk_controller = RiskManager(engine, config, oms=oms_system, gateway=gateway)
     strategy = MLSniperStrategy(engine, oms_system)
+    strategy_runtime = StrategyRuntime(
+        strategy,
+        config.get("system", {}).get("strategy_runtime", {}),
+        start_thread=False,
+    )
     recorder = DataRecorder(engine, config["symbols"]) if config.get("record_data", False) else None
     truth_monitor = TruthMonitor(oms_system, truth_provider, config, start_thread=False)
     venue_supervisor = VenueSupervisor(oms_system, gateway, config, start_thread=False)
@@ -106,6 +113,7 @@ def main():
     main.last_tick_time = time.time()
     main.stale_watchdog_triggered = False
     main.event_engine_watchdog_state = {}
+    main.strategy_runtime_watchdog_state = {}
 
     def on_hot_tick(_event):
         main.last_tick_time = time.time()
@@ -120,16 +128,26 @@ def main():
         lambda e: handle_system_health_event(e, risk_controller, oms_system),
     )
 
-    register_cold(EVENT_ORDERBOOK, lambda e: [strategy.on_orderbook(e.data), dashboard.update_market(e.data)])
-    register_cold(EVENT_AGG_TRADE, lambda e: strategy.on_market_trade(e.data))
-    register_cold(EVENT_ORDER_UPDATE, lambda e: strategy.on_order(e.data))
-    register_cold(EVENT_TRADE_UPDATE, lambda e: strategy.on_trade(e.data))
-    register_cold(EVENT_POSITION_UPDATE, lambda e: [strategy.on_position(e.data), dashboard.update_position(e.data)])
-    register_cold(EVENT_ACCOUNT_UPDATE, lambda e: [strategy.on_account_update(e.data), dashboard.update_account(e.data)])
+    register_cold(
+        EVENT_ORDERBOOK,
+        lambda e: [strategy_runtime.on_orderbook(e.data), dashboard.update_market(e.data)],
+    )
+    register_cold(EVENT_AGG_TRADE, lambda e: strategy_runtime.on_market_trade(e.data))
+    register_cold(EVENT_ORDER_UPDATE, lambda e: strategy_runtime.on_order(e.data))
+    register_cold(EVENT_TRADE_UPDATE, lambda e: strategy_runtime.on_trade(e.data))
+    register_cold(
+        EVENT_POSITION_UPDATE,
+        lambda e: [strategy_runtime.on_position(e.data), dashboard.update_position(e.data)],
+    )
+    register_cold(
+        EVENT_ACCOUNT_UPDATE,
+        lambda e: [strategy_runtime.on_account_update(e.data), dashboard.update_account(e.data)],
+    )
     register_cold(EVENT_STRATEGY_UPDATE, lambda e: dashboard.update_strategy(e.data))
-    register_cold(EVENT_SYSTEM_HEALTH, lambda e: strategy.on_system_health(e.data))
+    register_cold(EVENT_SYSTEM_HEALTH, lambda e: strategy_runtime.on_system_health(e.data))
 
     engine.start()
+    strategy_runtime.start()
     gateway.connect(config["symbols"])
 
     time.sleep(3)
@@ -156,12 +174,26 @@ def main():
                     main.event_engine_watchdog_state,
                     event_engine_config,
                 )
+                main.strategy_runtime_watchdog_state = emit_strategy_runtime_backlog_if_needed(
+                    strategy_runtime,
+                    oms_system,
+                    strategy.name,
+                    main.strategy_runtime_watchdog_state,
+                    config.get("system", {}).get("strategy_runtime", {}),
+                )
+                dashboard.update_runtime_metrics(
+                    {
+                        "event_engine": engine.get_metrics_snapshot(),
+                        "strategy_runtime": strategy_runtime.get_metrics_snapshot(),
+                    }
+                )
     except KeyboardInterrupt:
         logger.info("Shutdown signal received.")
         if recorder:
             recorder.close()
         venue_supervisor.stop()
         truth_monitor.stop()
+        strategy_runtime.stop()
         truth_provider.close()
         time_service.stop()
         oms_system.stop()
