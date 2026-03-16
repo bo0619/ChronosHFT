@@ -160,6 +160,9 @@ class BinanceRestApi:
             "quantity": req.volume,
         }
 
+        if req.reduce_only:
+            params["reduceOnly"] = "true"
+
         if client_oid:
             params["newClientOrderId"] = client_oid
 

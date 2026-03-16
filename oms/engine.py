@@ -4,14 +4,18 @@ import uuid
 from collections import deque
 from datetime import datetime
 
+from data.cache import data_cache
+from data.ref_data import ref_data_manager
 from infrastructure.logger import logger
 
 from event.type import (
     CancelRequest,
+    ExecutionPolicy,
     Event,
     ExchangeAccountUpdate,
     ExchangeOrderUpdate,
     LifecycleState,
+    OMSCapabilityMode,
     OrderIntent,
     OrderRequest,
     OrderStatus,
@@ -24,6 +28,8 @@ from event.type import (
     EVENT_POSITION_UPDATE,
     EVENT_SYSTEM_HEALTH,
     EVENT_TRADE_UPDATE,
+    TIF_GTX,
+    TIF_IOC,
 )
 
 from .account_manager import AccountManager
@@ -53,6 +59,10 @@ class OMS:
         self.strategy_guards = {}
         self.strategy_symbol_guards = {}
         self.lock = threading.RLock()
+        self.capability_mode = OMSCapabilityMode.READ_ONLY
+        self.capability_reason = "startup_bootstrap"
+        self.mode_override = None
+        self.mode_override_reason = ""
 
         target_leverage = int(config.get("account", {}).get("leverage", 0) or 0)
         if target_leverage > 0:
@@ -100,6 +110,14 @@ class OMS:
             0.0,
             float(oms_cfg.get("duplicate_intent_window_ms", 250.0) or 0.0) / 1000.0,
         )
+        self.degraded_aggressive_to_passive = bool(
+            oms_cfg.get("degraded_aggressive_to_passive", True)
+        )
+        self.emergency_flatten_cooldown_sec = max(
+            0.0,
+            float(oms_cfg.get("emergency_flatten_cooldown_sec", 5.0) or 0.0),
+        )
+        self.last_emergency_flatten_ts = {}
         self.last_reconcile_request_ts = 0.0
         self.last_reconcile_failure_ts = 0.0
         self.consecutive_reconcile_api_failures = 0
@@ -108,6 +126,7 @@ class OMS:
         logger.info("OMS: Bootstrapping state...")
         self._audit("bootstrap_requested", recovered=self.rebuild_summary)
         if self.manual_rearm_required or self.state == LifecycleState.HALTED:
+            self._sync_capability_mode("manual_rearm_required")
             logger.error("[OMS] Bootstrap blocked: manual rearm required after recovered HALT")
             self._audit(
                 "bootstrap_blocked",
@@ -119,6 +138,7 @@ class OMS:
         if self.state == LifecycleState.FROZEN or self._has_active_guards():
             logger.warning("[OMS] Bootstrapping into guarded reconcile mode")
             self.state = LifecycleState.FROZEN
+            self._sync_capability_mode("bootstrap_guarded")
             if not self.last_freeze_reason:
                 self.last_freeze_reason = "Recovered guarded state"
             self._audit(
@@ -142,6 +162,9 @@ class OMS:
             for key, value in summary.get("strategy_symbol_guards", {}).items()
             if "|" in key
         }
+        override_mode = str(summary.get("mode_override", "") or "")
+        self.mode_override = OMSCapabilityMode(override_mode) if override_mode else None
+        self.mode_override_reason = str(summary.get("mode_override_reason", "") or "")
 
         self.last_freeze_reason = str(summary.get("last_freeze_reason", "") or "")
         self.last_halt_reason = str(summary.get("last_halt_reason", "") or "")
@@ -154,12 +177,14 @@ class OMS:
             self.manual_rearm_required = True
             if not self.last_halt_reason:
                 self.last_halt_reason = "Recovered halted state"
+            self._sync_capability_mode("recovered_halted_state")
             return
 
         if dirty_shutdown:
             self.state = LifecycleState.FROZEN
             if not self.last_freeze_reason:
                 self.last_freeze_reason = "Recovered unclean shutdown"
+            self._sync_capability_mode("recovered_unclean_shutdown")
             return
 
         if self._has_active_guards() or last_lifecycle in {
@@ -169,9 +194,11 @@ class OMS:
             self.state = LifecycleState.FROZEN
             if not self.last_freeze_reason:
                 self.last_freeze_reason = "Recovered guarded state"
+            self._sync_capability_mode("recovered_guarded_state")
             return
 
         self.state = LifecycleState.BOOTSTRAP
+        self._sync_capability_mode("bootstrap")
 
     def _has_active_guards(self):
         return bool(
@@ -180,6 +207,342 @@ class OMS:
             or self.strategy_guards
             or self.strategy_symbol_guards
         )
+
+    def _sync_capability_mode(self, reason: str = ""):
+        previous_mode = getattr(self, "capability_mode", None)
+        previous_reason = getattr(self, "capability_reason", "")
+        base_mode = self._capability_mode_for_state()
+        override_mode = self.mode_override
+        next_mode = base_mode
+        next_reason = reason or self.state.value.lower()
+        if override_mode and self._mode_rank(override_mode) > self._mode_rank(base_mode):
+            next_mode = override_mode
+            next_reason = self.mode_override_reason or next_reason
+
+        changed = previous_mode != next_mode or previous_reason != next_reason
+        self.capability_mode = next_mode
+        self.capability_reason = next_reason
+        if changed:
+            self._audit(
+                "capability_mode_changed",
+                mode=next_mode.value,
+                reason=next_reason,
+                previous_mode=previous_mode.value if previous_mode else "",
+                previous_reason=previous_reason,
+            )
+
+    def _mode_rank(self, mode: OMSCapabilityMode) -> int:
+        ranks = {
+            OMSCapabilityMode.LIVE: 0,
+            OMSCapabilityMode.DEGRADED: 1,
+            OMSCapabilityMode.PASSIVE_ONLY: 2,
+            OMSCapabilityMode.CANCEL_ONLY: 3,
+            OMSCapabilityMode.READ_ONLY: 4,
+            OMSCapabilityMode.LOCKDOWN: 5,
+        }
+        return ranks.get(mode, 99)
+
+    def _capability_mode_for_state(self) -> OMSCapabilityMode:
+        if self.state == LifecycleState.LIVE:
+            return OMSCapabilityMode.LIVE
+        if self.state in {LifecycleState.BOOTSTRAP, LifecycleState.RECONCILING}:
+            return OMSCapabilityMode.READ_ONLY
+        if self.state in {LifecycleState.FROZEN, LifecycleState.HALTED}:
+            return OMSCapabilityMode.CANCEL_ONLY
+        return OMSCapabilityMode.LOCKDOWN
+
+    def _ensure_capability_mode_consistent(self):
+        expected_mode = self._capability_mode_for_state()
+        if self.mode_override and self._mode_rank(self.mode_override) > self._mode_rank(expected_mode):
+            expected_mode = self.mode_override
+        if self.capability_mode != expected_mode:
+            self._sync_capability_mode(f"state_sync:{self.state.value}")
+
+    def set_trading_mode(self, mode, reason: str):
+        if isinstance(mode, str):
+            mode = OMSCapabilityMode(mode)
+        if mode not in {OMSCapabilityMode.DEGRADED, OMSCapabilityMode.PASSIVE_ONLY}:
+            raise ValueError(f"Unsupported trading mode override: {mode}")
+        if self.mode_override == mode and self.mode_override_reason == reason:
+            return
+
+        previous_mode = self.mode_override.value if self.mode_override else ""
+        previous_reason = self.mode_override_reason
+        self.mode_override = mode
+        self.mode_override_reason = reason
+        self._sync_capability_mode(reason)
+        self._audit(
+            "trading_mode_override_set",
+            mode=mode.value,
+            reason=reason,
+            previous_mode=previous_mode,
+            previous_reason=previous_reason,
+        )
+
+    def clear_trading_mode(self, reason: str = "", prefixes=()):
+        if not self.mode_override:
+            return False
+        if prefixes and not any(self.mode_override_reason.startswith(prefix) for prefix in prefixes):
+            return False
+
+        previous_mode = self.mode_override.value
+        previous_reason = self.mode_override_reason
+        self.mode_override = None
+        self.mode_override_reason = ""
+        self._sync_capability_mode(reason or "trading_mode_cleared")
+        self._audit(
+            "trading_mode_override_cleared",
+            reason=reason or previous_reason,
+            previous_mode=previous_mode,
+            previous_reason=previous_reason,
+        )
+        return True
+
+    def can_query_exchange(self) -> bool:
+        self._ensure_capability_mode_consistent()
+        return self.capability_mode != OMSCapabilityMode.LOCKDOWN
+
+    def can_cancel_orders(self) -> bool:
+        self._ensure_capability_mode_consistent()
+        return self.capability_mode in {
+            OMSCapabilityMode.LIVE,
+            OMSCapabilityMode.DEGRADED,
+            OMSCapabilityMode.PASSIVE_ONLY,
+            OMSCapabilityMode.CANCEL_ONLY,
+        }
+
+    def can_open_new_risk(self) -> bool:
+        self._ensure_capability_mode_consistent()
+        return self.capability_mode in {
+            OMSCapabilityMode.LIVE,
+            OMSCapabilityMode.DEGRADED,
+            OMSCapabilityMode.PASSIVE_ONLY,
+        }
+
+    def get_capability_snapshot(self) -> dict:
+        return {
+            "mode": self.capability_mode.value,
+            "reason": self.capability_reason,
+            "override_mode": self.mode_override.value if self.mode_override else "",
+            "override_reason": self.mode_override_reason,
+            "can_query": self.can_query_exchange(),
+            "can_cancel": self.can_cancel_orders(),
+            "can_open_risk": self.can_open_new_risk(),
+        }
+
+    def _get_capability_block_reason(self, action: str) -> str:
+        return (
+            f"{action}_blocked:"
+            f"{self.capability_mode.value}:{self.capability_reason or self.state.value}"
+        )
+
+    def query_account_info(self):
+        if not self.can_query_exchange():
+            self._audit("query_rejected", query="account", reason=self._get_capability_block_reason("query"))
+            return None
+        return self.gateway.get_account_info()
+
+    def query_positions(self):
+        if not self.can_query_exchange():
+            self._audit("query_rejected", query="positions", reason=self._get_capability_block_reason("query"))
+            return None
+        return self.gateway.get_all_positions()
+
+    def query_open_orders(self):
+        if not self.can_query_exchange():
+            self._audit("query_rejected", query="open_orders", reason=self._get_capability_block_reason("query"))
+            return None
+        return self.gateway.get_open_orders()
+
+    def adapt_intent_for_trading_mode(self, intent: OrderIntent):
+        self._ensure_capability_mode_consistent()
+        if self.capability_mode == OMSCapabilityMode.PASSIVE_ONLY:
+            if not intent.is_post_only:
+                return None, "oms_mode_passive_only"
+            return intent, ""
+
+        if self.capability_mode == OMSCapabilityMode.DEGRADED and self.degraded_aggressive_to_passive:
+            if not intent.is_post_only:
+                adapted = OrderIntent(
+                    strategy_id=intent.strategy_id,
+                    symbol=intent.symbol,
+                    side=intent.side,
+                    price=intent.price,
+                    volume=intent.volume,
+                    order_type="LIMIT",
+                    time_in_force=TIF_GTX,
+                    is_post_only=True,
+                    policy=ExecutionPolicy.PASSIVE,
+                    tag=f"{intent.tag}|degraded" if intent.tag else "degraded",
+                )
+                self._audit(
+                    "intent_degraded_to_passive",
+                    strategy_id=intent.strategy_id,
+                    symbol=intent.symbol,
+                    side=intent.side.value,
+                    original_order_type=intent.order_type,
+                    original_tif=intent.time_in_force,
+                )
+                return adapted, ""
+        return intent, ""
+
+    def _estimate_emergency_price(self, symbol: str, side: Side) -> float:
+        bid, ask = data_cache.get_best_quote(symbol)
+        if side == Side.BUY and ask > 0:
+            return ask
+        if side == Side.SELL and bid > 0:
+            return bid
+
+        mark_price = data_cache.get_mark_price(symbol)
+        if mark_price > 0:
+            return mark_price
+
+        last_trade = data_cache.get_last_trade_price(symbol)
+        if last_trade > 0:
+            return last_trade
+
+        local_pos_price = abs(float(self.exposure.avg_prices.get(symbol, 0.0) or 0.0))
+        return local_pos_price if local_pos_price > 0 else 1.0
+
+    def _submit_internal_order(
+        self,
+        intent: OrderIntent,
+        request: OrderRequest,
+        client_oid: str,
+        snapshot_source: str,
+        audit_kind: str,
+        **audit_extra,
+    ) -> bool:
+        order = Order(client_oid, intent)
+
+        with self.lock:
+            self.orders[client_oid] = order
+            order.mark_submitting()
+            self.exposure.update_open_orders(self.orders)
+            self.account.calculate()
+            self._record_order_snapshot(order, snapshot_source, **audit_extra)
+
+        exchange_oid = self.gateway.send_order(request, client_oid)
+        if exchange_oid:
+            with self.lock:
+                order.mark_pending_ack(exchange_oid)
+                self.exchange_id_map[exchange_oid] = order
+                self._record_order_snapshot(order, f"{snapshot_source}_ack", **audit_extra)
+                self._emit_order_update(order)
+
+            event_data = OrderSubmitted(request, client_oid, time.time())
+            self.event_engine.put(Event(EVENT_ORDER_SUBMITTED, event_data))
+            payload = {
+                "client_oid": client_oid,
+                "exchange_oid": exchange_oid,
+                "symbol": intent.symbol,
+                "side": intent.side.value,
+                "price": intent.price,
+                "volume": intent.volume,
+            }
+            payload.update(audit_extra)
+            self._audit(audit_kind, **payload)
+            return True
+
+        with self.lock:
+            order.mark_rejected_locally("gateway_send_failed")
+            self._record_order_snapshot(order, f"{snapshot_source}_failed", **audit_extra)
+            self._emit_order_update(order)
+            self.orders.pop(client_oid, None)
+            self.exposure.update_open_orders(self.orders)
+            self.account.calculate()
+        self._write_tombstone(order)
+        payload = {
+            "client_oid": client_oid,
+            "symbol": intent.symbol,
+            "reason": "gateway_send_failed",
+        }
+        payload.update(audit_extra)
+        self._audit(f"{audit_kind}_failed", **payload)
+        return False
+
+    def emergency_reduce_only_flatten(self, reason: str, symbol: str = "") -> int:
+        target_symbols = {symbol.upper()} if symbol else set()
+        remote_positions = self.query_positions()
+        positions = {}
+
+        if remote_positions:
+            for payload in remote_positions:
+                remote_symbol = str(payload.get("symbol", "") or "").upper()
+                if not remote_symbol:
+                    continue
+                if target_symbols and remote_symbol not in target_symbols:
+                    continue
+                positions[remote_symbol] = float(payload.get("positionAmt", 0.0) or 0.0)
+
+        if not positions:
+            with self.lock:
+                for local_symbol, volume in self.exposure.net_positions.items():
+                    local_symbol = local_symbol.upper()
+                    if target_symbols and local_symbol not in target_symbols:
+                        continue
+                    if abs(volume) > 1e-9:
+                        positions[local_symbol] = volume
+
+        submitted = 0
+        now = time.time()
+        self._audit("emergency_flatten_requested", reason=reason, symbols=sorted(positions.keys()))
+        for target_symbol, volume in positions.items():
+            if abs(volume) <= 1e-9:
+                continue
+
+            last_sent = self.last_emergency_flatten_ts.get(target_symbol, 0.0)
+            if now - last_sent < self.emergency_flatten_cooldown_sec:
+                self._audit(
+                    "emergency_flatten_suppressed",
+                    reason=reason,
+                    symbol=target_symbol,
+                    cooldown_sec=self.emergency_flatten_cooldown_sec,
+                )
+                continue
+
+            qty = ref_data_manager.round_qty(target_symbol, abs(volume))
+            if qty <= 0:
+                continue
+
+            side = Side.SELL if volume > 0 else Side.BUY
+            estimate_price = self._estimate_emergency_price(target_symbol, side)
+            client_oid = f"EMERGENCY_{target_symbol}_{uuid.uuid4().hex[:16]}"
+            intent = OrderIntent(
+                "system_emergency",
+                target_symbol,
+                side,
+                estimate_price,
+                qty,
+                order_type="MARKET",
+                time_in_force=TIF_IOC,
+                is_post_only=False,
+                policy=ExecutionPolicy.AGGRESSIVE,
+                tag=f"reduce_only_flatten:{reason}",
+            )
+            request = OrderRequest(
+                symbol=target_symbol,
+                price=estimate_price,
+                volume=qty,
+                side=side.value,
+                order_type="MARKET",
+                time_in_force=TIF_IOC,
+                post_only=False,
+                reduce_only=True,
+            )
+            if self._submit_internal_order(
+                intent,
+                request,
+                client_oid,
+                "emergency_flatten",
+                "emergency_flatten_submitted",
+                reason=reason,
+                reduce_only=True,
+            ):
+                self.last_emergency_flatten_ts[target_symbol] = now
+                submitted += 1
+
+        return submitted
 
     def freeze_symbol(self, symbol: str, reason: str, cancel_active_orders: bool = True):
         if not symbol:
@@ -390,7 +753,7 @@ class OMS:
         return cleared
 
     def is_symbol_tradeable(self, symbol: str) -> bool:
-        return self.state == LifecycleState.LIVE and not self.get_symbol_freeze_reason(symbol)
+        return self.can_open_new_risk() and not self.get_symbol_freeze_reason(symbol)
 
     def can_submit_for_strategy(self, strategy_id: str, symbol: str = "") -> bool:
         return self._get_order_block_reason(strategy_id, symbol) == ""
@@ -406,8 +769,8 @@ class OMS:
             self.cancel_order(client_oid)
 
     def _get_order_block_reason(self, strategy_id: str = "", symbol: str = "") -> str:
-        if self.state != LifecycleState.LIVE:
-            return f"oms_not_live:{self.state.value}"
+        if not self.can_open_new_risk():
+            return self._get_capability_block_reason("open_risk")
 
         venue_reason = self.get_venue_freeze_reason()
         if venue_reason:
@@ -489,6 +852,7 @@ class OMS:
 
         previous_state = self.state
         self.state = LifecycleState.FROZEN
+        self._sync_capability_mode(reason)
         self.last_freeze_reason = reason
 
         if previous_state != LifecycleState.FROZEN:
@@ -521,9 +885,11 @@ class OMS:
         if self.state == LifecycleState.HALTED:
             self.last_halt_reason = reason
             self.manual_rearm_required = True
+            self._sync_capability_mode(reason)
             self._audit("halt_reasserted", reason=reason)
             return
         self.state = LifecycleState.HALTED
+        self._sync_capability_mode(reason)
         self.manual_rearm_required = True
         self.last_halt_reason = reason
         self.last_freeze_reason = ""
@@ -553,6 +919,7 @@ class OMS:
             halted_reason=self.last_halt_reason,
         )
         self.state = LifecycleState.RECONCILING
+        self._sync_capability_mode(f"manual_rearm:{reason}")
         self._audit(
             "lifecycle",
             state=self.state.value,
@@ -615,6 +982,7 @@ class OMS:
         self.last_reconcile_request_ts = now
         logger.warning(f"OMS dirty: {reason}. State -> RECONCILING")
         self.state = LifecycleState.RECONCILING
+        self._sync_capability_mode(reason)
         self._audit(
             "reconcile_requested",
             state=self.state.value,
@@ -671,8 +1039,8 @@ class OMS:
     def _execute_reconcile(self, suspicious_oid: str):
         self._audit("reconcile_started", suspicious_oid=suspicious_oid)
         try:
-            remote_positions = self.gateway.get_all_positions()
-            remote_orders = self.gateway.get_open_orders()
+            remote_positions = self.query_positions()
+            remote_orders = self.query_open_orders()
 
             if remote_positions is None or remote_orders is None:
                 self.consecutive_reconcile_api_failures += 1
@@ -756,6 +1124,7 @@ class OMS:
                 self._perform_full_reset()
             else:
                 self.state = LifecycleState.LIVE
+                self._sync_capability_mode("reconcile_cleared")
                 self.last_freeze_reason = ""
                 self._audit("reconcile_cleared", state=self.state.value)
                 logger.info("[Reconcile] False alarm. Resuming LIVE.")
@@ -771,9 +1140,9 @@ class OMS:
                 self.gateway.cancel_all_orders(symbol)
             time.sleep(1.0)
 
-            remote_orders = self.gateway.get_open_orders()
-            account = self.gateway.get_account_info()
-            positions = self.gateway.get_all_positions()
+            remote_orders = self.query_open_orders()
+            account = self.query_account_info()
+            positions = self.query_positions()
             if remote_orders is None or not account or positions is None:
                 raise RuntimeError("API failed during reset")
 
@@ -812,6 +1181,7 @@ class OMS:
                 self._emit_position_update(symbol)
 
             self.state = LifecycleState.LIVE
+            self._sync_capability_mode("full_reset_completed")
             self.manual_rearm_required = False
             self.last_freeze_reason = ""
             self.last_halt_reason = ""
@@ -831,6 +1201,7 @@ class OMS:
 
     def submit_order(self, intent: OrderIntent) -> OrderSubmitResult:
         client_oid = str(uuid.uuid4())
+        original_intent = intent
 
         block_reason = self._get_order_block_reason(intent.strategy_id, intent.symbol)
         if block_reason:
@@ -839,6 +1210,10 @@ class OMS:
                 client_oid,
                 block_reason,
             )
+
+        intent, mode_reject_reason = self.adapt_intent_for_trading_mode(intent)
+        if mode_reject_reason:
+            return self._reject_intent_locally(original_intent, client_oid, mode_reject_reason)
 
         valid, validation_reason = self.validator.validate_params(intent)
         if not valid:
@@ -965,10 +1340,18 @@ class OMS:
         )
 
     def cancel_order(self, client_oid: str):
+        if not self.can_cancel_orders():
+            self._audit(
+                "cancel_rejected",
+                client_oid=client_oid,
+                reason=self._get_capability_block_reason("cancel"),
+            )
+            return False
+
         with self.lock:
             order = self.orders.get(client_oid)
             if not order or not order.is_active():
-                return
+                return False
             target_id = order.exchange_oid if order.exchange_oid else client_oid
             try:
                 order.mark_cancelling()
@@ -985,10 +1368,19 @@ class OMS:
             target_id=target_id,
             symbol=request.symbol,
         )
+        return True
 
     def cancel_all_orders(self, symbol: str):
+        if not self.can_cancel_orders():
+            self._audit(
+                "cancel_all_rejected",
+                symbol=symbol,
+                reason=self._get_capability_block_reason("cancel"),
+            )
+            return False
         self._audit("cancel_all_submitted", symbol=symbol)
         self.gateway.cancel_all_orders(symbol)
+        return True
 
     def on_exchange_update(self, event):
         self._append_and_process(event)
@@ -1035,9 +1427,6 @@ class OMS:
         self.trigger_reconcile("Exchange account position drift")
 
     def _append_and_process(self, event):
-        if self.state == LifecycleState.HALTED:
-            return
-
         if event.type == "eExchangeOrderUpdate":
             update: ExchangeOrderUpdate = event.data
             if not self.sequence.check(update.seq):
@@ -1258,6 +1647,8 @@ class OMS:
                 "venue_guards": {},
                 "strategy_guards": {},
                 "strategy_symbol_guards": {},
+                "mode_override": "",
+                "mode_override_reason": "",
                 "clean_shutdown": True,
                 "dirty_shutdown": False,
             }
@@ -1271,6 +1662,8 @@ class OMS:
         venue_guards = {}
         strategy_guards = {}
         strategy_symbol_guards = {}
+        mode_override = ""
+        mode_override_reason = ""
         clean_shutdown = records[-1].get("kind") == "oms_stopped"
         for record in records:
             payload = record.get("payload", {})
@@ -1353,6 +1746,12 @@ class OMS:
                     strategy_symbol_guards.pop(f"{strategy_id}|{symbol}", None)
                 elif strategy_id:
                     strategy_guards.pop(strategy_id, None)
+            elif kind == "trading_mode_override_set":
+                mode_override = str(payload.get("mode", "") or "")
+                mode_override_reason = str(payload.get("reason", "") or "")
+            elif kind == "trading_mode_override_cleared":
+                mode_override = ""
+                mode_override_reason = ""
             elif kind == "oms_stopped":
                 state = payload.get("state")
                 if state:
@@ -1388,6 +1787,8 @@ class OMS:
             "venue_guards": venue_guards,
             "strategy_guards": strategy_guards,
             "strategy_symbol_guards": strategy_symbol_guards,
+            "mode_override": mode_override,
+            "mode_override_reason": mode_override_reason,
             "clean_shutdown": clean_shutdown,
             "dirty_shutdown": not clean_shutdown,
         }
@@ -1526,6 +1927,10 @@ class OMS:
 
     def _audit(self, kind: str, **payload):
         payload.setdefault("state", self.state.value)
+        payload.setdefault("capability_mode", self.capability_mode.value)
+        payload.setdefault("capability_reason", self.capability_reason)
+        payload.setdefault("mode_override", self.mode_override.value if self.mode_override else "")
+        payload.setdefault("mode_override_reason", self.mode_override_reason)
         self.journal.append(kind, payload)
 
     def _record_order_snapshot(self, order: Order, source: str, **extra):

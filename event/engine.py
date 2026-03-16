@@ -1,62 +1,104 @@
-# file: event/engine.py
-
-from queue import Queue, Empty
-from threading import Thread
 from collections import defaultdict
-from .type import Event
+from queue import Empty, Queue
+from threading import Thread
+
 from infrastructure.logger import logger
+
 
 class EventEngine:
     def __init__(self):
-        self._queue = Queue()
+        self._hot_queue = Queue()
+        self._cold_queue = Queue()
         self._active = False
-        self._thread = Thread(target=self._run)
-        self._handlers = defaultdict(list)
+        self._hot_thread = Thread(target=self._run_hot, daemon=True)
+        self._cold_thread = Thread(target=self._run_cold, daemon=True)
+        self._hot_handlers = defaultdict(list)
+        self._cold_handlers = defaultdict(list)
 
     def start(self):
-        """启动后台线程 (实盘模式)"""
         self._active = True
-        self._thread.start()
-        logger.info(">>> [EventEngine] 核心引擎已启动 (Threaded Mode)")
+        if not self._hot_thread.is_alive():
+            self._hot_thread = Thread(target=self._run_hot, daemon=True)
+            self._hot_thread.start()
+        if not self._cold_thread.is_alive():
+            self._cold_thread = Thread(target=self._run_cold, daemon=True)
+            self._cold_thread.start()
+        logger.info(">>> [EventEngine] started with split hot/cold lanes")
 
     def stop(self):
         self._active = False
-        if self._thread.is_alive():
-            self._thread.join()
-        logger.info(">>> [EventEngine] 核心引擎已停止")
+        if self._hot_thread.is_alive():
+            self._hot_thread.join()
+        if self._cold_thread.is_alive():
+            self._cold_thread.join()
+        logger.info(">>> [EventEngine] stopped")
 
-    def put(self, event: Event):
-        self._queue.put(event)
+    def put(self, event):
+        if event.type in self._hot_handlers:
+            self._hot_queue.put(event)
+            return
+        if event.type in self._cold_handlers:
+            self._cold_queue.put(event)
 
-    def register(self, type_: str, handler):
-        self._handlers[type_].append(handler)
+    def register(self, type_, handler):
+        self.register_cold(type_, handler)
 
-    def _run(self):
-        """后台线程轮询"""
+    def register_hot(self, type_, handler):
+        self._hot_handlers[type_].append(handler)
+
+    def register_cold(self, type_, handler):
+        self._cold_handlers[type_].append(handler)
+
+    def get_queue_snapshot(self):
+        return {
+            "hot_depth": self._hot_queue.qsize(),
+            "cold_depth": self._cold_queue.qsize(),
+        }
+
+    def _run_hot(self):
         while self._active:
             try:
-                event = self._queue.get(timeout=1.0)
-                self._process(event)
+                event = self._hot_queue.get(timeout=1.0)
+                self._process_hot(event)
+                if event.type in self._cold_handlers:
+                    self._cold_queue.put(event)
             except Empty:
                 pass
 
-    def _process(self, event: Event):
-        if event.type in self._handlers:
-            for handler in self._handlers[event.type]:
-                try:
-                    handler(event)
-                except Exception as e:
-                    logger.error(f"[Error] 事件处理异常 {event.type}: {e}")
-
-    # [NEW] 新增：同步处理方法 (回测专用)
-    def process_existing_events(self):
-        """
-        处理当前队列中积压的所有事件，直到队列为空。
-        用于回测时强制同步策略状态。
-        """
-        while not self._queue.empty():
+    def _run_cold(self):
+        while self._active:
             try:
-                event = self._queue.get_nowait()
-                self._process(event)
+                event = self._cold_queue.get(timeout=1.0)
+                self._process_cold(event)
+            except Empty:
+                pass
+
+    def _process_hot(self, event):
+        self._dispatch(self._hot_handlers.get(event.type, ()), event, lane="hot")
+
+    def _process_cold(self, event):
+        self._dispatch(self._cold_handlers.get(event.type, ()), event, lane="cold")
+
+    def _dispatch(self, handlers, event, lane: str):
+        for handler in handlers:
+            try:
+                handler(event)
+            except Exception as exc:
+                logger.error(f"[EventEngine:{lane}] handler failed {event.type}: {exc}")
+
+    def process_existing_events(self):
+        while not self._hot_queue.empty():
+            try:
+                event = self._hot_queue.get_nowait()
+                self._process_hot(event)
+                if event.type in self._cold_handlers:
+                    self._cold_queue.put(event)
+            except Empty:
+                break
+
+        while not self._cold_queue.empty():
+            try:
+                event = self._cold_queue.get_nowait()
+                self._process_cold(event)
             except Empty:
                 break

@@ -17,6 +17,7 @@ from event.type import (
     ExecutionPolicy,
     EVENT_EXCHANGE_ORDER_UPDATE,
     LifecycleState,
+    OMSCapabilityMode,
     OrderIntent,
     Side,
 )
@@ -47,11 +48,15 @@ class DummyGateway:
             "totalInitialMargin": "0",
         }
         self.cancelled_symbols = []
+        self.cancel_requests = []
+        self.sent_orders = []
 
     def send_order(self, req, client_oid):
-        return "ex-order"
+        self.sent_orders.append((req, client_oid))
+        return f"ex-order-{len(self.sent_orders)}"
 
     def cancel_order(self, req):
+        self.cancel_requests.append(req)
         return None
 
     def cancel_all_orders(self, symbol):
@@ -285,6 +290,190 @@ class OMSSurvivabilityTests(unittest.TestCase):
             self.assertFalse(result.accepted)
             self.assertIn("venue_frozen", result.reason)
             self.assertEqual(oms.state, LifecycleState.LIVE)
+        finally:
+            oms.stop()
+
+    def test_halted_state_is_cancel_only(self):
+        gateway = DummyGateway()
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            active_order = Order(
+                "oid-active",
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 1.0),
+            )
+            active_order.mark_submitting()
+            active_order.mark_pending_ack("ex-active")
+            active_order.mark_new("ex-active", update_time=1.0, seq=1)
+            oms.orders[active_order.client_oid] = active_order
+            oms.exchange_id_map[active_order.exchange_oid] = active_order
+
+            oms.halt_system("kill:test")
+
+            self.assertEqual(oms.capability_mode, OMSCapabilityMode.CANCEL_ONLY)
+            self.assertTrue(oms.can_query_exchange())
+            self.assertTrue(oms.can_cancel_orders())
+            self.assertFalse(oms.can_open_new_risk())
+            self.assertEqual(oms.query_open_orders(), [])
+
+            blocked = oms.submit_order(OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 1.0))
+            cancelled = oms.cancel_order("oid-active")
+
+            self.assertFalse(blocked.accepted)
+            self.assertIn("open_risk_blocked:CANCEL_ONLY", blocked.reason)
+            self.assertTrue(cancelled)
+            self.assertEqual(len(gateway.cancel_requests), 1)
+        finally:
+            oms.stop()
+
+    def test_reconciling_state_is_read_only_for_public_controls(self):
+        gateway = DummyGateway()
+        gateway.open_orders = [{"symbol": "BTCUSDT", "orderId": 1, "clientOrderId": "ghost-1", "side": "BUY"}]
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            active_order = Order(
+                "oid-active",
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 1.0),
+            )
+            active_order.mark_submitting()
+            active_order.mark_pending_ack("ex-active")
+            active_order.mark_new("ex-active", update_time=1.0, seq=1)
+            oms.orders[active_order.client_oid] = active_order
+            oms.exchange_id_map[active_order.exchange_oid] = active_order
+
+            oms.state = LifecycleState.RECONCILING
+
+            self.assertEqual(oms.get_capability_snapshot()["mode"], OMSCapabilityMode.READ_ONLY.value)
+            self.assertTrue(oms.can_query_exchange())
+            self.assertFalse(oms.can_cancel_orders())
+            self.assertFalse(oms.can_open_new_risk())
+            self.assertEqual(oms.query_open_orders(), gateway.open_orders)
+            self.assertFalse(oms.cancel_order("oid-active"))
+        finally:
+            oms.stop()
+
+    def test_exchange_updates_continue_while_halted(self):
+        gateway = DummyGateway()
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            order = Order(
+                "oid-active",
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 1.0),
+            )
+            order.mark_submitting()
+            order.mark_pending_ack("ex-active")
+            order.mark_new("ex-active", update_time=1.0, seq=1)
+            oms.orders[order.client_oid] = order
+            oms.exchange_id_map[order.exchange_oid] = order
+
+            oms.halt_system("operator:test")
+            oms.on_exchange_update(
+                Event(
+                    EVENT_EXCHANGE_ORDER_UPDATE,
+                    ExchangeOrderUpdate(
+                        client_oid="oid-active",
+                        exchange_oid="ex-active",
+                        symbol="BTCUSDT",
+                        status="CANCELED",
+                        filled_qty=0.0,
+                        filled_price=0.0,
+                        cum_filled_qty=0.0,
+                        update_time=2.0,
+                        seq=2,
+                    ),
+                )
+            )
+
+            self.assertEqual(oms.orders["oid-active"].status.value, "CANCELLED")
+        finally:
+            oms.stop()
+
+    def test_degraded_mode_converts_aggressive_orders_to_passive(self):
+        gateway = DummyGateway()
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.set_trading_mode(OMSCapabilityMode.DEGRADED, "processing_lag:test")
+            oms.exposure.check_risk = lambda *args, **kwargs: (True, "")
+
+            result = oms.submit_order(
+                OrderIntent(
+                    "alpha",
+                    "BTCUSDT",
+                    Side.BUY,
+                    100.0,
+                    1.0,
+                    order_type="LIMIT",
+                    time_in_force="IOC",
+                    is_post_only=False,
+                    policy=ExecutionPolicy.AGGRESSIVE,
+                )
+            )
+
+            self.assertTrue(result.accepted)
+            sent_req, _client_oid = gateway.sent_orders[-1]
+            self.assertTrue(sent_req.post_only)
+            self.assertEqual(sent_req.time_in_force, "GTX")
+            self.assertEqual(sent_req.order_type, "LIMIT")
+        finally:
+            oms.stop()
+
+    def test_passive_only_blocks_aggressive_orders_but_allows_post_only(self):
+        gateway = DummyGateway()
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.set_trading_mode(OMSCapabilityMode.PASSIVE_ONLY, "processing_lag:test")
+            oms.exposure.check_risk = lambda *args, **kwargs: (True, "")
+
+            blocked = oms.submit_order(
+                OrderIntent(
+                    "alpha",
+                    "BTCUSDT",
+                    Side.BUY,
+                    100.0,
+                    1.0,
+                    order_type="LIMIT",
+                    time_in_force="IOC",
+                    is_post_only=False,
+                    policy=ExecutionPolicy.AGGRESSIVE,
+                )
+            )
+            allowed = oms.submit_order(
+                OrderIntent(
+                    "alpha",
+                    "BTCUSDT",
+                    Side.BUY,
+                    100.0,
+                    1.0,
+                    order_type="LIMIT",
+                    time_in_force="GTX",
+                    is_post_only=True,
+                    policy=ExecutionPolicy.PASSIVE,
+                )
+            )
+
+            self.assertFalse(blocked.accepted)
+            self.assertEqual(blocked.reason, "oms_mode_passive_only")
+            self.assertTrue(allowed.accepted)
+        finally:
+            oms.stop()
+
+    def test_emergency_flatten_submits_reduce_only_market_order(self):
+        gateway = DummyGateway()
+        gateway.positions = [{"symbol": "BTCUSDT", "positionAmt": "1.5", "entryPrice": "100.0"}]
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            oms.exposure.force_sync("BTCUSDT", 1.5, 100.0)
+            oms.halt_system("kill:test")
+
+            submitted = oms.emergency_reduce_only_flatten("kill:test")
+
+            self.assertEqual(submitted, 1)
+            sent_req, client_oid = gateway.sent_orders[-1]
+            self.assertTrue(client_oid.startswith("EMERGENCY_"))
+            self.assertEqual(sent_req.order_type, "MARKET")
+            self.assertTrue(sent_req.reduce_only)
+            self.assertEqual(sent_req.side, "SELL")
         finally:
             oms.stop()
 

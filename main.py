@@ -87,35 +87,37 @@ def main():
     time_service.start(testnet=config["testnet"])
     ref_data_manager.init(testnet=config["testnet"])
 
-    engine.register(EVENT_ORDERBOOK, lambda e: data_cache.update_book(e.data))
-    engine.register(EVENT_MARK_PRICE, lambda e: data_cache.update_mark_price(e.data))
-    engine.register(EVENT_AGG_TRADE, lambda e: data_cache.update_trade(e.data))
+    register_hot = getattr(engine, "register_hot", engine.register)
+    register_cold = getattr(engine, "register_cold", engine.register)
+
+    register_hot(EVENT_ORDERBOOK, lambda e: data_cache.update_book(e.data))
+    register_hot(EVENT_MARK_PRICE, lambda e: data_cache.update_mark_price(e.data))
+    register_hot(EVENT_AGG_TRADE, lambda e: data_cache.update_trade(e.data))
 
     main.last_tick_time = time.time()
     main.stale_watchdog_triggered = False
 
-    def on_tick(orderbook):
+    def on_hot_tick(_event):
         main.last_tick_time = time.time()
         main.stale_watchdog_triggered = False
-        strategy.on_orderbook(orderbook)
-        dashboard.update_market(orderbook)
 
-    engine.register(EVENT_ORDERBOOK, lambda e: on_tick(e.data))
-    engine.register(EVENT_AGG_TRADE, lambda e: strategy.on_market_trade(e.data))
-
-    engine.register(EVENT_EXCHANGE_ORDER_UPDATE, oms_system.on_exchange_update)
-    engine.register(EVENT_EXCHANGE_ACCOUNT_UPDATE, oms_system.on_exchange_account_update)
-    engine.register(EVENT_ORDER_SUBMITTED, lambda e: oms_system.order_monitor.on_order_submitted(e))
-
-    engine.register(EVENT_ORDER_UPDATE, lambda e: strategy.on_order(e.data))
-    engine.register(EVENT_TRADE_UPDATE, lambda e: strategy.on_trade(e.data))
-    engine.register(EVENT_POSITION_UPDATE, lambda e: [strategy.on_position(e.data), dashboard.update_position(e.data)])
-    engine.register(EVENT_ACCOUNT_UPDATE, lambda e: [strategy.on_account_update(e.data), dashboard.update_account(e.data)])
-    engine.register(EVENT_STRATEGY_UPDATE, lambda e: dashboard.update_strategy(e.data))
-    engine.register(
+    register_hot(EVENT_ORDERBOOK, on_hot_tick)
+    register_hot(EVENT_EXCHANGE_ORDER_UPDATE, oms_system.on_exchange_update)
+    register_hot(EVENT_EXCHANGE_ACCOUNT_UPDATE, oms_system.on_exchange_account_update)
+    register_hot(EVENT_ORDER_SUBMITTED, lambda e: oms_system.order_monitor.on_order_submitted(e))
+    register_hot(
         EVENT_SYSTEM_HEALTH,
-        lambda e: [strategy.on_system_health(e.data), handle_system_health_event(e, risk_controller, oms_system)],
+        lambda e: handle_system_health_event(e, risk_controller, oms_system),
     )
+
+    register_cold(EVENT_ORDERBOOK, lambda e: [strategy.on_orderbook(e.data), dashboard.update_market(e.data)])
+    register_cold(EVENT_AGG_TRADE, lambda e: strategy.on_market_trade(e.data))
+    register_cold(EVENT_ORDER_UPDATE, lambda e: strategy.on_order(e.data))
+    register_cold(EVENT_TRADE_UPDATE, lambda e: strategy.on_trade(e.data))
+    register_cold(EVENT_POSITION_UPDATE, lambda e: [strategy.on_position(e.data), dashboard.update_position(e.data)])
+    register_cold(EVENT_ACCOUNT_UPDATE, lambda e: [strategy.on_account_update(e.data), dashboard.update_account(e.data)])
+    register_cold(EVENT_STRATEGY_UPDATE, lambda e: dashboard.update_strategy(e.data))
+    register_cold(EVENT_SYSTEM_HEALTH, lambda e: strategy.on_system_health(e.data))
 
     engine.start()
     gateway.connect(config["symbols"])

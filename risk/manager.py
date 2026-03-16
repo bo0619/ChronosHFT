@@ -4,6 +4,7 @@ from collections import defaultdict, deque
 from data.cache import data_cache
 from event.type import (
     Event,
+    OMSCapabilityMode,
     OrderRequest,
     EVENT_ACCOUNT_UPDATE,
     EVENT_LOG,
@@ -40,6 +41,11 @@ class RiskManager:
         self.max_processing_lag_ms = tech.get("max_processing_lag_ms", self.max_latency_ms)
         self.max_orders_per_sec = tech.get("max_order_count_per_sec", 20)
         self.consecutive_error_limit = max(1, int(tech.get("consecutive_error_limit", 10)))
+        self.degraded_error_limit = max(1, int(tech.get("degraded_error_limit", 1)))
+        self.passive_only_error_limit = max(
+            self.degraded_error_limit,
+            int(tech.get("passive_only_error_limit", max(2, self.degraded_error_limit + 1))),
+        )
 
         black_swan = self.config.get("black_swan", {})
         self.volatility_halt_threshold = black_swan.get("volatility_halt_threshold", 0.05)
@@ -56,6 +62,7 @@ class RiskManager:
         self.frozen_symbols = {}
         self.frozen_venues = {}
         self.venue_recovery_by_venue = defaultdict(int)
+        self.processing_mode_recovery_by_venue = defaultdict(int)
         self.symbol_freeze_recovery_updates = max(
             1,
             int(tech.get("symbol_freeze_recovery_updates", self.consecutive_error_limit)),
@@ -66,10 +73,17 @@ class RiskManager:
         )
         self.max_frozen_symbols_before_kill = int(tech.get("max_frozen_symbols_before_kill", 0))
 
-        self.engine.register(EVENT_ORDER_UPDATE, self.on_order_update)
-        self.engine.register(EVENT_MARK_PRICE, self.on_mark_price)
-        self.engine.register(EVENT_ACCOUNT_UPDATE, self.on_account_update)
-        self.engine.register(EVENT_ORDERBOOK, self.on_orderbook)
+        self._register_handler(EVENT_ORDER_UPDATE, self.on_order_update)
+        self._register_handler(EVENT_MARK_PRICE, self.on_mark_price)
+        self._register_handler(EVENT_ACCOUNT_UPDATE, self.on_account_update)
+        self._register_handler(EVENT_ORDERBOOK, self.on_orderbook)
+
+    def _register_handler(self, event_type, handler):
+        register_hot = getattr(self.engine, "register_hot", None)
+        if callable(register_hot):
+            register_hot(event_type, handler)
+            return
+        self.engine.register(event_type, handler)
 
     def check_order(self, req: OrderRequest) -> bool:
         if self.kill_switch_triggered:
@@ -155,6 +169,17 @@ class RiskManager:
         if processing_lag_ms > self.max_processing_lag_ms:
             self.processing_lag_breach_count += 1
             self.venue_recovery_by_venue[venue] = 0
+            self.processing_mode_recovery_by_venue[venue] = 0
+            if self.processing_lag_breach_count >= self.degraded_error_limit:
+                self._set_trading_mode(
+                    OMSCapabilityMode.DEGRADED,
+                    f"processing_lag:{processing_lag_ms:.1f}ms>{self.max_processing_lag_ms}ms",
+                )
+            if self.processing_lag_breach_count >= self.passive_only_error_limit:
+                self._set_trading_mode(
+                    OMSCapabilityMode.PASSIVE_ONLY,
+                    f"processing_lag:{processing_lag_ms:.1f}ms>{self.max_processing_lag_ms}ms",
+                )
             self._log_warn(
                 f"Market data processing lag {processing_lag_ms:.1f}ms > {self.max_processing_lag_ms}ms "
                 f"({self.processing_lag_breach_count}/{self.consecutive_error_limit})"
@@ -167,6 +192,13 @@ class RiskManager:
             return
 
         self.processing_lag_breach_count = 0
+        self.processing_mode_recovery_by_venue[venue] += 1
+        if self.processing_mode_recovery_by_venue[venue] >= self.venue_freeze_recovery_updates:
+            self._clear_trading_mode(
+                reason="processing lag recovered",
+                prefixes=("processing_lag:",),
+            )
+            self.processing_mode_recovery_by_venue[venue] = 0
         self._recover_venue_if_stable(venue, prefix="processing_lag:")
 
         if exchange_ts and received_ts:
@@ -250,6 +282,11 @@ class RiskManager:
                 self.oms.halt_system(f"KillSwitch: {reason}")
             except Exception as exc:
                 logger.error(f"[KillSwitch] oms.halt_system failed: {exc}")
+            try:
+                if hasattr(self.oms, "emergency_reduce_only_flatten"):
+                    self.oms.emergency_reduce_only_flatten(f"KillSwitch: {reason}")
+            except Exception as exc:
+                logger.error(f"[KillSwitch] emergency flatten failed: {exc}")
 
     def _freeze_symbol(self, symbol: str, reason: str):
         if not symbol:
@@ -350,6 +387,20 @@ class RiskManager:
                 )
             except Exception as exc:
                 logger.error(f"[Risk] oms.clear_venue_freeze({venue}) failed: {exc}")
+
+    def _set_trading_mode(self, mode: OMSCapabilityMode, reason: str):
+        if self.oms and hasattr(self.oms, "set_trading_mode"):
+            try:
+                self.oms.set_trading_mode(mode, reason)
+            except Exception as exc:
+                logger.error(f"[Risk] oms.set_trading_mode({mode.value}) failed: {exc}")
+
+    def _clear_trading_mode(self, reason: str = "", prefixes=()):
+        if self.oms and hasattr(self.oms, "clear_trading_mode"):
+            try:
+                self.oms.clear_trading_mode(reason=reason, prefixes=prefixes)
+            except Exception as exc:
+                logger.error(f"[Risk] oms.clear_trading_mode failed: {exc}")
 
     def _tracked_symbols(self):
         symbols = set(self.frozen_symbols.keys())

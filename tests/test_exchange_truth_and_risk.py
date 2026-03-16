@@ -44,6 +44,7 @@ from event.type import (
     ExecutionPolicy,
     GatewayState,
     MarkPriceData,
+    OMSCapabilityMode,
     OrderBook,
     OrderIntent,
     Side,
@@ -111,6 +112,9 @@ class DummyOMS:
         self.unfrozen_symbols = []
         self.frozen_venues = []
         self.unfrozen_venues = []
+        self.trading_modes = []
+        self.cleared_trading_modes = []
+        self.flatten_reasons = []
 
     def halt_system(self, reason):
         self.halt_reasons.append(reason)
@@ -128,6 +132,17 @@ class DummyOMS:
     def clear_venue_freeze(self, venue, reason=""):
         self.unfrozen_venues.append((venue, reason))
         return True
+
+    def set_trading_mode(self, mode, reason):
+        self.trading_modes.append((mode, reason))
+
+    def clear_trading_mode(self, reason="", prefixes=()):
+        self.cleared_trading_modes.append((reason, tuple(prefixes or ())))
+        return True
+
+    def emergency_reduce_only_flatten(self, reason):
+        self.flatten_reasons.append(reason)
+        return 0
 
 
 class ExchangeTruthTests(unittest.TestCase):
@@ -362,8 +377,11 @@ class RiskExecutionTests(unittest.TestCase):
                 },
                 "tech_health": {
                     "max_latency_ms": 100,
+                    "max_processing_lag_ms": 100,
                     "max_order_count_per_sec": 20,
                     "consecutive_error_limit": 2,
+                    "degraded_error_limit": 1,
+                    "passive_only_error_limit": 2,
                 },
                 "black_swan": {
                     "volatility_halt_threshold": 0.05,
@@ -565,6 +583,44 @@ class RiskExecutionTests(unittest.TestCase):
         risk.on_orderbook(Event("eOrderBook", fresh_book))
 
         self.assertTrue(oms.unfrozen_venues)
+
+    def test_processing_lag_degrades_before_venue_freeze(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        config = self.make_risk_config()
+        config["risk"]["tech_health"]["consecutive_error_limit"] = 3
+        risk = RiskManager(engine, config, oms=oms, gateway=gateway)
+
+        delayed_book = OrderBook(
+            symbol="BTCUSDT",
+            exchange="BINANCE",
+            datetime=datetime.now(),
+            exchange_timestamp=(datetime.now() - timedelta(milliseconds=50)).timestamp(),
+            received_timestamp=(datetime.now() - timedelta(milliseconds=250)).timestamp(),
+        )
+
+        risk.on_orderbook(Event("eOrderBook", delayed_book))
+        risk.on_orderbook(Event("eOrderBook", delayed_book))
+
+        self.assertTrue(any(mode == OMSCapabilityMode.DEGRADED for mode, _reason in oms.trading_modes))
+        self.assertTrue(any(mode == OMSCapabilityMode.PASSIVE_ONLY for mode, _reason in oms.trading_modes))
+        self.assertFalse(oms.frozen_venues)
+
+        risk.on_orderbook(Event("eOrderBook", delayed_book))
+        self.assertTrue(oms.frozen_venues)
+
+    def test_kill_switch_requests_emergency_flatten(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        oms.exposure.net_positions = {"BTCUSDT": 1.0}
+        risk = RiskManager(engine, self.make_risk_config(), oms=oms, gateway=gateway)
+
+        risk.trigger_kill_switch("test_kill")
+
+        self.assertTrue(oms.halt_reasons)
+        self.assertEqual(oms.flatten_reasons, ["KillSwitch: test_kill"])
 
 if __name__ == "__main__":
     unittest.main()

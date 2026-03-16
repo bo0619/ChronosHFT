@@ -69,6 +69,15 @@ class LifecycleState(Enum):
     HALTED = "HALTED"
 
 
+class OMSCapabilityMode(Enum):
+    LIVE = "LIVE"
+    DEGRADED = "DEGRADED"
+    PASSIVE_ONLY = "PASSIVE_ONLY"
+    CANCEL_ONLY = "CANCEL_ONLY"
+    READ_ONLY = "READ_ONLY"
+    LOCKDOWN = "LOCKDOWN"
+
+
 class SystemState(Enum):
     CLEAN = "CLEAN"
     DIRTY = "DIRTY"
@@ -127,6 +136,7 @@ class OrderRequest:
     order_type: str = "LIMIT"
     time_in_force: str = TIF_GTC
     post_only: bool = False
+    reduce_only: bool = False
 
 
 @dataclass

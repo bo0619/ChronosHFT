@@ -122,8 +122,13 @@ class BinanceGateway(BaseGateway):
                 action = "exit "
             elif client_oid and client_oid.startswith("ENTRY_"):
                 action = "enter"
+            elif client_oid and client_oid.startswith("EMERGENCY_"):
+                action = "flatten"
             else:
                 action = "order"
+
+            if req.reduce_only:
+                action = f"{action} reduce-only"
 
             logger.info(
                 f"{sym} {action} {side_str} @ {req.price:.6g}"

@@ -87,6 +87,13 @@ class StrategyTemplate:
         intent.price = ref_data_manager.round_price(intent.symbol, intent.price)
         intent.volume = ref_data_manager.round_qty(intent.symbol, intent.volume)
 
+        if hasattr(self.oms, "adapt_intent_for_trading_mode"):
+            adapted_intent, reject_reason = self.oms.adapt_intent_for_trading_mode(intent)
+            if reject_reason:
+                self.on_submit_rejected(intent, reject_reason)
+                return None
+            intent = adapted_intent
+
         info = ref_data_manager.get_info(intent.symbol)
         if info:
             notional = intent.price * intent.volume
