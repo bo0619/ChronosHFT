@@ -1,4 +1,4 @@
-﻿{
+{
     "testnet": true,
     "api_key": "BhluoNoQGdkMMganGvAtvunZXhqEDjRSqoiinlg4BFoBxOizNgMuTfFoTJjJEqzW",
     "api_secret": "rjKqzfsmoMd7pA8XukdtDZ7qYFapl39eRu073pcliZFPf5jinoMAs580TQS358X0",
@@ -91,22 +91,33 @@
     },
     "account": {
         "leverage": 10,
-        "initial_balance_usdt": 10000.0
+        "initial_balance_usdt": 100.0
     },
     "oms": {
         "journal_enabled": true,
         "replay_journal_on_startup": true,
         "journal_path": "storage/oms/oms_journal.jsonl",
-        "tombstone_max": 2000
+        "tombstone_max": 2000,
+        "truth_monitor": {
+            "poll_interval_sec": 5.0,
+            "api_freeze_threshold": 2,
+            "api_halt_threshold": 4,
+            "account_balance_tolerance": 1.0,
+            "testnet_account_balance_tolerance": 5.0,
+            "balance_drift_trigger_count": 3,
+            "ignore_flat_balance_drift": true,
+            "clean_polls_to_clear": 2
+        }
     },
 
     "risk": {
         "active": true,
         "limits": {
-            "max_order_qty": 100.0,
-            "max_order_notional": 5000.0,
-            "max_pos_notional": 20000.0,
-            "max_daily_loss": 500.0,
+            "max_order_qty": 10000.0,
+            "max_order_notional": 8.0,
+            "max_pos_notional": 45.0,
+            "max_account_gross_notional": 45.0,
+            "max_daily_loss": 5.0,
             "max_drawdown_pct": 0.05
         },
         "price_sanity": {
@@ -123,7 +134,7 @@
         }
     },
     "backtest": {
-        "initial_capital": 10000.0,
+        "initial_capital": 100.0,
         "taker_fee": 0.0005,
         "maker_fee": 0.0002,
         "latency_ms_mean": 20,
@@ -136,9 +147,23 @@
     },
     "strategy": {
         "use_rpi": true,        
-        "lot_multiplier": 1.0,
+        "_comment_capital_scaling": "Only change capital_multiplier. Order notional and caps scale together.",
+        "capital_multiplier": 1.0,
+        "capital_scaling": {
+            "enabled": true,
+            "reference_capital_usdt": 100.0,
+            "target_order_notional": 8.0,
+            "target_total_risk_notional": 45.0,
+            "target_concurrent_symbols": 3,
+            "target_daily_loss": 5.0,
+            "max_order_qty": 10000.0,
+            "position_buffer_orders": 2.0,
+            "reference_min_notional": 5.0,
+            "notional_buffer": 1.1
+        },
+        "lot_multiplier": 0.14545455,
         "spread_ratio": 0.0005,
         "skew_factor_usdt": 50.0,
-        "max_pos_usdt": 2000.0
+        "max_pos_usdt": 45.0
     }
 }

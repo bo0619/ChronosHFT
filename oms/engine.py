@@ -73,6 +73,11 @@ class OMS:
             .get("limits", {})
             .get("max_pos_notional", 2000.0)
         )
+        self.max_account_gross_notional = (
+            config.get("risk", {})
+            .get("limits", {})
+            .get("max_account_gross_notional", 0.0)
+        )
 
         self.sequence = SequenceValidator()
         self.validator = OrderValidator(config)
@@ -1243,6 +1248,8 @@ class OMS:
             intent.side,
             intent.volume,
             self.max_pos_notional,
+            self.max_account_gross_notional,
+            intent.price,
         )
         if not ok:
             logger.warning(f"[OMS] Risk rejected: {risk_reason}")

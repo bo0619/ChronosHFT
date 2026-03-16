@@ -19,6 +19,7 @@ from alpha.engine import FeatureEngine
 
 from data.ref_data import ref_data_manager
 from data.cache import data_cache
+from infrastructure.config_scaling import load_root_config
 
 class GLFTStrategy(StrategyTemplate):
     def __init__(self, engine, oms):
@@ -68,10 +69,7 @@ class GLFTStrategy(StrategyTemplate):
         print(f"[{self.name}] 策略已启动. BaseGamma={self.gamma_base}")
 
     def _load_full_config(self):
-        try:
-            import json
-            with open("config.json", "r") as f: return json.load(f)
-        except: return {}
+        return load_root_config("config.json")
 
     def _get_components(self, symbol):
         if symbol not in self.calibrators:

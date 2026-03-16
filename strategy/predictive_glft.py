@@ -38,6 +38,7 @@ from alpha.engine import FeatureEngine
 
 from data.ref_data import ref_data_manager
 from data.cache import data_cache
+from infrastructure.config_scaling import load_root_config
 
 
 class PredictiveGLFTStrategy(StrategyTemplate):
@@ -99,12 +100,7 @@ class PredictiveGLFTStrategy(StrategyTemplate):
     # ----------------------------------------------------------
 
     def _load_strategy_config(self):
-        try:
-            import json
-            with open("config.json", "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        return load_root_config("config.json")
 
     def _get_components(self, symbol):
         if symbol not in self.calibrators:

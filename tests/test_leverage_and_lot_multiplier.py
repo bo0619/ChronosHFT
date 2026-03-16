@@ -55,6 +55,7 @@ if "websocket" not in sys.modules:
 
 from event.type import LifecycleState
 from gateway.binance.gateway import BinanceGateway
+from infrastructure.config_scaling import apply_capital_scaling
 from oms.engine import OMS
 from strategy.ml_sniper.config_loader import load_sniper_config
 from strategy.ml_sniper.ml_sniper import MLSniperStrategy
@@ -122,6 +123,86 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
         self.assertEqual(config["lot_multiplier"], 10.0)
         self.assertIn("weights", config)
 
+    def test_capital_scaling_derives_runtime_limits_from_single_multiplier(self):
+        payload = {
+            "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"],
+            "account": {"leverage": 5, "initial_balance_usdt": 100.0},
+            "backtest": {"initial_capital": 100.0},
+            "risk": {
+                "limits": {
+                    "max_order_qty": 10000.0,
+                    "max_order_notional": 8.0,
+                    "max_pos_notional": 16.0,
+                    "max_account_gross_notional": 45.0,
+                    "max_daily_loss": 5.0,
+                }
+            },
+            "strategy": {
+                "capital_multiplier": 2.0,
+                "capital_scaling": {
+                    "enabled": True,
+                    "reference_capital_usdt": 100.0,
+                    "target_order_notional": 8.0,
+                    "target_total_risk_notional": 45.0,
+                    "target_concurrent_symbols": 3,
+                    "target_daily_loss": 5.0,
+                    "max_order_qty": 10000.0,
+                    "position_buffer_orders": 2.0,
+                    "reference_min_notional": 5.0,
+                    "notional_buffer": 1.1,
+                },
+            },
+        }
+
+        scaled = apply_capital_scaling(payload)
+
+        self.assertEqual(scaled["account"]["initial_balance_usdt"], 200.0)
+        self.assertEqual(scaled["backtest"]["initial_capital"], 200.0)
+        self.assertEqual(scaled["risk"]["limits"]["max_order_notional"], 16.0)
+        self.assertEqual(scaled["risk"]["limits"]["max_pos_notional"], 32.0)
+        self.assertEqual(scaled["risk"]["limits"]["max_account_gross_notional"], 90.0)
+        self.assertEqual(scaled["risk"]["limits"]["max_daily_loss"], 10.0)
+        self.assertEqual(scaled["risk"]["limits"]["max_order_qty"], 20000.0)
+        self.assertAlmostEqual(scaled["strategy"]["lot_multiplier"], 16.0 / 27.5, places=8)
+        self.assertEqual(scaled["strategy"]["max_pos_usdt"], 32.0)
+
+    def test_load_sniper_config_applies_capital_scaling_before_merge(self):
+        payload = {
+            "account": {"leverage": 5, "initial_balance_usdt": 100.0},
+            "backtest": {"initial_capital": 100.0},
+            "risk": {
+                "limits": {
+                    "max_order_qty": 10000.0,
+                    "max_order_notional": 8.0,
+                    "max_pos_notional": 16.0,
+                    "max_account_gross_notional": 45.0,
+                    "max_daily_loss": 5.0,
+                }
+            },
+            "strategy": {
+                "capital_multiplier": 2.0,
+                "capital_scaling": {
+                    "enabled": True,
+                    "reference_capital_usdt": 100.0,
+                    "target_order_notional": 8.0,
+                    "target_total_risk_notional": 45.0,
+                    "target_concurrent_symbols": 3,
+                    "position_buffer_orders": 2.0,
+                    "reference_min_notional": 5.0,
+                    "notional_buffer": 1.1,
+                },
+                "ml_sniper": {
+                    "weights": {"1s": 0.1, "10s": 0.5, "30s": 0.4}
+                },
+            },
+        }
+
+        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            config = load_sniper_config()
+
+        self.assertAlmostEqual(config["lot_multiplier"], 16.0 / 27.5, places=8)
+        self.assertIn("weights", config)
+
     @patch("strategy.ml_sniper.ml_sniper.load_sniper_config", return_value={"lot_multiplier": 10.0})
     @patch("strategy.ml_sniper.ml_sniper.ref_data_manager.round_qty", side_effect=lambda symbol, qty: round(qty, 2))
     @patch("strategy.ml_sniper.ml_sniper.ref_data_manager.get_info", return_value=SimpleNamespace(min_qty=0.01, min_notional=5.0))
@@ -144,6 +225,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             "risk": {
                 "limits": {
                     "max_pos_notional": 1234.0,
+                    "max_account_gross_notional": 4321.0,
                 }
             },
             "oms": {
@@ -156,6 +238,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
         oms = OMS(DummyEngine(), gateway, config)
         try:
             self.assertEqual(gateway.target_leverage, 7)
+            self.assertEqual(oms.max_account_gross_notional, 4321.0)
         finally:
             oms.stop()
 

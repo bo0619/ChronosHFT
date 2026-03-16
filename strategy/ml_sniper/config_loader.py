@@ -1,13 +1,11 @@
 # file: strategy/ml_sniper/config_loader.py
 
-import json
+from infrastructure.config_scaling import load_root_config
 
 
 def load_sniper_config():
-    try:
-        with open("config.json", "r", encoding="utf-8") as handle:
-            cfg = json.load(handle)
-    except Exception:
+    cfg = load_root_config("config.json")
+    if not cfg:
         return {}
 
     strategy_cfg = cfg.get("strategy", {})

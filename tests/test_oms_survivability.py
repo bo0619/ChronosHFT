@@ -634,6 +634,7 @@ class DummyTruthProvider:
 class TruthMonitorTests(unittest.TestCase):
     def make_config(self):
         return {
+            "testnet": False,
             "symbols": ["BTCUSDT"],
             "account": {
                 "initial_balance_usdt": 1000.0,
@@ -717,6 +718,80 @@ class TruthMonitorTests(unittest.TestCase):
 
             monitor.poll_once()
             self.assertEqual(oms.state, LifecycleState.HALTED)
+        finally:
+            oms.stop()
+
+    def test_truth_monitor_requires_consecutive_balance_drift_before_reconcile(self):
+        config = self.make_config()
+        config["oms"]["truth_monitor"]["balance_drift_trigger_count"] = 2
+        oms = OMS(DummyEngine(), DummyGateway(), config)
+        provider = DummyTruthProvider()
+        provider.account["totalWalletBalance"] = "1010"
+        monitor = TruthMonitor(oms, provider, config, start_thread=False)
+        reconcile_calls = []
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.trigger_reconcile = lambda reason, suspicious_oid=None: reconcile_calls.append((reason, suspicious_oid))
+
+            monitor.poll_once()
+            self.assertEqual(oms.get_venue_freeze_reason("BINANCE"), "")
+            self.assertEqual(reconcile_calls, [])
+
+            monitor.poll_once()
+            self.assertTrue(oms.get_venue_freeze_reason("BINANCE").startswith("truth_plane:balance_drift"))
+            self.assertEqual(reconcile_calls, [("Truth plane account balance drift", None)])
+        finally:
+            oms.stop()
+
+    def test_truth_monitor_ignores_flat_balance_drift_on_testnet(self):
+        config = self.make_config()
+        config["testnet"] = True
+        oms = OMS(DummyEngine(), DummyGateway(), config)
+        provider = DummyTruthProvider()
+        provider.account["totalWalletBalance"] = "1007"
+        monitor = TruthMonitor(oms, provider, config, start_thread=False)
+        try:
+            oms.state = LifecycleState.LIVE
+            reconcile_calls = []
+            oms.trigger_reconcile = lambda reason, suspicious_oid=None: reconcile_calls.append((reason, suspicious_oid))
+
+            monitor.poll_once()
+
+            self.assertEqual(oms.get_venue_freeze_reason("BINANCE"), "")
+            self.assertEqual(reconcile_calls, [])
+            self.assertEqual(monitor.consecutive_balance_drifts, 0)
+        finally:
+            oms.stop()
+
+    def test_truth_monitor_prefers_tracked_asset_balance_over_total_wallet(self):
+        config = self.make_config()
+        config["symbols"] = ["SOLUSDC"]
+        oms = OMS(DummyEngine(), DummyGateway(), config)
+        provider = DummyTruthProvider()
+        provider.account = {
+            "totalWalletBalance": "1200",
+            "totalInitialMargin": "0",
+            "availableBalance": "1200",
+            "assets": [
+                {"asset": "USDC", "walletBalance": "1000", "availableBalance": "1000"},
+                {"asset": "BNB", "walletBalance": "200", "availableBalance": "200"},
+            ],
+        }
+        monitor = TruthMonitor(oms, provider, config, start_thread=False)
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.account.force_sync(
+                1000.0,
+                0.0,
+                available=1000.0,
+                asset="USDC",
+                balances={"USDC": {"wallet_balance": 1000.0, "available_balance": 1000.0}},
+            )
+
+            monitor.poll_once()
+
+            self.assertEqual(oms.get_venue_freeze_reason("BINANCE"), "")
+            self.assertEqual(monitor.consecutive_balance_drifts, 0)
         finally:
             oms.stop()
 

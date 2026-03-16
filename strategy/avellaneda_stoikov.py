@@ -7,6 +7,7 @@ from collections import deque
 from .base import StrategyTemplate
 from event.type import OrderBook, TradeData, OrderStateSnapshot, Side, OrderIntent
 from data.ref_data import ref_data_manager
+from infrastructure.config_scaling import load_root_config
 
 class AvellanedaStoikovStrategy(StrategyTemplate):
     """
@@ -37,10 +38,8 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
         print(f"[{self.name}] A-S 模型已启动 (OMS驱动): Gamma={self.gamma}, K={self.k}, Cycle={self.interval}s")
 
     def _load_strategy_config(self):
-        try:
-            import json
-            with open("config.json", "r") as f: return json.load(f).get("strategy", {})
-        except: return {}
+        full_config = load_root_config("config.json")
+        return full_config.get("strategy", {}) if full_config else {}
 
     def _calculate_volatility_sq(self):
         """计算短期回报率的方差 (sigma^2)"""

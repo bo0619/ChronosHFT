@@ -1,4 +1,3 @@
-import json
 import os
 import sys
 import time
@@ -25,6 +24,7 @@ from event.type import (
 )
 from gateway.binance.gateway import BinanceGateway
 from gateway.binance.truth_provider import BinanceTruthSnapshotProvider
+from infrastructure.config_scaling import load_root_config
 from infrastructure.logger import logger
 from infrastructure.system_health import handle_system_health_event
 from infrastructure.time_service import time_service
@@ -43,11 +43,12 @@ from ui.dashboard import TUIDashboard
 
 
 def load_config():
+    config = load_root_config("config.json")
+    if config:
+        return config
     if not os.path.exists("config.json"):
         print("Error: config.json not found.")
-        return None
-    with open("config.json", "r", encoding="utf-8") as handle:
-        return json.load(handle)
+    return None
 
 
 def main():

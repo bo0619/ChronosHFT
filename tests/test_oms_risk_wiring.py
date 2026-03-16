@@ -110,6 +110,7 @@ class OMSConfigTests(unittest.TestCase):
             "risk": {
                 "limits": {
                     "max_pos_notional": 1234.0,
+                    "max_account_gross_notional": 4321.0,
                 }
             },
             "oms": {
@@ -121,6 +122,7 @@ class OMSConfigTests(unittest.TestCase):
         oms = OMS(DummyEngine(), DummyGateway(), config)
         try:
             self.assertEqual(oms.max_pos_notional, 1234.0)
+            self.assertEqual(oms.max_account_gross_notional, 4321.0)
         finally:
             oms.stop()
 

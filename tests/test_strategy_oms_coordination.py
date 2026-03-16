@@ -74,7 +74,7 @@ class DummyStrategy(StrategyTemplate):
 
 
 class StrategyOmsCoordinationTests(unittest.TestCase):
-    def make_config(self, max_order_notional=5000.0):
+    def make_config(self, max_order_notional=5000.0, max_account_gross_notional=0.0):
         return {
             "symbols": ["BTCUSDT"],
             "account": {
@@ -86,6 +86,7 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
                     "max_order_qty": 100.0,
                     "max_order_notional": max_order_notional,
                     "max_pos_notional": 5000.0,
+                    "max_account_gross_notional": max_account_gross_notional,
                 },
                 "price_sanity": {
                     "max_deviation_pct": 0.05,
@@ -192,6 +193,33 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         self.assertEqual(update.params["Avail"], "900.0")
         self.assertEqual(update.params["Health"], "HALT:test_gateway")
         self.assertEqual(update.params["Reject"], "insufficient_margin")
+
+    @patch("oms.validator.ref_data_manager.get_info", return_value=None)
+    @patch("oms.validator.data_cache.get_best_quote", return_value=(99.9, 100.1))
+    @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
+    @patch("oms.exposure.data_cache.get_best_quote", return_value=(99.9, 100.1))
+    @patch("oms.exposure.data_cache.get_mark_price", return_value=100.0)
+    def test_account_gross_limit_rejects_when_total_multi_symbol_risk_is_full(self, *_mocks):
+        engine = DispatchingEngine()
+        gateway = DummyGateway(send_order_result="ex-order")
+        config = self.make_config(max_order_notional=5000.0, max_account_gross_notional=150.0)
+        config["symbols"] = ["BTCUSDT", "ETHUSDT"]
+        oms = OMS(engine, gateway, config)
+        strategy = DummyStrategy(engine, oms)
+        engine.register(EVENT_ORDER_UPDATE, lambda event: strategy.on_order(event.data))
+        oms.state = LifecycleState.LIVE
+        oms.exposure.net_positions["ETHUSDT"] = 1.2
+        try:
+            oid = strategy.send_intent(OrderIntent("dummy", "BTCUSDT", Side.BUY, 100.0, 0.4))
+
+            self.assertIsNone(oid)
+            self.assertIn("Account Gross Exposure", strategy.last_submit_reject_reason)
+            order_updates = [event.data for event in engine.events if event.type == EVENT_ORDER_UPDATE]
+            self.assertEqual(len(order_updates), 1)
+            self.assertEqual(order_updates[0].status, OrderStatus.REJECTED_LOCALLY)
+            self.assertIn("Account Gross Exposure", order_updates[0].error_msg)
+        finally:
+            oms.stop()
 
 
 if __name__ == "__main__":

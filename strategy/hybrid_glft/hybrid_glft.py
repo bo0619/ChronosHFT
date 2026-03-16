@@ -7,7 +7,6 @@
 # [FIX-F] _update_quotes: is_post_only=True
 # [FIX-G] _update_quotes: cancelling 守卫消灭撤单竞态
 
-import json
 import math
 import time
 from collections import defaultdict
@@ -25,6 +24,7 @@ from alpha.factors import GLFTCalibrator
 from alpha.engine import FeatureEngine
 from data.ref_data import ref_data_manager
 from data.cache import data_cache
+from infrastructure.config_scaling import load_root_config
 
 
 class HybridGLFTStrategy(StrategyTemplate):
@@ -33,11 +33,7 @@ class HybridGLFTStrategy(StrategyTemplate):
         super().__init__(engine, oms, "HybridGLFT_Pro")
 
         # ── 读取 config ──────────────────────────────────────
-        try:
-            with open("config.json") as f:
-                cfg = json.load(f)
-        except Exception:
-            cfg = {}
+        cfg = load_root_config("config.json")
 
         sc   = cfg.get("strategy", {})
         glft = sc.get("glft", {})

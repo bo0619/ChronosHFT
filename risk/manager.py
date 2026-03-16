@@ -6,6 +6,7 @@ from event.type import (
     Event,
     OMSCapabilityMode,
     OrderRequest,
+    Side,
     EVENT_ACCOUNT_UPDATE,
     EVENT_LOG,
     EVENT_MARK_PRICE,
@@ -30,6 +31,7 @@ class RiskManager:
         self.max_order_qty = limits.get("max_order_qty", 1000.0)
         self.max_order_notional = limits.get("max_order_notional", 5000.0)
         self.max_pos_notional = limits.get("max_pos_notional", 20000.0)
+        self.max_account_gross_notional = limits.get("max_account_gross_notional", 0.0)
         self.max_daily_loss = limits.get("max_daily_loss", 500.0)
         self.max_drawdown_pct = limits.get("max_drawdown_pct", 0.0)
 
@@ -124,6 +126,23 @@ class RiskManager:
             if new_notional > self.max_pos_notional:
                 self._log_warn(f"Projected position {new_notional:.2f} > {self.max_pos_notional}")
                 return False
+            if self.max_account_gross_notional > 0:
+                order_side = req.side if isinstance(req.side, Side) else Side(str(req.side).upper())
+                gross_notional = self.oms.exposure.estimate_account_gross_notional(
+                    symbol=req.symbol,
+                    side=order_side,
+                    volume=req.volume,
+                    order_price=req.price,
+                )
+                if gross_notional is None:
+                    self._log_warn(f"Account gross exposure unavailable for {req.symbol}")
+                    return False
+                if gross_notional > self.max_account_gross_notional:
+                    self._log_warn(
+                        f"Projected account gross exposure {gross_notional:.2f} > "
+                        f"{self.max_account_gross_notional}"
+                    )
+                    return False
             if not self.oms.account.check_margin(notional):
                 return False
 
