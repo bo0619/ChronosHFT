@@ -63,7 +63,14 @@ def main():
     dashboard = TUIDashboard()
     logger.set_ui_callback(dashboard.add_log)
 
-    gateway = BinanceGateway(engine, config["api_key"], config["api_secret"], testnet=config["testnet"])
+    market_data_config = config.get("system", {}).get("market_data", {})
+    gateway = BinanceGateway(
+        engine,
+        config["api_key"],
+        config["api_secret"],
+        testnet=config["testnet"],
+        market_data_config=market_data_config,
+    )
     truth_provider = BinanceTruthSnapshotProvider(
         config["api_key"],
         config["api_secret"],

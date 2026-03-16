@@ -53,6 +53,10 @@
             "recovery_checks": 20,
             "alert_interval_sec": 5
         },
+        "market_data": {
+            "publish_depth_levels": 5,
+            "emit_full_orderbook_events": false
+        },
         "strategy_runtime": {
             "queue_warn_depth": 100,
             "warn_queue_depth": 20,

@@ -33,8 +33,8 @@ class DataRecorder:
         if ob.symbol not in self.depth_buffer: return
         
         # 提取 Top 5
-        sb = sorted(ob.bids.items(), key=lambda x: x[0], reverse=True)[:5]
-        sa = sorted(ob.asks.items(), key=lambda x: x[0])[:5]
+        sb = list(ob.get_top_bids(5))
+        sa = list(ob.get_top_asks(5))
         while len(sb) < 5: sb.append((0,0))
         while len(sa) < 5: sa.append((0,0))
         

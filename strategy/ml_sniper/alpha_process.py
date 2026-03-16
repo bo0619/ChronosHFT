@@ -14,8 +14,8 @@ from .predictor import TimeHorizonPredictor
 
 
 def _serialize_orderbook(orderbook: OrderBook) -> dict:
-    top_bids = sorted(orderbook.bids.items(), key=lambda item: item[0], reverse=True)[:5]
-    top_asks = sorted(orderbook.asks.items(), key=lambda item: item[0])[:5]
+    top_bids = orderbook.get_top_bids(5)
+    top_asks = orderbook.get_top_asks(5)
     return {
         "symbol": orderbook.symbol,
         "exchange": orderbook.exchange,
@@ -29,14 +29,23 @@ def _serialize_orderbook(orderbook: OrderBook) -> dict:
 
 
 def _deserialize_orderbook(payload: dict) -> OrderBook:
+    bids = tuple((float(price), float(volume)) for price, volume in payload.get("bids", ()))
+    asks = tuple((float(price), float(volume)) for price, volume in payload.get("asks", ()))
     return OrderBook(
         symbol=payload["symbol"],
         exchange=payload.get("exchange", ""),
         datetime=datetime.fromtimestamp(payload.get("datetime_ts", time.time())),
-        bids={float(price): float(volume) for price, volume in payload.get("bids", ())},
-        asks={float(price): float(volume) for price, volume in payload.get("asks", ())},
+        bids={price: volume for price, volume in bids},
+        asks={price: volume for price, volume in asks},
+        top_bids=bids,
+        top_asks=asks,
         exchange_timestamp=float(payload.get("exchange_timestamp", 0.0) or 0.0),
         received_timestamp=float(payload.get("received_timestamp", 0.0) or 0.0),
+        best_bid_price=float(bids[0][0]) if bids else 0.0,
+        best_bid_volume=float(bids[0][1]) if bids else 0.0,
+        best_ask_price=float(asks[0][0]) if asks else 0.0,
+        best_ask_volume=float(asks[0][1]) if asks else 0.0,
+        depth_levels=max(len(bids), len(asks)),
     )
 
 

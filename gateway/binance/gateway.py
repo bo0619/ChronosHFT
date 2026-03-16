@@ -40,11 +40,12 @@ class HFTAdapter(HTTPAdapter):
 
 
 class BinanceGateway(BaseGateway):
-    def __init__(self, event_engine, api_key, api_secret, testnet=True):
+    def __init__(self, event_engine, api_key, api_secret, testnet=True, market_data_config=None):
         super().__init__(event_engine, "BINANCE")
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
+        market_data_config = dict(market_data_config or {})
 
         self.session = requests.Session()
         adapter = HFTAdapter(pool_connections=20, pool_maxsize=20)
@@ -58,6 +59,13 @@ class BinanceGateway(BaseGateway):
         self.orderbooks = {}
         self.ws_buffer = {}
         self.book_resyncing = set()
+        self.publish_depth_levels = max(
+            1,
+            int(market_data_config.get("publish_depth_levels", 5) or 5),
+        )
+        self.emit_full_orderbook_events = bool(
+            market_data_config.get("emit_full_orderbook_events", False)
+        )
         self.active = False
         self.listen_key = ""
         self.target_leverage = 0
@@ -78,7 +86,7 @@ class BinanceGateway(BaseGateway):
         self.active = True
 
         for symbol in self.symbols:
-            self.orderbooks[symbol] = LocalOrderBook(symbol)
+            self.orderbooks[symbol] = self._new_local_orderbook(symbol)
             self.ws_buffer[symbol] = []
 
         target_leverage = int(getattr(self, "target_leverage", 0) or 0)
@@ -370,7 +378,7 @@ class BinanceGateway(BaseGateway):
             self._resync_book(symbol)
 
     def _recover_orderbook(self, symbol):
-        self.orderbooks[symbol] = LocalOrderBook(symbol)
+        self.orderbooks[symbol] = self._new_local_orderbook(symbol)
         self.ws_buffer[symbol] = []
         ok = self._resync_book(symbol)
         self.book_resyncing.discard(symbol)
@@ -397,7 +405,7 @@ class BinanceGateway(BaseGateway):
             self.ws = BinanceWsApi(self.on_ws_message, self.on_ws_error, self.testnet)
 
             for symbol in self.symbols:
-                self.orderbooks[symbol] = LocalOrderBook(symbol)
+                self.orderbooks[symbol] = self._new_local_orderbook(symbol)
                 self.ws_buffer[symbol] = []
 
             self.set_state(GatewayState.CONNECTING)
@@ -423,6 +431,13 @@ class BinanceGateway(BaseGateway):
             )
             logger.info(f"[{self.gateway_name}] Venue recovery complete.")
             return True
+
+    def _new_local_orderbook(self, symbol: str):
+        return LocalOrderBook(
+            symbol,
+            publish_depth_levels=getattr(self, "publish_depth_levels", 5),
+            emit_full_book=getattr(self, "emit_full_orderbook_events", False),
+        )
 
     def _resync_book(self, symbol):
         snapshot = self.rest.get_depth_snapshot(symbol)

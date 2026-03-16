@@ -74,8 +74,8 @@ class FeatureEngine:
 
         # --- 特征 2: Depth Slope (L5 Imbalance) ---
         # 提取 Top 5
-        sorted_bids = sorted(ob.bids.items(), key=lambda x: x[0], reverse=True)[:5]
-        sorted_asks = sorted(ob.asks.items(), key=lambda x: x[0])[:5]
+        sorted_bids = ob.get_top_bids(5)
+        sorted_asks = ob.get_top_asks(5)
         
         sum_bid_vol = sum(v for p, v in sorted_bids)
         sum_ask_vol = sum(v for p, v in sorted_asks)

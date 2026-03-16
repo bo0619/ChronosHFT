@@ -32,8 +32,8 @@ class TrendDetector:
         self.current_imbalance = (bid_1_v - ask_1_v) / total_l1 if total_l1 > 0 else 0.0
         
         # 计算深度比 (L5)
-        sorted_bids = sorted(ob.bids.items(), key=lambda x: x[0], reverse=True)[:5]
-        sorted_asks = sorted(ob.asks.items(), key=lambda x: x[0])[:5]
+        sorted_bids = ob.get_top_bids(5)
+        sorted_asks = ob.get_top_asks(5)
         bid_vol_5 = sum(v for _, v in sorted_bids)
         ask_vol_5 = sum(v for _, v in sorted_asks)
         self.current_depth_ratio = bid_vol_5 / (ask_vol_5 + 1e-9)

@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 EVENT_TICK = "eTick"
 EVENT_ORDERBOOK = "eOrderBook"
@@ -107,7 +107,7 @@ class OrderBookGapError(Exception):
     pass
 
 
-@dataclass
+@dataclass(slots=True)
 class Event:
     type: str
     data: Any = None
@@ -160,30 +160,57 @@ class OrderSubmitResult:
     state: str = ""
 
 
-@dataclass
+@dataclass(slots=True)
 class OrderBook:
     symbol: str
     exchange: str
     datetime: datetime
     asks: Dict[float, float] = field(default_factory=dict)
     bids: Dict[float, float] = field(default_factory=dict)
+    top_bids: Tuple[Tuple[float, float], ...] = field(default_factory=tuple)
+    top_asks: Tuple[Tuple[float, float], ...] = field(default_factory=tuple)
     exchange_timestamp: float = 0.0
     received_timestamp: float = 0.0
+    best_bid_price: float = 0.0
+    best_bid_volume: float = 0.0
+    best_ask_price: float = 0.0
+    best_ask_volume: float = 0.0
+    depth_levels: int = 0
 
     def get_best_bid(self):
+        if self.best_bid_price > 0.0:
+            return self.best_bid_price, self.best_bid_volume
+        if self.top_bids:
+            return self.top_bids[0]
         if not self.bids:
             return 0.0, 0.0
         price = max(self.bids.keys())
         return price, self.bids[price]
 
     def get_best_ask(self):
+        if self.best_ask_price > 0.0:
+            return self.best_ask_price, self.best_ask_volume
+        if self.top_asks:
+            return self.top_asks[0]
         if not self.asks:
             return 0.0, 0.0
         price = min(self.asks.keys())
         return price, self.asks[price]
 
+    def get_top_bids(self, limit: int = 5):
+        limit = max(1, int(limit or 1))
+        if self.top_bids:
+            return self.top_bids[:limit]
+        return tuple(sorted(self.bids.items(), key=lambda item: item[0], reverse=True)[:limit])
 
-@dataclass
+    def get_top_asks(self, limit: int = 5):
+        limit = max(1, int(limit or 1))
+        if self.top_asks:
+            return self.top_asks[:limit]
+        return tuple(sorted(self.asks.items(), key=lambda item: item[0])[:limit])
+
+
+@dataclass(slots=True)
 class MarkPriceData:
     symbol: str
     mark_price: float
@@ -193,7 +220,7 @@ class MarkPriceData:
     datetime: datetime
 
 
-@dataclass
+@dataclass(slots=True)
 class AggTradeData:
     symbol: str
     trade_id: int
@@ -203,7 +230,7 @@ class AggTradeData:
     datetime: datetime
 
 
-@dataclass
+@dataclass(slots=True)
 class ExchangeOrderUpdate:
     client_oid: str
     exchange_oid: str
@@ -257,7 +284,7 @@ class TradeData:
     datetime: datetime
 
 
-@dataclass
+@dataclass(slots=True)
 class ExchangeAccountUpdate:
     asset: str
     wallet_balance: float
