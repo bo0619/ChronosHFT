@@ -30,7 +30,10 @@ from infrastructure.system_health import handle_system_health_event
 from infrastructure.time_service import time_service
 from infrastructure.truth_monitor import TruthMonitor
 from infrastructure.venue_supervisor import VenueSupervisor
-from infrastructure.watchdog import emit_market_data_stale_if_needed
+from infrastructure.watchdog import (
+    emit_event_engine_backlog_if_needed,
+    emit_market_data_stale_if_needed,
+)
 from oms.engine import OMS
 from risk.manager import RiskManager
 from strategy.ml_sniper.ml_sniper import MLSniperStrategy
@@ -53,7 +56,8 @@ def main():
     config["system"]["log_console"] = False
     logger.init_logging(config)
 
-    engine = EventEngine()
+    event_engine_config = config.get("system", {}).get("event_engine", {})
+    engine = EventEngine(event_engine_config)
     dashboard = TUIDashboard()
     logger.set_ui_callback(dashboard.add_log)
 
@@ -87,25 +91,31 @@ def main():
     time_service.start(testnet=config["testnet"])
     ref_data_manager.init(testnet=config["testnet"])
 
-    register_hot = getattr(engine, "register_hot", engine.register)
+    register_market = getattr(engine, "register_market", None)
+    if not callable(register_market):
+        register_market = getattr(engine, "register_hot", engine.register)
+    register_execution = getattr(engine, "register_execution", None)
+    if not callable(register_execution):
+        register_execution = getattr(engine, "register_hot", engine.register)
     register_cold = getattr(engine, "register_cold", engine.register)
 
-    register_hot(EVENT_ORDERBOOK, lambda e: data_cache.update_book(e.data))
-    register_hot(EVENT_MARK_PRICE, lambda e: data_cache.update_mark_price(e.data))
-    register_hot(EVENT_AGG_TRADE, lambda e: data_cache.update_trade(e.data))
+    register_market(EVENT_ORDERBOOK, lambda e: data_cache.update_book(e.data))
+    register_market(EVENT_MARK_PRICE, lambda e: data_cache.update_mark_price(e.data))
+    register_market(EVENT_AGG_TRADE, lambda e: data_cache.update_trade(e.data))
 
     main.last_tick_time = time.time()
     main.stale_watchdog_triggered = False
+    main.event_engine_watchdog_state = {}
 
     def on_hot_tick(_event):
         main.last_tick_time = time.time()
         main.stale_watchdog_triggered = False
 
-    register_hot(EVENT_ORDERBOOK, on_hot_tick)
-    register_hot(EVENT_EXCHANGE_ORDER_UPDATE, oms_system.on_exchange_update)
-    register_hot(EVENT_EXCHANGE_ACCOUNT_UPDATE, oms_system.on_exchange_account_update)
-    register_hot(EVENT_ORDER_SUBMITTED, lambda e: oms_system.order_monitor.on_order_submitted(e))
-    register_hot(
+    register_market(EVENT_ORDERBOOK, on_hot_tick)
+    register_execution(EVENT_EXCHANGE_ORDER_UPDATE, oms_system.on_exchange_update)
+    register_execution(EVENT_EXCHANGE_ACCOUNT_UPDATE, oms_system.on_exchange_account_update)
+    register_execution(EVENT_ORDER_SUBMITTED, lambda e: oms_system.order_monitor.on_order_submitted(e))
+    register_execution(
         EVENT_SYSTEM_HEALTH,
         lambda e: handle_system_health_event(e, risk_controller, oms_system),
     )
@@ -138,6 +148,13 @@ def main():
                     engine,
                     main.last_tick_time,
                     main.stale_watchdog_triggered,
+                )
+                main.event_engine_watchdog_state = emit_event_engine_backlog_if_needed(
+                    engine,
+                    oms_system,
+                    getattr(gateway, "gateway_name", "UNKNOWN"),
+                    main.event_engine_watchdog_state,
+                    event_engine_config,
                 )
     except KeyboardInterrupt:
         logger.info("Shutdown signal received.")

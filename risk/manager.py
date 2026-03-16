@@ -79,6 +79,10 @@ class RiskManager:
         self._register_handler(EVENT_ORDERBOOK, self.on_orderbook)
 
     def _register_handler(self, event_type, handler):
+        register_execution = getattr(self.engine, "register_execution", None)
+        if callable(register_execution):
+            register_execution(event_type, handler)
+            return
         register_hot = getattr(self.engine, "register_hot", None)
         if callable(register_hot):
             register_hot(event_type, handler)
