@@ -31,12 +31,55 @@ class DummyOMS:
             }
         }
         self.exposure = types.SimpleNamespace(net_positions={})
+        self.frozen_strategies = []
 
     def cancel_order(self, client_oid):
         return None
 
     def cancel_all_orders(self, symbol):
         return None
+
+    def freeze_strategy(self, strategy_id, reason, symbol="", cancel_active_orders=True):
+        self.frozen_strategies.append((strategy_id, reason, symbol, cancel_active_orders))
+
+
+class FakeAlphaProcess:
+    def __init__(self, snapshots=None, healthy=True, unhealthy_symbols=None):
+        self.enabled = True
+        self.snapshots = list(snapshots or [])
+        self.healthy = healthy
+        self.unhealthy_symbols = set(unhealthy_symbols or [])
+        self.orderbooks = []
+        self.trades = []
+        self.stopped = False
+
+    def start(self):
+        return True
+
+    def stop(self):
+        self.stopped = True
+
+    def submit_orderbook(self, orderbook):
+        self.orderbooks.append(orderbook.symbol)
+        return True
+
+    def submit_trade(self, trade):
+        self.trades.append(trade.trade_id)
+        return True
+
+    def poll(self):
+        pending = list(self.snapshots)
+        self.snapshots.clear()
+        return pending
+
+    def is_healthy(self):
+        return self.healthy
+
+    def get_metrics_snapshot(self):
+        return {"alive": self.healthy, "deferred_depth": 0}
+
+    def get_unhealthy_symbols(self):
+        return set(self.unhealthy_symbols)
 
 
 class MLSniperAdaptationTests(unittest.TestCase):
@@ -282,6 +325,59 @@ class MLSniperAdaptationTests(unittest.TestCase):
             )
 
         cancel_order.assert_called_once_with("exit-1")
+
+    def test_alpha_process_snapshot_drives_publish_and_fsm(self):
+        sym = "BTCUSDT"
+        self.strategy.alpha_process = FakeAlphaProcess(
+            snapshots=[
+                {
+                    "kind": "alpha_snapshot",
+                    "symbol": sym,
+                    "now": 10.0,
+                    "bid_1": 99.9,
+                    "ask_1": 100.1,
+                    "mid": 100.0,
+                    "preds": {"1s": 2.0, "10s": 3.0, "30s": 4.0},
+                    "spread_bps": 20.0,
+                    "sigma_bps": 12.0,
+                    "diagnostics": {
+                        "1s": {"confidence": 0.8},
+                        "10s": {"confidence": 0.6},
+                        "30s": {"confidence": 0.5},
+                    },
+                    "weights_1s": [0.1] * 9,
+                    "warmup_progress": {"1s": 2, "10s": 2, "30s": 2},
+                    "predictor_warmed_up": True,
+                }
+            ]
+        )
+        self.strategy.alpha_process.enabled = True
+
+        with patch.object(self.strategy, "_publish_state") as publish_state, patch.object(
+            self.strategy, "_run_fsm"
+        ) as run_fsm:
+            self.strategy.on_orderbook(
+                types.SimpleNamespace(
+                    symbol=sym,
+                    bids={99.9: 1.0},
+                    asks={100.1: 1.0},
+                )
+            )
+
+        publish_state.assert_called_once()
+        run_fsm.assert_called_once()
+        self.assertEqual(self.strategy.latest_sigma_bps[sym], 12.0)
+        self.assertEqual(self.strategy.latest_preds[sym]["10s"], 3.0)
+
+    def test_unhealthy_alpha_process_freezes_strategy(self):
+        self.strategy.alpha_process = FakeAlphaProcess(healthy=False, unhealthy_symbols={"BTCUSDT"})
+        self.strategy.alpha_process.enabled = True
+
+        self.strategy.poll_async_workers()
+
+        self.assertEqual(self.oms.frozen_strategies[-1][0], self.strategy.name)
+        self.assertEqual(self.oms.frozen_strategies[-1][1], "alpha_process_unhealthy")
+        self.assertEqual(self.oms.frozen_strategies[-1][2], "BTCUSDT")
 
 
 if __name__ == "__main__":

@@ -59,9 +59,16 @@
             "freeze_queue_depth": 80,
             "warn_backlog_ms": 400,
             "freeze_backlog_ms": 1500,
+            "alpha_process_warn_deferred": 8,
+            "alpha_process_freeze_deferred": 32,
             "recovery_checks": 20,
             "slow_handler_ms": 100,
-            "alert_interval_sec": 5
+            "alert_interval_sec": 5,
+            "alpha_process": {
+                "enabled": true,
+                "queue_size": 256,
+                "processes": 2
+            }
         }
     },
     "alert": {

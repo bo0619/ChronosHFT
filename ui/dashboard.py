@@ -217,6 +217,14 @@ class TUIDashboard:
             )
             if strategy_wait:
                 strategy_bits.append(f"W {strategy_wait:.0f}ms")
+            async_worker = strategy.get("async_worker", {})
+            if async_worker:
+                status = "UP" if async_worker.get("alive") else "DOWN"
+                alive_workers = int(async_worker.get("alive_workers", 0))
+                worker_count = int(async_worker.get("worker_count", 0))
+                strategy_bits.append(
+                    f"AP {status} {alive_workers}/{worker_count} D{int(async_worker.get('deferred_depth', 0))}"
+                )
 
         return " | ".join(part for part in (" ".join(engine_bits), " ".join(strategy_bits)) if part).strip() or "-"
 

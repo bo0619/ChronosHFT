@@ -61,6 +61,9 @@ class StrategyRuntime:
             self._condition.notify_all()
         if self._thread and self._thread.is_alive():
             self._thread.join()
+        stop_async_workers = getattr(self.strategy, "stop_async_workers", None)
+        if callable(stop_async_workers):
+            stop_async_workers()
         logger.info(f"[StrategyRuntime] stopped for {getattr(self.strategy, 'name', 'strategy')}")
 
     def on_orderbook(self, orderbook):
@@ -110,6 +113,9 @@ class StrategyRuntime:
             snapshot["inflight_kind"] = self._inflight["kind"]
             snapshot["inflight_ms"] = inflight_ms
             snapshot["inflight_wait_ms"] = inflight_wait_ms
+            async_metrics = self._get_async_worker_metrics()
+            if async_metrics:
+                snapshot["async_worker"] = async_metrics
             return snapshot
 
     def process_pending(self, max_items=None):
@@ -173,6 +179,7 @@ class StrategyRuntime:
         while self._active:
             work = self._pop_next_work(block=True)
             if work is None:
+                self._poll_async_workers()
                 continue
             self._execute(*work)
 
@@ -195,6 +202,7 @@ class StrategyRuntime:
     def _execute(self, kind: str, enqueued_at: float, payload):
         if payload is None:
             return
+        self._poll_async_workers()
         handler = self._resolve_handler(kind)
         if handler is None:
             return
@@ -233,6 +241,24 @@ class StrategyRuntime:
                         f"[StrategyRuntime] slow handler kind={kind} "
                         f"elapsed={elapsed_ms:.1f}ms wait={wait_ms:.1f}ms"
                     )
+        self._poll_async_workers()
+
+    def _poll_async_workers(self):
+        poll = getattr(self.strategy, "poll_async_workers", None)
+        if callable(poll):
+            try:
+                poll()
+            except Exception as exc:
+                logger.error(f"[StrategyRuntime] async worker poll failed: {exc}")
+
+    def _get_async_worker_metrics(self):
+        get_metrics = getattr(self.strategy, "get_async_worker_metrics", None)
+        if callable(get_metrics):
+            try:
+                return get_metrics() or {}
+            except Exception:
+                return {}
+        return {}
 
     def _resolve_handler(self, kind: str):
         if kind == "orderbook":

@@ -175,6 +175,8 @@ def _strategy_runtime_severity(metrics: dict, config: dict):
     control_depth = int(metrics.get("control_depth", 0) or 0)
     market_depth = int(metrics.get("market_depth", 0) or 0)
     total_depth = control_depth + market_depth
+    async_worker = metrics.get("async_worker", {}) or {}
+    deferred_depth = int(async_worker.get("deferred_depth", 0) or 0)
     backlog_ms = max(
         float(metrics.get("oldest_control_wait_ms", 0.0) or 0.0),
         float(metrics.get("oldest_market_wait_ms", 0.0) or 0.0),
@@ -184,12 +186,19 @@ def _strategy_runtime_severity(metrics: dict, config: dict):
     kind = metrics.get("inflight_kind") or metrics.get("last_kind") or "-"
     reason = (
         f"strategy_runtime_backlog:kind={kind}:control={control_depth}:market={market_depth}:"
-        f"backlog={backlog_ms:.1f}ms"
+        f"deferred={deferred_depth}:backlog={backlog_ms:.1f}ms"
     )
 
-    if _metric_trip(total_depth, backlog_ms, config, "freeze_queue_depth", "freeze_backlog_ms", 80, 1500.0):
+    if (
+        _metric_trip(total_depth, backlog_ms, config, "freeze_queue_depth", "freeze_backlog_ms", 80, 1500.0)
+        or deferred_depth >= int(config.get("alpha_process_freeze_deferred", 32))
+        or (async_worker and not async_worker.get("alive", True))
+    ):
         return 2, reason
-    if _metric_trip(total_depth, backlog_ms, config, "warn_queue_depth", "warn_backlog_ms", 20, 400.0):
+    if (
+        _metric_trip(total_depth, backlog_ms, config, "warn_queue_depth", "warn_backlog_ms", 20, 400.0)
+        or deferred_depth >= int(config.get("alpha_process_warn_deferred", 8))
+    ):
         return 1, reason
     return 0, reason
 

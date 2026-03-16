@@ -18,6 +18,7 @@ from alpha.engine import FeatureEngine
 from alpha.factors import GLFTCalibrator
 from data.ref_data import ref_data_manager
 
+from .alpha_process import MLSniperAlphaProcess
 from .config_loader import load_sniper_config
 from .predictor import TimeHorizonPredictor
 
@@ -34,7 +35,7 @@ class MLSniperStrategy(StrategyTemplate):
       FLAT -> ENTERING -> ENTERING_PARTIAL -> HOLDING -> EXITING -> FLAT
     """
 
-    def __init__(self, engine, oms):
+    def __init__(self, engine, oms, alpha_process_config=None):
         super().__init__(engine, oms, "ML_Sniper_USDC")
 
         self.strat_conf = load_sniper_config()
@@ -126,6 +127,8 @@ class MLSniperStrategy(StrategyTemplate):
         self.feature_engine = FeatureEngine()
         self.predictors = {}
         self.calibrators = {}
+        self.remote_predictor_ready = defaultdict(bool)
+        self.remote_model_meta = defaultdict(dict)
 
         self.state = defaultdict(lambda: "FLAT")
         self.pos_entry_ts = defaultdict(float)
@@ -151,6 +154,16 @@ class MLSniperStrategy(StrategyTemplate):
         self.latest_sigma_bps = defaultdict(float)
         self.order_context = {}
         self.execution_feedback = defaultdict(self._new_execution_feedback)
+        alpha_process_config = dict(alpha_process_config or {})
+        alpha_process_config.setdefault("tick_interval_sec", self.tick_interval)
+        alpha_process_config.setdefault("cycle_interval_sec", self.cycle_interval)
+        label_cfg = dict(self.labeling_cfg)
+        label_cfg.setdefault("maker_fee_bps", self.maker_fee_bps)
+        label_cfg.setdefault("taker_fee_bps", self.taker_fee_bps)
+        alpha_process_config.setdefault("labeling", label_cfg)
+        self.alpha_process = MLSniperAlphaProcess(alpha_process_config)
+        if self.alpha_process.enabled:
+            self.alpha_process.start()
 
     def _new_execution_feedback(self):
         return {
@@ -179,7 +192,7 @@ class MLSniperStrategy(StrategyTemplate):
             self.calibrators[symbol] = GLFTCalibrator(window=500)
         return self.predictors[symbol]
 
-    def _check_warmup(self, symbol: str) -> bool:
+    def _check_warmup(self, symbol: str, predictor_ready: bool = None) -> bool:
         if self.symbol_warmup_ready[symbol]:
             return True
 
@@ -188,8 +201,10 @@ class MLSniperStrategy(StrategyTemplate):
         if elapsed < self.min_warmup_sec:
             return False
 
-        predictor = self._get_predictor(symbol)
-        if not predictor.is_warmed_up:
+        if predictor_ready is None:
+            predictor = self._get_predictor(symbol)
+            predictor_ready = predictor.is_warmed_up
+        if not predictor_ready:
             return False
 
         self.symbol_warmup_ready[symbol] = True
@@ -214,8 +229,14 @@ class MLSniperStrategy(StrategyTemplate):
             return info.tick_size
         return ref_data_manager.round_price(symbol, mid * 0.0001)
 
+    def _current_sigma_bps(self, symbol: str, default: float = 10.0) -> float:
+        latest = float(self.latest_sigma_bps.get(symbol, 0.0) or 0.0)
+        if latest > 0.0:
+            return latest
+        return float(max(0.0, getattr(self.calibrators.get(symbol), "sigma_bps", default)))
+
     def _force_exit_slippage(self, symbol: str) -> float:
-        atr = getattr(self.calibrators.get(symbol), "sigma_bps", 20.0)
+        atr = self._current_sigma_bps(symbol, default=20.0)
         slippage_bps = float(max(10.0, min(80.0, atr * 1.5)))
         return slippage_bps / 10000.0
 
@@ -284,7 +305,7 @@ class MLSniperStrategy(StrategyTemplate):
             return float("inf")
 
         spread_bps = max(0.0, (ask_1 - bid_1) / mid * 10000.0)
-        sigma_bps = float(max(0.0, getattr(self.calibrators.get(symbol), "sigma_bps", 10.0)))
+        sigma_bps = self._current_sigma_bps(symbol, default=10.0)
         feedback = self.execution_feedback[symbol]
 
         if mode == "IOC":
@@ -305,7 +326,9 @@ class MLSniperStrategy(StrategyTemplate):
         return max(threshold_bps, effective_cost_bps + self.net_edge_buffer_bps), cost_bps
 
     def _prediction_confidence(self, predictor: TimeHorizonPredictor, preds: dict) -> float:
-        diagnostics = predictor.get_last_diagnostics()
+        return self._prediction_confidence_from_diagnostics(preds, predictor.get_last_diagnostics())
+
+    def _prediction_confidence_from_diagnostics(self, preds: dict, diagnostics: dict) -> float:
         weighted = 0.0
         total_weight = 0.0
         for horizon, weight in self.weights.items():
@@ -325,7 +348,7 @@ class MLSniperStrategy(StrategyTemplate):
             return False, "bad_mid", 0.0, 0.0
 
         spread_bps = max(0.0, (ask_1 - bid_1) / mid * 10000.0)
-        sigma_bps = float(max(0.0, getattr(self.calibrators.get(symbol), "sigma_bps", 10.0)))
+        sigma_bps = self._current_sigma_bps(symbol, default=10.0)
         strong_edge = abs(signal) >= max(required_signal, 1.0) * self.high_edge_confidence_relaxation
 
         if spread_bps > self.max_entry_spread_bps:
@@ -361,7 +384,7 @@ class MLSniperStrategy(StrategyTemplate):
 
     def _dynamic_profit_target_bps(self, symbol: str, side: Side, signal: float, confidence: float, holding_time: float) -> float:
         aligned_signal = max(0.0, self._directional_signal(side, signal))
-        sigma_bps = float(max(0.0, getattr(self.calibrators.get(symbol), "sigma_bps", 10.0)))
+        sigma_bps = self._current_sigma_bps(symbol, default=10.0)
         decay = self._clamp(holding_time / max(self.max_hold_sec, 1.0), 0.0, 1.0)
 
         target = self.profit_target + aligned_signal * self.exit_signal_profit_weight + sigma_bps * self.exit_sigma_profit_weight + confidence * self.exit_confidence_profit_weight
@@ -414,6 +437,14 @@ class MLSniperStrategy(StrategyTemplate):
         return (entry_price / fill_price - 1.0) * 10000.0
 
     def on_orderbook(self, ob: OrderBook):
+        if self.alpha_process.enabled:
+            self.alpha_process.submit_orderbook(ob)
+            self.poll_async_workers()
+            return
+
+        self._process_orderbook_inline(ob)
+
+    def _process_orderbook_inline(self, ob: OrderBook):
         now = time.time()
         sym = ob.symbol
         if self.symbol_start_ts[sym] == 0.0:
@@ -466,11 +497,112 @@ class MLSniperStrategy(StrategyTemplate):
         self._run_fsm(sym, mid, bid_1, ask_1, signal, velocity, confidence, now)
 
     def on_market_trade(self, trade: AggTradeData):
+        if self.alpha_process.enabled:
+            self.alpha_process.submit_trade(trade)
+            self.poll_async_workers()
+            return
+
         self.feature_engine.on_trade(trade)
         current_mid = self.latest_mid.get(trade.symbol, 0.0)
         calibrator = self.calibrators.get(trade.symbol)
         if calibrator and current_mid > 0:
             calibrator.on_market_trade(trade, current_mid)
+
+    def poll_async_workers(self):
+        if not self.alpha_process.enabled:
+            return
+
+        for snapshot in self.alpha_process.poll():
+            if snapshot.get("kind") == "alpha_snapshot":
+                self._consume_alpha_snapshot(snapshot)
+
+        if not self.alpha_process.is_healthy() and hasattr(self.oms, "freeze_strategy"):
+            unhealthy_symbols = set()
+            if hasattr(self.alpha_process, "get_unhealthy_symbols"):
+                unhealthy_symbols = set(self.alpha_process.get_unhealthy_symbols())
+            if unhealthy_symbols:
+                for symbol in unhealthy_symbols:
+                    self.oms.freeze_strategy(
+                        self.name,
+                        "alpha_process_unhealthy",
+                        symbol=symbol,
+                        cancel_active_orders=True,
+                    )
+            else:
+                self.oms.freeze_strategy(self.name, "alpha_process_unhealthy", cancel_active_orders=True)
+
+    def stop_async_workers(self):
+        if self.alpha_process.enabled:
+            self.alpha_process.stop()
+
+    def get_async_worker_metrics(self):
+        if self.alpha_process.enabled:
+            return self.alpha_process.get_metrics_snapshot()
+        return {}
+
+    def _consume_alpha_snapshot(self, snapshot: dict):
+        sym = snapshot["symbol"]
+        now = float(snapshot.get("now", time.time()) or time.time())
+        if self.symbol_start_ts[sym] == 0.0:
+            self.symbol_start_ts[sym] = now
+
+        bid_1 = float(snapshot.get("bid_1", 0.0) or 0.0)
+        ask_1 = float(snapshot.get("ask_1", 0.0) or 0.0)
+        mid = float(snapshot.get("mid", 0.0) or 0.0)
+        if bid_1 <= 0.0 or ask_1 <= 0.0 or mid <= 0.0:
+            return
+
+        preds = {horizon: float(snapshot.get("preds", {}).get(horizon, 0.0)) for horizon in self.weights}
+        confidence = self._prediction_confidence_from_diagnostics(preds, snapshot.get("diagnostics", {}))
+        try:
+            signal = (
+                float(preds.get("1s", 0.0)) * self.weights.get("1s", 0.1)
+                + float(preds.get("10s", 0.0)) * self.weights.get("10s", 0.5)
+                + float(preds.get("30s", 0.0)) * self.weights.get("30s", 0.4)
+            )
+        except Exception:
+            signal = 0.0
+
+        velocity = self._compute_signal_velocity(sym, signal, now)
+        self.latest_mid[sym] = mid
+        self.latest_signal[sym] = signal
+        self.latest_velocity[sym] = velocity
+        self.latest_preds[sym] = preds
+        self.latest_confidence[sym] = confidence
+        self.latest_spread_bps[sym] = float(snapshot.get("spread_bps", 0.0) or 0.0)
+        self.latest_sigma_bps[sym] = float(snapshot.get("sigma_bps", 0.0) or 0.0)
+        self.remote_predictor_ready[sym] = bool(snapshot.get("predictor_warmed_up", False))
+        self.remote_model_meta[sym] = {
+            "weights_1s": list(snapshot.get("weights_1s", ()) or ()),
+            "warmup_progress": dict(snapshot.get("warmup_progress", {}) or {}),
+        }
+
+        if not self._check_warmup(sym, predictor_ready=self.remote_predictor_ready[sym]):
+            self._publish_warmup(
+                sym,
+                mid,
+                signal,
+                velocity,
+                preds,
+                predictor=None,
+                confidence=confidence,
+                model_meta=self.remote_model_meta[sym],
+            )
+            return
+
+        self._publish_state(
+            sym,
+            mid,
+            bid_1,
+            ask_1,
+            signal,
+            velocity,
+            preds,
+            predictor=None,
+            confidence=confidence,
+            model_meta=self.remote_model_meta[sym],
+        )
+        self._run_fsm(sym, mid, bid_1, ask_1, signal, velocity, confidence, now)
 
     def _run_fsm(self, sym: str, mid: float, bid_1: float, ask_1: float, signal: float, velocity: float, confidence: float = 0.0, now: float = 0.0):
         curr_state = self.state[sym]
@@ -719,10 +851,29 @@ class MLSniperStrategy(StrategyTemplate):
         feedback["win_rate_ewma"] = self._ema(feedback["win_rate_ewma"], 1.0 if avg_exit_pnl_bps > 0 else 0.0)
         feedback["closed_trades"] += 1
 
-    def _publish_state(self, sym: str, mid: float, bid_1: float, ask_1: float, signal: float, velocity: float, preds: dict, predictor: TimeHorizonPredictor, confidence: float = 0.0):
-        weights_1s = predictor.get_model_weights("1s")
+    def _publish_state(
+        self,
+        sym: str,
+        mid: float,
+        bid_1: float,
+        ask_1: float,
+        signal: float,
+        velocity: float,
+        preds: dict,
+        predictor: TimeHorizonPredictor,
+        confidence: float = 0.0,
+        model_meta: dict = None,
+    ):
+        model_meta = model_meta or {}
+        weights_1s = model_meta.get("weights_1s")
+        if weights_1s is None and predictor is not None:
+            weights_1s = predictor.get_model_weights("1s")
+        weights_1s = weights_1s or []
         labeled_w = {FEATURE_LABELS[i]: round(weight, 4) for i, weight in enumerate(weights_1s) if i < len(FEATURE_LABELS)}
-        warmup_prog = predictor.warmup_progress()
+        warmup_prog = model_meta.get("warmup_progress")
+        if warmup_prog is None and predictor is not None:
+            warmup_prog = predictor.warmup_progress()
+        warmup_prog = warmup_prog or {}
         maker_required, maker_cost = self._required_signal_bps(sym, mid, bid_1, ask_1, "GTX")
         taker_required, taker_cost = self._required_signal_bps(sym, mid, bid_1, ask_1, "IOC")
         consensus = self._consensus_direction(preds)
@@ -782,10 +933,24 @@ class MLSniperStrategy(StrategyTemplate):
         }
         self.engine.put(Event(EVENT_STRATEGY_UPDATE, StrategyData(symbol=sym, fair_value=mid, alpha_bps=signal, params=params)))
 
-    def _publish_warmup(self, sym: str, mid: float, signal: float, velocity: float, preds: dict, predictor: TimeHorizonPredictor, confidence: float = 0.0):
+    def _publish_warmup(
+        self,
+        sym: str,
+        mid: float,
+        signal: float,
+        velocity: float,
+        preds: dict,
+        predictor: TimeHorizonPredictor,
+        confidence: float = 0.0,
+        model_meta: dict = None,
+    ):
         started_at = self.symbol_start_ts[sym] or self.start_time
         elapsed = time.time() - started_at
-        warmup_prog = predictor.warmup_progress()
+        model_meta = model_meta or {}
+        warmup_prog = model_meta.get("warmup_progress")
+        if warmup_prog is None and predictor is not None:
+            warmup_prog = predictor.warmup_progress()
+        warmup_prog = warmup_prog or {}
         progress_pct = min(100.0, elapsed / self.min_warmup_sec * 100.0)
 
         params = {
@@ -799,6 +964,13 @@ class MLSniperStrategy(StrategyTemplate):
             "Reject": self.last_submit_reject_by_symbol.get(sym, "-")[:32],
             "Blend": {horizon: round(self.weights.get(horizon, 0.0), 2) for horizon in ("1s", "10s", "30s")},
             "Train": warmup_prog,
-            "Weights": {FEATURE_LABELS[i]: round(weight, 4) for i, weight in enumerate(predictor.get_model_weights("1s")) if i < len(FEATURE_LABELS)},
+            "Weights": {
+                FEATURE_LABELS[i]: round(weight, 4)
+                for i, weight in enumerate(
+                    (model_meta.get("weights_1s") or [])
+                    or (predictor.get_model_weights("1s") if predictor is not None else [])
+                )
+                if i < len(FEATURE_LABELS)
+            },
         }
         self.engine.put(Event(EVENT_STRATEGY_UPDATE, StrategyData(symbol=sym, fair_value=mid, alpha_bps=0, params=params)))

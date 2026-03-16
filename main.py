@@ -71,7 +71,14 @@ def main():
     )
     oms_system = OMS(engine, gateway, config)
     risk_controller = RiskManager(engine, config, oms=oms_system, gateway=gateway)
-    strategy = MLSniperStrategy(engine, oms_system)
+    alpha_process_config = (
+        config.get("system", {})
+        .get("strategy_runtime", {})
+        .get("alpha_process", {"enabled": True})
+    )
+    alpha_process_config = dict(alpha_process_config or {})
+    alpha_process_config.setdefault("processes", min(4, max(1, len(config.get("symbols", [])))))
+    strategy = MLSniperStrategy(engine, oms_system, alpha_process_config=alpha_process_config)
     strategy_runtime = StrategyRuntime(
         strategy,
         config.get("system", {}).get("strategy_runtime", {}),
