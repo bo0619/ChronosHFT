@@ -24,9 +24,12 @@ from event.type import (
     EVENT_TRADE_UPDATE,
 )
 from gateway.binance.gateway import BinanceGateway
+from gateway.binance.truth_provider import BinanceTruthSnapshotProvider
 from infrastructure.logger import logger
 from infrastructure.system_health import handle_system_health_event
 from infrastructure.time_service import time_service
+from infrastructure.truth_monitor import TruthMonitor
+from infrastructure.venue_supervisor import VenueSupervisor
 from infrastructure.watchdog import emit_market_data_stale_if_needed
 from oms.engine import OMS
 from risk.manager import RiskManager
@@ -55,10 +58,17 @@ def main():
     logger.set_ui_callback(dashboard.add_log)
 
     gateway = BinanceGateway(engine, config["api_key"], config["api_secret"], testnet=config["testnet"])
+    truth_provider = BinanceTruthSnapshotProvider(
+        config["api_key"],
+        config["api_secret"],
+        testnet=config["testnet"],
+    )
     oms_system = OMS(engine, gateway, config)
     risk_controller = RiskManager(engine, config, oms=oms_system, gateway=gateway)
     strategy = MLSniperStrategy(engine, oms_system)
     recorder = DataRecorder(engine, config["symbols"]) if config.get("record_data", False) else None
+    truth_monitor = TruthMonitor(oms_system, truth_provider, config, start_thread=False)
+    venue_supervisor = VenueSupervisor(oms_system, gateway, config, start_thread=False)
 
     def on_time_service_health(severity, reason, details):
         if severity == "freeze":
@@ -102,13 +112,18 @@ def main():
     engine.register(EVENT_POSITION_UPDATE, lambda e: [strategy.on_position(e.data), dashboard.update_position(e.data)])
     engine.register(EVENT_ACCOUNT_UPDATE, lambda e: [strategy.on_account_update(e.data), dashboard.update_account(e.data)])
     engine.register(EVENT_STRATEGY_UPDATE, lambda e: dashboard.update_strategy(e.data))
-    engine.register(EVENT_SYSTEM_HEALTH, lambda e: [strategy.on_system_health(e.data), handle_system_health_event(e, risk_controller)])
+    engine.register(
+        EVENT_SYSTEM_HEALTH,
+        lambda e: [strategy.on_system_health(e.data), handle_system_health_event(e, risk_controller, oms_system)],
+    )
 
     engine.start()
     gateway.connect(config["symbols"])
 
     time.sleep(3)
     oms_system.bootstrap()
+    truth_monitor.start()
+    venue_supervisor.start()
 
     logger.info("ChronosHFT Core Engine LIVE. (Minimalist Mode)")
 
@@ -126,6 +141,9 @@ def main():
         logger.info("Shutdown signal received.")
         if recorder:
             recorder.close()
+        venue_supervisor.stop()
+        truth_monitor.stop()
+        truth_provider.close()
         time_service.stop()
         oms_system.stop()
         engine.stop()

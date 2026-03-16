@@ -57,9 +57,12 @@ class BinanceGateway(BaseGateway):
         self.symbols = []
         self.orderbooks = {}
         self.ws_buffer = {}
+        self.book_resyncing = set()
         self.active = False
         self.listen_key = ""
         self.target_leverage = 0
+        self.recovery_lock = threading.Lock()
+        self.keep_alive_generation = 0
 
         self.global_sequence_id = 0
         self.seq_lock = threading.Lock()
@@ -84,13 +87,16 @@ class BinanceGateway(BaseGateway):
             if target_leverage > 0:
                 self.rest.set_leverage(symbol, target_leverage)
 
-        self.ws.start_market_stream(self.symbols)
-
-        listen_key = self.rest.create_listen_key()
-        if listen_key:
-            self.listen_key = listen_key
-            self.ws.start_user_stream(listen_key)
-            threading.Thread(target=self._keep_alive_loop, daemon=True).start()
+        if not self._start_streams():
+            self.active = False
+            self.set_state(GatewayState.ERROR)
+            self.event_engine.put(
+                Event(
+                    EVENT_SYSTEM_HEALTH,
+                    f"FREEZE_VENUE:{self.gateway_name}:USER_STREAM_START_FAILED",
+                )
+            )
+            return
 
         threading.Thread(target=self._init_books, daemon=True).start()
         self.set_state(GatewayState.READY)
@@ -147,9 +153,28 @@ class BinanceGateway(BaseGateway):
     def get_depth_snapshot(self, symbol):
         return self.rest.get_depth_snapshot(symbol)
 
-    def _keep_alive_loop(self):
-        while self.active:
+    def _start_streams(self):
+        self.ws.start_market_stream(self.symbols)
+
+        listen_key = self.rest.create_listen_key()
+        if not listen_key:
+            return False
+
+        self.listen_key = listen_key
+        self.ws.start_user_stream(listen_key)
+        self.keep_alive_generation += 1
+        threading.Thread(
+            target=self._keep_alive_loop,
+            args=(self.keep_alive_generation,),
+            daemon=True,
+        ).start()
+        return True
+
+    def _keep_alive_loop(self, generation):
+        while self.active and generation == self.keep_alive_generation:
             time.sleep(1800)
+            if not self.active or generation != self.keep_alive_generation:
+                return
             self.rest.keep_alive_listen_key()
 
     def on_ws_message(self, raw_msg):
@@ -202,7 +227,12 @@ class BinanceGateway(BaseGateway):
             ws_client.close()
         if self.state != GatewayState.ERROR:
             self.set_state(GatewayState.ERROR)
-        self.event_engine.put(Event(EVENT_SYSTEM_HEALTH, message))
+        self.event_engine.put(
+            Event(
+                EVENT_SYSTEM_HEALTH,
+                f"FREEZE_VENUE:{self.gateway_name}:{message}",
+            )
+        )
 
     def _handle_user_update(self, msg):
         order = msg.get("o", {})
@@ -301,14 +331,80 @@ class BinanceGateway(BaseGateway):
             if data:
                 self.on_market_data(EVENT_ORDERBOOK, data)
         except OrderBookGapError:
-            logger.critical(f"[{symbol}] FATAL: OrderBook Gap! Terminating Gateway.")
-            self.event_engine.put(Event(EVENT_SYSTEM_HEALTH, "FATAL_GAP"))
-            self.close()
+            logger.critical(f"[{symbol}] OrderBook gap detected. Freezing symbol and resyncing.")
+            self.event_engine.put(
+                Event(
+                    EVENT_SYSTEM_HEALTH,
+                    f"FREEZE_SYMBOL:{symbol}:FATAL_GAP",
+                )
+            )
+            if symbol not in self.book_resyncing:
+                self.book_resyncing.add(symbol)
+                threading.Thread(
+                    target=self._recover_orderbook,
+                    args=(symbol,),
+                    daemon=True,
+                ).start()
 
     def _init_books(self):
         time.sleep(2)
         for symbol in self.symbols:
             self._resync_book(symbol)
+
+    def _recover_orderbook(self, symbol):
+        self.orderbooks[symbol] = LocalOrderBook(symbol)
+        self.ws_buffer[symbol] = []
+        ok = self._resync_book(symbol)
+        self.book_resyncing.discard(symbol)
+        if ok:
+            self.event_engine.put(
+                Event(
+                    EVENT_SYSTEM_HEALTH,
+                    f"CLEAR_SYMBOL:{symbol}:ORDERBOOK_RESYNCED",
+                )
+            )
+
+    def recover_connectivity(self):
+        with self.recovery_lock:
+            if not self.symbols:
+                return False
+
+            logger.warning(f"[{self.gateway_name}] Recovering venue connectivity...")
+            self.active = True
+            self.book_resyncing.clear()
+            self.keep_alive_generation += 1
+
+            if self.ws:
+                self.ws.close()
+            self.ws = BinanceWsApi(self.on_ws_message, self.on_ws_error, self.testnet)
+
+            for symbol in self.symbols:
+                self.orderbooks[symbol] = LocalOrderBook(symbol)
+                self.ws_buffer[symbol] = []
+
+            self.set_state(GatewayState.CONNECTING)
+            if not self._start_streams():
+                logger.error(f"[{self.gateway_name}] Recovery failed: listen key unavailable")
+                self.set_state(GatewayState.ERROR)
+                return False
+
+            time.sleep(1.0)
+            for symbol in self.symbols:
+                if not self._resync_book(symbol):
+                    logger.error(f"[{self.gateway_name}] Recovery failed during book sync: {symbol}")
+                    self.set_state(GatewayState.ERROR)
+                    return False
+
+            self.active = True
+            self.set_state(GatewayState.READY)
+            self.event_engine.put(
+                Event(
+                    EVENT_SYSTEM_HEALTH,
+                    f"CLEAR_VENUE:{self.gateway_name}:WS_RECOVERED",
+                )
+            )
+            logger.info(f"[{self.gateway_name}] Venue recovery complete.")
+            return True
 
     def _resync_book(self, symbol):
         snapshot = self.rest.get_depth_snapshot(symbol)
@@ -320,10 +416,16 @@ class BinanceGateway(BaseGateway):
                         self.orderbooks[symbol].process_delta(message)
                     self.ws_buffer[symbol] = None
                 except OrderBookGapError:
-                    logger.critical(f"[{symbol}] Gap during init. Failed.")
-                    self.close()
-                    return
+                    logger.critical(f"[{symbol}] Gap during init. Resync failed.")
+                    self.event_engine.put(
+                        Event(
+                            EVENT_SYSTEM_HEALTH,
+                            f"FREEZE_SYMBOL:{symbol}:ORDERBOOK_RESYNC_FAILED",
+                        )
+                    )
+                    return False
         logger.info(f"[{symbol}] Initial Sync Done.")
+        return snapshot is not None
 
     def _parse_optional_float(self, value):
         if value in (None, ""):

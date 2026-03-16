@@ -37,6 +37,7 @@ class RiskManager:
 
         tech = self.config.get("tech_health", {})
         self.max_latency_ms = tech.get("max_latency_ms", 1000)
+        self.max_processing_lag_ms = tech.get("max_processing_lag_ms", self.max_latency_ms)
         self.max_orders_per_sec = tech.get("max_order_count_per_sec", 20)
         self.consecutive_error_limit = max(1, int(tech.get("consecutive_error_limit", 10)))
 
@@ -47,14 +48,21 @@ class RiskManager:
         self.initial_equity = 0.0
         self.peak_equity = 0.0
         self.latency_breach_count = 0
+        self.processing_lag_breach_count = 0
         self.latency_breach_by_symbol = defaultdict(int)
         self.latency_recovery_by_symbol = defaultdict(int)
         self.divergence_breach_by_symbol = defaultdict(int)
         self.divergence_recovery_by_symbol = defaultdict(int)
         self.frozen_symbols = {}
+        self.frozen_venues = {}
+        self.venue_recovery_by_venue = defaultdict(int)
         self.symbol_freeze_recovery_updates = max(
             1,
             int(tech.get("symbol_freeze_recovery_updates", self.consecutive_error_limit)),
+        )
+        self.venue_freeze_recovery_updates = max(
+            1,
+            int(tech.get("venue_freeze_recovery_updates", self.consecutive_error_limit)),
         )
         self.max_frozen_symbols_before_kill = int(tech.get("max_frozen_symbols_before_kill", 0))
 
@@ -139,10 +147,36 @@ class RiskManager:
 
         orderbook = event.data
         symbol = getattr(orderbook, "symbol", "").upper()
+        venue = self._current_venue()
+        now = time.time()
         exchange_ts = float(getattr(orderbook, "exchange_timestamp", 0.0) or 0.0)
         received_ts = float(getattr(orderbook, "received_timestamp", 0.0) or 0.0)
-        reference_ts = exchange_ts or received_ts or orderbook.datetime.timestamp()
-        latency_ms = max(0.0, (time.time() - reference_ts) * 1000.0)
+        processing_lag_ms = max(0.0, (now - received_ts) * 1000.0) if received_ts else 0.0
+        if processing_lag_ms > self.max_processing_lag_ms:
+            self.processing_lag_breach_count += 1
+            self.venue_recovery_by_venue[venue] = 0
+            self._log_warn(
+                f"Market data processing lag {processing_lag_ms:.1f}ms > {self.max_processing_lag_ms}ms "
+                f"({self.processing_lag_breach_count}/{self.consecutive_error_limit})"
+            )
+            if self.processing_lag_breach_count >= self.consecutive_error_limit:
+                self._freeze_venue(
+                    venue,
+                    f"processing_lag:{processing_lag_ms:.1f}ms>{self.max_processing_lag_ms}ms",
+                )
+            return
+
+        self.processing_lag_breach_count = 0
+        self._recover_venue_if_stable(venue, prefix="processing_lag:")
+
+        if exchange_ts and received_ts:
+            latency_ms = max(0.0, (received_ts - exchange_ts) * 1000.0)
+        elif exchange_ts:
+            latency_ms = max(0.0, (now - exchange_ts) * 1000.0)
+        elif received_ts:
+            latency_ms = max(0.0, (now - received_ts) * 1000.0)
+        else:
+            latency_ms = max(0.0, (now - orderbook.datetime.timestamp()) * 1000.0)
         if latency_ms > self.max_latency_ms:
             self.latency_breach_count += 1
             if symbol:
@@ -265,6 +299,57 @@ class RiskManager:
 
         self.latency_recovery_by_symbol[symbol] = 0
         self.divergence_recovery_by_symbol[symbol] = 0
+
+    def _current_venue(self):
+        venue = ""
+        if self.gateway:
+            venue = getattr(self.gateway, "gateway_name", "") or venue
+        if not venue and self.oms:
+            venue = getattr(getattr(self.oms, "gateway", None), "gateway_name", "") or venue
+        return (venue or "UNKNOWN").upper()
+
+    def _freeze_venue(self, venue: str, reason: str):
+        if not venue:
+            return
+
+        venue = venue.upper()
+        existing_reason = self.frozen_venues.get(venue, "")
+        self.frozen_venues[venue] = reason
+        self.venue_recovery_by_venue[venue] = 0
+        if existing_reason == reason:
+            return
+
+        logger.error(f"[Risk] Venue circuit breaker {venue}: {reason}")
+        self._log_warn(f"Venue frozen {venue}: {reason}")
+        if self.oms and hasattr(self.oms, "freeze_venue"):
+            try:
+                self.oms.freeze_venue(venue, reason, cancel_active_orders=False)
+            except Exception as exc:
+                logger.error(f"[Risk] oms.freeze_venue({venue}) failed: {exc}")
+
+    def _recover_venue_if_stable(self, venue: str, prefix: str):
+        venue = (venue or "UNKNOWN").upper()
+        frozen_reason = self.frozen_venues.get(venue, "")
+        if not frozen_reason.startswith(prefix):
+            return
+
+        self.venue_recovery_by_venue[venue] += 1
+        stable_updates = self.venue_recovery_by_venue[venue]
+        if stable_updates < self.venue_freeze_recovery_updates:
+            return
+
+        self.frozen_venues.pop(venue, None)
+        self.venue_recovery_by_venue[venue] = 0
+        logger.info(f"[Risk] Venue circuit breaker cleared {venue}: {prefix}recovered")
+        self._log_warn(f"Venue restored {venue}: {prefix}recovered")
+        if self.oms and hasattr(self.oms, "clear_venue_freeze"):
+            try:
+                self.oms.clear_venue_freeze(
+                    venue,
+                    reason=f"{prefix.rstrip(':')} recovered after {stable_updates} healthy updates",
+                )
+            except Exception as exc:
+                logger.error(f"[Risk] oms.clear_venue_freeze({venue}) failed: {exc}")
 
     def _tracked_symbols(self):
         symbols = set(self.frozen_symbols.keys())

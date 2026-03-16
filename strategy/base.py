@@ -74,6 +74,8 @@ class StrategyTemplate:
         self.last_submit_reject_by_symbol[intent.symbol] = reason
 
     def can_submit_orders(self, symbol: str = "") -> bool:
+        if hasattr(self.oms, "can_submit_for_strategy"):
+            return bool(self.oms.can_submit_for_strategy(self.name, symbol))
         if symbol and hasattr(self.oms, "is_symbol_tradeable"):
             return bool(self.oms.is_symbol_tradeable(symbol))
         return getattr(self.oms, "state", None) == LifecycleState.LIVE

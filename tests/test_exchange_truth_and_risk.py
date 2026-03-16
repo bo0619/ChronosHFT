@@ -72,6 +72,7 @@ class DummyEngine:
 
 class DummyGateway:
     def __init__(self):
+        self.gateway_name = "BINANCE"
         self.cancelled_symbols = []
         self.open_orders = []
         self.positions = []
@@ -108,6 +109,8 @@ class DummyOMS:
         self.halt_reasons = []
         self.frozen_symbols = []
         self.unfrozen_symbols = []
+        self.frozen_venues = []
+        self.unfrozen_venues = []
 
     def halt_system(self, reason):
         self.halt_reasons.append(reason)
@@ -117,6 +120,13 @@ class DummyOMS:
 
     def clear_symbol_freeze(self, symbol, reason=""):
         self.unfrozen_symbols.append((symbol, reason))
+        return True
+
+    def freeze_venue(self, venue, reason, cancel_active_orders=True):
+        self.frozen_venues.append((venue, reason, cancel_active_orders))
+
+    def clear_venue_freeze(self, venue, reason=""):
+        self.unfrozen_venues.append((venue, reason))
         return True
 
 
@@ -504,6 +514,57 @@ class RiskExecutionTests(unittest.TestCase):
         risk.on_orderbook(Event("eOrderBook", fresh_book))
 
         self.assertTrue(oms.unfrozen_symbols)
+
+    def test_processing_lag_freezes_venue_instead_of_symbol(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        risk = RiskManager(engine, self.make_risk_config(), oms=oms, gateway=gateway)
+
+        delayed_book = OrderBook(
+            symbol="BTCUSDT",
+            exchange="BINANCE",
+            datetime=datetime.now(),
+            exchange_timestamp=(datetime.now() - timedelta(milliseconds=50)).timestamp(),
+            received_timestamp=(datetime.now() - timedelta(milliseconds=250)).timestamp(),
+        )
+
+        risk.on_orderbook(Event("eOrderBook", delayed_book))
+        risk.on_orderbook(Event("eOrderBook", delayed_book))
+
+        self.assertFalse(oms.frozen_symbols)
+        self.assertTrue(oms.frozen_venues)
+        self.assertIn("processing_lag:", oms.frozen_venues[-1][1])
+
+    def test_processing_lag_venue_freeze_clears_after_stable_updates(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        risk = RiskManager(engine, self.make_risk_config(), oms=oms, gateway=gateway)
+
+        delayed_book = OrderBook(
+            symbol="BTCUSDT",
+            exchange="BINANCE",
+            datetime=datetime.now(),
+            exchange_timestamp=(datetime.now() - timedelta(milliseconds=50)).timestamp(),
+            received_timestamp=(datetime.now() - timedelta(milliseconds=250)).timestamp(),
+        )
+        fresh_book = OrderBook(
+            symbol="BTCUSDT",
+            exchange="BINANCE",
+            datetime=datetime.now(),
+            exchange_timestamp=(datetime.now() - timedelta(milliseconds=20)).timestamp(),
+            received_timestamp=datetime.now().timestamp(),
+        )
+
+        risk.on_orderbook(Event("eOrderBook", delayed_book))
+        risk.on_orderbook(Event("eOrderBook", delayed_book))
+        self.assertTrue(oms.frozen_venues)
+
+        risk.on_orderbook(Event("eOrderBook", fresh_book))
+        risk.on_orderbook(Event("eOrderBook", fresh_book))
+
+        self.assertTrue(oms.unfrozen_venues)
 
 if __name__ == "__main__":
     unittest.main()

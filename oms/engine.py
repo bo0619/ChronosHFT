@@ -49,6 +49,9 @@ class OMS:
         self.orders = {}
         self.exchange_id_map = {}
         self.symbol_guards = {}
+        self.venue_guards = {}
+        self.strategy_guards = {}
+        self.strategy_symbol_guards = {}
         self.lock = threading.RLock()
 
         target_leverage = int(config.get("account", {}).get("leverage", 0) or 0)
@@ -76,28 +79,107 @@ class OMS:
         self.TOMBSTONE_MAX = config.get("oms", {}).get("tombstone_max", 2000)
         self.terminated_oids = set()
         self.terminated_oid_queue = deque()
+        self.reconcile_retry_scheduled = False
+        self.manual_rearm_required = False
+        self.last_freeze_reason = ""
+        self.last_halt_reason = ""
         self.rebuild_summary = self.rebuild_from_log()
+        self._apply_rebuild_summary()
 
         oms_cfg = config.get("oms", {})
         self.reconcile_min_interval_sec = float(oms_cfg.get("reconcile_min_interval_sec", 5.0))
         self.reconcile_api_failure_threshold = int(oms_cfg.get("reconcile_api_failure_threshold", 3))
         self.reconcile_api_cooldown_sec = float(oms_cfg.get("reconcile_api_cooldown_sec", 10.0))
+        self.max_total_active_orders = int(oms_cfg.get("max_total_active_orders", 100) or 0)
+        self.max_symbol_active_orders = int(oms_cfg.get("max_symbol_active_orders", 20) or 0)
+        self.max_strategy_active_orders = int(oms_cfg.get("max_strategy_active_orders", 30) or 0)
+        self.max_strategy_symbol_active_orders = int(
+            oms_cfg.get("max_strategy_symbol_active_orders", 10) or 0
+        )
+        self.duplicate_intent_window_sec = max(
+            0.0,
+            float(oms_cfg.get("duplicate_intent_window_ms", 250.0) or 0.0) / 1000.0,
+        )
         self.last_reconcile_request_ts = 0.0
         self.last_reconcile_failure_ts = 0.0
         self.consecutive_reconcile_api_failures = 0
-        self.reconcile_retry_scheduled = False
-        self.manual_rearm_required = False
-        self.last_freeze_reason = ""
-        self.last_halt_reason = ""
 
     def bootstrap(self):
         logger.info("OMS: Bootstrapping state...")
-        self.manual_rearm_required = False
-        self.last_freeze_reason = ""
-        self.last_halt_reason = ""
-        self.symbol_guards.clear()
         self._audit("bootstrap_requested", recovered=self.rebuild_summary)
+        if self.manual_rearm_required or self.state == LifecycleState.HALTED:
+            logger.error("[OMS] Bootstrap blocked: manual rearm required after recovered HALT")
+            self._audit(
+                "bootstrap_blocked",
+                reason="manual_rearm_required",
+                recovered=self.rebuild_summary,
+            )
+            return False
+
+        if self.state == LifecycleState.FROZEN or self._has_active_guards():
+            logger.warning("[OMS] Bootstrapping into guarded reconcile mode")
+            self.state = LifecycleState.FROZEN
+            if not self.last_freeze_reason:
+                self.last_freeze_reason = "Recovered guarded state"
+            self._audit(
+                "bootstrap_guarded",
+                reason=self.last_freeze_reason,
+                recovered=self.rebuild_summary,
+            )
+            self.trigger_reconcile("Recovered guarded state")
+            return True
+
         self._perform_full_reset()
+        return True
+
+    def _apply_rebuild_summary(self):
+        summary = self.rebuild_summary or {}
+        self.symbol_guards = dict(summary.get("symbol_guards", {}))
+        self.venue_guards = dict(summary.get("venue_guards", {}))
+        self.strategy_guards = dict(summary.get("strategy_guards", {}))
+        self.strategy_symbol_guards = {
+            tuple(key.split("|", 1)): value
+            for key, value in summary.get("strategy_symbol_guards", {}).items()
+            if "|" in key
+        }
+
+        self.last_freeze_reason = str(summary.get("last_freeze_reason", "") or "")
+        self.last_halt_reason = str(summary.get("last_halt_reason", "") or "")
+        self.manual_rearm_required = bool(summary.get("manual_rearm_required", False))
+
+        last_lifecycle = summary.get("last_lifecycle")
+        dirty_shutdown = bool(summary.get("dirty_shutdown", False))
+        if self.manual_rearm_required or last_lifecycle == LifecycleState.HALTED.value:
+            self.state = LifecycleState.HALTED
+            self.manual_rearm_required = True
+            if not self.last_halt_reason:
+                self.last_halt_reason = "Recovered halted state"
+            return
+
+        if dirty_shutdown:
+            self.state = LifecycleState.FROZEN
+            if not self.last_freeze_reason:
+                self.last_freeze_reason = "Recovered unclean shutdown"
+            return
+
+        if self._has_active_guards() or last_lifecycle in {
+            LifecycleState.FROZEN.value,
+            LifecycleState.RECONCILING.value,
+        }:
+            self.state = LifecycleState.FROZEN
+            if not self.last_freeze_reason:
+                self.last_freeze_reason = "Recovered guarded state"
+            return
+
+        self.state = LifecycleState.BOOTSTRAP
+
+    def _has_active_guards(self):
+        return bool(
+            self.symbol_guards
+            or self.venue_guards
+            or self.strategy_guards
+            or self.strategy_symbol_guards
+        )
 
     def freeze_symbol(self, symbol: str, reason: str, cancel_active_orders: bool = True):
         if not symbol:
@@ -144,8 +226,262 @@ class OMS:
             return ""
         return self.symbol_guards.get(symbol.upper(), "")
 
+    def freeze_venue(self, venue: str, reason: str, cancel_active_orders: bool = True):
+        venue = (venue or getattr(self.gateway, "gateway_name", "UNKNOWN")).upper()
+        previous_reason = self.venue_guards.get(venue, "")
+        self.venue_guards[venue] = reason
+
+        if previous_reason != reason:
+            logger.error(f"[OMS] Venue frozen {venue}: {reason}")
+            self._audit(
+                "venue_frozen",
+                venue=venue,
+                reason=reason,
+                previous_reason=previous_reason,
+            )
+        else:
+            self._audit("venue_freeze_reasserted", venue=venue, reason=reason)
+
+        if not cancel_active_orders:
+            return
+
+        try:
+            for symbol in self.config.get("symbols", []):
+                self.cancel_all_orders(symbol)
+        except Exception:
+            pass
+
+    def clear_venue_freeze(self, venue: str, reason: str = ""):
+        venue = (venue or getattr(self.gateway, "gateway_name", "UNKNOWN")).upper()
+        previous_reason = self.venue_guards.pop(venue, "")
+        if not previous_reason:
+            return False
+
+        logger.info(f"[OMS] Venue restored {venue}: {reason or previous_reason}")
+        self._audit(
+            "venue_unfrozen",
+            venue=venue,
+            reason=reason or previous_reason,
+            previous_reason=previous_reason,
+        )
+        return True
+
+    def get_venue_freeze_reason(self, venue: str = "") -> str:
+        venue = (venue or getattr(self.gateway, "gateway_name", "UNKNOWN")).upper()
+        return self.venue_guards.get(venue, "")
+
+    def freeze_strategy(
+        self,
+        strategy_id: str,
+        reason: str,
+        symbol: str = "",
+        cancel_active_orders: bool = True,
+    ):
+        strategy_id = (strategy_id or "").strip()
+        if not strategy_id:
+            return
+
+        symbol = symbol.upper() if symbol else ""
+        if symbol:
+            key = (strategy_id, symbol)
+            previous_reason = self.strategy_symbol_guards.get(key, "")
+            self.strategy_symbol_guards[key] = reason
+            payload = {
+                "strategy_id": strategy_id,
+                "symbol": symbol,
+                "reason": reason,
+                "previous_reason": previous_reason,
+            }
+            log_message = f"[OMS] Strategy frozen {strategy_id}/{symbol}: {reason}"
+            audit_kind = "strategy_symbol_frozen"
+        else:
+            previous_reason = self.strategy_guards.get(strategy_id, "")
+            self.strategy_guards[strategy_id] = reason
+            payload = {
+                "strategy_id": strategy_id,
+                "reason": reason,
+                "previous_reason": previous_reason,
+            }
+            log_message = f"[OMS] Strategy frozen {strategy_id}: {reason}"
+            audit_kind = "strategy_frozen"
+
+        if previous_reason != reason:
+            logger.error(log_message)
+            self._audit(audit_kind, **payload)
+        else:
+            self._audit("strategy_freeze_reasserted", **payload)
+
+        if not cancel_active_orders:
+            return
+
+        self._cancel_orders_matching(
+            lambda order: order.intent.strategy_id == strategy_id
+            and (not symbol or order.intent.symbol == symbol)
+        )
+
+    def clear_strategy_freeze(self, strategy_id: str, symbol: str = "", reason: str = ""):
+        strategy_id = (strategy_id or "").strip()
+        if not strategy_id:
+            return False
+
+        symbol = symbol.upper() if symbol else ""
+        if symbol:
+            previous_reason = self.strategy_symbol_guards.pop((strategy_id, symbol), "")
+        else:
+            previous_reason = self.strategy_guards.pop(strategy_id, "")
+        if not previous_reason:
+            return False
+
+        payload = {
+            "strategy_id": strategy_id,
+            "reason": reason or previous_reason,
+            "previous_reason": previous_reason,
+        }
+        if symbol:
+            payload["symbol"] = symbol
+            logger.info(f"[OMS] Strategy restored {strategy_id}/{symbol}: {reason or previous_reason}")
+        else:
+            logger.info(f"[OMS] Strategy restored {strategy_id}: {reason or previous_reason}")
+        self._audit("strategy_unfrozen", **payload)
+        return True
+
+    def get_strategy_freeze_reason(self, strategy_id: str, symbol: str = "") -> str:
+        strategy_id = (strategy_id or "").strip()
+        if not strategy_id:
+            return ""
+
+        symbol = symbol.upper() if symbol else ""
+        if symbol:
+            scoped_reason = self.strategy_symbol_guards.get((strategy_id, symbol), "")
+            if scoped_reason:
+                return scoped_reason
+        return self.strategy_guards.get(strategy_id, "")
+
+    def clear_transient_guards(self, prefixes=("truth_plane:",)):
+        prefixes = tuple(prefixes or ())
+        if not prefixes:
+            return 0
+
+        cleared = 0
+        for symbol, reason in list(self.symbol_guards.items()):
+            if any(reason.startswith(prefix) for prefix in prefixes):
+                if self.clear_symbol_freeze(symbol, reason=f"transient guard cleared: {reason}"):
+                    cleared += 1
+
+        for venue, reason in list(self.venue_guards.items()):
+            if any(reason.startswith(prefix) for prefix in prefixes):
+                if self.clear_venue_freeze(venue, reason=f"transient guard cleared: {reason}"):
+                    cleared += 1
+
+        for strategy_id, reason in list(self.strategy_guards.items()):
+            if any(reason.startswith(prefix) for prefix in prefixes):
+                if self.clear_strategy_freeze(strategy_id, reason=f"transient guard cleared: {reason}"):
+                    cleared += 1
+
+        for (strategy_id, symbol), reason in list(self.strategy_symbol_guards.items()):
+            if any(reason.startswith(prefix) for prefix in prefixes):
+                if self.clear_strategy_freeze(
+                    strategy_id,
+                    symbol=symbol,
+                    reason=f"transient guard cleared: {reason}",
+                ):
+                    cleared += 1
+
+        return cleared
+
     def is_symbol_tradeable(self, symbol: str) -> bool:
         return self.state == LifecycleState.LIVE and not self.get_symbol_freeze_reason(symbol)
+
+    def can_submit_for_strategy(self, strategy_id: str, symbol: str = "") -> bool:
+        return self._get_order_block_reason(strategy_id, symbol) == ""
+
+    def _cancel_orders_matching(self, predicate):
+        with self.lock:
+            client_oids = [
+                order.client_oid
+                for order in self.orders.values()
+                if order.is_active() and predicate(order)
+            ]
+        for client_oid in client_oids:
+            self.cancel_order(client_oid)
+
+    def _get_order_block_reason(self, strategy_id: str = "", symbol: str = "") -> str:
+        if self.state != LifecycleState.LIVE:
+            return f"oms_not_live:{self.state.value}"
+
+        venue_reason = self.get_venue_freeze_reason()
+        if venue_reason:
+            return f"venue_frozen:{venue_reason}"
+
+        symbol_reason = self.get_symbol_freeze_reason(symbol)
+        if symbol_reason:
+            return f"symbol_frozen:{symbol_reason}"
+
+        strategy_reason = self.get_strategy_freeze_reason(strategy_id, symbol)
+        if strategy_reason:
+            return f"strategy_frozen:{strategy_reason}"
+
+        return ""
+
+    def _get_submission_safety_reason_locked(self, intent: OrderIntent) -> str:
+        total_active = 0
+        symbol_active = 0
+        strategy_active = 0
+        strategy_symbol_active = 0
+        now = time.time()
+
+        for order in self.orders.values():
+            if not order.is_active():
+                continue
+
+            total_active += 1
+            same_symbol = order.intent.symbol == intent.symbol
+            same_strategy = order.intent.strategy_id == intent.strategy_id
+            if same_symbol:
+                symbol_active += 1
+            if same_strategy:
+                strategy_active += 1
+            if same_symbol and same_strategy:
+                strategy_symbol_active += 1
+
+            if self.duplicate_intent_window_sec <= 0:
+                continue
+            if now - float(getattr(order, "created_at", now)) > self.duplicate_intent_window_sec:
+                continue
+            if not same_symbol or not same_strategy:
+                continue
+            if order.intent.side != intent.side:
+                continue
+            if order.intent.order_type != intent.order_type:
+                continue
+            if order.intent.time_in_force != intent.time_in_force:
+                continue
+            if bool(order.intent.is_post_only) != bool(intent.is_post_only):
+                continue
+            if abs(order.intent.price - intent.price) > 1e-9:
+                continue
+            if abs(order.intent.volume - intent.volume) > 1e-9:
+                continue
+            return (
+                "duplicate_active_intent:"
+                f"{intent.strategy_id}:{intent.symbol}:{intent.side.value}"
+            )
+
+        if self.max_total_active_orders > 0 and total_active >= self.max_total_active_orders:
+            return f"active_order_limit:total:{total_active}>={self.max_total_active_orders}"
+        if self.max_symbol_active_orders > 0 and symbol_active >= self.max_symbol_active_orders:
+            return f"active_order_limit:symbol:{symbol_active}>={self.max_symbol_active_orders}"
+        if self.max_strategy_active_orders > 0 and strategy_active >= self.max_strategy_active_orders:
+            return f"active_order_limit:strategy:{strategy_active}>={self.max_strategy_active_orders}"
+        if (
+            self.max_strategy_symbol_active_orders > 0
+            and strategy_symbol_active >= self.max_strategy_symbol_active_orders
+        ):
+            return (
+                "active_order_limit:strategy_symbol:"
+                f"{strategy_symbol_active}>={self.max_strategy_symbol_active_orders}"
+            )
+        return ""
 
     def freeze_system(self, reason: str, cancel_active_orders: bool = False):
         if self.state == LifecycleState.HALTED:
@@ -233,7 +569,15 @@ class OMS:
         return False
 
     def stop(self):
-        self._audit("oms_stopped", state=self.state.value)
+        self._audit(
+            "oms_stopped",
+            state=self.state.value,
+            manual_rearm_required=self.manual_rearm_required,
+            symbol_guard_count=len(self.symbol_guards),
+            venue_guard_count=len(self.venue_guards),
+            strategy_guard_count=len(self.strategy_guards),
+            strategy_symbol_guard_count=len(self.strategy_symbol_guards),
+        )
         self.order_monitor.stop()
 
     def trigger_reconcile(self, reason: str, suspicious_oid: str = None):
@@ -472,6 +816,7 @@ class OMS:
             self.last_freeze_reason = ""
             self.last_halt_reason = ""
             self.reconcile_retry_scheduled = False
+            self.clear_transient_guards(prefixes=("truth_plane:",))
             self._audit(
                 "full_reset_completed",
                 state=self.state.value,
@@ -487,24 +832,26 @@ class OMS:
     def submit_order(self, intent: OrderIntent) -> OrderSubmitResult:
         client_oid = str(uuid.uuid4())
 
-        if self.state != LifecycleState.LIVE:
+        block_reason = self._get_order_block_reason(intent.strategy_id, intent.symbol)
+        if block_reason:
             return self._reject_intent_locally(
                 intent,
                 client_oid,
-                f"oms_not_live:{self.state.value}",
-            )
-
-        symbol_guard_reason = self.get_symbol_freeze_reason(intent.symbol)
-        if symbol_guard_reason:
-            return self._reject_intent_locally(
-                intent,
-                client_oid,
-                f"symbol_frozen:{symbol_guard_reason}",
+                block_reason,
             )
 
         valid, validation_reason = self.validator.validate_params(intent)
         if not valid:
             return self._reject_intent_locally(intent, client_oid, validation_reason)
+
+        with self.lock:
+            submission_safety_reason = self._get_submission_safety_reason_locked(intent)
+        if submission_safety_reason:
+            return self._reject_intent_locally(
+                intent,
+                client_oid,
+                submission_safety_reason,
+            )
 
         notional = intent.price * intent.volume
         if not self.account.check_margin(notional):
@@ -903,18 +1250,115 @@ class OMS:
                 "records": 0,
                 "recovered_orders": 0,
                 "recovered_terminal_ids": 0,
+                "last_lifecycle": None,
+                "last_freeze_reason": "",
+                "last_halt_reason": "",
+                "manual_rearm_required": False,
+                "symbol_guards": {},
+                "venue_guards": {},
+                "strategy_guards": {},
+                "strategy_symbol_guards": {},
+                "clean_shutdown": True,
+                "dirty_shutdown": False,
             }
 
         latest_order_records = {}
         last_lifecycle = None
+        last_freeze_reason = ""
+        last_halt_reason = ""
+        manual_rearm_required = False
+        symbol_guards = {}
+        venue_guards = {}
+        strategy_guards = {}
+        strategy_symbol_guards = {}
+        clean_shutdown = records[-1].get("kind") == "oms_stopped"
         for record in records:
             payload = record.get("payload", {})
-            if record.get("kind") == "order_snapshot":
+            kind = record.get("kind")
+            if kind == "order_snapshot":
                 client_oid = payload.get("client_oid")
                 if client_oid:
                     latest_order_records[client_oid] = payload
-            elif record.get("kind") == "lifecycle":
+            elif kind == "lifecycle":
                 last_lifecycle = payload.get("state")
+                reason = str(payload.get("reason", "") or "")
+                if last_lifecycle == LifecycleState.FROZEN.value and reason:
+                    last_freeze_reason = reason
+                elif last_lifecycle == LifecycleState.HALTED.value:
+                    if reason:
+                        last_halt_reason = reason
+                    manual_rearm_required = bool(payload.get("manual_rearm_required", True))
+                elif last_lifecycle == LifecycleState.LIVE.value:
+                    manual_rearm_required = False
+                    last_halt_reason = ""
+                    last_freeze_reason = ""
+            elif kind in {"full_reset_completed", "reconcile_cleared", "rearm_completed"}:
+                last_lifecycle = payload.get("state") or LifecycleState.LIVE.value
+                if last_lifecycle == LifecycleState.LIVE.value:
+                    manual_rearm_required = False
+                    last_freeze_reason = ""
+                    if kind == "rearm_completed":
+                        last_halt_reason = ""
+            elif kind in {"reconcile_requested", "reconcile_started", "full_reset_started"}:
+                last_lifecycle = LifecycleState.RECONCILING.value
+            elif kind in {"bootstrap_guarded", "freeze_reasserted"}:
+                reason = str(payload.get("reason", "") or "")
+                if reason:
+                    last_freeze_reason = reason
+                if last_lifecycle != LifecycleState.HALTED.value:
+                    last_lifecycle = LifecycleState.FROZEN.value
+            elif kind == "halt_reasserted":
+                last_lifecycle = LifecycleState.HALTED.value
+                reason = str(payload.get("reason", "") or "")
+                if reason:
+                    last_halt_reason = reason
+                manual_rearm_required = True
+            elif kind in {"symbol_frozen", "symbol_freeze_reasserted"}:
+                symbol = str(payload.get("symbol", "") or "").upper()
+                reason = str(payload.get("reason", "") or "")
+                if symbol and reason:
+                    symbol_guards[symbol] = reason
+            elif kind == "symbol_unfrozen":
+                symbol = str(payload.get("symbol", "") or "").upper()
+                if symbol:
+                    symbol_guards.pop(symbol, None)
+            elif kind in {"venue_frozen", "venue_freeze_reasserted"}:
+                venue = str(payload.get("venue", "") or "").upper()
+                reason = str(payload.get("reason", "") or "")
+                if venue and reason:
+                    venue_guards[venue] = reason
+            elif kind == "venue_unfrozen":
+                venue = str(payload.get("venue", "") or "").upper()
+                if venue:
+                    venue_guards.pop(venue, None)
+            elif kind in {"strategy_frozen", "strategy_freeze_reasserted"}:
+                strategy_id = str(payload.get("strategy_id", "") or "").strip()
+                symbol = str(payload.get("symbol", "") or "").upper()
+                reason = str(payload.get("reason", "") or "")
+                if strategy_id and reason:
+                    if symbol:
+                        strategy_symbol_guards[f"{strategy_id}|{symbol}"] = reason
+                    else:
+                        strategy_guards[strategy_id] = reason
+            elif kind == "strategy_symbol_frozen":
+                strategy_id = str(payload.get("strategy_id", "") or "").strip()
+                symbol = str(payload.get("symbol", "") or "").upper()
+                reason = str(payload.get("reason", "") or "")
+                if strategy_id and symbol and reason:
+                    strategy_symbol_guards[f"{strategy_id}|{symbol}"] = reason
+            elif kind == "strategy_unfrozen":
+                strategy_id = str(payload.get("strategy_id", "") or "").strip()
+                symbol = str(payload.get("symbol", "") or "").upper()
+                if strategy_id and symbol:
+                    strategy_symbol_guards.pop(f"{strategy_id}|{symbol}", None)
+                elif strategy_id:
+                    strategy_guards.pop(strategy_id, None)
+            elif kind == "oms_stopped":
+                state = payload.get("state")
+                if state:
+                    last_lifecycle = state
+                if payload.get("manual_rearm_required") is True:
+                    manual_rearm_required = True
 
         with self.lock:
             self.terminated_oids.clear()
@@ -937,6 +1381,15 @@ class OMS:
             "recovered_orders": len(latest_order_records),
             "recovered_terminal_ids": recovered_terminal_ids,
             "last_lifecycle": last_lifecycle,
+            "last_freeze_reason": last_freeze_reason,
+            "last_halt_reason": last_halt_reason,
+            "manual_rearm_required": manual_rearm_required,
+            "symbol_guards": symbol_guards,
+            "venue_guards": venue_guards,
+            "strategy_guards": strategy_guards,
+            "strategy_symbol_guards": strategy_symbol_guards,
+            "clean_shutdown": clean_shutdown,
+            "dirty_shutdown": not clean_shutdown,
         }
         if recovered_terminal_ids:
             logger.info(
