@@ -35,6 +35,9 @@ class DashboardV2Tests(unittest.TestCase):
                 datetime=datetime.utcnow(),
                 balances={"USDT": 900.0, "USDC": 225.0},
                 available_balances={"USDT": 850.0, "USDC": 130.0},
+                trading_budget_by_asset={"USDT": 100.0, "USDC": 25.0},
+                budget_balance=125.0,
+                budget_available=90.0,
             )
         )
         dashboard.update_strategy(
@@ -50,6 +53,38 @@ class DashboardV2Tests(unittest.TestCase):
         self.assertIn("USDT: 900.00/850.00", text)
         self.assertIn("USDC: 225.00/130.00", text)
         self.assertIn("System: RECONCILING", text)
+
+    def test_header_shows_rearm_command_hint_when_manual_rearm_required(self):
+        dashboard = TUIDashboard()
+        dashboard.update_account(
+            AccountData(
+                balance=1100.0,
+                equity=1125.0,
+                available=980.0,
+                used_margin=145.0,
+                datetime=datetime.utcnow(),
+                balances={"USDT": 900.0},
+                available_balances={"USDT": 850.0},
+                trading_budget_by_asset={"USDT": 100.0},
+                budget_balance=100.0,
+                budget_available=85.0,
+            )
+        )
+        dashboard.update_strategy(
+            StrategyData(
+                symbol="BTCUSDT",
+                fair_value=100.0,
+                alpha_bps=0.0,
+                params={
+                    "Health": "HALTED",
+                    "Rearm": "Y",
+                    "HealthDetail": "manual_rearm_required:processing_lag",
+                },
+            )
+        )
+
+        text = self.render_to_text(dashboard._render_header())
+        self.assertIn("RearmCmd: python main.py --rearm", text)
 
     def test_signal_board_groups_core_metrics(self):
         dashboard = TUIDashboard()

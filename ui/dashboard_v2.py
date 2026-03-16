@@ -194,6 +194,15 @@ class TUIDashboard:
                 return detail
         return ""
 
+    def _manual_rearm_hint(self) -> str:
+        for sym in self._display_symbols(limit=12):
+            strat = self.strategy_cache.get(sym)
+            if not strat:
+                continue
+            if self._param_str(strat, "Rearm", "N") == "Y":
+                return "python main.py --rearm --rearm-reason operator_ack"
+        return ""
+
     def _smart_dict(self, value: Any) -> str:
         if not isinstance(value, dict) or not value:
             return "-"
@@ -253,6 +262,9 @@ class TUIDashboard:
         )
         if health_detail:
             bottom_line += f" | Reason: {health_detail[:52]}"
+        rearm_hint = self._manual_rearm_hint()
+        if rearm_hint:
+            bottom_line += f" | RearmCmd: {rearm_hint}"
         return Panel(Align.center(f"{top_line}\n{bottom_line}"), title="Account", border_style="blue")
 
     def _render_market(self):

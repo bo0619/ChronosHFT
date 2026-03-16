@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 import time
@@ -42,17 +43,52 @@ from strategy.runtime import StrategyRuntime
 from ui.dashboard import TUIDashboard
 
 
-def load_config():
-    config = load_root_config("config.json")
+def parse_cli_args(argv=None):
+    parser = argparse.ArgumentParser(description="ChronosHFT live engine")
+    parser.add_argument(
+        "--config",
+        default="config.json",
+        help="Path to the root config JSON file.",
+    )
+    parser.add_argument(
+        "--rearm",
+        action="store_true",
+        help="If the recovered OMS state requires manual rearm, execute it automatically at startup.",
+    )
+    parser.add_argument(
+        "--rearm-reason",
+        default="cli",
+        help="Operator reason recorded when --rearm is used.",
+    )
+    return parser.parse_args(argv)
+
+
+def load_config(path="config.json"):
+    config = load_root_config(path)
     if config:
         return config
-    if not os.path.exists("config.json"):
-        print("Error: config.json not found.")
+    if not os.path.exists(path):
+        print(f"Error: {path} not found.")
     return None
 
 
-def main():
-    config = load_config()
+def bootstrap_or_rearm(oms_system, auto_rearm=False, rearm_reason="cli"):
+    bootstrapped = oms_system.bootstrap()
+    if bootstrapped:
+        return True
+
+    if getattr(oms_system, "manual_rearm_required", False):
+        hint = "python main.py --rearm --rearm-reason operator_ack"
+        logger.warning(f"[OMS] Manual rearm required. Command: {hint}")
+        if auto_rearm:
+            logger.warning(f"[OMS] Auto rearm requested via CLI: {rearm_reason}")
+            return bool(oms_system.rearm_system(rearm_reason))
+    return False
+
+
+def main(argv=None):
+    args = parse_cli_args(argv)
+    config = load_config(args.config)
     if not config:
         return
 
@@ -166,7 +202,11 @@ def main():
     gateway.connect(config["symbols"])
 
     time.sleep(3)
-    oms_system.bootstrap()
+    bootstrap_or_rearm(
+        oms_system,
+        auto_rearm=bool(args.rearm),
+        rearm_reason=str(args.rearm_reason or "cli"),
+    )
     truth_monitor.start()
     venue_supervisor.start()
 

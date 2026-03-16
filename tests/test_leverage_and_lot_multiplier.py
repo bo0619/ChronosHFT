@@ -260,6 +260,32 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             {"USDT": 50.0, "USDC": 150.0},
         )
 
+    def test_capital_scaling_can_raise_order_notional_limit_above_base_target(self):
+        payload = {
+            "symbols": ["BTCUSDT", "ETHUSDT"],
+            "account": {"leverage": 8, "initial_balance_usdt": 100.0},
+            "backtest": {"initial_capital": 100.0},
+            "risk": {"limits": {"max_order_notional": 8.0, "max_pos_notional": 16.0}},
+            "strategy": {
+                "capital_multiplier": 1.0,
+                "capital_scaling": {
+                    "enabled": True,
+                    "reference_capital_usdt": 100.0,
+                    "target_order_notional": 8.0,
+                    "order_notional_limit_factor": 1.5,
+                    "target_total_risk_notional": 36.0,
+                    "target_concurrent_symbols": 2,
+                    "reference_min_notional": 5.0,
+                    "notional_buffer": 1.1,
+                },
+            },
+        }
+
+        scaled = apply_capital_scaling(payload)
+
+        self.assertEqual(scaled["risk"]["limits"]["max_order_notional"], 12.0)
+        self.assertAlmostEqual(scaled["strategy"]["lot_multiplier"], 8.0 / 44.0, places=8)
+
     @patch("strategy.ml_sniper.ml_sniper.load_sniper_config", return_value={"lot_multiplier": 10.0})
     @patch("strategy.ml_sniper.ml_sniper.ref_data_manager.round_qty", side_effect=lambda symbol, qty: round(qty, 2))
     @patch("strategy.ml_sniper.ml_sniper.ref_data_manager.get_info", return_value=SimpleNamespace(min_qty=0.01, min_notional=5.0))

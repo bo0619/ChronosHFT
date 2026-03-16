@@ -125,6 +125,13 @@ def apply_capital_scaling(config: dict) -> dict:
             8.0,
         ),
     )
+    order_notional_limit_factor = max(
+        1.0,
+        _to_float(
+            scaling.get("order_notional_limit_factor", 1.0),
+            1.0,
+        ),
+    )
     target_total_risk_notional = max(
         target_order_notional,
         _to_float(
@@ -193,7 +200,10 @@ def apply_capital_scaling(config: dict) -> dict:
         if value > 0.0
     }
     backtest["initial_capital"] = round(derived_capital, 8)
-    limits["max_order_notional"] = round(derived_order_notional, 8)
+    limits["max_order_notional"] = round(
+        derived_order_notional * order_notional_limit_factor,
+        8,
+    )
     limits["max_pos_notional"] = round(derived_symbol_cap, 8)
     limits["max_account_gross_notional"] = round(derived_total_risk_notional, 8)
     limits["max_daily_loss"] = round(derived_daily_loss, 8)

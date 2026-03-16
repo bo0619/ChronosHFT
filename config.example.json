@@ -120,10 +120,10 @@
         "active": true,
         "limits": {
             "max_order_qty": 10000.0,
-            "max_order_notional": 8.0,
-            "max_pos_notional": 45.0,
-            "max_account_gross_notional": 45.0,
-            "max_daily_loss": 5.0,
+            "max_order_notional": 12.0,
+            "max_pos_notional": 18.0,
+            "max_account_gross_notional": 36.0,
+            "max_daily_loss": 4.0,
             "max_drawdown_pct": 0.05
         },
         "price_sanity": {
@@ -159,9 +159,11 @@
             "enabled": true,
             "reference_capital_usdt": 100.0,
             "target_order_notional": 8.0,
-            "target_total_risk_notional": 45.0,
-            "target_concurrent_symbols": 3,
-            "target_daily_loss": 5.0,
+            "_comment_order_notional_limit_factor": "Allows modest size-up without letting validator block every strong signal.",
+            "order_notional_limit_factor": 1.5,
+            "target_total_risk_notional": 36.0,
+            "target_concurrent_symbols": 2,
+            "target_daily_loss": 4.0,
             "max_order_qty": 10000.0,
             "_comment_budget_asset_weights": "When symbols span both USDT and USDC, use weights to decide how the trading budget is split.",
             "budget_asset_weights": {
@@ -174,6 +176,6 @@
         "lot_multiplier": 0.18181818,
         "spread_ratio": 0.0005,
         "skew_factor_usdt": 50.0,
-        "max_pos_usdt": 45.0
+        "max_pos_usdt": 18.0
     }
 }
