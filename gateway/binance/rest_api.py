@@ -33,6 +33,7 @@ class BinanceRestApi:
             EP_ALL_OPEN_ORDERS: 0.30,
             EP_LEVERAGE: 0.30,
             EP_MARGIN_TYPE: 0.30,
+            EP_POSITION_MODE: 0.30,
             EP_LISTEN_KEY: 0.30,
         }
         self.max_retries = 2
@@ -94,10 +95,20 @@ class BinanceRestApi:
             return True
         return error_code in {"-1001", "-1003", "-1007", "-1008"}
 
-    def request(self, method, endpoint, params=None, signed=True):
+    def response_succeeded(self, response, accepted_error_codes=None) -> bool:
+        accepted_error_codes = {str(code) for code in (accepted_error_codes or set())}
+        if response is None:
+            return False
+        if response.status_code == 200:
+            return True
+        error_code, _message = self._extract_error_details(response)
+        return bool(error_code and error_code in accepted_error_codes)
+
+    def request(self, method, endpoint, params=None, signed=True, suppress_error_codes=None):
         url = self.base_url + endpoint
         base_params = dict(params or {})
         headers = {"X-MBX-APIKEY": self.api_key} if signed else {}
+        suppress_error_codes = {str(code) for code in (suppress_error_codes or set())}
 
         for attempt in range(1, self.max_retries + 1):
             self._throttle(endpoint, signed)
@@ -116,6 +127,8 @@ class BinanceRestApi:
                     return response
 
                 error_code, error_message = self._extract_error_details(response)
+                if error_code and error_code in suppress_error_codes:
+                    return response
                 logger.error(
                     f"REST Error [{endpoint}] status={response.status_code} code={error_code or '-'} "
                     f"msg={error_message or '-'}"
@@ -192,14 +205,29 @@ class BinanceRestApi:
 
     def set_leverage(self, symbol, leverage):
         params = {"symbol": symbol, "leverage": leverage}
-        self.request("POST", EP_LEVERAGE, params, signed=True)
+        return self.request("POST", EP_LEVERAGE, params, signed=True)
 
     def set_margin_type(self, symbol, margin_type="CROSSED"):
         params = {"symbol": symbol, "marginType": margin_type}
-        try:
-            self.request("POST", EP_MARGIN_TYPE, params, signed=True)
-        except Exception:
-            pass
+        return self.request(
+            "POST",
+            EP_MARGIN_TYPE,
+            params,
+            signed=True,
+            suppress_error_codes={"-4046"},
+        )
+
+    def set_position_mode(self, position_mode="ONE_WAY"):
+        normalized = str(position_mode or "ONE_WAY").upper()
+        dual_side = "true" if normalized in {"HEDGE", "HEDGE_MODE"} else "false"
+        params = {"dualSidePosition": dual_side}
+        return self.request(
+            "POST",
+            EP_POSITION_MODE,
+            params,
+            signed=True,
+            suppress_error_codes={"-4059"},
+        )
 
     def get_account(self):
         return self.request("GET", EP_ACCOUNT, signed=True)

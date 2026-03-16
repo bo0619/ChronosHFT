@@ -67,6 +67,14 @@ class OMS:
         target_leverage = int(config.get("account", {}).get("leverage", 0) or 0)
         if target_leverage > 0:
             self.gateway.target_leverage = target_leverage
+        target_margin_type = str(
+            config.get("account", {}).get("margin_type", "CROSSED") or "CROSSED"
+        ).upper()
+        self.gateway.target_margin_type = target_margin_type
+        target_position_mode = str(
+            config.get("account", {}).get("position_mode", "ONE_WAY") or "ONE_WAY"
+        ).upper()
+        self.gateway.target_position_mode = target_position_mode
 
         self.max_pos_notional = (
             config.get("risk", {})

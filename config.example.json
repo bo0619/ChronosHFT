@@ -90,7 +90,9 @@
         "telegram_chat_id": ""
     },
     "account": {
-        "leverage": 10,
+        "leverage": 8,
+        "margin_type": "ISOLATED",
+        "position_mode": "ONE_WAY",
         "initial_balance_usdt": 100.0
     },
     "oms": {
@@ -161,7 +163,7 @@
             "reference_min_notional": 5.0,
             "notional_buffer": 1.1
         },
-        "lot_multiplier": 0.14545455,
+        "lot_multiplier": 0.18181818,
         "spread_ratio": 0.0005,
         "skew_factor_usdt": 50.0,
         "max_pos_usdt": 45.0

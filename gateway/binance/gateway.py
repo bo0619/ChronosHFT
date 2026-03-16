@@ -69,6 +69,8 @@ class BinanceGateway(BaseGateway):
         self.active = False
         self.listen_key = ""
         self.target_leverage = 0
+        self.target_margin_type = "CROSSED"
+        self.target_position_mode = "ONE_WAY"
         self.recovery_lock = threading.Lock()
         self.keep_alive_generation = 0
 
@@ -89,11 +91,16 @@ class BinanceGateway(BaseGateway):
             self.orderbooks[symbol] = self._new_local_orderbook(symbol)
             self.ws_buffer[symbol] = []
 
-        target_leverage = int(getattr(self, "target_leverage", 0) or 0)
-        for symbol in self.symbols:
-            self.rest.set_margin_type(symbol, "CROSSED")
-            if target_leverage > 0:
-                self.rest.set_leverage(symbol, target_leverage)
+        if not self._apply_account_trading_configuration():
+            self.active = False
+            self.set_state(GatewayState.ERROR)
+            self.event_engine.put(
+                Event(
+                    EVENT_SYSTEM_HEALTH,
+                    f"FREEZE_VENUE:{self.gateway_name}:ACCOUNT_CONFIG_FAILED",
+                )
+            )
+            return
 
         if not self._start_streams():
             self.active = False
@@ -181,6 +188,35 @@ class BinanceGateway(BaseGateway):
             args=(self.keep_alive_generation,),
             daemon=True,
         ).start()
+        return True
+
+    def _apply_account_trading_configuration(self):
+        target_leverage = int(getattr(self, "target_leverage", 0) or 0)
+        target_margin_type = str(getattr(self, "target_margin_type", "CROSSED") or "CROSSED").upper()
+        target_position_mode = str(
+            getattr(self, "target_position_mode", "ONE_WAY") or "ONE_WAY"
+        ).upper()
+
+        response = self.rest.set_position_mode(target_position_mode)
+        if not self.rest.response_succeeded(response, accepted_error_codes={"-4059"}):
+            logger.error(f"[{self.gateway_name}] Failed to set position mode {target_position_mode}")
+            return False
+
+        for symbol in self.symbols:
+            response = self.rest.set_margin_type(symbol, target_margin_type)
+            if not self.rest.response_succeeded(response, accepted_error_codes={"-4046"}):
+                logger.error(
+                    f"[{self.gateway_name}] Failed to set margin type {target_margin_type} for {symbol}"
+                )
+                return False
+
+            if target_leverage > 0:
+                response = self.rest.set_leverage(symbol, target_leverage)
+                if not self.rest.response_succeeded(response):
+                    logger.error(
+                        f"[{self.gateway_name}] Failed to set leverage {target_leverage} for {symbol}"
+                    )
+                    return False
         return True
 
     def _keep_alive_loop(self, generation):

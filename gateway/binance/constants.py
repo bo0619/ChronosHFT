@@ -16,6 +16,7 @@ EP_TIME = "/fapi/v1/time"
 EP_EXCHANGE_INFO = "/fapi/v1/exchangeInfo"
 EP_LEVERAGE = "/fapi/v1/leverage"
 EP_MARGIN_TYPE = "/fapi/v1/marginType"
+EP_POSITION_MODE = "/fapi/v1/positionSide/dual"
 
 # Account
 EP_ACCOUNT = "/fapi/v2/account"

@@ -78,7 +78,7 @@ class DummyOMS:
     def __init__(self, leverage=5, max_order_notional=200.0):
         self.state = LifecycleState.LIVE
         self.config = {
-            "account": {"leverage": leverage},
+            "account": {"leverage": leverage, "margin_type": "ISOLATED", "position_mode": "ONE_WAY"},
             "risk": {"limits": {"max_order_notional": max_order_notional}},
             "backtest": {
                 "maker_fee": 0.0,
@@ -221,6 +221,8 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             "account": {
                 "initial_balance_usdt": 1000.0,
                 "leverage": 7,
+                "margin_type": "ISOLATED",
+                "position_mode": "ONE_WAY",
             },
             "risk": {
                 "limits": {
@@ -238,6 +240,8 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
         oms = OMS(DummyEngine(), gateway, config)
         try:
             self.assertEqual(gateway.target_leverage, 7)
+            self.assertEqual(gateway.target_margin_type, "ISOLATED")
+            self.assertEqual(gateway.target_position_mode, "ONE_WAY")
             self.assertEqual(oms.max_account_gross_notional, 4321.0)
         finally:
             oms.stop()
@@ -254,10 +258,13 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             gateway = BinanceGateway(DummyEngine(), "key", "secret", testnet=True)
             gateway._init_books = lambda: None
             gateway.target_leverage = 9
+            gateway.target_margin_type = "ISOLATED"
+            gateway.target_position_mode = "ONE_WAY"
             gateway.connect(["BTCUSDT", "ETHUSDT"])
 
+            rest.set_position_mode.assert_called_once_with("ONE_WAY")
             self.assertEqual(rest.set_leverage.call_args_list, [call("BTCUSDT", 9), call("ETHUSDT", 9)])
-            self.assertEqual(rest.set_margin_type.call_args_list, [call("BTCUSDT", "CROSSED"), call("ETHUSDT", "CROSSED")])
+            self.assertEqual(rest.set_margin_type.call_args_list, [call("BTCUSDT", "ISOLATED"), call("ETHUSDT", "ISOLATED")])
             ws.start_market_stream.assert_called_once_with(["BTCUSDT", "ETHUSDT"])
             gateway.close()
 

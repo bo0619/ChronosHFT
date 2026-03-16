@@ -217,6 +217,8 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway.active = True
         gateway.listen_key = ""
         gateway.target_leverage = 0
+        gateway.target_margin_type = "ISOLATED"
+        gateway.target_position_mode = "ONE_WAY"
         gateway.recovery_lock = threading.Lock()
         gateway.keep_alive_generation = 0
         gateway.state = GatewayState.READY
@@ -252,6 +254,8 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway.active = False
         gateway.listen_key = ""
         gateway.target_leverage = 0
+        gateway.target_margin_type = "ISOLATED"
+        gateway.target_position_mode = "ONE_WAY"
         gateway.recovery_lock = threading.Lock()
         gateway.keep_alive_generation = 0
         gateway.state = GatewayState.ERROR
@@ -278,10 +282,17 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway.active = False
         gateway.listen_key = ""
         gateway.target_leverage = 0
+        gateway.target_margin_type = "ISOLATED"
+        gateway.target_position_mode = "ONE_WAY"
         gateway.recovery_lock = threading.Lock()
         gateway.keep_alive_generation = 0
         gateway.state = GatewayState.DISCONNECTED
-        gateway.rest = SimpleNamespace(set_margin_type=lambda *_args, **_kwargs: None, set_leverage=lambda *_args, **_kwargs: None)
+        gateway.rest = SimpleNamespace(
+            response_succeeded=lambda *_args, **_kwargs: True,
+            set_position_mode=lambda *_args, **_kwargs: None,
+            set_margin_type=lambda *_args, **_kwargs: None,
+            set_leverage=lambda *_args, **_kwargs: None,
+        )
         gateway.ws = SimpleNamespace(close=lambda: None)
         gateway._start_streams = lambda: False
 
@@ -290,6 +301,46 @@ class GatewayRecoveryTests(unittest.TestCase):
         self.assertEqual(gateway.state, GatewayState.ERROR)
         self.assertEqual(engine.events[-1].type, EVENT_SYSTEM_HEALTH)
         self.assertEqual(engine.events[-1].data, "FREEZE_VENUE:BINANCE:USER_STREAM_START_FAILED")
+
+    def test_connect_fails_closed_when_account_configuration_cannot_be_applied(self):
+        engine = DummyEngine()
+        gateway = BinanceGateway.__new__(BinanceGateway)
+        gateway.event_engine = engine
+        gateway.gateway_name = "BINANCE"
+        gateway.testnet = True
+        gateway.symbols = []
+        gateway.orderbooks = {}
+        gateway.ws_buffer = {}
+        gateway.book_resyncing = set()
+        gateway.active = False
+        gateway.listen_key = ""
+        gateway.target_leverage = 8
+        gateway.target_margin_type = "ISOLATED"
+        gateway.target_position_mode = "ONE_WAY"
+        gateway.recovery_lock = threading.Lock()
+        gateway.keep_alive_generation = 0
+        gateway.state = GatewayState.DISCONNECTED
+
+        class FailedResponse:
+            status_code = 400
+
+            def json(self):
+                return {"code": -9999, "msg": "config failed"}
+
+        gateway.rest = SimpleNamespace(
+            response_succeeded=lambda response, accepted_error_codes=None: False,
+            set_position_mode=lambda *_args, **_kwargs: FailedResponse(),
+            set_margin_type=lambda *_args, **_kwargs: FailedResponse(),
+            set_leverage=lambda *_args, **_kwargs: FailedResponse(),
+        )
+        gateway.ws = SimpleNamespace(close=lambda: None)
+        gateway._start_streams = lambda: True
+
+        gateway.connect(["BTCUSDT"])
+
+        self.assertEqual(gateway.state, GatewayState.ERROR)
+        self.assertEqual(engine.events[-1].type, EVENT_SYSTEM_HEALTH)
+        self.assertEqual(engine.events[-1].data, "FREEZE_VENUE:BINANCE:ACCOUNT_CONFIG_FAILED")
 
 
 if __name__ == "__main__":
