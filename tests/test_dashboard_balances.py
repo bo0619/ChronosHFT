@@ -69,7 +69,7 @@ class DashboardBalanceTests(unittest.TestCase):
         panel = dashboard._render_header()
         content = str(panel.renderable.renderable)
 
-        self.assertIn("RearmCmd: python main.py --rearm", content)
+        self.assertIn("RearmCmd: python main.py --admin-command rearm", content)
 
 
 if __name__ == "__main__":

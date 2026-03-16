@@ -25,6 +25,7 @@ from event.type import (
 )
 from gateway.binance.gateway import BinanceGateway
 from gateway.binance.truth_provider import BinanceTruthSnapshotProvider
+from infrastructure.admin_control import AdminControlServer, submit_admin_command
 from infrastructure.config_scaling import load_root_config
 from infrastructure.logger import logger
 from infrastructure.system_health import handle_system_health_event
@@ -60,6 +61,22 @@ def parse_cli_args(argv=None):
         default="cli",
         help="Operator reason recorded when --rearm is used.",
     )
+    parser.add_argument(
+        "--admin-command",
+        choices=["rearm", "status"],
+        help="Send an admin command to an already-running ChronosHFT process and exit.",
+    )
+    parser.add_argument(
+        "--admin-reason",
+        default="operator_ack",
+        help="Reason recorded for the admin command.",
+    )
+    parser.add_argument(
+        "--admin-timeout",
+        type=float,
+        default=5.0,
+        help="How long to wait for a running process to acknowledge an admin command.",
+    )
     return parser.parse_args(argv)
 
 
@@ -90,6 +107,28 @@ def main(argv=None):
     args = parse_cli_args(argv)
     config = load_config(args.config)
     if not config:
+        return
+
+    if args.admin_command:
+        result = submit_admin_command(
+            action=args.admin_command,
+            reason=str(args.admin_reason or "operator_ack"),
+            config=config,
+            wait_timeout_sec=float(args.admin_timeout or 5.0),
+        )
+        snapshot = result.get("snapshot", {}) or {}
+        print(
+            f"admin_command={args.admin_command} accepted={result.get('accepted')} "
+            f"status={result.get('status')} message={result.get('message')}"
+        )
+        if snapshot:
+            print(
+                "snapshot="
+                f"state={snapshot.get('state')} "
+                f"mode={snapshot.get('capability_mode')} "
+                f"manual_rearm_required={snapshot.get('manual_rearm_required')} "
+                f"halt_reason={snapshot.get('last_halt_reason')}"
+            )
         return
 
     config["system"]["log_console"] = False
@@ -131,6 +170,7 @@ def main(argv=None):
     recorder = DataRecorder(engine, config["symbols"]) if config.get("record_data", False) else None
     truth_monitor = TruthMonitor(oms_system, truth_provider, config, start_thread=False)
     venue_supervisor = VenueSupervisor(oms_system, gateway, config, start_thread=False)
+    admin_control = AdminControlServer(oms_system, config)
 
     def on_time_service_health(severity, reason, details):
         if severity == "freeze":
@@ -242,6 +282,7 @@ def main(argv=None):
                         "strategy_runtime": strategy_runtime.get_metrics_snapshot(),
                     }
                 )
+                admin_control.poll_once()
     except KeyboardInterrupt:
         logger.info("Shutdown signal received.")
         if recorder:

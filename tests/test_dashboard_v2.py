@@ -84,7 +84,7 @@ class DashboardV2Tests(unittest.TestCase):
         )
 
         text = self.render_to_text(dashboard._render_header())
-        self.assertIn("RearmCmd: python main.py --rearm", text)
+        self.assertIn("RearmCmd: python main.py --admin-command rearm", text)
 
     def test_signal_board_groups_core_metrics(self):
         dashboard = TUIDashboard()

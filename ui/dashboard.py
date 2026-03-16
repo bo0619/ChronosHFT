@@ -204,7 +204,7 @@ class TUIDashboard:
             if not strat:
                 continue
             if self._param_str(strat, "Rearm", "N") == "Y":
-                return "python main.py --rearm --rearm-reason operator_ack"
+                return "python main.py --admin-command rearm --admin-reason operator_ack"
         return ""
 
     def _runtime_summary(self) -> str:
