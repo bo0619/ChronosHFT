@@ -225,6 +225,9 @@ class TUIDashboard:
                 strategy_bits.append(
                     f"AP {status} {alive_workers}/{worker_count} D{int(async_worker.get('deferred_depth', 0))}"
                 )
+                recovering = int(async_worker.get("recovering_symbols", 0))
+                if recovering:
+                    strategy_bits.append(f"RW {recovering}")
 
         return " | ".join(part for part in (" ".join(engine_bits), " ".join(strategy_bits)) if part).strip() or "-"
 

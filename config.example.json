@@ -67,7 +67,9 @@
             "alpha_process": {
                 "enabled": true,
                 "queue_size": 256,
-                "processes": 2
+                "processes": 2,
+                "auto_restart": true,
+                "restart_cooldown_sec": 2.0
             }
         }
     },

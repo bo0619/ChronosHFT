@@ -32,6 +32,9 @@ class DummyOMS:
         }
         self.exposure = types.SimpleNamespace(net_positions={})
         self.frozen_strategies = []
+        self.cleared_strategies = []
+        self.strategy_guards = {}
+        self.strategy_symbol_guards = {}
 
     def cancel_order(self, client_oid):
         return None
@@ -40,15 +43,49 @@ class DummyOMS:
         return None
 
     def freeze_strategy(self, strategy_id, reason, symbol="", cancel_active_orders=True):
+        symbol = (symbol or "").upper()
+        if symbol:
+            self.strategy_symbol_guards[(strategy_id, symbol)] = reason
+        else:
+            self.strategy_guards[strategy_id] = reason
         self.frozen_strategies.append((strategy_id, reason, symbol, cancel_active_orders))
+
+    def clear_strategy_freeze(self, strategy_id, symbol="", reason=""):
+        symbol = (symbol or "").upper()
+        previous_reason = ""
+        if symbol:
+            previous_reason = self.strategy_symbol_guards.pop((strategy_id, symbol), "")
+        else:
+            previous_reason = self.strategy_guards.pop(strategy_id, "")
+        if not previous_reason:
+            return False
+        self.cleared_strategies.append((strategy_id, symbol, reason or previous_reason))
+        return True
+
+    def get_strategy_freeze_reason(self, strategy_id, symbol=""):
+        symbol = (symbol or "").upper()
+        if symbol:
+            scoped_reason = self.strategy_symbol_guards.get((strategy_id, symbol), "")
+            if scoped_reason:
+                return scoped_reason
+        return self.strategy_guards.get(strategy_id, "")
 
 
 class FakeAlphaProcess:
-    def __init__(self, snapshots=None, healthy=True, unhealthy_symbols=None):
+    def __init__(
+        self,
+        snapshots=None,
+        healthy=True,
+        unhealthy_symbols=None,
+        recovering_symbols=None,
+        restart_events=None,
+    ):
         self.enabled = True
         self.snapshots = list(snapshots or [])
         self.healthy = healthy
         self.unhealthy_symbols = set(unhealthy_symbols or [])
+        self.recovering_symbols = set(recovering_symbols or [])
+        self.restart_events = set(restart_events or [])
         self.orderbooks = []
         self.trades = []
         self.stopped = False
@@ -80,6 +117,17 @@ class FakeAlphaProcess:
 
     def get_unhealthy_symbols(self):
         return set(self.unhealthy_symbols)
+
+    def get_recovering_symbols(self):
+        return set(self.recovering_symbols)
+
+    def drain_restart_events(self):
+        pending = set(self.restart_events)
+        self.restart_events.clear()
+        return pending
+
+    def mark_symbol_recovered(self, symbol):
+        self.recovering_symbols.discard((symbol or "").upper())
 
 
 class MLSniperAdaptationTests(unittest.TestCase):
@@ -378,6 +426,68 @@ class MLSniperAdaptationTests(unittest.TestCase):
         self.assertEqual(self.oms.frozen_strategies[-1][0], self.strategy.name)
         self.assertEqual(self.oms.frozen_strategies[-1][1], "alpha_process_unhealthy")
         self.assertEqual(self.oms.frozen_strategies[-1][2], "BTCUSDT")
+
+    def test_alpha_process_restart_rewarms_and_auto_clears_symbol_freeze(self):
+        sym = "BTCUSDT"
+        self.strategy.symbol_warmup_ready[sym] = True
+        self.strategy.remote_predictor_ready[sym] = True
+        self.strategy.latest_signal[sym] = 4.0
+        self.strategy.signal_history[sym].append((1.0, 4.0))
+        self.strategy.alpha_process = FakeAlphaProcess(
+            snapshots=[
+                {
+                    "kind": "alpha_snapshot",
+                    "symbol": sym,
+                    "now": 10.0,
+                    "bid_1": 99.9,
+                    "ask_1": 100.1,
+                    "mid": 100.0,
+                    "preds": {"1s": 1.0, "10s": 2.0, "30s": 3.0},
+                    "spread_bps": 20.0,
+                    "sigma_bps": 12.0,
+                    "diagnostics": {
+                        "1s": {"confidence": 0.8},
+                        "10s": {"confidence": 0.7},
+                        "30s": {"confidence": 0.6},
+                    },
+                    "weights_1s": [0.1] * 9,
+                    "warmup_progress": {"1s": 2, "10s": 2, "30s": 2},
+                    "predictor_warmed_up": True,
+                }
+            ],
+            recovering_symbols={sym},
+            restart_events={sym},
+        )
+        self.strategy.alpha_process.enabled = True
+
+        with patch.object(self.strategy, "_publish_state") as publish_state, patch.object(
+            self.strategy, "_run_fsm"
+        ) as run_fsm:
+            self.strategy.poll_async_workers()
+
+        self.assertIn((self.strategy.name, "alpha_process_recovering", sym, True), self.oms.frozen_strategies)
+        self.assertIn((self.strategy.name, sym, "alpha_process_recovered"), self.oms.cleared_strategies)
+        self.assertNotIn(sym, self.strategy.alpha_rewarming_symbols)
+        self.assertNotIn(sym, self.strategy.alpha_process.recovering_symbols)
+        self.assertEqual(len(self.strategy.signal_history[sym]), 1)
+        publish_state.assert_called_once()
+        run_fsm.assert_called_once()
+
+    def test_alpha_recovery_does_not_override_non_alpha_freeze_reason(self):
+        sym = "BTCUSDT"
+        self.oms.freeze_strategy(self.strategy.name, "system_health:manual", symbol=sym, cancel_active_orders=True)
+        baseline_freeze_count = len(self.oms.frozen_strategies)
+        self.strategy.alpha_process = FakeAlphaProcess(recovering_symbols={sym}, restart_events={sym})
+        self.strategy.alpha_process.enabled = True
+
+        self.strategy.poll_async_workers()
+
+        self.assertEqual(len(self.oms.frozen_strategies), baseline_freeze_count)
+        self.assertEqual(
+            self.oms.get_strategy_freeze_reason(self.strategy.name, symbol=sym),
+            "system_health:manual",
+        )
+        self.assertIn(sym, self.strategy.alpha_rewarming_symbols)
 
 
 if __name__ == "__main__":

@@ -161,10 +161,18 @@ class MLSniperAlphaProcess:
         self.enabled = bool(self.config.get("enabled", False))
         self.queue_size = max(16, int(self.config.get("queue_size", 256)))
         self.worker_count = max(1, int(self.config.get("processes", 1)))
+        self.auto_restart = bool(self.config.get("auto_restart", True))
+        self.restart_cooldown_sec = max(
+            0.5,
+            float(self.config.get("restart_cooldown_sec", 2.0) or 2.0),
+        )
         self._context = get_context("spawn")
         self._workers = []
         self._symbol_worker = {}
         self._worker_symbols = defaultdict(set)
+        self._recovering_symbols = set()
+        self._restart_events = set()
+        self._stopping = False
         self._stats = {
             "submitted": 0,
             "deferred": 0,
@@ -172,6 +180,8 @@ class MLSniperAlphaProcess:
             "results": 0,
             "alive_workers": 0,
             "worker_count": self.worker_count,
+            "restarts": 0,
+            "restart_failures": 0,
         }
 
     def start(self):
@@ -180,33 +190,21 @@ class MLSniperAlphaProcess:
         if self._workers and all(worker["process"].is_alive() for worker in self._workers if worker["process"]):
             return True
 
+        self._stopping = False
         worker_config = {
             "tick_interval_sec": float(self.config.get("tick_interval_sec", 0.1)),
             "cycle_interval_sec": float(self.config.get("cycle_interval_sec", 1.0)),
             "labeling": dict(self.config.get("labeling", {}) or {}),
         }
         self._workers = []
+        self._recovering_symbols.clear()
+        self._restart_events.clear()
         started_workers = 0
         for worker_id in range(self.worker_count):
+            worker = self._new_worker_state(worker_id)
             try:
-                in_queue = self._context.Queue(maxsize=self.queue_size)
-                out_queue = self._context.Queue(maxsize=self.queue_size)
-                process = self._context.Process(
-                    target=_worker_main,
-                    args=(in_queue, out_queue, worker_config),
-                    daemon=True,
-                    name=f"MLSniperAlphaProcess-{worker_id}",
-                )
-                process.start()
-                self._workers.append(
-                    {
-                        "worker_id": worker_id,
-                        "in_queue": in_queue,
-                        "out_queue": out_queue,
-                        "process": process,
-                        "deferred": {},
-                    }
-                )
+                self._start_worker(worker, worker_config)
+                self._workers.append(worker)
                 started_workers += 1
             except Exception as exc:
                 logger.error(
@@ -224,6 +222,7 @@ class MLSniperAlphaProcess:
     def stop(self):
         if not self._workers:
             return
+        self._stopping = True
         for worker in self._workers:
             try:
                 worker["in_queue"].put({"kind": "stop"}, timeout=0.2)
@@ -236,6 +235,8 @@ class MLSniperAlphaProcess:
                 process.terminate()
                 process.join(timeout=1.0)
         self._stats["alive_workers"] = 0
+        self._recovering_symbols.clear()
+        self._restart_events.clear()
         logger.info("[MLSniperAlphaProcess] stopped")
 
     def submit_orderbook(self, orderbook: OrderBook):
@@ -263,6 +264,7 @@ class MLSniperAlphaProcess:
     def poll(self, limit: int = 32):
         if not self.enabled or not self._workers:
             return []
+        self._restart_dead_workers()
         results = []
         budget_per_worker = max(1, limit // max(len(self._workers), 1))
         alive_workers = 0
@@ -289,6 +291,7 @@ class MLSniperAlphaProcess:
         snapshot = dict(self._stats)
         snapshot["alive"] = self.is_healthy()
         snapshot["deferred_depth"] = sum(len(worker["deferred"]) for worker in self._workers)
+        snapshot["recovering_symbols"] = len(self._recovering_symbols)
         snapshot["workers"] = [
             {
                 "worker_id": worker["worker_id"],
@@ -296,6 +299,7 @@ class MLSniperAlphaProcess:
                 "pid": int(getattr(worker["process"], "pid", 0) or 0),
                 "deferred_depth": len(worker["deferred"]),
                 "symbol_count": len(self._worker_symbols.get(worker["worker_id"], set())),
+                "generation": int(worker.get("generation", 0)),
             }
             for worker in self._workers
         ]
@@ -307,6 +311,20 @@ class MLSniperAlphaProcess:
             if not worker["process"].is_alive():
                 unhealthy.update(self._worker_symbols.get(worker["worker_id"], set()))
         return unhealthy
+
+    def get_recovering_symbols(self):
+        return set(self._recovering_symbols)
+
+    def drain_restart_events(self):
+        restarted = set(self._restart_events)
+        self._restart_events.clear()
+        return restarted
+
+    def mark_symbol_recovered(self, symbol: str):
+        symbol = (symbol or "").upper()
+        if not symbol:
+            return
+        self._recovering_symbols.discard(symbol)
 
     def _worker_index(self, symbol: str) -> int:
         symbol = (symbol or "").upper()
@@ -322,6 +340,9 @@ class MLSniperAlphaProcess:
             return False
         worker = self._workers[worker_index]
         process = worker["process"]
+        if not process or not process.is_alive():
+            self._restart_worker(worker)
+            process = worker["process"]
         if not process or not process.is_alive():
             self._stats["alive_workers"] = sum(1 for item in self._workers if item["process"].is_alive())
             worker["deferred"][key] = message
@@ -347,3 +368,77 @@ class MLSniperAlphaProcess:
                 break
             del worker["deferred"][key]
             self._stats["flushed"] += 1
+
+    def _new_worker_state(self, worker_id: int) -> dict:
+        return {
+            "worker_id": worker_id,
+            "in_queue": None,
+            "out_queue": None,
+            "process": None,
+            "deferred": {},
+            "generation": 0,
+            "last_restart_attempt_ts": 0.0,
+            "last_restart_ts": 0.0,
+        }
+
+    def _start_worker(self, worker: dict, worker_config: dict):
+        in_queue = self._context.Queue(maxsize=self.queue_size)
+        out_queue = self._context.Queue(maxsize=self.queue_size)
+        process = self._context.Process(
+            target=_worker_main,
+            args=(in_queue, out_queue, worker_config),
+            daemon=True,
+            name=f"MLSniperAlphaProcess-{worker['worker_id']}",
+        )
+        process.start()
+        worker["in_queue"] = in_queue
+        worker["out_queue"] = out_queue
+        worker["process"] = process
+        worker["generation"] = int(worker.get("generation", 0)) + 1
+        worker["last_restart_attempt_ts"] = time.time()
+
+    def _restart_dead_workers(self):
+        for worker in self._workers:
+            process = worker.get("process")
+            if process and process.is_alive():
+                continue
+            self._restart_worker(worker)
+
+    def _restart_worker(self, worker: dict):
+        if self._stopping or not self.auto_restart:
+            return False
+
+        process = worker.get("process")
+        if process and process.is_alive():
+            return True
+
+        now = time.time()
+        last_attempt = float(worker.get("last_restart_attempt_ts", 0.0) or 0.0)
+        if last_attempt and now - last_attempt < self.restart_cooldown_sec:
+            return False
+
+        worker_config = {
+            "tick_interval_sec": float(self.config.get("tick_interval_sec", 0.1)),
+            "cycle_interval_sec": float(self.config.get("cycle_interval_sec", 1.0)),
+            "labeling": dict(self.config.get("labeling", {}) or {}),
+        }
+        try:
+            self._start_worker(worker, worker_config)
+        except Exception as exc:
+            worker["last_restart_attempt_ts"] = now
+            self._stats["restart_failures"] += 1
+            logger.error(
+                f"[MLSniperAlphaProcess] worker {worker['worker_id']} restart failed: {exc}"
+            )
+            return False
+
+        worker["last_restart_ts"] = now
+        recovered_symbols = set(self._worker_symbols.get(worker["worker_id"], set()))
+        if recovered_symbols:
+            self._recovering_symbols.update(recovered_symbols)
+            self._restart_events.update(recovered_symbols)
+        self._stats["restarts"] += 1
+        logger.warning(
+            f"[MLSniperAlphaProcess] worker {worker['worker_id']} restarted, recovering={sorted(recovered_symbols)}"
+        )
+        return True

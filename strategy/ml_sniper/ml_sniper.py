@@ -141,6 +141,7 @@ class MLSniperStrategy(StrategyTemplate):
         self.last_cycle_ts = defaultdict(float)
         self.symbol_start_ts = defaultdict(float)
         self.symbol_warmup_ready = defaultdict(bool)
+        self.alpha_rewarming_symbols = set()
 
         self.signal_history = defaultdict(lambda: deque(maxlen=20))
         self.latest_mid = defaultdict(float)
@@ -209,6 +210,74 @@ class MLSniperStrategy(StrategyTemplate):
 
         self.symbol_warmup_ready[symbol] = True
         return True
+
+    def _begin_alpha_symbol_recovery(self, symbol: str, reset_model_state: bool = False):
+        symbol = (symbol or "").upper()
+        if not symbol:
+            return
+
+        if reset_model_state:
+            self.signal_history[symbol].clear()
+            self.latest_signal[symbol] = 0.0
+            self.latest_velocity[symbol] = 0.0
+            self.latest_preds[symbol] = {horizon: 0.0 for horizon in self.weights}
+            self.latest_confidence[symbol] = 0.0
+            self.latest_size_scale[symbol] = 1.0
+            self.latest_regime[symbol] = "RECOVERING"
+            self.latest_spread_bps[symbol] = 0.0
+            self.latest_sigma_bps[symbol] = 0.0
+            self.symbol_warmup_ready[symbol] = False
+            self.remote_predictor_ready[symbol] = False
+            self.remote_model_meta[symbol] = {}
+            self.symbol_start_ts[symbol] = time.time()
+            self.last_tick_ts[symbol] = 0.0
+            self.last_cycle_ts[symbol] = 0.0
+
+        self.alpha_rewarming_symbols.add(symbol)
+
+    def _freeze_alpha_symbol(self, symbol: str, reason: str):
+        if not hasattr(self.oms, "freeze_strategy"):
+            return
+
+        current_reason = ""
+        if hasattr(self.oms, "get_strategy_freeze_reason"):
+            current_reason = self.oms.get_strategy_freeze_reason(self.name, symbol=symbol)
+        if current_reason and not current_reason.startswith("alpha_process_"):
+            return
+        if current_reason == reason:
+            return
+
+        self.oms.freeze_strategy(
+            self.name,
+            reason,
+            symbol=symbol,
+            cancel_active_orders=True,
+        )
+
+    def _complete_alpha_symbol_recovery(self, symbol: str):
+        symbol = (symbol or "").upper()
+        if not symbol:
+            return
+
+        self.alpha_rewarming_symbols.discard(symbol)
+        if hasattr(self.alpha_process, "mark_symbol_recovered"):
+            self.alpha_process.mark_symbol_recovered(symbol)
+
+        if not hasattr(self.oms, "clear_strategy_freeze"):
+            return
+
+        freeze_reason = ""
+        if hasattr(self.oms, "get_strategy_freeze_reason"):
+            freeze_reason = self.oms.get_strategy_freeze_reason(self.name, symbol=symbol)
+            if freeze_reason and not freeze_reason.startswith("alpha_process_"):
+                return
+
+        if freeze_reason or not hasattr(self.oms, "get_strategy_freeze_reason"):
+            self.oms.clear_strategy_freeze(
+                self.name,
+                symbol=symbol,
+                reason="alpha_process_recovered",
+            )
 
     def _calc_vol(self, symbol: str, price: float) -> float:
         info = ref_data_manager.get_info(symbol)
@@ -512,7 +581,22 @@ class MLSniperStrategy(StrategyTemplate):
         if not self.alpha_process.enabled:
             return
 
-        for snapshot in self.alpha_process.poll():
+        snapshots = list(self.alpha_process.poll())
+        restarted_symbols = set()
+        if hasattr(self.alpha_process, "drain_restart_events"):
+            restarted_symbols = set(self.alpha_process.drain_restart_events())
+        for symbol in restarted_symbols:
+            self._begin_alpha_symbol_recovery(symbol, reset_model_state=True)
+            self._freeze_alpha_symbol(symbol, "alpha_process_recovering")
+
+        recovering_symbols = set()
+        if hasattr(self.alpha_process, "get_recovering_symbols"):
+            recovering_symbols = set(self.alpha_process.get_recovering_symbols())
+        for symbol in recovering_symbols:
+            self._begin_alpha_symbol_recovery(symbol, reset_model_state=False)
+            self._freeze_alpha_symbol(symbol, "alpha_process_recovering")
+
+        for snapshot in snapshots:
             if snapshot.get("kind") == "alpha_snapshot":
                 self._consume_alpha_snapshot(snapshot)
 
@@ -522,12 +606,8 @@ class MLSniperStrategy(StrategyTemplate):
                 unhealthy_symbols = set(self.alpha_process.get_unhealthy_symbols())
             if unhealthy_symbols:
                 for symbol in unhealthy_symbols:
-                    self.oms.freeze_strategy(
-                        self.name,
-                        "alpha_process_unhealthy",
-                        symbol=symbol,
-                        cancel_active_orders=True,
-                    )
+                    self._begin_alpha_symbol_recovery(symbol, reset_model_state=False)
+                    self._freeze_alpha_symbol(symbol, "alpha_process_unhealthy")
             else:
                 self.oms.freeze_strategy(self.name, "alpha_process_unhealthy", cancel_active_orders=True)
 
@@ -589,6 +669,9 @@ class MLSniperStrategy(StrategyTemplate):
                 model_meta=self.remote_model_meta[sym],
             )
             return
+
+        if sym in self.alpha_rewarming_symbols:
+            self._complete_alpha_symbol_recovery(sym)
 
         self._publish_state(
             sym,
