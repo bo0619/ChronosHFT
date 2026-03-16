@@ -79,12 +79,14 @@ class TUIDashboard:
 
     def _fmt_asset_balance(self, asset: str) -> str:
         if not self.account_data:
-            return f"{asset}: -/-"
+            return f"{asset}: -/-/-"
         wallet = self.account_data.balances.get(asset)
         available = self.account_data.available_balances.get(asset)
+        budget = self.account_data.trading_budget_by_asset.get(asset)
         wallet_s = "-" if wallet is None else f"{wallet:.2f}"
         available_s = "-" if available is None else f"{available:.2f}"
-        return f"{asset}: {wallet_s}/{available_s}"
+        budget_s = "-" if budget is None or budget <= 0.0 else f"{budget:.2f}"
+        return f"{asset}: {wallet_s}/{available_s}/{budget_s}"
 
     def _extract_number(self, value: Any) -> Optional[float]:
         if isinstance(value, (int, float)):
@@ -186,6 +188,16 @@ class TUIDashboard:
                 return health
         return "LIVE" if self.account_data else "-"
 
+    def _system_health_detail(self) -> str:
+        for sym in self._display_symbols(limit=12):
+            strat = self.strategy_cache.get(sym)
+            if not strat:
+                continue
+            detail = self._param_str(strat, "HealthDetail", "")
+            if detail and detail != "-":
+                return detail
+        return ""
+
     def _runtime_summary(self) -> str:
         engine = self.runtime_metrics.get("event_engine", {})
         strategy = self.runtime_metrics.get("strategy_runtime", {})
@@ -286,13 +298,17 @@ class TUIDashboard:
             f"Equity: [{equity_style}]{acc.equity:.2f}[/] | "
             f"Balance: {acc.balance:.2f} | "
             f"Avail: {acc.available:.2f} | "
+            f"Budget: {acc.budget_available:.2f}/{acc.budget_balance:.2f} | "
             f"Margin: {acc.used_margin:.2f} ({margin_pct:.1f}%)"
         )
+        health_detail = self._system_health_detail()
         bottom_line = (
             f"[{health_style}]System: {health}[/] | "
             f"{self._fmt_asset_balance('USDT')} | {self._fmt_asset_balance('USDC')} | "
             f"Runtime: {self._runtime_summary()}"
         )
+        if health_detail:
+            bottom_line += f" | Reason: {health_detail[:52]}"
         return Panel(Align.center(f"{top_line}\n{bottom_line}"), title="Account", border_style="blue")
 
     def _render_market(self):
@@ -418,7 +434,13 @@ class TUIDashboard:
             Text.assemble(("Costs: ", "bold"), (f"Maker {self._param_str(strat, 'MakerCost')} | Taker {self._param_str(strat, 'TakerCost')}", "white")),
             Text.assemble(("Req: ", "bold"), (f"Maker {self._param_str(strat, 'MakerReq')} | Taker {self._param_str(strat, 'TakerReq')}", "white")),
             Text.assemble(("Exec: ", "bold"), (f"MEdge {self._param_str(strat, 'MEdge')} | TEdge {self._param_str(strat, 'TEdge')} | Exit {self._param_str(strat, 'ExitEWMA')}", "white")),
-            Text.assemble(("Health: ", "bold"), (self._param_str(strat, "Health"), self._style_health(self._param_str(strat, "Health")))),
+            Text.assemble(
+                ("Health: ", "bold"),
+                (self._param_str(strat, "Health"), self._style_health(self._param_str(strat, "Health"))),
+                (" | Rearm: ", "bold"),
+                (self._param_str(strat, "Rearm"), "yellow" if self._param_str(strat, "Rearm") == "Y" else "white"),
+            ),
+            Text.assemble(("Reason: ", "bold"), (self._param_str(strat, "HealthDetail"), "yellow" if self._param_str(strat, "HealthDetail") != "-" else "dim")),
             Text.assemble(("Reject: ", "bold"), (self._param_str(strat, "Reject"), "yellow" if self._param_str(strat, "Reject") != "-" else "dim")),
         ]
         return Panel(Group(*lines), title="Focus", border_style="green")

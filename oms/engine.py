@@ -140,6 +140,7 @@ class OMS:
         self._audit("bootstrap_requested", recovered=self.rebuild_summary)
         if self.manual_rearm_required or self.state == LifecycleState.HALTED:
             self._sync_capability_mode("manual_rearm_required")
+            self._refresh_read_only_account_snapshot()
             logger.error("[OMS] Bootstrap blocked: manual rearm required after recovered HALT")
             self._audit(
                 "bootstrap_blocked",
@@ -163,6 +164,50 @@ class OMS:
             return True
 
         self._perform_full_reset()
+        return True
+
+    def _refresh_read_only_account_snapshot(self):
+        if not self.can_query_exchange():
+            return False
+
+        try:
+            account = self.gateway.get_account_info()
+        except Exception as exc:
+            logger.warning(f"[OMS] Read-only account sync failed: {exc}")
+            return False
+
+        if not isinstance(account, dict) or not account:
+            return False
+
+        balances = {}
+        for entry in account.get("assets", []) or []:
+            asset = str(entry.get("asset", "") or "").upper()
+            if not asset:
+                continue
+            available_balance = entry.get("availableBalance")
+            balances[asset] = {
+                "wallet_balance": float(entry.get("walletBalance", 0.0) or 0.0),
+                "available_balance": (
+                    float(available_balance or 0.0)
+                    if available_balance is not None
+                    else None
+                ),
+            }
+
+        available_balance = account.get("availableBalance")
+        self.account.force_sync(
+            float(account.get("totalWalletBalance", self.account.balance) or self.account.balance),
+            float(account.get("totalInitialMargin", self.account.used_margin) or 0.0),
+            float(available_balance) if available_balance is not None else None,
+            balances=balances or None,
+        )
+        self._audit(
+            "read_only_account_sync",
+            balance=self.account.balance,
+            available=self.account.available,
+            budget_available=self.account.budget_available,
+            assets=sorted(balances.keys()),
+        )
         return True
 
     def _apply_rebuild_summary(self):

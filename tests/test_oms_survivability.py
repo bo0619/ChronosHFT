@@ -554,6 +554,32 @@ class OMSSurvivabilityTests(unittest.TestCase):
             finally:
                 recovered.stop()
 
+    def test_bootstrap_blocked_halt_still_refreshes_account_snapshot(self):
+        gateway = DummyGateway()
+        gateway.account = {
+            "totalWalletBalance": "4999.342098",
+            "totalInitialMargin": "0",
+            "availableBalance": "4999.342098",
+            "assets": [
+                {
+                    "asset": "USDC",
+                    "walletBalance": "4999.342098",
+                    "availableBalance": "4999.342098",
+                }
+            ],
+        }
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            oms.halt_system("processing_lag:test")
+
+            self.assertFalse(oms.bootstrap())
+            self.assertEqual(oms.state, LifecycleState.HALTED)
+            self.assertAlmostEqual(oms.account.balance, 4999.342098)
+            self.assertAlmostEqual(oms.account.balances["USDC"], 4999.342098)
+            self.assertTrue(oms.account.exchange_balance_synced)
+        finally:
+            oms.stop()
+
     def test_restart_restores_scoped_guards_from_journal(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             journal_path = os.path.join(tmpdir, "oms_journal.jsonl")
@@ -731,6 +757,13 @@ class TruthMonitorTests(unittest.TestCase):
         reconcile_calls = []
         try:
             oms.state = LifecycleState.LIVE
+            oms.account.force_sync(
+                1000.0,
+                0.0,
+                available=1000.0,
+                asset="USDT",
+                balances={"USDT": {"wallet_balance": 1000.0, "available_balance": 1000.0}},
+            )
             oms.trigger_reconcile = lambda reason, suspicious_oid=None: reconcile_calls.append((reason, suspicious_oid))
 
             monitor.poll_once()
@@ -792,6 +825,52 @@ class TruthMonitorTests(unittest.TestCase):
 
             self.assertEqual(oms.get_venue_freeze_reason("BINANCE"), "")
             self.assertEqual(monitor.consecutive_balance_drifts, 0)
+        finally:
+            oms.stop()
+
+    def test_truth_monitor_skips_balance_drift_when_local_asset_snapshot_is_unsynced(self):
+        config = self.make_config()
+        config["symbols"] = ["SOLUSDC"]
+        config["account"]["initial_balance_usdt"] = 2000.0
+        oms = OMS(DummyEngine(), DummyGateway(), config)
+        provider = DummyTruthProvider()
+        provider.account = {
+            "totalWalletBalance": "4999.342098",
+            "totalInitialMargin": "0",
+            "availableBalance": "4999.342098",
+            "assets": [
+                {"asset": "USDC", "walletBalance": "4999.342098", "availableBalance": "4999.342098"},
+            ],
+        }
+        monitor = TruthMonitor(oms, provider, config, start_thread=False)
+        try:
+            oms.state = LifecycleState.HALTED
+            oms.manual_rearm_required = True
+
+            monitor.poll_once()
+
+            self.assertEqual(oms.get_venue_freeze_reason("BINANCE"), "")
+            self.assertEqual(monitor.consecutive_balance_drifts, 0)
+        finally:
+            oms.stop()
+
+    def test_account_margin_checks_use_trading_budget_not_full_wallet_balance(self):
+        config = self.make_config()
+        config["account"]["trading_budget_total"] = 2000.0
+        config["account"]["trading_budget_by_asset"] = {"USDC": 2000.0}
+        oms = OMS(DummyEngine(), DummyGateway(), config)
+        try:
+            oms.account.force_sync(
+                4999.342098,
+                0.0,
+                available=4999.342098,
+                balances={"USDC": {"wallet_balance": 4999.342098, "available_balance": 4999.342098}},
+            )
+
+            self.assertAlmostEqual(oms.account.budget_balance, 2000.0)
+            self.assertAlmostEqual(oms.account.budget_available, 2000.0)
+            self.assertTrue(oms.account.check_margin(19999.0))
+            self.assertFalse(oms.account.check_margin(25000.0))
         finally:
             oms.stop()
 

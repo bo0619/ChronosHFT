@@ -2,6 +2,9 @@ import json
 from copy import deepcopy
 
 
+QUOTE_ASSET_SUFFIXES = ("USDT", "USDC", "BUSD", "FDUSD")
+
+
 def _to_float(value, default):
     try:
         return float(value)
@@ -14,6 +17,69 @@ def _to_int(value, default):
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _extract_quote_asset(symbol: str) -> str:
+    symbol = str(symbol or "").upper()
+    for suffix in QUOTE_ASSET_SUFFIXES:
+        if symbol.endswith(suffix):
+            return suffix
+    return ""
+
+
+def _tracked_quote_assets(symbols) -> list[str]:
+    assets = []
+    for symbol in symbols or []:
+        asset = _extract_quote_asset(symbol)
+        if asset and asset not in assets:
+            assets.append(asset)
+    return assets
+
+
+def _normalize_budget_weights(raw_weights, quote_assets) -> dict[str, float]:
+    if not isinstance(raw_weights, dict):
+        return {}
+
+    normalized = {}
+    for asset, weight in raw_weights.items():
+        asset_key = str(asset or "").upper()
+        if quote_assets and asset_key not in quote_assets:
+            continue
+        parsed = _to_float(weight, 0.0)
+        if parsed > 0.0:
+            normalized[asset_key] = parsed
+    return normalized
+
+
+def _derive_budget_by_asset(total_budget: float, quote_assets, raw_weights=None) -> dict[str, float]:
+    assets = list(quote_assets or [])
+    weights = _normalize_budget_weights(raw_weights, assets)
+    if not assets:
+        assets = list(weights.keys()) or ["USDT"]
+        if weights:
+            weights = _normalize_budget_weights(weights, assets)
+
+    if not weights:
+        equal_weight = 1.0 / max(1, len(assets))
+        weights = {asset: equal_weight for asset in assets}
+    else:
+        weight_sum = sum(weights.values())
+        if weight_sum <= 0.0:
+            equal_weight = 1.0 / max(1, len(assets))
+            weights = {asset: equal_weight for asset in assets}
+        else:
+            weights = {asset: value / weight_sum for asset, value in weights.items()}
+
+    allocation = {}
+    residual = max(0.0, float(total_budget))
+    for index, asset in enumerate(assets):
+        if index == len(assets) - 1:
+            allocation[asset] = round(residual, 8)
+            break
+        asset_budget = round(total_budget * weights.get(asset, 0.0), 8)
+        residual = round(max(0.0, residual - asset_budget), 8)
+        allocation[asset] = asset_budget
+    return allocation
 
 
 def apply_capital_scaling(config: dict) -> dict:
@@ -95,6 +161,10 @@ def apply_capital_scaling(config: dict) -> dict:
         _to_float(scaling.get("notional_buffer", 1.1), 1.1),
     )
     leverage = max(1.0, _to_float(account.get("leverage", 1.0), 1.0))
+    quote_assets = _tracked_quote_assets(symbols)
+    budget_weights = scaling.get("budget_asset_weights")
+    if not isinstance(budget_weights, dict):
+        budget_weights = account.get("trading_budget_by_asset", {})
 
     derived_capital = reference_capital * capital_multiplier
     derived_order_notional = target_order_notional * capital_multiplier
@@ -108,9 +178,20 @@ def apply_capital_scaling(config: dict) -> dict:
     derived_lot_multiplier = derived_order_notional / (
         reference_min_notional * notional_buffer * leverage
     )
+    derived_budget_by_asset = _derive_budget_by_asset(
+        derived_capital,
+        quote_assets,
+        raw_weights=budget_weights,
+    )
 
     strategy["capital_multiplier"] = round(capital_multiplier, 8)
     account["initial_balance_usdt"] = round(derived_capital, 8)
+    account["trading_budget_total"] = round(derived_capital, 8)
+    account["trading_budget_by_asset"] = {
+        asset: round(value, 8)
+        for asset, value in derived_budget_by_asset.items()
+        if value > 0.0
+    }
     backtest["initial_capital"] = round(derived_capital, 8)
     limits["max_order_notional"] = round(derived_order_notional, 8)
     limits["max_pos_notional"] = round(derived_symbol_cap, 8)

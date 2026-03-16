@@ -157,6 +157,8 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
         scaled = apply_capital_scaling(payload)
 
         self.assertEqual(scaled["account"]["initial_balance_usdt"], 200.0)
+        self.assertEqual(scaled["account"]["trading_budget_total"], 200.0)
+        self.assertEqual(scaled["account"]["trading_budget_by_asset"], {"USDT": 200.0})
         self.assertEqual(scaled["backtest"]["initial_capital"], 200.0)
         self.assertEqual(scaled["risk"]["limits"]["max_order_notional"], 16.0)
         self.assertEqual(scaled["risk"]["limits"]["max_pos_notional"], 32.0)
@@ -202,6 +204,61 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
 
         self.assertAlmostEqual(config["lot_multiplier"], 16.0 / 27.5, places=8)
         self.assertIn("weights", config)
+
+    def test_capital_scaling_splits_budget_across_usdt_and_usdc_symbols(self):
+        payload = {
+            "symbols": ["BTCUSDT", "SOLUSDC"],
+            "account": {"leverage": 8, "initial_balance_usdt": 100.0},
+            "backtest": {"initial_capital": 100.0},
+            "risk": {"limits": {"max_order_notional": 8.0, "max_pos_notional": 16.0}},
+            "strategy": {
+                "capital_multiplier": 2.0,
+                "capital_scaling": {
+                    "enabled": True,
+                    "reference_capital_usdt": 100.0,
+                    "target_order_notional": 8.0,
+                    "target_total_risk_notional": 45.0,
+                    "target_concurrent_symbols": 2,
+                    "reference_min_notional": 5.0,
+                    "notional_buffer": 1.1,
+                },
+            },
+        }
+
+        scaled = apply_capital_scaling(payload)
+
+        self.assertEqual(
+            scaled["account"]["trading_budget_by_asset"],
+            {"USDT": 100.0, "USDC": 100.0},
+        )
+
+    def test_capital_scaling_honors_budget_asset_weights(self):
+        payload = {
+            "symbols": ["BTCUSDT", "SOLUSDC"],
+            "account": {"leverage": 8, "initial_balance_usdt": 100.0},
+            "backtest": {"initial_capital": 100.0},
+            "risk": {"limits": {"max_order_notional": 8.0, "max_pos_notional": 16.0}},
+            "strategy": {
+                "capital_multiplier": 2.0,
+                "capital_scaling": {
+                    "enabled": True,
+                    "reference_capital_usdt": 100.0,
+                    "target_order_notional": 8.0,
+                    "target_total_risk_notional": 45.0,
+                    "target_concurrent_symbols": 2,
+                    "reference_min_notional": 5.0,
+                    "notional_buffer": 1.1,
+                    "budget_asset_weights": {"USDC": 3.0, "USDT": 1.0},
+                },
+            },
+        }
+
+        scaled = apply_capital_scaling(payload)
+
+        self.assertEqual(
+            scaled["account"]["trading_budget_by_asset"],
+            {"USDT": 50.0, "USDC": 150.0},
+        )
 
     @patch("strategy.ml_sniper.ml_sniper.load_sniper_config", return_value={"lot_multiplier": 10.0})
     @patch("strategy.ml_sniper.ml_sniper.ref_data_manager.round_qty", side_effect=lambda symbol, qty: round(qty, 2))

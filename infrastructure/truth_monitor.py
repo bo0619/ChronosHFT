@@ -125,7 +125,7 @@ class TruthMonitor:
                 exchange_positions,
                 tracked_symbols,
             )
-            local_balance = self._local_balance_value(tracked_assets)
+            local_balance, _local_source = self._local_balance_value(tracked_assets)
 
         remote_active_orders = self.oms._normalize_remote_open_orders(open_orders)
         if local_active_orders != remote_active_orders:
@@ -156,6 +156,13 @@ class TruthMonitor:
             self.oms.trigger_reconcile("Truth plane position mismatch")
             self.clean_polls = 0
             return False
+
+        if local_balance is None:
+            self.consecutive_balance_drifts = 0
+            self.clean_polls += 1
+            if self.clean_polls >= self.clean_polls_to_clear:
+                self.oms.clear_transient_guards(prefixes=("truth_plane:",))
+            return True
 
         remote_balance, remote_source = self._remote_balance_value(account, tracked_assets)
         balance_delta = remote_balance - local_balance
@@ -213,16 +220,21 @@ class TruthMonitor:
         return ""
 
     def _local_balance_value(self, tracked_assets):
-        local_balance = float(getattr(self.oms.account, "balance", 0.0) or 0.0)
         local_balances = dict(getattr(self.oms.account, "balances", {}) or {})
-        tracked_values = [
-            float(local_balances.get(asset, 0.0) or 0.0)
-            for asset in tracked_assets
-            if asset in local_balances
-        ]
-        if tracked_values:
-            return float(sum(tracked_values))
-        return local_balance
+        if tracked_assets:
+            if all(asset in local_balances for asset in tracked_assets):
+                tracked_values = [
+                    float(local_balances.get(asset, 0.0) or 0.0)
+                    for asset in tracked_assets
+                ]
+                return float(sum(tracked_values)), f"tracked_assets:{','.join(tracked_assets)}"
+            return None, "tracked_assets_unsynced"
+
+        if not getattr(self.oms.account, "exchange_balance_synced", False):
+            return None, "exchange_balance_unsynced"
+
+        local_balance = float(getattr(self.oms.account, "balance", 0.0) or 0.0)
+        return local_balance, "totalWalletBalance"
 
     def _remote_balance_value(self, account, tracked_assets):
         remote_assets = {}

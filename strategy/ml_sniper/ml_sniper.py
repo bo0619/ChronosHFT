@@ -5,6 +5,7 @@ from event.type import (
     AggTradeData,
     Event,
     EVENT_STRATEGY_UPDATE,
+    LifecycleState,
     OrderBook,
     OrderIntent,
     OrderStateSnapshot,
@@ -176,6 +177,19 @@ class MLSniperStrategy(StrategyTemplate):
             "maker_fills": 0,
             "taker_fills": 0,
         }
+
+    def _oms_health_detail(self) -> str:
+        oms_state = getattr(self.oms, "state", None)
+        capability_reason = str(getattr(self.oms, "capability_reason", "") or "")
+        if oms_state == LifecycleState.HALTED:
+            halt_reason = str(getattr(self.oms, "last_halt_reason", "") or capability_reason)
+            if getattr(self.oms, "manual_rearm_required", False):
+                return f"manual_rearm_required:{halt_reason}" if halt_reason else "manual_rearm_required"
+            return halt_reason or "halted"
+        if oms_state == LifecycleState.FROZEN:
+            freeze_reason = str(getattr(self.oms, "last_freeze_reason", "") or capability_reason)
+            return freeze_reason or "frozen"
+        return capability_reason or str(self.last_system_health or "")
 
     def _ema(self, previous: float, value: float) -> float:
         alpha = self.feedback_alpha
@@ -1024,6 +1038,11 @@ class MLSniperStrategy(StrategyTemplate):
             "Closed": feedback["closed_trades"],
             "Avail": account_available,
             "Health": health,
+            "HealthDetail": self._oms_health_detail()[:72] or "-",
+            "Rearm": "Y" if getattr(self.oms, "manual_rearm_required", False) else "N",
+            "OMSMode": getattr(self.oms, "capability_mode", "-").value
+            if hasattr(getattr(self.oms, "capability_mode", None), "value")
+            else str(getattr(self.oms, "capability_mode", "-")),
             "Reject": reject_reason[:32],
             "Blend": {horizon: round(self.weights.get(horizon, 0.0), 2) for horizon in ("1s", "10s", "30s")},
             "Weights": labeled_w,
@@ -1059,6 +1078,11 @@ class MLSniperStrategy(StrategyTemplate):
             "Consensus": "UP" if self._consensus_direction(preds) > 0 else "DOWN" if self._consensus_direction(preds) < 0 else "MIXED",
             "Avail": f"{self.latest_account.available:.1f}" if self.latest_account is not None else "-",
             "Health": self.last_system_health or getattr(self.oms.state, "value", str(self.oms.state)),
+            "HealthDetail": self._oms_health_detail()[:72] or "-",
+            "Rearm": "Y" if getattr(self.oms, "manual_rearm_required", False) else "N",
+            "OMSMode": getattr(self.oms, "capability_mode", "-").value
+            if hasattr(getattr(self.oms, "capability_mode", None), "value")
+            else str(getattr(self.oms, "capability_mode", "-")),
             "Reject": self.last_submit_reject_by_symbol.get(sym, "-")[:32],
             "Blend": {horizon: round(self.weights.get(horizon, 0.0), 2) for horizon in ("1s", "10s", "30s")},
             "Train": warmup_prog,

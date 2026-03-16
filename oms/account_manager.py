@@ -10,14 +10,32 @@ class AccountManager:
         self.exposure = exposure_manager
 
         acc_conf = config.get("account", {})
-        self.balance = acc_conf.get("initial_balance_usdt", 10000.0)
+        self.configured_balance = float(acc_conf.get("initial_balance_usdt", 10000.0) or 10000.0)
+        self.balance = self.configured_balance
         self.leverage = acc_conf.get("leverage", 10)
+        raw_budget_by_asset = acc_conf.get("trading_budget_by_asset", {}) or {}
+        self.trading_budget_by_asset = {
+            str(asset).upper(): float(value or 0.0)
+            for asset, value in raw_budget_by_asset.items()
+            if float(value or 0.0) > 0.0
+        }
+        self.trading_budget_total = float(
+            acc_conf.get(
+                "trading_budget_total",
+                sum(self.trading_budget_by_asset.values()) or self.configured_balance,
+            )
+            or 0.0
+        )
 
         self.equity = self.balance
         self.used_margin = 0.0
         self.available = self.balance
+        self.budget_equity = min(self.balance, self.trading_budget_total) if self.trading_budget_total > 0 else self.balance
+        self.budget_balance = self.budget_equity
+        self.budget_available = self.budget_equity
         self.balances = {}
         self.available_balances = {}
+        self.exchange_balance_synced = False
 
     def force_sync(
         self,
@@ -28,6 +46,7 @@ class AccountManager:
         balances: dict = None,
     ):
         self.balance = balance
+        self.exchange_balance_synced = True
         self._sync_balance_maps(asset=asset, balance=balance, available=available, balances=balances)
         self.calculate(used_margin_override=used_margin, available_override=available)
 
@@ -39,6 +58,7 @@ class AccountManager:
         balances: dict = None,
     ):
         self.balance = balance
+        self.exchange_balance_synced = True
         self._sync_balance_maps(asset=asset, balance=balance, available=available, balances=balances)
         self.calculate(available_override=available)
 
@@ -86,6 +106,9 @@ class AccountManager:
 
         self.used_margin = max(local_used_margin, exchange_used_margin, available_used_margin)
         self.available = max(0.0, self.equity - self.used_margin)
+        self.budget_equity = self._budget_equity_value()
+        self.budget_balance = self.budget_equity
+        self.budget_available = max(0.0, self.budget_equity - self.used_margin)
 
         data = AccountData(
             balance=self.balance,
@@ -95,26 +118,35 @@ class AccountManager:
             datetime=datetime.now(),
             balances=dict(self.balances),
             available_balances=dict(self.available_balances),
+            budget_balance=self.budget_equity,
+            budget_available=self.budget_available,
+            trading_budget_by_asset=dict(self.trading_budget_by_asset),
         )
         self.engine.put(Event(EVENT_ACCOUNT_UPDATE, data))
 
     def _sync_balance_maps(self, asset: str = "", balance: float = None, available: float = None, balances: dict = None):
         if balances:
             self.balances = {
-                key: float((payload or {}).get("wallet_balance", 0.0) or 0.0)
+                str(key).upper(): float((payload or {}).get("wallet_balance", 0.0) or 0.0)
                 for key, payload in balances.items()
             }
             self.available_balances = {
-                key: float(payload.get("available_balance", 0.0) or 0.0)
+                str(key).upper(): float(payload.get("available_balance", 0.0) or 0.0)
                 for key, payload in balances.items()
                 if payload.get("available_balance") is not None
             }
             return
 
         if asset:
+            asset = str(asset).upper()
             self.balances[asset] = float(balance or 0.0)
             if available is not None:
                 self.available_balances[asset] = float(available)
+
+    def _budget_equity_value(self):
+        if self.trading_budget_total > 0.0:
+            return min(self.equity, self.trading_budget_total)
+        return self.equity
 
     def _get_price_safely(self, symbol):
         price = data_cache.get_mark_price(symbol)
@@ -124,9 +156,11 @@ class AccountManager:
 
     def check_margin(self, notional_value):
         required = notional_value / self.leverage
-        if self.available == 0:
+        effective_available = self.budget_available if self.trading_budget_total > 0.0 else self.available
+        if effective_available == 0:
             self.calculate()
-        return self.available >= required
+            effective_available = self.budget_available if self.trading_budget_total > 0.0 else self.available
+        return effective_available >= required
 
     def get_margin_ratio(self):
         if self.equity <= 0:

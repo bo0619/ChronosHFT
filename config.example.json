@@ -93,7 +93,11 @@
         "leverage": 8,
         "margin_type": "ISOLATED",
         "position_mode": "ONE_WAY",
-        "initial_balance_usdt": 100.0
+        "initial_balance_usdt": 100.0,
+        "trading_budget_total": 100.0,
+        "trading_budget_by_asset": {
+            "USDT": 100.0
+        }
     },
     "oms": {
         "journal_enabled": true,
@@ -159,6 +163,10 @@
             "target_concurrent_symbols": 3,
             "target_daily_loss": 5.0,
             "max_order_qty": 10000.0,
+            "_comment_budget_asset_weights": "When symbols span both USDT and USDC, use weights to decide how the trading budget is split.",
+            "budget_asset_weights": {
+                "USDT": 1.0
+            },
             "position_buffer_orders": 2.0,
             "reference_min_notional": 5.0,
             "notional_buffer": 1.1

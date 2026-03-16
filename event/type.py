@@ -312,6 +312,9 @@ class AccountData:
     datetime: datetime
     balances: Dict[str, float] = field(default_factory=dict)
     available_balances: Dict[str, float] = field(default_factory=dict)
+    budget_balance: float = 0.0
+    budget_available: float = 0.0
+    trading_budget_by_asset: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
