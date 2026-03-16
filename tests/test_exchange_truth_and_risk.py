@@ -106,9 +106,18 @@ class DummyOMS:
         self.config = {"symbols": ["BTCUSDT"]}
         self.exposure = types.SimpleNamespace(net_positions={})
         self.halt_reasons = []
+        self.frozen_symbols = []
+        self.unfrozen_symbols = []
 
     def halt_system(self, reason):
         self.halt_reasons.append(reason)
+
+    def freeze_symbol(self, symbol, reason, cancel_active_orders=True):
+        self.frozen_symbols.append((symbol, reason, cancel_active_orders))
+
+    def clear_symbol_freeze(self, symbol, reason=""):
+        self.unfrozen_symbols.append((symbol, reason))
+        return True
 
 
 class ExchangeTruthTests(unittest.TestCase):
@@ -295,6 +304,37 @@ class ExchangeTruthTests(unittest.TestCase):
         finally:
             oms.stop()
 
+    def test_exchange_account_position_drift_triggers_reconcile_with_active_orders(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = OMS(engine, gateway, self.make_config())
+        try:
+            oms.exposure.force_sync("BTCUSDT", 1.0, 100.0)
+            active_order = Order(
+                "oid-active",
+                OrderIntent("test", "BTCUSDT", Side.BUY, 100.0, 1.0),
+            )
+            active_order.mark_submitting()
+            oms.orders[active_order.client_oid] = active_order
+
+            called = []
+            oms.trigger_reconcile = lambda reason, suspicious_oid=None: called.append((reason, suspicious_oid))
+
+            update = ExchangeAccountUpdate(
+                asset="USDT",
+                wallet_balance=1000.0,
+                available_balance=1000.0,
+                balances={"USDT": {"wallet_balance": 1000.0, "available_balance": 1000.0}},
+                positions={},
+                reason="ORDER",
+                event_time=1.0,
+            )
+            oms.on_exchange_account_update(Event(EVENT_EXCHANGE_ACCOUNT_UPDATE, update))
+
+            self.assertEqual(called, [("Exchange account position drift", None)])
+        finally:
+            oms.stop()
+
 class RiskExecutionTests(unittest.TestCase):
     def make_risk_config(self):
         return {
@@ -336,8 +376,9 @@ class RiskExecutionTests(unittest.TestCase):
         self.assertFalse(risk.kill_switch_triggered)
         risk.on_orderbook(Event("eOrderBook", stale_book))
 
-        self.assertTrue(risk.kill_switch_triggered)
-        self.assertTrue(oms.halt_reasons)
+        self.assertFalse(risk.kill_switch_triggered)
+        self.assertEqual(len(oms.frozen_symbols), 1)
+        self.assertTrue(oms.frozen_symbols[0][1].startswith("latency:"))
 
     def test_drawdown_pct_limit_triggers_kill_switch(self):
         engine = DummyEngine()
@@ -370,9 +411,23 @@ class RiskExecutionTests(unittest.TestCase):
                 ),
             )
         )
+        risk.on_mark_price(
+            Event(
+                "eMarkPrice",
+                MarkPriceData(
+                    symbol="BTCUSDT",
+                    mark_price=106.0,
+                    index_price=100.0,
+                    funding_rate=0.0,
+                    next_funding_time=datetime.now(),
+                    datetime=datetime.now(),
+                ),
+            )
+        )
 
-        self.assertTrue(risk.kill_switch_triggered)
-        self.assertIn("divergence", risk.kill_reason)
+        self.assertFalse(risk.kill_switch_triggered)
+        self.assertTrue(oms.frozen_symbols)
+        self.assertIn("divergence:", oms.frozen_symbols[-1][1])
 
 
     def test_latency_limit_uses_exchange_timestamp_over_local_datetime(self):
@@ -392,7 +447,63 @@ class RiskExecutionTests(unittest.TestCase):
         risk.on_orderbook(Event("eOrderBook", stale_book))
         risk.on_orderbook(Event("eOrderBook", stale_book))
 
+        self.assertFalse(risk.kill_switch_triggered)
+        self.assertTrue(oms.frozen_symbols)
+
+    def test_symbol_freeze_escalates_when_multiple_symbols_are_frozen(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        oms.config = {"symbols": ["BTCUSDT", "ETHUSDT"]}
+        risk = RiskManager(engine, self.make_risk_config(), oms=oms, gateway=gateway)
+
+        stale_btc = OrderBook(
+            symbol="BTCUSDT",
+            exchange="BINANCE",
+            datetime=datetime.now() - timedelta(milliseconds=250),
+        )
+        stale_eth = OrderBook(
+            symbol="ETHUSDT",
+            exchange="BINANCE",
+            datetime=datetime.now() - timedelta(milliseconds=250),
+        )
+
+        risk.on_orderbook(Event("eOrderBook", stale_btc))
+        risk.on_orderbook(Event("eOrderBook", stale_btc))
+        self.assertFalse(risk.kill_switch_triggered)
+
+        risk.on_orderbook(Event("eOrderBook", stale_eth))
+        risk.on_orderbook(Event("eOrderBook", stale_eth))
+
         self.assertTrue(risk.kill_switch_triggered)
+        self.assertTrue(oms.halt_reasons)
+
+    def test_symbol_freeze_clears_after_stable_market_updates(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        risk = RiskManager(engine, self.make_risk_config(), oms=oms, gateway=gateway)
+
+        stale_book = OrderBook(
+            symbol="BTCUSDT",
+            exchange="BINANCE",
+            datetime=datetime.now() - timedelta(milliseconds=250),
+        )
+        fresh_book = OrderBook(
+            symbol="BTCUSDT",
+            exchange="BINANCE",
+            datetime=datetime.now(),
+            exchange_timestamp=datetime.now().timestamp(),
+        )
+
+        risk.on_orderbook(Event("eOrderBook", stale_book))
+        risk.on_orderbook(Event("eOrderBook", stale_book))
+        self.assertTrue(oms.frozen_symbols)
+
+        risk.on_orderbook(Event("eOrderBook", fresh_book))
+        risk.on_orderbook(Event("eOrderBook", fresh_book))
+
+        self.assertTrue(oms.unfrozen_symbols)
 
 if __name__ == "__main__":
     unittest.main()

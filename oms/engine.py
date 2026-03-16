@@ -48,6 +48,7 @@ class OMS:
         self.event_log = []
         self.orders = {}
         self.exchange_id_map = {}
+        self.symbol_guards = {}
         self.lock = threading.RLock()
 
         target_leverage = int(config.get("account", {}).get("leverage", 0) or 0)
@@ -84,24 +85,152 @@ class OMS:
         self.last_reconcile_request_ts = 0.0
         self.last_reconcile_failure_ts = 0.0
         self.consecutive_reconcile_api_failures = 0
+        self.reconcile_retry_scheduled = False
+        self.manual_rearm_required = False
+        self.last_freeze_reason = ""
+        self.last_halt_reason = ""
 
     def bootstrap(self):
         logger.info("OMS: Bootstrapping state...")
+        self.manual_rearm_required = False
+        self.last_freeze_reason = ""
+        self.last_halt_reason = ""
+        self.symbol_guards.clear()
         self._audit("bootstrap_requested", recovered=self.rebuild_summary)
         self._perform_full_reset()
 
-    def halt_system(self, reason: str):
+    def freeze_symbol(self, symbol: str, reason: str, cancel_active_orders: bool = True):
+        if not symbol:
+            return
+
+        symbol = symbol.upper()
+        previous_reason = self.symbol_guards.get(symbol, "")
+        self.symbol_guards[symbol] = reason
+
+        if previous_reason != reason:
+            logger.error(f"[OMS] Symbol frozen {symbol}: {reason}")
+            self._audit(
+                "symbol_frozen",
+                symbol=symbol,
+                reason=reason,
+                previous_reason=previous_reason,
+            )
+        else:
+            self._audit("symbol_freeze_reasserted", symbol=symbol, reason=reason)
+
+        if cancel_active_orders:
+            self.cancel_all_orders(symbol)
+
+    def clear_symbol_freeze(self, symbol: str, reason: str = ""):
+        if not symbol:
+            return False
+
+        symbol = symbol.upper()
+        previous_reason = self.symbol_guards.pop(symbol, "")
+        if not previous_reason:
+            return False
+
+        logger.info(f"[OMS] Symbol restored {symbol}: {reason or previous_reason}")
+        self._audit(
+            "symbol_unfrozen",
+            symbol=symbol,
+            reason=reason or previous_reason,
+            previous_reason=previous_reason,
+        )
+        return True
+
+    def get_symbol_freeze_reason(self, symbol: str) -> str:
+        if not symbol:
+            return ""
+        return self.symbol_guards.get(symbol.upper(), "")
+
+    def is_symbol_tradeable(self, symbol: str) -> bool:
+        return self.state == LifecycleState.LIVE and not self.get_symbol_freeze_reason(symbol)
+
+    def freeze_system(self, reason: str, cancel_active_orders: bool = False):
         if self.state == LifecycleState.HALTED:
             return
+
+        previous_state = self.state
+        self.state = LifecycleState.FROZEN
+        self.last_freeze_reason = reason
+
+        if previous_state != LifecycleState.FROZEN:
+            logger.error(f"OMS FROZEN: {reason}")
+            self._audit(
+                "lifecycle",
+                state=self.state.value,
+                reason=reason,
+                previous_state=previous_state.value,
+            )
+        else:
+            logger.error(f"OMS still FROZEN: {reason}")
+            self._audit("freeze_reasserted", reason=reason)
+
+        if not cancel_active_orders:
+            return
+
+        self._audit(
+            "freeze_cancel_all_requested",
+            reason=reason,
+            symbols=self.config.get("symbols", []),
+        )
+        try:
+            for symbol in self.config["symbols"]:
+                self.gateway.cancel_all_orders(symbol)
+        except Exception:
+            pass
+
+    def halt_system(self, reason: str):
+        if self.state == LifecycleState.HALTED:
+            self.last_halt_reason = reason
+            self.manual_rearm_required = True
+            self._audit("halt_reasserted", reason=reason)
+            return
         self.state = LifecycleState.HALTED
+        self.manual_rearm_required = True
+        self.last_halt_reason = reason
+        self.last_freeze_reason = ""
         logger.critical(f"OMS HALTED: {reason}")
-        self._audit("lifecycle", state=self.state.value, reason=reason)
+        self._audit(
+            "lifecycle",
+            state=self.state.value,
+            reason=reason,
+            manual_rearm_required=True,
+        )
         self.event_engine.put(Event(EVENT_SYSTEM_HEALTH, f"HALT:{reason}"))
         try:
             for symbol in self.config["symbols"]:
                 self.gateway.cancel_all_orders(symbol)
         except Exception:
             pass
+
+    def rearm_system(self, reason: str = "manual"):
+        if self.state != LifecycleState.HALTED or not self.manual_rearm_required:
+            self._audit("rearm_ignored", reason=reason)
+            return False
+
+        logger.warning(f"OMS manual rearm requested: {reason}")
+        self._audit(
+            "rearm_requested",
+            reason=reason,
+            halted_reason=self.last_halt_reason,
+        )
+        self.state = LifecycleState.RECONCILING
+        self._audit(
+            "lifecycle",
+            state=self.state.value,
+            reason=f"manual_rearm:{reason}",
+        )
+        self._perform_full_reset()
+        if self.state == LifecycleState.LIVE:
+            self.manual_rearm_required = False
+            self.last_halt_reason = ""
+            self._audit("rearm_completed", state=self.state.value, reason=reason)
+            return True
+
+        self.manual_rearm_required = True
+        return False
 
     def stop(self):
         self._audit("oms_stopped", state=self.state.value)
@@ -110,6 +239,11 @@ class OMS:
     def trigger_reconcile(self, reason: str, suspicious_oid: str = None):
         if self.state in [LifecycleState.RECONCILING, LifecycleState.HALTED]:
             return
+
+        self.freeze_system(
+            f"Awaiting reconcile: {reason}",
+            cancel_active_orders=True,
+        )
 
         now = time.monotonic()
         if self.last_reconcile_failure_ts and now - self.last_reconcile_failure_ts < self.reconcile_api_cooldown_sec:
@@ -120,6 +254,7 @@ class OMS:
                 suspicious_oid=suspicious_oid,
                 cooldown="api_failure",
             )
+            self._schedule_reconcile_retry(reason, suspicious_oid=suspicious_oid)
             return
 
         if now - self.last_reconcile_request_ts < self.reconcile_min_interval_sec:
@@ -130,6 +265,7 @@ class OMS:
                 suspicious_oid=suspicious_oid,
                 cooldown="min_interval",
             )
+            self._schedule_reconcile_retry(reason, suspicious_oid=suspicious_oid)
             return
 
         self.last_reconcile_request_ts = now
@@ -146,6 +282,47 @@ class OMS:
             args=(suspicious_oid,),
             daemon=True,
         ).start()
+
+    def _schedule_reconcile_retry(
+        self,
+        reason: str,
+        suspicious_oid: str = None,
+        delay_sec: float = None,
+    ):
+        if self.reconcile_retry_scheduled or self.state == LifecycleState.HALTED:
+            return
+
+        if delay_sec is None:
+            now = time.monotonic()
+            cooldown_remaining = 0.0
+            if self.last_reconcile_failure_ts:
+                cooldown_remaining = max(
+                    0.0,
+                    self.reconcile_api_cooldown_sec - (now - self.last_reconcile_failure_ts),
+                )
+            interval_remaining = max(
+                0.0,
+                self.reconcile_min_interval_sec - (now - self.last_reconcile_request_ts),
+            )
+            delay_sec = max(cooldown_remaining, interval_remaining, 0.05)
+
+        delay_sec = max(delay_sec, 0.05)
+        self.reconcile_retry_scheduled = True
+        self._audit(
+            "reconcile_retry_scheduled",
+            reason=reason,
+            suspicious_oid=suspicious_oid,
+            delay_sec=delay_sec,
+        )
+
+        def _retry():
+            time.sleep(delay_sec)
+            self.reconcile_retry_scheduled = False
+            if self.state != LifecycleState.FROZEN:
+                return
+            self.trigger_reconcile(reason, suspicious_oid=suspicious_oid)
+
+        threading.Thread(target=_retry, daemon=True).start()
 
     def _execute_reconcile(self, suspicious_oid: str):
         self._audit("reconcile_started", suspicious_oid=suspicious_oid)
@@ -167,9 +344,13 @@ class OMS:
                 else:
                     logger.error(
                         f"[Reconcile] API unreachable ({attempt}/{self.reconcile_api_failure_threshold}); "
-                        "keeping LIVE and backing off."
+                        "keeping FROZEN and backing off."
                     )
-                    self.state = LifecycleState.LIVE
+                    self.freeze_system("Reconcile API unreachable")
+                    self._schedule_reconcile_retry(
+                        "Reconcile API retry",
+                        suspicious_oid=suspicious_oid,
+                    )
                 return
 
             self.consecutive_reconcile_api_failures = 0
@@ -231,6 +412,7 @@ class OMS:
                 self._perform_full_reset()
             else:
                 self.state = LifecycleState.LIVE
+                self.last_freeze_reason = ""
                 self._audit("reconcile_cleared", state=self.state.value)
                 logger.info("[Reconcile] False alarm. Resuming LIVE.")
 
@@ -286,6 +468,10 @@ class OMS:
                 self._emit_position_update(symbol)
 
             self.state = LifecycleState.LIVE
+            self.manual_rearm_required = False
+            self.last_freeze_reason = ""
+            self.last_halt_reason = ""
+            self.reconcile_retry_scheduled = False
             self._audit(
                 "full_reset_completed",
                 state=self.state.value,
@@ -306,6 +492,14 @@ class OMS:
                 intent,
                 client_oid,
                 f"oms_not_live:{self.state.value}",
+            )
+
+        symbol_guard_reason = self.get_symbol_freeze_reason(intent.symbol)
+        if symbol_guard_reason:
+            return self._reject_intent_locally(
+                intent,
+                client_oid,
+                f"symbol_frozen:{symbol_guard_reason}",
             )
 
         valid, validation_reason = self.validator.validate_params(intent)
@@ -487,10 +681,10 @@ class OMS:
             return
 
         if has_active_orders:
-            logger.warning(f"[OMS] Exchange position drift detected while orders are active: {position_drift}")
-            return
+            logger.error(f"[OMS] Exchange position drift detected while orders are active: {position_drift}")
+        else:
+            logger.error(f"[OMS] Exchange position drift detected without active orders: {position_drift}")
 
-        logger.error(f"[OMS] Exchange position drift detected without active orders: {position_drift}")
         self.trigger_reconcile("Exchange account position drift")
 
     def _append_and_process(self, event):

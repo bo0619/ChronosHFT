@@ -177,6 +177,46 @@ class OMSSurvivabilityTests(unittest.TestCase):
         finally:
             oms.stop()
 
+    def test_manual_rearm_requires_explicit_reset_path(self):
+        gateway = DummyGateway()
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            oms.halt_system("operator_test")
+
+            self.assertEqual(oms.state, LifecycleState.HALTED)
+            self.assertTrue(oms.manual_rearm_required)
+
+            rearmed = oms.rearm_system("operator_ack")
+
+            self.assertTrue(rearmed)
+            self.assertEqual(oms.state, LifecycleState.LIVE)
+            self.assertFalse(oms.manual_rearm_required)
+        finally:
+            oms.stop()
+
+    def test_symbol_freeze_blocks_new_orders_without_halting_account(self):
+        gateway = DummyGateway()
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.freeze_symbol("BTCUSDT", "latency:test")
+
+            result = oms.submit_order(
+                OrderIntent(
+                    "test",
+                    "BTCUSDT",
+                    Side.BUY,
+                    100.0,
+                    1.0,
+                )
+            )
+
+            self.assertFalse(result.accepted)
+            self.assertIn("symbol_frozen", result.reason)
+            self.assertEqual(oms.state, LifecycleState.LIVE)
+        finally:
+            oms.stop()
+
 
 class SystemHealthHandlerTests(unittest.TestCase):
     def test_non_halt_health_event_triggers_kill_switch(self):

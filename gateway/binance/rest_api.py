@@ -75,6 +75,25 @@ class BinanceRestApi:
         self.endpoint_cooldown_until[endpoint] = time.monotonic() + cooldown_sec
         return cooldown_sec
 
+    def _extract_error_details(self, response):
+        code = ""
+        message = ""
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+
+        if isinstance(payload, dict):
+            raw_code = payload.get("code")
+            code = "" if raw_code is None else str(raw_code)
+            message = str(payload.get("msg", "") or "")
+        return code, message
+
+    def _is_retryable_response(self, status_code: int, error_code: str) -> bool:
+        if status_code >= 500 or status_code in {418, 429}:
+            return True
+        return error_code in {"-1001", "-1003", "-1007", "-1008"}
+
     def request(self, method, endpoint, params=None, signed=True):
         url = self.base_url + endpoint
         base_params = dict(params or {})
@@ -93,6 +112,30 @@ class BinanceRestApi:
                 prepped = self.session.prepare_request(req)
                 response = self.session.send(prepped, timeout=self.timeout_sec)
                 self.endpoint_cooldown_until[endpoint] = 0.0
+                if response.status_code == 200:
+                    return response
+
+                error_code, error_message = self._extract_error_details(response)
+                logger.error(
+                    f"REST Error [{endpoint}] status={response.status_code} code={error_code or '-'} "
+                    f"msg={error_message or '-'}"
+                )
+
+                if signed and error_code == "-1021":
+                    sync_ok = time_service._sync()
+                    if attempt < self.max_retries and sync_ok:
+                        logger.warning(
+                            f"REST retry [{endpoint}] attempt {attempt}/{self.max_retries} after timestamp resync"
+                        )
+                        continue
+
+                if attempt < self.max_retries and self._is_retryable_response(response.status_code, error_code):
+                    cooldown_sec = self._mark_failure_cooldown(endpoint, attempt)
+                    logger.warning(
+                        f"REST retry [{endpoint}] attempt {attempt}/{self.max_retries} after "
+                        f"{cooldown_sec:.2f}s: status={response.status_code} code={error_code or '-'}"
+                    )
+                    continue
                 return response
             except Exception as exc:
                 cooldown_sec = self._mark_failure_cooldown(endpoint, attempt)

@@ -64,8 +64,9 @@ class GatewayError(Enum):
 class LifecycleState(Enum):
     BOOTSTRAP = "BOOTSTRAP"
     LIVE = "LIVE"
-    HALTED = "HALTED"
+    FROZEN = "FROZEN"
     RECONCILING = "RECONCILING"
+    HALTED = "HALTED"
 
 
 class SystemState(Enum):

@@ -49,8 +49,6 @@ def main():
 
     config["system"]["log_console"] = False
     logger.init_logging(config)
-    time_service.start(testnet=config["testnet"])
-    ref_data_manager.init(testnet=config["testnet"])
 
     engine = EventEngine()
     dashboard = TUIDashboard()
@@ -61,6 +59,23 @@ def main():
     risk_controller = RiskManager(engine, config, oms=oms_system, gateway=gateway)
     strategy = MLSniperStrategy(engine, oms_system)
     recorder = DataRecorder(engine, config["symbols"]) if config.get("record_data", False) else None
+
+    def on_time_service_health(severity, reason, details):
+        if severity == "freeze":
+            oms_system.freeze_system(f"TimeSync: {reason}", cancel_active_orders=True)
+            return
+        if severity == "halt":
+            risk_controller.trigger_kill_switch(f"TimeSync: {reason}")
+            return
+        if severity == "recovered" and oms_system.state.value == "FROZEN":
+            if oms_system.last_freeze_reason.startswith("TimeSync:"):
+                oms_system.trigger_reconcile("Time sync recovered")
+
+    time_service.clear_listeners()
+    time_service.configure(config.get("system", {}).get("time_sync", {}))
+    time_service.register_listener(on_time_service_health)
+    time_service.start(testnet=config["testnet"])
+    ref_data_manager.init(testnet=config["testnet"])
 
     engine.register(EVENT_ORDERBOOK, lambda e: data_cache.update_book(e.data))
     engine.register(EVENT_MARK_PRICE, lambda e: data_cache.update_mark_price(e.data))

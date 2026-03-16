@@ -477,7 +477,7 @@ class MLSniperStrategy(StrategyTemplate):
         preds = self.latest_preds[sym]
         net_pos = self.oms.exposure.net_positions.get(sym, 0.0)
         tick = self._tick_size(sym, mid)
-        can_submit = self.can_submit_orders()
+        can_submit = self.can_submit_orders(sym)
         if confidence <= 0.0:
             confidence = self.latest_confidence[sym] if self.latest_confidence[sym] > 0.0 else 1.0
 
@@ -735,7 +735,7 @@ class MLSniperStrategy(StrategyTemplate):
         self.latest_spread_bps[sym] = spread_bps
         self.latest_sigma_bps[sym] = sigma_bps
 
-        if not self.can_submit_orders():
+        if not self.can_submit_orders(sym):
             entry_mode = "PAUSED"
         elif not regime_ok:
             entry_mode = f"BLOCKED:{regime_reason}"

@@ -54,7 +54,7 @@ class DummyGateway:
 
 
 class OMSReconcileBackoffTests(unittest.TestCase):
-    def make_config(self, failure_threshold=3):
+    def make_config(self, failure_threshold=3, min_interval=5.0, cooldown=10.0):
         return {
             "symbols": ["BTCUSDT"],
             "account": {
@@ -69,6 +69,8 @@ class OMSReconcileBackoffTests(unittest.TestCase):
                 "journal_enabled": False,
                 "replay_journal_on_startup": False,
                 "reconcile_api_failure_threshold": failure_threshold,
+                "reconcile_min_interval_sec": min_interval,
+                "reconcile_api_cooldown_sec": cooldown,
             },
             "risk": {
                 "limits": {
@@ -77,25 +79,37 @@ class OMSReconcileBackoffTests(unittest.TestCase):
             },
         }
 
-    def test_transient_api_failure_returns_live(self):
+    def test_transient_api_failure_keeps_system_frozen(self):
         oms = OMS(DummyEngine(), DummyGateway(), self.make_config(failure_threshold=3))
         try:
+            scheduled = []
+            oms._schedule_reconcile_retry = lambda reason, suspicious_oid=None, delay_sec=None: scheduled.append(
+                (reason, suspicious_oid, delay_sec)
+            )
             oms.state = LifecycleState.RECONCILING
             oms._execute_reconcile(None)
-            self.assertEqual(oms.state, LifecycleState.LIVE)
+            self.assertEqual(oms.state, LifecycleState.FROZEN)
+            self.assertEqual(oms.consecutive_reconcile_api_failures, 1)
+            self.assertEqual(len(scheduled), 1)
         finally:
             oms.stop()
 
     def test_repeated_api_failure_eventually_halts(self):
-        oms = OMS(DummyEngine(), DummyGateway(), self.make_config(failure_threshold=2))
+        oms = OMS(
+            DummyEngine(),
+            DummyGateway(),
+            self.make_config(failure_threshold=2, min_interval=0.0, cooldown=0.0),
+        )
         try:
+            oms._schedule_reconcile_retry = lambda reason, suspicious_oid=None, delay_sec=None: None
             oms.state = LifecycleState.RECONCILING
             oms._execute_reconcile(None)
-            self.assertEqual(oms.state, LifecycleState.LIVE)
+            self.assertEqual(oms.state, LifecycleState.FROZEN)
 
             oms.state = LifecycleState.RECONCILING
             oms._execute_reconcile(None)
             self.assertEqual(oms.state, LifecycleState.HALTED)
+            self.assertTrue(oms.manual_rearm_required)
         finally:
             oms.stop()
 

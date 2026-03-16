@@ -131,7 +131,7 @@ class TUIDashboard:
         upper = value.upper()
         if "LIVE" in upper:
             return "green"
-        if "RECON" in upper or "DIRTY" in upper:
+        if "RECON" in upper or "DIRTY" in upper or "FROZEN" in upper:
             return "yellow"
         if "HALT" in upper or "ERROR" in upper:
             return "red"
@@ -410,7 +410,7 @@ class TUIDashboard:
             upper = line.upper()
             if "[ERROR]" in upper or "HALT" in upper:
                 style = "bold red"
-            elif "[WARNING]" in upper or "RECONCILING" in upper:
+            elif "[WARNING]" in upper or "RECONCILING" in upper or "FROZEN" in upper:
                 style = "yellow"
             elif "[INFO]" in upper or "LIVE" in upper:
                 style = "green"

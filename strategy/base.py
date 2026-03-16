@@ -73,7 +73,9 @@ class StrategyTemplate:
         self.last_submit_reject_oid = client_oid or ""
         self.last_submit_reject_by_symbol[intent.symbol] = reason
 
-    def can_submit_orders(self) -> bool:
+    def can_submit_orders(self, symbol: str = "") -> bool:
+        if symbol and hasattr(self.oms, "is_symbol_tradeable"):
+            return bool(self.oms.is_symbol_tradeable(symbol))
         return getattr(self.oms, "state", None) == LifecycleState.LIVE
 
     def log(self, msg):
