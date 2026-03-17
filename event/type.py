@@ -123,6 +123,7 @@ class OrderIntent:
     order_type: str = "LIMIT"
     time_in_force: str = TIF_GTC
     is_post_only: bool = False
+    reduce_only: bool = False
     policy: ExecutionPolicy = ExecutionPolicy.PASSIVE
     tag: str = ""
 

@@ -433,6 +433,7 @@ class OMS:
                     order_type="LIMIT",
                     time_in_force=TIF_GTX,
                     is_post_only=True,
+                    reduce_only=intent.reduce_only,
                     policy=ExecutionPolicy.PASSIVE,
                     tag=f"{intent.tag}|degraded" if intent.tag else "degraded",
                 )
@@ -1367,6 +1368,7 @@ class OMS:
             order_type=intent.order_type,
             time_in_force=intent.time_in_force,
             post_only=intent.is_post_only,
+            reduce_only=intent.reduce_only,
         )
 
         exchange_oid = self.gateway.send_order(request, client_oid)
@@ -2065,6 +2067,7 @@ class OMS:
             "order_type": intent.order_type,
             "time_in_force": intent.time_in_force,
             "is_post_only": intent.is_post_only,
+            "reduce_only": intent.reduce_only,
             "policy": intent.policy.value,
             "tag": intent.tag,
         }

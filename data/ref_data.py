@@ -2,6 +2,7 @@
 
 import requests
 import math
+from decimal import Decimal, ROUND_DOWN
 from dataclasses import dataclass
 from infrastructure.logger import logger
 
@@ -110,9 +111,14 @@ class ReferenceDataManager:
         # 这里使用严谨算法：
         # round(qty - (qty % step_size), precision)
         if info.step_size == 0: return qty
-        
-        steps = math.floor(qty / info.step_size)
-        rounded = steps * info.step_size
-        return round(rounded, info.qty_precision)
+
+        # Use decimal arithmetic with a tiny step-relative epsilon so values
+        # like 2.4/0.1 do not become 23.999999... and round down to 2.3.
+        qty_dec = Decimal(str(qty))
+        step_dec = Decimal(str(info.step_size))
+        epsilon = step_dec * Decimal("1e-9")
+        steps = ((qty_dec + epsilon) / step_dec).to_integral_value(rounding=ROUND_DOWN)
+        rounded = steps * step_dec
+        return round(float(rounded), info.qty_precision)
 
 ref_data_manager = ReferenceDataManager()

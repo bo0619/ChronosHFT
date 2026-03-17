@@ -44,8 +44,10 @@ class DispatchingEngine:
 class DummyGateway:
     def __init__(self, send_order_result="ex-order"):
         self.send_order_result = send_order_result
+        self.sent_requests = []
 
     def send_order(self, req, client_oid):
+        self.sent_requests.append((req, client_oid))
         return self.send_order_result
 
     def cancel_order(self, req):
@@ -218,6 +220,27 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             self.assertEqual(len(order_updates), 1)
             self.assertEqual(order_updates[0].status, OrderStatus.REJECTED_LOCALLY)
             self.assertIn("Account Gross Exposure", order_updates[0].error_msg)
+        finally:
+            oms.stop()
+
+    @patch("oms.validator.ref_data_manager.get_info", return_value=None)
+    @patch("oms.validator.data_cache.get_best_quote", return_value=(99.9, 100.1))
+    @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
+    def test_exit_orders_are_submitted_as_reduce_only(self, *_mocks):
+        engine = DispatchingEngine()
+        gateway = DummyGateway(send_order_result="ex-order")
+        oms = OMS(engine, gateway, self.make_config())
+        strategy = DummyStrategy(engine, oms)
+        oms.state = LifecycleState.LIVE
+        oms._sync_capability_mode("test_live")
+        try:
+            oid = strategy.exit_short("BTCUSDT", 100.0, 1.0)
+
+            self.assertTrue(oid)
+            self.assertEqual(len(gateway.sent_requests), 1)
+            sent_req, _client_oid = gateway.sent_requests[0]
+            self.assertTrue(sent_req.reduce_only)
+            self.assertEqual(sent_req.side, "BUY")
         finally:
             oms.stop()
 

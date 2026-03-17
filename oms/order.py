@@ -140,6 +140,7 @@ class Order:
                 "order_type": self.intent.order_type,
                 "time_in_force": self.intent.time_in_force,
                 "is_post_only": self.intent.is_post_only,
+                "reduce_only": self.intent.reduce_only,
                 "policy": self.intent.policy.value,
                 "tag": self.intent.tag,
             },
@@ -157,6 +158,7 @@ class Order:
             order_type=intent_payload.get("order_type", "LIMIT"),
             time_in_force=intent_payload.get("time_in_force", "GTC"),
             is_post_only=bool(intent_payload.get("is_post_only", False)),
+            reduce_only=bool(intent_payload.get("reduce_only", False)),
             policy=ExecutionPolicy(
                 intent_payload.get("policy", ExecutionPolicy.PASSIVE.value)
             ),

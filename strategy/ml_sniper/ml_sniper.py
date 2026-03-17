@@ -860,7 +860,7 @@ class MLSniperStrategy(StrategyTemplate):
             self.log(f"{sym_clean} enter {side_str} @ {price:.6g} ({mode}, vol={vol})")
 
     def _place_exit(self, sym: str, side: Side, price: float, vol: float):
-        intent = OrderIntent(self.name, sym, side, price, vol, is_post_only=True)
+        intent = OrderIntent(self.name, sym, side, price, vol, is_post_only=True, reduce_only=True)
         oid = self.send_intent(intent)
         if oid:
             self.exit_oid[sym] = oid

@@ -124,7 +124,7 @@ class StrategyTemplate:
         return self.send_intent(intent)
 
     def exit_long(self, symbol, price, volume):
-        intent = OrderIntent(self.name, symbol, Side.SELL, price, volume)
+        intent = OrderIntent(self.name, symbol, Side.SELL, price, volume, reduce_only=True)
         return self.send_intent(intent)
 
     def entry_short(self, symbol, price, volume):
@@ -132,7 +132,7 @@ class StrategyTemplate:
         return self.send_intent(intent)
 
     def exit_short(self, symbol, price, volume):
-        intent = OrderIntent(self.name, symbol, Side.BUY, price, volume)
+        intent = OrderIntent(self.name, symbol, Side.BUY, price, volume, reduce_only=True)
         return self.send_intent(intent)
 
     def buy(self, symbol, price, volume):
