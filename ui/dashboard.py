@@ -453,6 +453,7 @@ class TUIDashboard:
                 (self._param_str(strat, "Rearm"), "yellow" if self._param_str(strat, "Rearm") == "Y" else "white"),
             ),
             Text.assemble(("Reason: ", "bold"), (self._param_str(strat, "HealthDetail"), "yellow" if self._param_str(strat, "HealthDetail") != "-" else "dim")),
+            Text.assemble(("Block: ", "bold"), (self._param_str(strat, "Block"), "yellow" if self._param_str(strat, "Block") != "-" else "dim")),
             Text.assemble(("Reject: ", "bold"), (self._param_str(strat, "Reject"), "yellow" if self._param_str(strat, "Reject") != "-" else "dim")),
         ]
         return Panel(Group(*lines), title="Focus", border_style="green")

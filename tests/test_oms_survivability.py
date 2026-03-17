@@ -634,6 +634,29 @@ class OMSSurvivabilityTests(unittest.TestCase):
             finally:
                 recovered.stop()
 
+    def test_recovered_guards_are_cleared_after_successful_reconcile(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal_path = os.path.join(tmpdir, "oms_journal.jsonl")
+            config = self.make_journaled_config(journal_path)
+
+            oms = OMS(DummyEngine(), DummyGateway(), config)
+            oms.freeze_strategy("alpha", "manual:test", cancel_active_orders=False)
+            oms.stop()
+
+            recovered = OMS(DummyEngine(), DummyGateway(), config)
+            try:
+                self.assertEqual(recovered.state, LifecycleState.FROZEN)
+                self.assertEqual(recovered.get_strategy_freeze_reason("alpha"), "manual:test")
+                self.assertFalse(recovered.can_submit_for_strategy("alpha", "BTCUSDT"))
+
+                recovered._execute_reconcile(None)
+
+                self.assertEqual(recovered.state, LifecycleState.LIVE)
+                self.assertEqual(recovered.get_strategy_freeze_reason("alpha"), "")
+                self.assertTrue(recovered.can_submit_for_strategy("alpha", "BTCUSDT"))
+            finally:
+                recovered.stop()
+
 
 class DummyTruthProvider:
     gateway_name = "BINANCE"

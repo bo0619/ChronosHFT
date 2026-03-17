@@ -95,7 +95,7 @@ def bootstrap_or_rearm(oms_system, auto_rearm=False, rearm_reason="cli"):
         return True
 
     if getattr(oms_system, "manual_rearm_required", False):
-        hint = "python main.py --rearm --rearm-reason operator_ack"
+        hint = "python main.py --admin-command rearm --admin-reason operator_ack"
         logger.warning(f"[OMS] Manual rearm required. Command: {hint}")
         if auto_rearm:
             logger.warning(f"[OMS] Auto rearm requested via CLI: {rearm_reason}")

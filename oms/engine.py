@@ -106,6 +106,7 @@ class OMS:
         self.manual_rearm_required = False
         self.last_freeze_reason = ""
         self.last_halt_reason = ""
+        self.recovered_guard_cleanup_pending = False
         self.rebuild_summary = self.rebuild_from_log()
         self._apply_rebuild_summary()
 
@@ -153,6 +154,7 @@ class OMS:
             logger.warning("[OMS] Bootstrapping into guarded reconcile mode")
             self.state = LifecycleState.FROZEN
             self._sync_capability_mode("bootstrap_guarded")
+            self.recovered_guard_cleanup_pending = True
             if not self.last_freeze_reason:
                 self.last_freeze_reason = "Recovered guarded state"
             self._audit(
@@ -250,6 +252,7 @@ class OMS:
             LifecycleState.RECONCILING.value,
         }:
             self.state = LifecycleState.FROZEN
+            self.recovered_guard_cleanup_pending = True
             if not self.last_freeze_reason:
                 self.last_freeze_reason = "Recovered guarded state"
             self._sync_capability_mode("recovered_guarded_state")
@@ -810,11 +813,44 @@ class OMS:
 
         return cleared
 
+    def _clear_recovered_guards_if_pending(self, reason: str = ""):
+        if not self.recovered_guard_cleanup_pending:
+            return 0
+
+        cleared = 0
+        for symbol in list(self.symbol_guards.keys()):
+            if self.clear_symbol_freeze(symbol, reason=reason or "recovered_guard_cleared"):
+                cleared += 1
+
+        for venue in list(self.venue_guards.keys()):
+            if self.clear_venue_freeze(venue, reason=reason or "recovered_guard_cleared"):
+                cleared += 1
+
+        for strategy_id in list(self.strategy_guards.keys()):
+            if self.clear_strategy_freeze(strategy_id, reason=reason or "recovered_guard_cleared"):
+                cleared += 1
+
+        for strategy_id, symbol in list(self.strategy_symbol_guards.keys()):
+            if self.clear_strategy_freeze(
+                strategy_id,
+                symbol=symbol,
+                reason=reason or "recovered_guard_cleared",
+            ):
+                cleared += 1
+
+        self.recovered_guard_cleanup_pending = False
+        if cleared:
+            self._audit("recovered_guards_cleared", reason=reason or "recovered_guard_cleared", count=cleared)
+        return cleared
+
     def is_symbol_tradeable(self, symbol: str) -> bool:
         return self.can_open_new_risk() and not self.get_symbol_freeze_reason(symbol)
 
     def can_submit_for_strategy(self, strategy_id: str, symbol: str = "") -> bool:
         return self._get_order_block_reason(strategy_id, symbol) == ""
+
+    def get_order_block_reason(self, strategy_id: str = "", symbol: str = "") -> str:
+        return self._get_order_block_reason(strategy_id, symbol)
 
     def _cancel_orders_matching(self, predicate):
         with self.lock:
@@ -1184,6 +1220,7 @@ class OMS:
                 self.state = LifecycleState.LIVE
                 self._sync_capability_mode("reconcile_cleared")
                 self.last_freeze_reason = ""
+                self._clear_recovered_guards_if_pending("reconcile_cleared")
                 self._audit("reconcile_cleared", state=self.state.value)
                 logger.info("[Reconcile] False alarm. Resuming LIVE.")
 
@@ -1245,6 +1282,7 @@ class OMS:
             self.last_halt_reason = ""
             self.reconcile_retry_scheduled = False
             self.clear_transient_guards(prefixes=("truth_plane:",))
+            self._clear_recovered_guards_if_pending("full_reset_completed")
             self._audit(
                 "full_reset_completed",
                 state=self.state.value,

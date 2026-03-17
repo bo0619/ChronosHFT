@@ -993,6 +993,11 @@ class MLSniperStrategy(StrategyTemplate):
         health = self.last_system_health or getattr(self.oms.state, "value", str(self.oms.state))
         account_available = f"{self.latest_account.available:.1f}" if self.latest_account is not None else "-"
         reject_reason = self.last_submit_reject_by_symbol.get(sym, "-")
+        block_reason = (
+            self.oms.get_order_block_reason(self.name, sym)
+            if hasattr(self.oms, "get_order_block_reason")
+            else ""
+        )
         regime_ok, regime_reason, spread_bps, sigma_bps = self._regime_status(sym, mid, bid_1, ask_1, signal, min(maker_required, taker_required), confidence)
         self.latest_regime[sym] = regime_reason
         self.latest_spread_bps[sym] = spread_bps
@@ -1043,6 +1048,7 @@ class MLSniperStrategy(StrategyTemplate):
             "OMSMode": getattr(self.oms, "capability_mode", "-").value
             if hasattr(getattr(self.oms, "capability_mode", None), "value")
             else str(getattr(self.oms, "capability_mode", "-")),
+            "Block": block_reason[:72] if block_reason else "-",
             "Reject": reject_reason[:32],
             "Blend": {horizon: round(self.weights.get(horizon, 0.0), 2) for horizon in ("1s", "10s", "30s")},
             "Weights": labeled_w,
@@ -1083,6 +1089,11 @@ class MLSniperStrategy(StrategyTemplate):
             "OMSMode": getattr(self.oms, "capability_mode", "-").value
             if hasattr(getattr(self.oms, "capability_mode", None), "value")
             else str(getattr(self.oms, "capability_mode", "-")),
+            "Block": (
+                self.oms.get_order_block_reason(self.name, sym)[:72]
+                if hasattr(self.oms, "get_order_block_reason") and self.oms.get_order_block_reason(self.name, sym)
+                else "-"
+            ),
             "Reject": self.last_submit_reject_by_symbol.get(sym, "-")[:32],
             "Blend": {horizon: round(self.weights.get(horizon, 0.0), 2) for horizon in ("1s", "10s", "30s")},
             "Train": warmup_prog,
