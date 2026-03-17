@@ -60,6 +60,52 @@ class TimeServiceTests(unittest.TestCase):
         self.assertEqual(self.events[1][0], "recovered")
 
     @patch("infrastructure.time_service.requests.get")
+    @patch("infrastructure.time_service.time.time")
+    def test_large_offset_waits_for_configured_breach_threshold(self, mock_time, mock_get):
+        self.service.configure(
+            {
+                "max_offset_ms": 100.0,
+                "halt_offset_ms": 500.0,
+                "max_rtt_ms": 5000.0,
+                "freeze_breach_threshold": 2,
+                "halt_breach_threshold": 2,
+                "recovery_success_threshold": 2,
+            }
+        )
+        mock_time.side_effect = [
+            1000.0,
+            1000.02,
+            1000.03,
+            1100.0,
+            1100.02,
+            1100.03,
+            1200.0,
+            1200.02,
+            1200.03,
+            1300.0,
+            1300.02,
+            1300.03,
+        ]
+        mock_get.side_effect = [
+            DummyResponse({"serverTime": 1000.20 * 1000}),
+            DummyResponse({"serverTime": 1100.20 * 1000}),
+            DummyResponse({"serverTime": 1200.03 * 1000}),
+            DummyResponse({"serverTime": 1300.03 * 1000}),
+        ]
+
+        self.service._sync()
+        self.assertEqual(self.events, [])
+
+        self.service._sync()
+        self.assertEqual(self.events[0][0], "freeze")
+
+        self.service._sync()
+        self.assertEqual(len(self.events), 1)
+
+        self.service._sync()
+        self.assertEqual(self.events[1][0], "recovered")
+
+    @patch("infrastructure.time_service.requests.get")
     def test_repeated_sync_failures_emit_halt(self, mock_get):
         mock_get.side_effect = RuntimeError("network down")
 

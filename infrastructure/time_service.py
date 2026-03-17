@@ -25,10 +25,18 @@ class TimeService:
         self.halt_offset_ms = 1000.0
         self.max_rtt_ms = 1500.0
         self.max_consecutive_failures = 3
+        self.freeze_breach_threshold = 1
+        self.halt_breach_threshold = 1
+        self.recovery_success_threshold = 1
+        self.sync_interval_sec = 600.0
+        self.unhealthy_retry_sec = 15.0
         self.last_sync_time = 0.0
         self.last_rtt_ms = 0.0
         self.last_error = ""
         self.consecutive_failures = 0
+        self.freeze_breach_count = 0
+        self.halt_breach_count = 0
+        self.recovery_success_count = 0
         self._health_state = "healthy"
 
     def configure(self, config=None):
@@ -39,6 +47,26 @@ class TimeService:
         self.max_consecutive_failures = max(
             1,
             int(config.get("max_consecutive_failures", self.max_consecutive_failures) or self.max_consecutive_failures),
+        )
+        self.freeze_breach_threshold = max(
+            1,
+            int(config.get("freeze_breach_threshold", self.freeze_breach_threshold) or self.freeze_breach_threshold),
+        )
+        self.halt_breach_threshold = max(
+            1,
+            int(config.get("halt_breach_threshold", self.halt_breach_threshold) or self.halt_breach_threshold),
+        )
+        self.recovery_success_threshold = max(
+            1,
+            int(config.get("recovery_success_threshold", self.recovery_success_threshold) or self.recovery_success_threshold),
+        )
+        self.sync_interval_sec = max(
+            1.0,
+            float(config.get("sync_interval_sec", self.sync_interval_sec) or self.sync_interval_sec),
+        )
+        self.unhealthy_retry_sec = max(
+            1.0,
+            float(config.get("unhealthy_retry_sec", self.unhealthy_retry_sec) or self.unhealthy_retry_sec),
         )
 
     def register_listener(self, listener):
@@ -90,21 +118,38 @@ class TimeService:
 
             severity = ""
             reason = "time sync healthy"
+            threshold_reached = False
             if abs(self.offset) >= self.halt_offset_ms:
-                severity = "halt"
+                self.halt_breach_count += 1
+                self.freeze_breach_count = max(self.freeze_breach_count, self.halt_breach_count)
+                self.recovery_success_count = 0
                 reason = (
                     f"clock offset {self.offset:.1f}ms exceeds halt threshold "
                     f"{self.halt_offset_ms:.1f}ms"
                 )
+                threshold_reached = self.halt_breach_count >= self.halt_breach_threshold
+                severity = "halt" if threshold_reached else ""
             elif abs(self.offset) >= self.max_offset_ms:
-                severity = "freeze"
+                self.freeze_breach_count += 1
+                self.halt_breach_count = 0
+                self.recovery_success_count = 0
                 reason = (
                     f"clock offset {self.offset:.1f}ms exceeds freeze threshold "
                     f"{self.max_offset_ms:.1f}ms"
                 )
+                threshold_reached = self.freeze_breach_count >= self.freeze_breach_threshold
+                severity = "freeze" if threshold_reached else ""
             elif self.max_rtt_ms > 0 and rtt >= self.max_rtt_ms:
-                severity = "freeze"
+                self.freeze_breach_count += 1
+                self.halt_breach_count = 0
+                self.recovery_success_count = 0
                 reason = f"time sync RTT {rtt:.1f}ms exceeds {self.max_rtt_ms:.1f}ms"
+                threshold_reached = self.freeze_breach_count >= self.freeze_breach_threshold
+                severity = "freeze" if threshold_reached else ""
+            else:
+                self.freeze_breach_count = 0
+                self.halt_breach_count = 0
+                self.recovery_success_count += 1
 
             previous_state = self._health_state
             if severity:
@@ -116,7 +161,13 @@ class TimeService:
                     rtt_ms=rtt,
                     consecutive_failures=self.consecutive_failures,
                 )
-            elif previous_state != "healthy":
+            elif threshold_reached is False and reason != "time sync healthy":
+                logger.warning(
+                    f"Time Sync breach observed but below trigger threshold: {reason} "
+                    f"(freeze={self.freeze_breach_count}/{self.freeze_breach_threshold} "
+                    f"halt={self.halt_breach_count}/{self.halt_breach_threshold})"
+                )
+            elif previous_state != "healthy" and self.recovery_success_count >= self.recovery_success_threshold:
                 self._health_state = "healthy"
                 self._notify(
                     "recovered",
@@ -126,7 +177,8 @@ class TimeService:
                     consecutive_failures=self.consecutive_failures,
                 )
             else:
-                self._health_state = "healthy"
+                if previous_state == "healthy":
+                    self._health_state = "healthy"
 
             return True
         except Exception as exc:
@@ -145,7 +197,8 @@ class TimeService:
 
     def _auto_sync_loop(self):
         while self.active:
-            time.sleep(600)
+            interval = self.sync_interval_sec if self._health_state == "healthy" else self.unhealthy_retry_sec
+            time.sleep(interval)
             self._sync()
 
 

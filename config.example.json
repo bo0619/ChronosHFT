@@ -10,6 +10,17 @@
         "log_path": "logs",
         "log_console": false,
         "web_port": 8000,
+        "time_sync": {
+            "max_offset_ms": 250.0,
+            "halt_offset_ms": 1000.0,
+            "max_rtt_ms": 1500.0,
+            "freeze_breach_threshold": 2,
+            "halt_breach_threshold": 2,
+            "recovery_success_threshold": 2,
+            "sync_interval_sec": 600.0,
+            "unhealthy_retry_sec": 15.0,
+            "max_consecutive_failures": 3
+        },
         "event_engine": {
             "queue_warn_depth": {
                 "market": 25,
