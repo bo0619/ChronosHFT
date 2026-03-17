@@ -35,6 +35,29 @@ class OrderStateMachineTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             order.mark_new("ex-2", update_time=3.0, seq=3)
 
+    def test_submitting_accepts_out_of_order_new(self):
+        intent = OrderIntent("test", "BTCUSDT", Side.BUY, 100.0, 1.0)
+        order = Order("oid-3", intent)
+
+        order.mark_submitting()
+        order.mark_new("ex-3", update_time=1.0, seq=1)
+
+        self.assertEqual(order.status, OrderStatus.NEW)
+        self.assertEqual(order.exchange_oid, "ex-3")
+
+    def test_cancelling_accepts_late_new_ack(self):
+        intent = OrderIntent("test", "BTCUSDT", Side.BUY, 100.0, 1.0)
+        order = Order("oid-4", intent)
+        order.mark_submitting()
+        order.mark_pending_ack("ex-4")
+        order.mark_new("ex-4", update_time=1.0, seq=1)
+        order.mark_cancelling()
+
+        order.mark_new("ex-4", update_time=2.0, seq=2)
+
+        self.assertEqual(order.status, OrderStatus.NEW)
+        self.assertEqual(order.last_exchange_status, "NEW")
+
 
 class JournalTests(unittest.TestCase):
     def test_journal_appends_and_loads_records(self):

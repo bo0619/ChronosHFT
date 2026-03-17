@@ -19,6 +19,7 @@ from event.type import (
     LifecycleState,
     OMSCapabilityMode,
     OrderIntent,
+    OrderStatus,
     Side,
 )
 from infrastructure.system_health import handle_system_health_event
@@ -384,6 +385,40 @@ class OMSSurvivabilityTests(unittest.TestCase):
             )
 
             self.assertEqual(oms.orders["oid-active"].status.value, "CANCELLED")
+        finally:
+            oms.stop()
+
+    def test_out_of_order_new_ack_does_not_trigger_reconcile(self):
+        gateway = DummyGateway()
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            order = Order(
+                "oid-race",
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 1.0),
+            )
+            order.mark_submitting()
+            oms.orders[order.client_oid] = order
+
+            oms.on_exchange_update(
+                Event(
+                    EVENT_EXCHANGE_ORDER_UPDATE,
+                    ExchangeOrderUpdate(
+                        client_oid="oid-race",
+                        exchange_oid="ex-race",
+                        symbol="BTCUSDT",
+                        status="NEW",
+                        filled_qty=0.0,
+                        filled_price=0.0,
+                        cum_filled_qty=0.0,
+                        update_time=2.0,
+                        seq=1,
+                    ),
+                )
+            )
+
+            self.assertEqual(order.status, OrderStatus.NEW)
+            self.assertEqual(order.exchange_oid, "ex-race")
+            self.assertNotEqual(oms.state, LifecycleState.FROZEN)
         finally:
             oms.stop()
 

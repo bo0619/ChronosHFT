@@ -19,7 +19,17 @@ TERMINAL_STATUSES = {
 
 _ALLOWED_TRANSITIONS: Dict[OrderStatus, Set[OrderStatus]] = {
     OrderStatus.CREATED: {OrderStatus.SUBMITTING, OrderStatus.REJECTED_LOCALLY},
-    OrderStatus.SUBMITTING: {OrderStatus.PENDING_ACK, OrderStatus.REJECTED_LOCALLY},
+    OrderStatus.SUBMITTING: {
+        OrderStatus.PENDING_ACK,
+        OrderStatus.NEW,
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.FILLED,
+        OrderStatus.CANCELLING,
+        OrderStatus.CANCELLED,
+        OrderStatus.REJECTED,
+        OrderStatus.EXPIRED,
+        OrderStatus.REJECTED_LOCALLY,
+    },
     OrderStatus.PENDING_ACK: {
         OrderStatus.NEW,
         OrderStatus.PARTIALLY_FILLED,
@@ -46,6 +56,7 @@ _ALLOWED_TRANSITIONS: Dict[OrderStatus, Set[OrderStatus]] = {
         OrderStatus.EXPIRED,
     },
     OrderStatus.CANCELLING: {
+        OrderStatus.NEW,
         OrderStatus.PARTIALLY_FILLED,
         OrderStatus.FILLED,
         OrderStatus.CANCELLED,
