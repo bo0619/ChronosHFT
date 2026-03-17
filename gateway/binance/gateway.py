@@ -153,10 +153,10 @@ class BinanceGateway(BaseGateway):
         return None
 
     def cancel_order(self, req: CancelRequest):
-        self.rest.cancel_order(req)
+        return self.rest.cancel_order(req)
 
     def cancel_all_orders(self, symbol: str):
-        self.rest.cancel_all_orders(symbol)
+        return self.rest.cancel_all_orders(symbol)
 
     def get_account_info(self):
         resp = self.rest.get_account()

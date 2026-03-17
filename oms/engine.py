@@ -1459,7 +1459,53 @@ class OMS:
                 pass
             request = CancelRequest(order.intent.symbol, target_id)
 
-        self.gateway.cancel_order(request)
+        response = self.gateway.cancel_order(request)
+        error_code = ""
+        error_message = ""
+        if response is not None and getattr(response, "status_code", 0) != 200:
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {}
+            if isinstance(payload, dict):
+                raw_code = payload.get("code")
+                error_code = "" if raw_code is None else str(raw_code)
+                error_message = str(payload.get("msg", "") or "")
+
+        if error_code == "-2011":
+            with self.lock:
+                order = self.orders.get(client_oid)
+                if order:
+                    try:
+                        order.mark_cancelled(
+                            update_time=time.time(),
+                            exchange_status="CANCEL_UNKNOWN",
+                        )
+                    except ValueError:
+                        order.note_exchange_update(
+                            exchange_status="CANCEL_UNKNOWN",
+                            update_time=time.time(),
+                        )
+                    self._record_order_snapshot(
+                        order,
+                        "cancel_unknown",
+                        exchange_error_code=error_code,
+                        exchange_error_message=error_message,
+                    )
+                    self._emit_order_update(order)
+                    self._write_tombstone(order)
+                    self.exposure.update_open_orders(self.orders)
+                    self.account.calculate()
+            self._audit(
+                "cancel_unknown_order",
+                client_oid=client_oid,
+                target_id=target_id,
+                symbol=request.symbol,
+                error_code=error_code,
+                error_message=error_message,
+            )
+            return True
+
         self._audit(
             "cancel_submitted",
             client_oid=client_oid,

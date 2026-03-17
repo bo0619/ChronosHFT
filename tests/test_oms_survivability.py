@@ -51,6 +51,7 @@ class DummyGateway:
         self.cancelled_symbols = []
         self.cancel_requests = []
         self.sent_orders = []
+        self.cancel_response = None
 
     def send_order(self, req, client_oid):
         self.sent_orders.append((req, client_oid))
@@ -58,7 +59,7 @@ class DummyGateway:
 
     def cancel_order(self, req):
         self.cancel_requests.append(req)
-        return None
+        return self.cancel_response
 
     def cancel_all_orders(self, symbol):
         self.cancelled_symbols.append(symbol)
@@ -105,6 +106,15 @@ class DummyScopedOms:
 
     def freeze_strategy(self, strategy_id, reason, symbol="", cancel_active_orders=True):
         self.strategy_freezes.append((strategy_id, symbol, reason, cancel_active_orders))
+
+
+class DummyResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
 
 
 class OMSSurvivabilityTests(unittest.TestCase):
@@ -419,6 +429,35 @@ class OMSSurvivabilityTests(unittest.TestCase):
             self.assertEqual(order.status, OrderStatus.NEW)
             self.assertEqual(order.exchange_oid, "ex-race")
             self.assertNotEqual(oms.state, LifecycleState.FROZEN)
+        finally:
+            oms.stop()
+
+    def test_cancel_unknown_order_clears_local_active_risk(self):
+        gateway = DummyGateway()
+        gateway.cancel_response = DummyResponse(
+            400,
+            {"code": -2011, "msg": "Unknown order sent."},
+        )
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            oms.state = LifecycleState.LIVE
+            oms._sync_capability_mode("test_live")
+            order = Order(
+                "oid-cancel-unknown",
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 2.0),
+            )
+            order.mark_submitting()
+            order.mark_pending_ack("ex-cancel-unknown")
+            order.mark_new("ex-cancel-unknown", update_time=1.0, seq=1)
+            oms.orders[order.client_oid] = order
+            oms.exchange_id_map[order.exchange_oid] = order
+            oms.exposure.update_open_orders(oms.orders)
+
+            self.assertGreater(oms.exposure.open_buy_qty["BTCUSDT"], 0.0)
+            self.assertTrue(oms.cancel_order(order.client_oid))
+
+            self.assertEqual(order.status, OrderStatus.CANCELLED)
+            self.assertEqual(oms.exposure.open_buy_qty["BTCUSDT"], 0.0)
         finally:
             oms.stop()
 
