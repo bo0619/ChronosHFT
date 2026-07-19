@@ -35,11 +35,13 @@ class OrderStatus(Enum):
     CREATED = "CREATED"
     REJECTED_LOCALLY = "REJECTED_LOCALLY"
     SUBMITTING = "SUBMITTING"
+    SUBMIT_UNKNOWN = "SUBMIT_UNKNOWN"
     PENDING_ACK = "PENDING_ACK"
     NEW = "NEW"
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
     FILLED = "FILLED"
     CANCELLING = "CANCELLING"
+    CANCEL_UNKNOWN = "CANCEL_UNKNOWN"
     CANCELLED = "CANCELLED"
     REJECTED = "REJECTED"
     EXPIRED = "EXPIRED"
@@ -58,6 +60,12 @@ class GatewayError(Enum):
     RATE_LIMIT = "RATE_LIMIT"
     AUTH_ERROR = "AUTH_ERROR"
     SERVER_OVERLOAD = "SERVER_OVERLOAD"
+    UNKNOWN = "UNKNOWN"
+
+
+class CommandOutcome(Enum):
+    ACKNOWLEDGED = "ACKNOWLEDGED"
+    REJECTED = "REJECTED"
     UNKNOWN = "UNKNOWN"
 
 
@@ -151,6 +159,7 @@ class OrderSubmitted:
     req: OrderRequest
     order_id: str
     timestamp: float
+    status: OrderStatus = OrderStatus.PENDING_ACK
 
 
 @dataclass
@@ -159,6 +168,15 @@ class OrderSubmitResult:
     client_oid: str = ""
     reason: str = ""
     state: str = ""
+
+
+@dataclass(slots=True)
+class GatewayCommandResult:
+    outcome: CommandOutcome
+    exchange_oid: str = ""
+    error_code: str = ""
+    error_message: str = ""
+    response: Any = None
 
 
 @dataclass(slots=True)
@@ -246,6 +264,7 @@ class ExchangeOrderUpdate:
     commission_asset: str = ""
     realized_pnl: Optional[float] = None
     is_maker: Optional[bool] = None
+    trade_id: int = -1
 
 
 @dataclass

@@ -53,6 +53,15 @@ class BaseGateway(ABC):
     def get_open_orders(self):
         pass
 
+    def get_order(self, symbol: str, order_id: str):
+        return None
+
+    def get_all_orders(self, symbol: str, **kwargs):
+        return None
+
+    def get_user_trades(self, symbol: str, **kwargs):
+        return None
+
     @abstractmethod
     def get_depth_snapshot(self, symbol: str):
         pass

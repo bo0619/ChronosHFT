@@ -38,6 +38,7 @@ if "websocket" not in sys.modules:
 
 from event.type import (
     AccountData,
+    CommandOutcome,
     Event,
     ExchangeAccountUpdate,
     ExchangeOrderUpdate,
@@ -47,6 +48,7 @@ from event.type import (
     OMSCapabilityMode,
     OrderBook,
     OrderIntent,
+    OrderRequest,
     Side,
     EVENT_ACCOUNT_UPDATE,
     EVENT_EXCHANGE_ACCOUNT_UPDATE,
@@ -267,6 +269,7 @@ class ExchangeTruthTests(unittest.TestCase):
                     "N": "USDT",
                     "rp": "1.23",
                     "m": True,
+                    "t": 987,
                 },
             }
         )
@@ -287,6 +290,8 @@ class ExchangeTruthTests(unittest.TestCase):
         self.assertEqual(order_event.data.realized_pnl, 1.23)
         self.assertEqual(order_event.data.commission, 0.02)
         self.assertTrue(order_event.data.is_maker)
+        self.assertEqual(order_event.data.trade_id, 987)
+        self.assertEqual(order_event.data.seq, 0)
         self.assertEqual(account_event.data.wallet_balance, 980.5)
         self.assertEqual(account_event.data.available_balance, 950.0)
         self.assertEqual(account_event.data.balances["USDT"]["wallet_balance"], 980.5)
@@ -305,7 +310,91 @@ class ExchangeTruthTests(unittest.TestCase):
         self.assertEqual(engine.events[-1].type, EVENT_SYSTEM_HEALTH)
         self.assertIn("WS_PARSE_ERROR", engine.events[-1].data)
 
-    def test_exchange_account_position_drift_triggers_reconcile_without_active_orders(self):
+    def test_gateway_classifies_missing_submit_response_as_unknown(self):
+        gateway = BinanceGateway.__new__(BinanceGateway)
+        gateway.gateway_name = "BINANCE"
+        gateway.rest = types.SimpleNamespace(new_order=lambda _req, _client_oid: None)
+        request = OrderRequest(
+            symbol="BTCUSDT",
+            price=100.0,
+            volume=1.0,
+            side="BUY",
+        )
+
+        result = gateway.send_order(request, "oid-timeout")
+
+        self.assertEqual(result.outcome, CommandOutcome.UNKNOWN)
+        self.assertEqual(result.exchange_oid, "")
+
+    def test_gateway_keeps_position_only_account_update(self):
+        engine = DummyEngine()
+        gateway = BinanceGateway.__new__(BinanceGateway)
+        gateway.event_engine = engine
+        gateway.gateway_name = "BINANCE"
+        gateway.symbols = ["BTCUSDT"]
+
+        gateway._handle_account_update(
+            {
+                "e": "ACCOUNT_UPDATE",
+                "T": 3000,
+                "a": {
+                    "m": "MARGIN_TYPE_CHANGE",
+                    "B": [],
+                    "P": [
+                        {
+                            "s": "BTCUSDT",
+                            "pa": "0.25",
+                            "ep": "102.0",
+                            "up": "0.5",
+                        }
+                    ],
+                },
+            }
+        )
+
+        self.assertEqual(len(engine.events), 1)
+        account_update = engine.events[0].data
+        self.assertEqual(account_update.asset, "")
+        self.assertEqual(account_update.balances, {})
+        self.assertEqual(account_update.event_time, 3.0)
+        self.assertEqual(account_update.positions["BTCUSDT"]["volume"], 0.25)
+
+    def test_position_only_account_update_does_not_overwrite_balance(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = OMS(engine, gateway, self.make_config())
+        try:
+            oms.account.force_sync(1000.0, 0.0, 900.0)
+            active_order = Order(
+                "oid-position-only",
+                OrderIntent("test", "BTCUSDT", Side.BUY, 102.0, 0.25),
+            )
+            active_order.mark_submitting()
+            oms.orders[active_order.client_oid] = active_order
+
+            update = ExchangeAccountUpdate(
+                asset="",
+                wallet_balance=0.0,
+                available_balance=None,
+                balances={},
+                positions={
+                    "BTCUSDT": {
+                        "volume": 0.25,
+                        "entry_price": 102.0,
+                        "unrealized_pnl": 0.0,
+                    }
+                },
+                reason="MARGIN_TYPE_CHANGE",
+                event_time=3.0,
+            )
+            oms.on_exchange_account_update(Event(EVENT_EXCHANGE_ACCOUNT_UPDATE, update))
+
+            self.assertAlmostEqual(oms.exposure.net_positions["BTCUSDT"], 0.25)
+            self.assertAlmostEqual(oms.account.balance, 1000.0)
+        finally:
+            oms.stop()
+
+    def test_partial_exchange_account_update_does_not_flatten_absent_position(self):
         engine = DummyEngine()
         gateway = DummyGateway()
         oms = OMS(engine, gateway, self.make_config())
@@ -325,11 +414,12 @@ class ExchangeTruthTests(unittest.TestCase):
             )
             oms.on_exchange_account_update(Event(EVENT_EXCHANGE_ACCOUNT_UPDATE, update))
 
-            self.assertEqual(called, [("Exchange account position drift", None)])
+            self.assertEqual(called, [])
+            self.assertAlmostEqual(oms.exposure.net_positions["BTCUSDT"], 1.0)
         finally:
             oms.stop()
 
-    def test_exchange_account_position_drift_triggers_reconcile_with_active_orders(self):
+    def test_exchange_account_position_sync_with_active_order_is_idempotent(self):
         engine = DummyEngine()
         gateway = DummyGateway()
         oms = OMS(engine, gateway, self.make_config())
@@ -350,13 +440,164 @@ class ExchangeTruthTests(unittest.TestCase):
                 wallet_balance=1000.0,
                 available_balance=1000.0,
                 balances={"USDT": {"wallet_balance": 1000.0, "available_balance": 1000.0}},
-                positions={},
+                positions={
+                    "BTCUSDT": {
+                        "volume": 2.0,
+                        "entry_price": 100.0,
+                        "unrealized_pnl": 0.0,
+                    }
+                },
                 reason="ORDER",
-                event_time=1.0,
+                event_time=2.0,
             )
             oms.on_exchange_account_update(Event(EVENT_EXCHANGE_ACCOUNT_UPDATE, update))
 
-            self.assertEqual(called, [("Exchange account position drift", None)])
+            self.assertEqual(called, [])
+            self.assertAlmostEqual(oms.exposure.net_positions["BTCUSDT"], 2.0)
+            self.assertTrue(
+                any(
+                    event.type == "ePositionUpdate"
+                    and event.data.symbol == "BTCUSDT"
+                    and event.data.volume == 2.0
+                    for event in engine.events
+                )
+            )
+        finally:
+            oms.stop()
+
+    def test_unexpected_exchange_position_is_synced_before_reconcile(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = OMS(engine, gateway, self.make_config())
+        try:
+            called = []
+            oms.trigger_reconcile = lambda reason, suspicious_oid=None: called.append((reason, suspicious_oid))
+            update = ExchangeAccountUpdate(
+                asset="USDT",
+                wallet_balance=1000.0,
+                available_balance=900.0,
+                balances={"USDT": {"wallet_balance": 1000.0, "available_balance": 900.0}},
+                positions={
+                    "BTCUSDT": {
+                        "volume": 1.0,
+                        "entry_price": 101.0,
+                        "unrealized_pnl": 0.0,
+                    }
+                },
+                reason="ORDER",
+                event_time=2.0,
+            )
+
+            oms.on_exchange_account_update(Event(EVENT_EXCHANGE_ACCOUNT_UPDATE, update))
+
+            self.assertAlmostEqual(oms.exposure.net_positions["BTCUSDT"], 1.0)
+            self.assertAlmostEqual(oms.exposure.avg_prices["BTCUSDT"], 101.0)
+            self.assertEqual(
+                called,
+                [("Unexpected exchange account position correction", None)],
+            )
+        finally:
+            oms.stop()
+
+    def test_account_update_before_fill_does_not_double_apply_position_or_balance(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = OMS(engine, gateway, self.make_config())
+        try:
+            intent = OrderIntent("test", "BTCUSDT", Side.BUY, 100.0, 1.0)
+            order = Order("oid-buy", intent)
+            order.mark_submitting()
+            order.mark_pending_ack("ex-buy")
+            order.mark_new("ex-buy", update_time=1.0, seq=1)
+            oms.orders[order.client_oid] = order
+            oms.exchange_id_map[order.exchange_oid] = order
+
+            account_update = ExchangeAccountUpdate(
+                asset="USDT",
+                wallet_balance=999.5,
+                available_balance=899.5,
+                balances={"USDT": {"wallet_balance": 999.5, "available_balance": 899.5}},
+                positions={
+                    "BTCUSDT": {
+                        "volume": 1.0,
+                        "entry_price": 100.0,
+                        "unrealized_pnl": 0.0,
+                    }
+                },
+                reason="ORDER",
+                event_time=2.0,
+            )
+            oms.on_exchange_account_update(Event(EVENT_EXCHANGE_ACCOUNT_UPDATE, account_update))
+
+            fill_update = ExchangeOrderUpdate(
+                client_oid="oid-buy",
+                exchange_oid="ex-buy",
+                symbol="BTCUSDT",
+                status="FILLED",
+                filled_qty=1.0,
+                filled_price=100.0,
+                cum_filled_qty=1.0,
+                update_time=2.0,
+                seq=2,
+                commission=0.5,
+                commission_asset="USDT",
+                realized_pnl=0.0,
+                is_maker=True,
+            )
+            oms._apply_event(Event(EVENT_EXCHANGE_ORDER_UPDATE, fill_update))
+
+            self.assertAlmostEqual(oms.exposure.net_positions["BTCUSDT"], 1.0)
+            self.assertAlmostEqual(oms.account.balance, 999.5)
+            self.assertAlmostEqual(order.filled_volume, 1.0)
+        finally:
+            oms.stop()
+
+    def test_stale_account_position_cannot_overwrite_newer_fill(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = OMS(engine, gateway, self.make_config())
+        try:
+            intent = OrderIntent("test", "BTCUSDT", Side.BUY, 100.0, 1.0)
+            order = Order("oid-newer", intent)
+            order.mark_submitting()
+            order.mark_pending_ack("ex-newer")
+            order.mark_new("ex-newer", update_time=1.0, seq=1)
+            oms.orders[order.client_oid] = order
+            oms.exchange_id_map[order.exchange_oid] = order
+
+            fill_update = ExchangeOrderUpdate(
+                client_oid="oid-newer",
+                exchange_oid="ex-newer",
+                symbol="BTCUSDT",
+                status="FILLED",
+                filled_qty=1.0,
+                filled_price=100.0,
+                cum_filled_qty=1.0,
+                update_time=3.0,
+                seq=2,
+                commission=0.0,
+                realized_pnl=0.0,
+            )
+            oms._apply_event(Event(EVENT_EXCHANGE_ORDER_UPDATE, fill_update))
+
+            stale_account_update = ExchangeAccountUpdate(
+                asset="USDT",
+                wallet_balance=1000.0,
+                available_balance=1000.0,
+                balances={"USDT": {"wallet_balance": 1000.0, "available_balance": 1000.0}},
+                positions={
+                    "BTCUSDT": {
+                        "volume": 0.0,
+                        "entry_price": 0.0,
+                        "unrealized_pnl": 0.0,
+                    }
+                },
+                reason="ORDER",
+                event_time=2.0,
+            )
+            oms.on_exchange_account_update(Event(EVENT_EXCHANGE_ACCOUNT_UPDATE, stale_account_update))
+
+            self.assertAlmostEqual(oms.exposure.net_positions["BTCUSDT"], 1.0)
         finally:
             oms.stop()
 

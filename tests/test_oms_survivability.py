@@ -432,7 +432,7 @@ class OMSSurvivabilityTests(unittest.TestCase):
         finally:
             oms.stop()
 
-    def test_cancel_unknown_order_clears_local_active_risk(self):
+    def test_cancel_unknown_order_keeps_local_risk_until_truth_is_known(self):
         gateway = DummyGateway()
         gateway.cancel_response = DummyResponse(
             400,
@@ -456,8 +456,8 @@ class OMSSurvivabilityTests(unittest.TestCase):
             self.assertGreater(oms.exposure.open_buy_qty["BTCUSDT"], 0.0)
             self.assertTrue(oms.cancel_order(order.client_oid))
 
-            self.assertEqual(order.status, OrderStatus.CANCELLED)
-            self.assertEqual(oms.exposure.open_buy_qty["BTCUSDT"], 0.0)
+            self.assertEqual(order.status, OrderStatus.CANCEL_UNKNOWN)
+            self.assertGreater(oms.exposure.open_buy_qty["BTCUSDT"], 0.0)
         finally:
             oms.stop()
 

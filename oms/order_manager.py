@@ -17,6 +17,11 @@ class OrderManager:
         monitor_config = monitor_config or {}
         self.ACK_TIMEOUT = float(monitor_config.get("ack_timeout_sec", 5.0))
         self.ACK_TIMEOUT_RECHECK = float(monitor_config.get("ack_timeout_recheck_sec", 60.0))
+        self.UNKNOWN_RECHECK = float(monitor_config.get("unknown_recheck_sec", 1.0))
+        self.CANCEL_TIMEOUT = float(monitor_config.get("cancel_timeout_sec", 5.0))
+        self.ACTIVE_ORDER_AUDIT_INTERVAL = float(
+            monitor_config.get("active_order_audit_interval_sec", 30.0)
+        )
         self.CHECK_INTERVAL = float(monitor_config.get("monitor_check_interval_sec", 1.0))
 
         self.active = True
@@ -32,7 +37,19 @@ class OrderManager:
                 "symbol": data.req.symbol,
                 "submit_time": data.timestamp,
                 "last_ack_time": 0.0,
-                "status": OrderStatus.PENDING_ACK,
+                "status": data.status,
+                "ack_timeout_reported": False,
+                "last_timeout_reported_at": 0.0,
+            }
+
+    def recover_order(self, order):
+        """Resume truth auditing for an active order restored from the ledger."""
+        with self.lock:
+            self.monitored_orders[order.client_oid] = {
+                "symbol": order.intent.symbol,
+                "submit_time": order.created_at,
+                "last_ack_time": order.updated_at,
+                "status": order.status,
                 "ack_timeout_reported": False,
                 "last_timeout_reported_at": 0.0,
             }
@@ -57,6 +74,8 @@ class OrderManager:
                 OrderStatus.NEW,
                 OrderStatus.PARTIALLY_FILLED,
                 OrderStatus.CANCELLING,
+                OrderStatus.SUBMIT_UNKNOWN,
+                OrderStatus.CANCEL_UNKNOWN,
             }:
                 self.monitored_orders[order_id]["last_ack_time"] = time.time()
                 self.monitored_orders[order_id]["ack_timeout_reported"] = False
@@ -68,23 +87,46 @@ class OrderManager:
 
         with self.lock:
             for oid, info in list(self.monitored_orders.items()):
-                if info["last_ack_time"] != 0:
+                status = info["status"]
+                reference_time = info["last_ack_time"] or info["submit_time"]
+                elapsed = now - reference_time
+
+                if status == OrderStatus.SUBMIT_UNKNOWN:
+                    timeout = self.UNKNOWN_RECHECK
+                    reason = "Order submit outcome unknown"
+                elif status in {OrderStatus.CANCELLING, OrderStatus.CANCEL_UNKNOWN}:
+                    timeout = self.UNKNOWN_RECHECK if status == OrderStatus.CANCEL_UNKNOWN else self.CANCEL_TIMEOUT
+                    reason = "Order cancel outcome unknown"
+                elif status in {OrderStatus.SUBMITTING, OrderStatus.PENDING_ACK}:
+                    timeout = self.ACK_TIMEOUT
+                    reason = "Order ACK Timeout"
+                elif status in {OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED}:
+                    timeout = self.ACTIVE_ORDER_AUDIT_INTERVAL
+                    reason = "Active order truth audit"
+                else:
                     continue
-                if now - info["submit_time"] <= self.ACK_TIMEOUT:
+
+                if elapsed <= timeout:
                     continue
                 if info["ack_timeout_reported"]:
                     elapsed_since_report = now - info["last_timeout_reported_at"]
-                    if elapsed_since_report < self.ACK_TIMEOUT_RECHECK:
+                    recheck = (
+                        self.UNKNOWN_RECHECK
+                        if status in {OrderStatus.SUBMIT_UNKNOWN, OrderStatus.CANCEL_UNKNOWN}
+                        else self.ACK_TIMEOUT_RECHECK
+                    )
+                    if elapsed_since_report < recheck:
                         continue
 
-                logger.error(f"[OMS] ACK timeout: {oid}. User stream may be stale.")
+                logger.error(f"[OMS] {reason}: {oid}. Verifying exchange truth.")
                 info["ack_timeout_reported"] = True
                 info["last_timeout_reported_at"] = now
-                suspicious_oid = oid
+                suspicious_oid = (oid, reason)
                 break
 
         if suspicious_oid and self.dirty_callback:
-            self.dirty_callback("Order ACK Timeout", suspicious_oid=suspicious_oid)
+            oid, reason = suspicious_oid
+            self.dirty_callback(reason, suspicious_oid=oid)
 
     def _check_loop(self):
         while self.active:

@@ -20,6 +20,7 @@ TERMINAL_STATUSES = {
 _ALLOWED_TRANSITIONS: Dict[OrderStatus, Set[OrderStatus]] = {
     OrderStatus.CREATED: {OrderStatus.SUBMITTING, OrderStatus.REJECTED_LOCALLY},
     OrderStatus.SUBMITTING: {
+        OrderStatus.SUBMIT_UNKNOWN,
         OrderStatus.PENDING_ACK,
         OrderStatus.NEW,
         OrderStatus.PARTIALLY_FILLED,
@@ -30,11 +31,24 @@ _ALLOWED_TRANSITIONS: Dict[OrderStatus, Set[OrderStatus]] = {
         OrderStatus.EXPIRED,
         OrderStatus.REJECTED_LOCALLY,
     },
+    OrderStatus.SUBMIT_UNKNOWN: {
+        OrderStatus.PENDING_ACK,
+        OrderStatus.NEW,
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.FILLED,
+        OrderStatus.CANCELLING,
+        OrderStatus.CANCEL_UNKNOWN,
+        OrderStatus.CANCELLED,
+        OrderStatus.REJECTED,
+        OrderStatus.EXPIRED,
+        OrderStatus.REJECTED_LOCALLY,
+    },
     OrderStatus.PENDING_ACK: {
         OrderStatus.NEW,
         OrderStatus.PARTIALLY_FILLED,
         OrderStatus.FILLED,
         OrderStatus.CANCELLING,
+        OrderStatus.CANCEL_UNKNOWN,
         OrderStatus.CANCELLED,
         OrderStatus.REJECTED,
         OrderStatus.EXPIRED,
@@ -44,6 +58,7 @@ _ALLOWED_TRANSITIONS: Dict[OrderStatus, Set[OrderStatus]] = {
         OrderStatus.PARTIALLY_FILLED,
         OrderStatus.FILLED,
         OrderStatus.CANCELLING,
+        OrderStatus.CANCEL_UNKNOWN,
         OrderStatus.CANCELLED,
         OrderStatus.REJECTED,
         OrderStatus.EXPIRED,
@@ -52,6 +67,7 @@ _ALLOWED_TRANSITIONS: Dict[OrderStatus, Set[OrderStatus]] = {
         OrderStatus.PARTIALLY_FILLED,
         OrderStatus.FILLED,
         OrderStatus.CANCELLING,
+        OrderStatus.CANCEL_UNKNOWN,
         OrderStatus.CANCELLED,
         OrderStatus.EXPIRED,
     },
@@ -59,14 +75,27 @@ _ALLOWED_TRANSITIONS: Dict[OrderStatus, Set[OrderStatus]] = {
         OrderStatus.NEW,
         OrderStatus.PARTIALLY_FILLED,
         OrderStatus.FILLED,
+        OrderStatus.CANCEL_UNKNOWN,
         OrderStatus.CANCELLED,
         OrderStatus.EXPIRED,
     },
+    OrderStatus.CANCEL_UNKNOWN: {
+        OrderStatus.NEW,
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.FILLED,
+        OrderStatus.CANCELLING,
+        OrderStatus.CANCELLED,
+        OrderStatus.REJECTED,
+        OrderStatus.EXPIRED,
+    },
     OrderStatus.FILLED: set(),
-    OrderStatus.CANCELLED: set(),
+    # A terminal update can reach the OMS before an earlier fill after a
+    # disconnect. Recovery may temporarily reopen the order to book the
+    # missing cumulative fill, then restore the exchange terminal state.
+    OrderStatus.CANCELLED: {OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED},
     OrderStatus.REJECTED: set(),
     OrderStatus.REJECTED_LOCALLY: set(),
-    OrderStatus.EXPIRED: set(),
+    OrderStatus.EXPIRED: {OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED},
 }
 
 
@@ -91,14 +120,17 @@ class Order:
         self.error_msg = ""
         self.last_update_seq = 0
         self.last_exchange_status = ""
+        self.last_exchange_update_time = 0.0
 
     def is_active(self):
         return self.status in {
             OrderStatus.SUBMITTING,
+            OrderStatus.SUBMIT_UNKNOWN,
             OrderStatus.PENDING_ACK,
             OrderStatus.NEW,
             OrderStatus.PARTIALLY_FILLED,
             OrderStatus.CANCELLING,
+            OrderStatus.CANCEL_UNKNOWN,
         }
 
     def is_terminal(self):
@@ -131,6 +163,7 @@ class Order:
             "error_msg": self.error_msg,
             "last_update_seq": self.last_update_seq,
             "last_exchange_status": self.last_exchange_status,
+            "last_exchange_update_time": self.last_exchange_update_time,
             "intent": {
                 "strategy_id": self.intent.strategy_id,
                 "symbol": self.intent.symbol,
@@ -175,6 +208,7 @@ class Order:
         order.error_msg = payload.get("error_msg", "")
         order.last_update_seq = int(payload.get("last_update_seq", 0))
         order.last_exchange_status = payload.get("last_exchange_status", "")
+        order.last_exchange_update_time = float(payload.get("last_exchange_update_time", 0.0))
         return order
 
     def note_exchange_update(
@@ -188,6 +222,11 @@ class Order:
             self.exchange_oid = exchange_oid
         if exchange_status:
             self.last_exchange_status = exchange_status
+            if update_time:
+                self.last_exchange_update_time = max(
+                    self.last_exchange_update_time,
+                    float(update_time),
+                )
         if seq:
             self.last_update_seq = max(self.last_update_seq, seq)
         self.updated_at = update_time if update_time else time.time()
@@ -197,6 +236,9 @@ class Order:
 
     def mark_pending_ack(self, exchange_oid: str = ""):
         self._transition(OrderStatus.PENDING_ACK, exchange_oid=exchange_oid)
+
+    def mark_submit_unknown(self, reason: str = "submit_outcome_unknown"):
+        self._transition(OrderStatus.SUBMIT_UNKNOWN, reason=reason)
 
     def mark_new(self, exchange_oid: str = "", update_time: float = None, seq: int = 0):
         self._transition(
@@ -209,6 +251,9 @@ class Order:
 
     def mark_cancelling(self):
         self._transition(OrderStatus.CANCELLING)
+
+    def mark_cancel_unknown(self, reason: str = "cancel_outcome_unknown"):
+        self._transition(OrderStatus.CANCEL_UNKNOWN, reason=reason)
 
     def mark_cancelled(
         self,

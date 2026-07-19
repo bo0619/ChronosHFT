@@ -10,10 +10,12 @@ from requests.adapters import HTTPAdapter
 from event.type import (
     AggTradeData,
     CancelRequest,
+    CommandOutcome,
     Event,
     ExchangeAccountUpdate,
     ExchangeOrderUpdate,
     GatewayState,
+    GatewayCommandResult,
     MarkPriceData,
     OrderBookGapError,
     OrderRequest,
@@ -125,10 +127,18 @@ class BinanceGateway(BaseGateway):
             self.session.close()
         logger.info(f"[{self.gateway_name}] Closed.")
 
-    def send_order(self, req: OrderRequest, client_oid: str = None) -> str:
+    def send_order(self, req: OrderRequest, client_oid: str = None) -> GatewayCommandResult:
         resp = self.rest.new_order(req, client_oid)
         if resp and resp.status_code == 200:
-            data = resp.json()
+            try:
+                data = resp.json()
+                exchange_oid = str(data["orderId"])
+            except Exception as exc:
+                return GatewayCommandResult(
+                    CommandOutcome.UNKNOWN,
+                    error_message=f"invalid order acknowledgement: {exc}",
+                    response=resp,
+                )
             sym = req.symbol.replace("USDC", "").replace("USDT", "").lower()
             side_str = "long" if req.side == "BUY" else "short"
             tif_str = "GTX" if req.post_only else "IOC"
@@ -149,8 +159,26 @@ class BinanceGateway(BaseGateway):
                 f"{sym} {action} {side_str} @ {req.price:.6g}"
                 f"  ({tif_str}, vol={req.volume})"
             )
-            return str(data["orderId"])
-        return None
+            return GatewayCommandResult(
+                CommandOutcome.ACKNOWLEDGED,
+                exchange_oid=exchange_oid,
+                response=resp,
+            )
+
+        error_code, error_message = self._response_error(resp)
+        ambiguous_codes = {"-1001", "-1003", "-1007", "-1008", "-4111", "-4116"}
+        ambiguous = bool(
+            resp is None
+            or getattr(resp, "status_code", 0) >= 500
+            or getattr(resp, "status_code", 0) in {418, 429}
+            or error_code in ambiguous_codes
+        )
+        return GatewayCommandResult(
+            CommandOutcome.UNKNOWN if ambiguous else CommandOutcome.REJECTED,
+            error_code=error_code,
+            error_message=error_message,
+            response=resp,
+        )
 
     def cancel_order(self, req: CancelRequest):
         return self.rest.cancel_order(req)
@@ -168,6 +196,27 @@ class BinanceGateway(BaseGateway):
 
     def get_open_orders(self):
         resp = self.rest.get_open_orders()
+        return resp.json() if resp and resp.status_code == 200 else None
+
+    def get_order(self, symbol: str, order_id: str):
+        resp = self.rest.query_order(symbol, order_id)
+        if resp and resp.status_code == 200:
+            return resp.json()
+        error_code, error_message = self._response_error(resp)
+        if error_code in {"-2011", "-2013"}:
+            return {
+                "_query_status": "NOT_FOUND",
+                "code": error_code,
+                "msg": error_message,
+            }
+        return None
+
+    def get_all_orders(self, symbol: str, **kwargs):
+        resp = self.rest.get_all_orders(symbol, **kwargs)
+        return resp.json() if resp and resp.status_code == 200 else None
+
+    def get_user_trades(self, symbol: str, **kwargs):
+        resp = self.rest.get_user_trades(symbol, **kwargs)
         return resp.json() if resp and resp.status_code == 200 else None
 
     def get_depth_snapshot(self, symbol):
@@ -300,19 +349,22 @@ class BinanceGateway(BaseGateway):
         order = msg.get("o", {})
         update_time_ms = order.get("T") or msg.get("T") or msg.get("E") or 0
         update = ExchangeOrderUpdate(
-            seq=self._next_seq(),
+            # USD-M user data events do not expose a globally contiguous
+            # sequence. Ordering is validated per order in the OMS instead.
+            seq=0,
             client_oid=order.get("c", ""),
             exchange_oid=str(order.get("i", "")),
             symbol=order.get("s", ""),
             status=order.get("X", ""),
             filled_qty=float(order.get("l", 0.0) or 0.0),
-            filled_price=float(order.get("L", 0.0) or 0.0),
+            filled_price=float(order.get("L", 0.0) or order.get("ap", 0.0) or 0.0),
             cum_filled_qty=float(order.get("z", 0.0) or 0.0),
             update_time=float(update_time_ms) / 1000.0 if update_time_ms else time.time(),
             commission=self._parse_optional_float(order.get("n")),
             commission_asset=order.get("N") or "",
             realized_pnl=self._parse_optional_float(order.get("rp")),
             is_maker=bool(order.get("m")) if "m" in order else None,
+            trade_id=self._parse_optional_int(order.get("t"), default=-1),
         )
         self.on_order_update(update)
 
@@ -320,8 +372,6 @@ class BinanceGateway(BaseGateway):
         payload = msg.get("a", {})
         balances = payload.get("B", [])
         balance_entry = self._select_balance_entry(balances)
-        if not balance_entry:
-            return
 
         balance_snapshot = self._extract_balance_snapshot(balances)
         positions = {}
@@ -335,11 +385,22 @@ class BinanceGateway(BaseGateway):
                 "unrealized_pnl": float(raw_position.get("up", 0.0) or 0.0),
             }
 
-        event_time_ms = msg.get("E") or msg.get("T") or 0
+        # Transaction time is the ordering boundary shared with order updates.
+        # Event time is the delivery time and can be later even when the account
+        # state belongs to an older matching-engine transaction.
+        event_time_ms = msg.get("T") or msg.get("E") or 0
         update = ExchangeAccountUpdate(
-            asset=balance_entry.get("a", ""),
-            wallet_balance=float(balance_entry.get("wb", 0.0) or 0.0),
-            available_balance=self._parse_optional_float(balance_entry.get("cw")),
+            asset=balance_entry.get("a", "") if balance_entry else "",
+            wallet_balance=(
+                float(balance_entry.get("wb", 0.0) or 0.0)
+                if balance_entry
+                else 0.0
+            ),
+            available_balance=(
+                self._parse_optional_float(balance_entry.get("cw"))
+                if balance_entry
+                else None
+            ),
             balances=balance_snapshot,
             positions=positions,
             reason=payload.get("m", ""),
@@ -500,6 +561,24 @@ class BinanceGateway(BaseGateway):
         if value in (None, ""):
             return None
         return float(value)
+
+    def _parse_optional_int(self, value, default=None):
+        if value in (None, ""):
+            return default
+        return int(value)
+
+    def _response_error(self, response):
+        if response is None:
+            return "", "transport response unavailable"
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            return "", ""
+        raw_code = payload.get("code")
+        code = "" if raw_code is None else str(raw_code)
+        return code, str(payload.get("msg", "") or "")
 
     def _extract_balance_snapshot(self, balances):
         snapshot = {}

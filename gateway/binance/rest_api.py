@@ -29,6 +29,8 @@ class BinanceRestApi:
             EP_ACCOUNT: 1.00,
             EP_POSITION_RISK: 1.50,
             EP_OPEN_ORDERS: 1.00,
+            EP_ALL_ORDERS: 1.00,
+            EP_USER_TRADES: 0.50,
             EP_ORDER: 0.10,
             EP_ALL_OPEN_ORDERS: 0.30,
             EP_LEVERAGE: 0.30,
@@ -41,6 +43,7 @@ class BinanceRestApi:
         self.failure_backoff_multiplier = 2.0
         self.max_endpoint_cooldown_sec = 10.0
         self.timeout_sec = 3.0
+        self.recv_window_ms = 5000
 
     def _sign(self, params: dict):
         query = urlencode(params)
@@ -116,6 +119,7 @@ class BinanceRestApi:
 
             if signed:
                 req_params["timestamp"] = time_service.now()
+                req_params["recvWindow"] = self.recv_window_ms
                 self._sign(req_params)
 
             try:
@@ -237,3 +241,46 @@ class BinanceRestApi:
 
     def get_open_orders(self):
         return self.request("GET", EP_OPEN_ORDERS, signed=True)
+
+    def query_order(self, symbol, order_id):
+        params = {"symbol": symbol}
+        if str(order_id).isdigit():
+            params["orderId"] = order_id
+        else:
+            params["origClientOrderId"] = order_id
+        return self.request("GET", EP_ORDER, params, signed=True)
+
+    def get_all_orders(
+        self,
+        symbol,
+        order_id=None,
+        start_time=None,
+        end_time=None,
+        limit=1000,
+    ):
+        params = {"symbol": symbol, "limit": int(limit)}
+        if order_id is not None:
+            params["orderId"] = int(order_id)
+        if start_time is not None:
+            params["startTime"] = int(start_time)
+        if end_time is not None:
+            params["endTime"] = int(end_time)
+        return self.request("GET", EP_ALL_ORDERS, params, signed=True)
+
+    def get_user_trades(
+        self,
+        symbol,
+        from_id=None,
+        start_time=None,
+        end_time=None,
+        limit=1000,
+    ):
+        params = {"symbol": symbol, "limit": int(limit)}
+        if from_id is not None:
+            params["fromId"] = int(from_id)
+        else:
+            if start_time is not None:
+                params["startTime"] = int(start_time)
+            if end_time is not None:
+                params["endTime"] = int(end_time)
+        return self.request("GET", EP_USER_TRADES, params, signed=True)

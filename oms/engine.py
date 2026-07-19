@@ -7,13 +7,16 @@ from datetime import datetime
 from data.cache import data_cache
 from data.ref_data import ref_data_manager
 from infrastructure.logger import logger
+from infrastructure.time_service import time_service
 
 from event.type import (
     CancelRequest,
+    CommandOutcome,
     ExecutionPolicy,
     Event,
     ExchangeAccountUpdate,
     ExchangeOrderUpdate,
+    GatewayCommandResult,
     LifecycleState,
     OMSCapabilityMode,
     OrderIntent,
@@ -24,6 +27,7 @@ from event.type import (
     Side,
     TradeData,
     EVENT_ORDER_SUBMITTED,
+    EVENT_EXCHANGE_ORDER_UPDATE,
     EVENT_ORDER_UPDATE,
     EVENT_POSITION_UPDATE,
     EVENT_SYSTEM_HEALTH,
@@ -34,10 +38,9 @@ from event.type import (
 
 from .account_manager import AccountManager
 from .exposure import ExposureManager
-from .journal import OMSJournal
+from .journal import JournalCorruptionError, JournalError, OMSJournal
 from .order import Order, TERMINAL_STATUSES
 from .order_manager import OrderManager
-from .sequence import SequenceValidator
 from .validator import OrderValidator
 
 
@@ -59,6 +62,13 @@ class OMS:
         self.strategy_guards = {}
         self.strategy_symbol_guards = {}
         self.lock = threading.RLock()
+        # Exchange account updates and order updates for the same fill may arrive
+        # in either order. These watermarks make position/balance application
+        # idempotent regardless of that delivery order.
+        self._position_state_event_time = {}
+        self._exchange_position_event_time = {}
+        self._account_state_event_time = 0.0
+        self._exchange_account_event_time = 0.0
         self.capability_mode = OMSCapabilityMode.READ_ONLY
         self.capability_reason = "startup_bootstrap"
         self.mode_override = None
@@ -87,14 +97,13 @@ class OMS:
             .get("max_account_gross_notional", 0.0)
         )
 
-        self.sequence = SequenceValidator()
         self.validator = OrderValidator(config)
         self.exposure = ExposureManager()
         self.account = AccountManager(event_engine, self.exposure, config)
         self.order_monitor = OrderManager(
             event_engine,
             gateway,
-            self.trigger_reconcile,
+            self._on_order_truth_check,
             config.get("oms", {}),
         )
 
@@ -103,6 +112,11 @@ class OMS:
         self.terminated_oids = set()
         self.terminated_oid_queue = deque()
         self.reconcile_retry_scheduled = False
+        self._order_truth_resolution_inflight = set()
+        self._unknown_not_found_counts = {}
+        self.trade_cursors = {}
+        self.trade_scan_end_ms = {}
+        self.execution_ids = set()
         self.manual_rearm_required = False
         self.last_freeze_reason = ""
         self.last_halt_reason = ""
@@ -114,6 +128,44 @@ class OMS:
         self.reconcile_min_interval_sec = float(oms_cfg.get("reconcile_min_interval_sec", 5.0))
         self.reconcile_api_failure_threshold = int(oms_cfg.get("reconcile_api_failure_threshold", 3))
         self.reconcile_api_cooldown_sec = float(oms_cfg.get("reconcile_api_cooldown_sec", 10.0))
+        self.unknown_order_min_not_found = max(
+            2,
+            int(oms_cfg.get("unknown_order_min_not_found", 3)),
+        )
+        self.unknown_order_resolution_timeout_sec = max(
+            1.0,
+            float(oms_cfg.get("unknown_order_resolution_timeout_sec", 15.0)),
+        )
+        self.trade_recovery_lookback_ms = max(
+            60_000,
+            int(oms_cfg.get("trade_recovery_lookback_ms", 86_400_000)),
+        )
+        self.trade_recovery_overlap_ms = max(
+            0,
+            int(oms_cfg.get("trade_recovery_overlap_ms", 60_000)),
+        )
+        self.snapshot_stability_required = max(
+            2,
+            int(oms_cfg.get("snapshot_stability_required", 2)),
+        )
+        self.snapshot_max_attempts = max(
+            self.snapshot_stability_required,
+            int(oms_cfg.get("snapshot_max_attempts", 6)),
+        )
+        self.snapshot_settle_interval_sec = max(
+            0.01,
+            float(oms_cfg.get("snapshot_settle_interval_sec", 0.25)),
+        )
+        gateway_rest = getattr(self.gateway, "rest", None)
+        default_command_fence_sec = (
+            float(getattr(gateway_rest, "recv_window_ms", 0) or 0) / 1000.0 + 0.25
+            if gateway_rest is not None
+            else 0.0
+        )
+        self.command_fence_timeout_sec = max(
+            0.0,
+            float(oms_cfg.get("command_fence_timeout_sec", default_command_fence_sec)),
+        )
         self.max_total_active_orders = int(oms_cfg.get("max_total_active_orders", 100) or 0)
         self.max_symbol_active_orders = int(oms_cfg.get("max_symbol_active_orders", 20) or 0)
         self.max_strategy_active_orders = int(oms_cfg.get("max_strategy_active_orders", 30) or 0)
@@ -214,6 +266,14 @@ class OMS:
 
     def _apply_rebuild_summary(self):
         summary = self.rebuild_summary or {}
+        self.trade_cursors = {
+            str(symbol).upper(): int(trade_id)
+            for symbol, trade_id in summary.get("trade_cursors", {}).items()
+        }
+        self.trade_scan_end_ms = {
+            str(symbol).upper(): int(end_time_ms)
+            for symbol, end_time_ms in summary.get("trade_scan_end_ms", {}).items()
+        }
         self.symbol_guards = dict(summary.get("symbol_guards", {}))
         self.venue_guards = dict(summary.get("venue_guards", {}))
         self.strategy_guards = dict(summary.get("strategy_guards", {}))
@@ -232,12 +292,24 @@ class OMS:
 
         last_lifecycle = summary.get("last_lifecycle")
         dirty_shutdown = bool(summary.get("dirty_shutdown", False))
+        recovered_active_orders = int(summary.get("recovered_active_orders", 0) or 0)
+        pending_commands = int(summary.get("pending_commands", 0) or 0)
         if self.manual_rearm_required or last_lifecycle == LifecycleState.HALTED.value:
             self.state = LifecycleState.HALTED
             self.manual_rearm_required = True
             if not self.last_halt_reason:
                 self.last_halt_reason = "Recovered halted state"
             self._sync_capability_mode("recovered_halted_state")
+            return
+
+        if recovered_active_orders or pending_commands:
+            self.state = LifecycleState.FROZEN
+            self.recovered_guard_cleanup_pending = True
+            self.last_freeze_reason = (
+                "Recovered orders require exchange truth: "
+                f"active={recovered_active_orders}, pending_commands={pending_commands}"
+            )
+            self._sync_capability_mode("recovered_inflight_commands")
             return
 
         if dirty_shutdown:
@@ -415,6 +487,625 @@ class OMS:
             return None
         return self.gateway.get_open_orders()
 
+    def query_order(self, symbol: str, order_id: str):
+        if not self.can_query_exchange():
+            return None
+        query = getattr(self.gateway, "get_order", None)
+        if not callable(query):
+            return None
+        return query(symbol, order_id)
+
+    def query_user_trades(self, symbol: str, **kwargs):
+        if not self.can_query_exchange():
+            return None
+        query = getattr(self.gateway, "get_user_trades", None)
+        if not callable(query):
+            return None
+        return query(symbol, **kwargs)
+
+    def _normalize_submit_command(self, raw_result) -> GatewayCommandResult:
+        if isinstance(raw_result, GatewayCommandResult):
+            return raw_result
+        if isinstance(raw_result, str) and raw_result:
+            return GatewayCommandResult(
+                CommandOutcome.ACKNOWLEDGED,
+                exchange_oid=raw_result,
+            )
+        # Compatibility for simple/custom gateways which predate the explicit
+        # command outcome contract. The Binance gateway never returns bare None.
+        return GatewayCommandResult(
+            CommandOutcome.REJECTED,
+            error_message="gateway_send_failed",
+        )
+
+    def _record_command_prepared(
+        self,
+        command_id: str,
+        command_type: str,
+        order: Order,
+        request,
+    ):
+        if isinstance(request, OrderRequest):
+            request_payload = {
+                "symbol": request.symbol,
+                "price": request.price,
+                "volume": request.volume,
+                "side": request.side,
+                "order_type": request.order_type,
+                "time_in_force": request.time_in_force,
+                "post_only": request.post_only,
+                "reduce_only": request.reduce_only,
+            }
+        else:
+            request_payload = {
+                "symbol": request.symbol,
+                "order_id": request.order_id,
+            }
+        return self.journal.append(
+            "command_prepared",
+            {
+                "command_id": command_id,
+                "command_type": command_type,
+                "idempotency_key": order.client_oid,
+                "client_oid": order.client_oid,
+                "exchange_oid": order.exchange_oid,
+                "order": order.to_record(),
+                "request": request_payload,
+            },
+        )
+
+    def _record_command_result(
+        self,
+        command_id: str,
+        command_type: str,
+        order: Order,
+        outcome: CommandOutcome,
+        exchange_oid: str = "",
+        error_code: str = "",
+        error_message: str = "",
+    ):
+        return self.journal.append(
+            "command_result",
+            {
+                "command_id": command_id,
+                "command_type": command_type,
+                "idempotency_key": order.client_oid,
+                "client_oid": order.client_oid,
+                "exchange_oid": exchange_oid or order.exchange_oid,
+                "outcome": outcome.value,
+                "error_code": error_code,
+                "error_message": error_message,
+            },
+        )
+
+    def _execution_id(self, order: Order, update: ExchangeOrderUpdate) -> str:
+        venue = str(getattr(self.gateway, "gateway_name", "UNKNOWN") or "UNKNOWN").upper()
+        if update.trade_id >= 0:
+            return f"{venue}:{order.intent.symbol}:{update.trade_id}"
+        exchange_order_id = update.exchange_oid or order.exchange_oid or order.client_oid
+        return (
+            f"{venue}:{order.intent.symbol}:{exchange_order_id}:"
+            f"{int(float(update.update_time or 0.0) * 1000)}:"
+            f"{float(update.cum_filled_qty):.12g}"
+        )
+
+    def _record_execution(
+        self,
+        order: Order,
+        update: ExchangeOrderUpdate,
+        fill_qty: float,
+        fee: float,
+    ) -> str:
+        execution_id = self._execution_id(order, update)
+        if execution_id in self.execution_ids:
+            return execution_id
+
+        self.journal.append(
+            "execution_record",
+            {
+                "execution_id": execution_id,
+                "venue": str(
+                    getattr(self.gateway, "gateway_name", "UNKNOWN") or "UNKNOWN"
+                ).upper(),
+                "client_oid": order.client_oid,
+                "exchange_oid": update.exchange_oid or order.exchange_oid,
+                "symbol": order.intent.symbol,
+                "side": order.intent.side.value,
+                "fill_qty": fill_qty,
+                "fill_price": update.filled_price,
+                "cum_filled_qty": update.cum_filled_qty,
+                "exchange_status": update.status,
+                "exchange_time": update.update_time,
+                "trade_id": update.trade_id,
+                "commission": update.commission,
+                "commission_asset": update.commission_asset,
+                "booked_fee": fee,
+                "realized_pnl": update.realized_pnl,
+                "is_maker": update.is_maker,
+                "pre_status": order.status.value,
+            },
+        )
+        self.execution_ids.add(execution_id)
+        return execution_id
+
+    def _fail_closed_on_journal_error(
+        self,
+        exc: Exception,
+        context: str,
+        symbol: str = "",
+    ):
+        """Enter cancel-only mode without depending on the failed journal."""
+        reason = f"durable_journal_unavailable:{context}:{exc}"
+        logger.critical(f"[OMS] {reason}")
+        with self.lock:
+            self.state = LifecycleState.HALTED
+            self.manual_rearm_required = True
+            self.last_halt_reason = reason
+            self.last_freeze_reason = ""
+            self.capability_mode = OMSCapabilityMode.CANCEL_ONLY
+            self.capability_reason = reason
+            if symbol:
+                self.symbol_guards[symbol.upper()] = reason
+
+        self.event_engine.put(Event(EVENT_SYSTEM_HEALTH, f"HALT:{reason}"))
+        try:
+            for target_symbol in self.config.get("symbols", []):
+                self.gateway.cancel_all_orders(target_symbol)
+        except Exception as cancel_exc:
+            logger.critical(
+                f"[OMS] Failed to cancel orders after journal failure: {cancel_exc}"
+            )
+
+    def _on_order_truth_check(self, reason: str, suspicious_oid: str = None):
+        if not suspicious_oid:
+            return
+        with self.lock:
+            if suspicious_oid in self._order_truth_resolution_inflight:
+                return
+            self._order_truth_resolution_inflight.add(suspicious_oid)
+
+        threading.Thread(
+            target=self._resolve_order_truth,
+            args=(suspicious_oid, reason),
+            daemon=True,
+        ).start()
+
+    def _resolve_order_truth(self, client_oid: str, reason: str = ""):
+        try:
+            with self.lock:
+                order = self.orders.get(client_oid)
+                if not order or order.is_terminal():
+                    return
+                symbol = order.intent.symbol
+                target_id = order.exchange_oid or order.client_oid
+                local_status = order.status
+
+            remote = self.query_order(symbol, target_id)
+            if remote is None:
+                self._audit(
+                    "order_truth_query_unavailable",
+                    client_oid=client_oid,
+                    symbol=symbol,
+                    reason=reason,
+                )
+                if local_status in {OrderStatus.SUBMIT_UNKNOWN, OrderStatus.CANCEL_UNKNOWN}:
+                    self.order_monitor.on_order_update(client_oid, local_status)
+                return
+
+            if remote.get("_query_status") == "NOT_FOUND":
+                count = self._unknown_not_found_counts.get(client_oid, 0) + 1
+                self._unknown_not_found_counts[client_oid] = count
+                with self.lock:
+                    order = self.orders.get(client_oid)
+                    elapsed = time.time() - order.updated_at if order else 0.0
+                    current_status = order.status if order else None
+
+                self._audit(
+                    "order_truth_not_found",
+                    client_oid=client_oid,
+                    symbol=symbol,
+                    confirmations=count,
+                    elapsed_sec=elapsed,
+                    local_status=current_status.value if current_status else "",
+                )
+                if (
+                    current_status == OrderStatus.SUBMIT_UNKNOWN
+                    and count >= self.unknown_order_min_not_found
+                    and elapsed >= self.unknown_order_resolution_timeout_sec
+                ):
+                    with self.lock:
+                        order = self.orders.get(client_oid)
+                        if order and order.status == OrderStatus.SUBMIT_UNKNOWN:
+                            order.mark_rejected_locally("exchange_confirmed_order_absent")
+                            self._record_order_snapshot(order, "submit_unknown_absent")
+                            self._emit_order_update(order)
+                            self._write_tombstone(order)
+                            self.exposure.update_open_orders(self.orders)
+                            self.account.calculate()
+                    self._clear_order_truth_guard(symbol)
+                    return
+
+                if current_status in {OrderStatus.SUBMIT_UNKNOWN, OrderStatus.CANCEL_UNKNOWN}:
+                    if (
+                        current_status == OrderStatus.CANCEL_UNKNOWN
+                        and count >= self.unknown_order_min_not_found
+                        and elapsed >= self.unknown_order_resolution_timeout_sec
+                    ):
+                        self.trigger_reconcile(
+                            "Cancel outcome remained unresolvable",
+                            suspicious_oid=client_oid,
+                        )
+                        return
+                    self.order_monitor.on_order_update(client_oid, current_status)
+                elif current_status in {OrderStatus.CANCELLING, OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED}:
+                    self.trigger_reconcile("Order absent from targeted query", suspicious_oid=client_oid)
+                return
+
+            self._unknown_not_found_counts.pop(client_oid, None)
+            self._backfill_trade_history(
+                symbols={symbol},
+                end_time_ms=time_service.now(),
+            )
+            self._apply_exchange_order_snapshot(remote, source="targeted_order_query")
+
+            with self.lock:
+                order = self.orders.get(client_oid)
+                resolved_status = order.status if order else None
+
+            if (
+                local_status in {OrderStatus.CANCEL_UNKNOWN, OrderStatus.CANCELLING}
+                and resolved_status in {OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED}
+            ):
+                self.cancel_order(client_oid)
+            elif resolved_status not in {OrderStatus.SUBMIT_UNKNOWN, OrderStatus.CANCEL_UNKNOWN}:
+                self._clear_order_truth_guard(symbol)
+        except Exception as exc:
+            self._audit(
+                "order_truth_resolution_failed",
+                client_oid=client_oid,
+                reason=reason,
+                error=str(exc),
+            )
+            logger.error(f"[OMS] Order truth resolution failed for {client_oid}: {exc}")
+        finally:
+            with self.lock:
+                self._order_truth_resolution_inflight.discard(client_oid)
+
+    def _clear_order_truth_guard(self, symbol: str):
+        reason = self.get_symbol_freeze_reason(symbol)
+        if reason.startswith("order_truth:"):
+            self.clear_symbol_freeze(symbol, reason="order truth resolved")
+
+    def _create_recovered_order(self, remote: dict) -> Order:
+        symbol = str(remote.get("symbol", "") or "").upper()
+        exchange_oid = str(remote.get("orderId", "") or "")
+        client_oid = str(remote.get("clientOrderId", "") or "")
+        if not client_oid:
+            client_oid = f"EXTERNAL_{symbol}_{exchange_oid}"
+        side = Side(str(remote.get("side", "BUY") or "BUY").upper())
+        volume = float(remote.get("origQty", remote.get("executedQty", 0.0)) or 0.0)
+        if volume <= 0:
+            volume = float(remote.get("qty", 0.0) or 0.0)
+        price = float(
+            remote.get("price", 0.0)
+            or remote.get("avgPrice", 0.0)
+            or remote.get("trade_price", 0.0)
+            or 1.0
+        )
+        intent = OrderIntent(
+            strategy_id="exchange_recovery",
+            symbol=symbol,
+            side=side,
+            price=price,
+            volume=volume,
+            order_type=str(remote.get("type", "LIMIT") or "LIMIT"),
+            time_in_force=str(remote.get("timeInForce", TIF_GTC) or TIF_GTC),
+            is_post_only=str(remote.get("timeInForce", "") or "") == TIF_GTX,
+            reduce_only=bool(remote.get("reduceOnly", False)),
+            policy=ExecutionPolicy.PASSIVE,
+            tag="exchange_recovered",
+        )
+        order = Order(client_oid, intent)
+        order.mark_submitting()
+        order.mark_new(exchange_oid=exchange_oid)
+        self.orders[client_oid] = order
+        if exchange_oid:
+            self.exchange_id_map[exchange_oid] = order
+        self._audit(
+            "external_order_recovered",
+            client_oid=client_oid,
+            exchange_oid=exchange_oid,
+            symbol=symbol,
+        )
+        return order
+
+    def _apply_exchange_order_snapshot(self, remote: dict, source: str = "order_query"):
+        if not isinstance(remote, dict) or remote.get("_query_status"):
+            return False
+        client_oid = str(remote.get("clientOrderId", "") or "")
+        exchange_oid = str(remote.get("orderId", "") or "")
+        with self.lock:
+            order = self.orders.get(client_oid) if client_oid else None
+            if not order and exchange_oid:
+                order = self.exchange_id_map.get(exchange_oid)
+            if not order:
+                order = self._create_recovered_order(remote)
+
+        status = str(remote.get("status", "") or "").upper()
+        if status == "EXPIRED_IN_MATCH":
+            status = "EXPIRED"
+        if status not in {"NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED", "REJECTED"}:
+            self._audit("unhandled_order_snapshot_status", status=status, source=source)
+            return False
+
+        executed_qty = float(remote.get("executedQty", 0.0) or 0.0)
+        avg_price = float(remote.get("avgPrice", 0.0) or remote.get("price", 0.0) or 0.0)
+        update_time_ms = remote.get("updateTime") or remote.get("time") or time_service.now()
+        if (
+            status in {"CANCELED", "EXPIRED"}
+            and executed_qty > order.filled_volume + 1e-9
+        ):
+            recovery_price = avg_price or order.avg_price or order.intent.price
+            self._audit(
+                "order_snapshot_fill_inferred",
+                client_oid=order.client_oid,
+                exchange_oid=exchange_oid,
+                local_filled=order.filled_volume,
+                exchange_filled=executed_qty,
+                source=source,
+            )
+            fill_update = ExchangeOrderUpdate(
+                client_oid=order.client_oid,
+                exchange_oid=exchange_oid or order.exchange_oid,
+                symbol=order.intent.symbol,
+                status="PARTIALLY_FILLED",
+                filled_qty=executed_qty - order.filled_volume,
+                filled_price=recovery_price,
+                cum_filled_qty=executed_qty,
+                update_time=float(update_time_ms) / 1000.0,
+                seq=0,
+            )
+            self._apply_event(Event(EVENT_EXCHANGE_ORDER_UPDATE, fill_update))
+
+        update = ExchangeOrderUpdate(
+            client_oid=order.client_oid,
+            exchange_oid=exchange_oid or order.exchange_oid,
+            symbol=order.intent.symbol,
+            status=status,
+            filled_qty=max(0.0, executed_qty - order.filled_volume),
+            filled_price=avg_price,
+            cum_filled_qty=executed_qty,
+            update_time=float(update_time_ms) / 1000.0,
+            seq=0,
+        )
+        self._apply_event(Event(EVENT_EXCHANGE_ORDER_UPDATE, update))
+        self._audit(
+            "order_snapshot_applied",
+            client_oid=order.client_oid,
+            exchange_oid=update.exchange_oid,
+            exchange_status=status,
+            source=source,
+        )
+        return True
+
+    def _advance_trade_cursor(self, symbol: str, trade_id: int, trade_time: float, source: str):
+        symbol = str(symbol or "").upper()
+        trade_id = int(trade_id)
+        current = int(self.trade_cursors.get(symbol, -1))
+        if trade_id <= current:
+            return False
+        self.trade_cursors[symbol] = trade_id
+        self.journal.append(
+            "trade_cursor_advanced",
+            {
+                "symbol": symbol,
+                "trade_id": trade_id,
+                "trade_time": trade_time,
+                "source": source,
+            },
+        )
+        return True
+
+    def _apply_exchange_trade(self, trade: dict) -> bool:
+        symbol = str(trade.get("symbol", "") or "").upper()
+        trade_id = int(trade.get("id", -1))
+        if trade_id <= int(self.trade_cursors.get(symbol, -1)):
+            return True
+
+        exchange_oid = str(trade.get("orderId", "") or "")
+        with self.lock:
+            order = self.exchange_id_map.get(exchange_oid)
+        if not order:
+            remote = self.query_order(symbol, exchange_oid)
+            if not remote or remote.get("_query_status") == "NOT_FOUND":
+                return False
+            remote = dict(remote)
+            remote["trade_price"] = trade.get("price", 0.0)
+            with self.lock:
+                order = self._create_recovered_order(remote)
+
+        original_terminal_status = order.status if order.is_terminal() else None
+        original_terminal_time = order.last_exchange_update_time
+
+        qty = float(trade.get("qty", 0.0) or 0.0)
+        price = float(trade.get("price", 0.0) or 0.0)
+        if qty <= 0 or price <= 0:
+            return False
+        cumulative = min(order.intent.volume, order.filled_volume + qty)
+        status = "FILLED" if cumulative >= order.intent.volume - 1e-8 else "PARTIALLY_FILLED"
+        trade_time_ms = int(trade.get("time", time_service.now()) or time_service.now())
+        update = ExchangeOrderUpdate(
+            client_oid=order.client_oid,
+            exchange_oid=order.exchange_oid or exchange_oid,
+            symbol=symbol,
+            status=status,
+            filled_qty=qty,
+            filled_price=price,
+            cum_filled_qty=cumulative,
+            update_time=trade_time_ms / 1000.0,
+            seq=0,
+            commission=float(trade.get("commission", 0.0) or 0.0),
+            commission_asset=str(trade.get("commissionAsset", "") or ""),
+            realized_pnl=float(trade.get("realizedPnl", 0.0) or 0.0),
+            is_maker=bool(trade.get("maker")) if "maker" in trade else None,
+            trade_id=trade_id,
+        )
+        self._apply_event(Event(EVENT_EXCHANGE_ORDER_UPDATE, update))
+        if order.filled_volume + 1e-9 < cumulative:
+            self._audit(
+                "trade_backfill_apply_failed",
+                symbol=symbol,
+                trade_id=trade_id,
+                client_oid=order.client_oid,
+                expected_cumulative=cumulative,
+                actual_cumulative=order.filled_volume,
+            )
+            return False
+        if (
+            original_terminal_status in {OrderStatus.CANCELLED, OrderStatus.EXPIRED}
+            and order.status == OrderStatus.PARTIALLY_FILLED
+        ):
+            with self.lock:
+                if original_terminal_status == OrderStatus.CANCELLED:
+                    order.mark_cancelled(
+                        update_time=max(original_terminal_time, update.update_time),
+                        exchange_status="CANCELED",
+                    )
+                else:
+                    order.mark_expired(
+                        update_time=max(original_terminal_time, update.update_time),
+                    )
+                self.order_monitor.on_order_update(order.client_oid, order.status)
+                self.exposure.update_open_orders(self.orders)
+                self.account.calculate()
+                self._record_order_snapshot(order, "terminal_restored_after_trade_backfill")
+                self._emit_order_update(order)
+        self._advance_trade_cursor(symbol, trade_id, update.update_time, source="rest_backfill")
+        return True
+
+    def _backfill_trade_history(self, symbols=None, end_time_ms: int = None) -> bool:
+        query = getattr(self.gateway, "get_user_trades", None)
+        if not callable(query):
+            return True
+        symbols = set(symbols or self.config.get("symbols", []))
+        end_time_ms = int(end_time_ms or time_service.now())
+        limit = 1000
+
+        for symbol in sorted(symbols):
+            cursor = int(self.trade_cursors.get(symbol, -1))
+            page_count = 0
+            while page_count < 20:
+                page_count += 1
+                if cursor >= 0:
+                    trades = self.query_user_trades(symbol, from_id=cursor + 1, limit=limit)
+                else:
+                    prior_scan = int(self.trade_scan_end_ms.get(symbol, 0))
+                    start_time = max(
+                        0,
+                        (prior_scan or end_time_ms - self.trade_recovery_lookback_ms)
+                        - self.trade_recovery_overlap_ms,
+                    )
+                    trades = self.query_user_trades(
+                        symbol,
+                        start_time=start_time,
+                        end_time=end_time_ms,
+                        limit=limit,
+                    )
+                if trades is None:
+                    return False
+                trades = sorted(
+                    (trade for trade in trades if isinstance(trade, dict)),
+                    key=lambda trade: (int(trade.get("time", 0) or 0), int(trade.get("id", -1))),
+                )
+                for trade in trades:
+                    if not self._apply_exchange_trade(trade):
+                        return False
+                    cursor = max(cursor, int(trade.get("id", -1)))
+                if len(trades) < limit:
+                    break
+            if page_count >= 20 and len(trades) >= limit:
+                return False
+            self.trade_scan_end_ms[symbol] = end_time_ms
+            self.journal.append(
+                "trade_scan_completed",
+                {
+                    "symbol": symbol,
+                    "end_time_ms": end_time_ms,
+                    "cursor": int(self.trade_cursors.get(symbol, -1)),
+                },
+            )
+        return True
+
+    def _prime_trade_history_baseline(self, end_time_ms: int) -> bool:
+        query = getattr(self.gateway, "get_user_trades", None)
+        if not callable(query):
+            return True
+        start_time = max(0, int(end_time_ms) - self.trade_recovery_lookback_ms)
+        for symbol in sorted(set(self.config.get("symbols", []))):
+            trades = self.query_user_trades(
+                symbol,
+                start_time=start_time,
+                end_time=int(end_time_ms),
+                limit=1000,
+            )
+            if trades is None:
+                return False
+            valid_ids = [
+                int(trade.get("id", -1))
+                for trade in trades
+                if isinstance(trade, dict) and int(trade.get("id", -1)) >= 0
+            ]
+            if valid_ids:
+                self._advance_trade_cursor(
+                    symbol,
+                    max(valid_ids),
+                    float(end_time_ms) / 1000.0,
+                    source="bootstrap_baseline",
+                )
+            self.trade_scan_end_ms[symbol] = int(end_time_ms)
+            self.journal.append(
+                "trade_scan_completed",
+                {
+                    "symbol": symbol,
+                    "end_time_ms": int(end_time_ms),
+                    "cursor": int(self.trade_cursors.get(symbol, -1)),
+                    "source": "bootstrap_baseline",
+                },
+            )
+        return True
+
+    def _refresh_missing_local_order_terminals(self, remote_orders) -> bool:
+        query = getattr(self.gateway, "get_order", None)
+        if not callable(query):
+            return True
+        remote_identifiers = {
+            identifier
+            for item in self._normalize_remote_open_orders(remote_orders)
+            for identifier in item["identifiers"]
+        }
+        with self.lock:
+            missing = [
+                (order.client_oid, order.intent.symbol, order.exchange_oid or order.client_oid)
+                for order in self.orders.values()
+                if order.is_active()
+                and order.client_oid not in remote_identifiers
+                and (not order.exchange_oid or order.exchange_oid not in remote_identifiers)
+            ]
+
+        for client_oid, symbol, target_id in missing:
+            remote = self.query_order(symbol, target_id)
+            if remote is None:
+                return False
+            if remote.get("_query_status") == "NOT_FOUND":
+                self._audit(
+                    "active_order_missing_from_exchange_history",
+                    client_oid=client_oid,
+                    symbol=symbol,
+                )
+                continue
+            self._apply_exchange_order_snapshot(remote, source="reconcile_missing_terminal")
+        return True
+
     def adapt_intent_for_trading_mode(self, intent: OrderIntent):
         self._ensure_capability_mode_consistent()
         if self.capability_mode == OMSCapabilityMode.PASSIVE_ONLY:
@@ -476,21 +1167,73 @@ class OMS:
         **audit_extra,
     ) -> bool:
         order = Order(client_oid, intent)
+        command_id = f"SUBMIT:{client_oid}"
 
-        with self.lock:
-            self.orders[client_oid] = order
-            order.mark_submitting()
-            self.exposure.update_open_orders(self.orders)
-            self.account.calculate()
-            self._record_order_snapshot(order, snapshot_source, **audit_extra)
-
-        exchange_oid = self.gateway.send_order(request, client_oid)
-        if exchange_oid:
+        try:
             with self.lock:
-                order.mark_pending_ack(exchange_oid)
-                self.exchange_id_map[exchange_oid] = order
-                self._record_order_snapshot(order, f"{snapshot_source}_ack", **audit_extra)
+                self.orders[client_oid] = order
+                order.mark_submitting()
+                self.exposure.update_open_orders(self.orders)
+                self.account.calculate()
+                self._record_order_snapshot(order, snapshot_source, **audit_extra)
+            self._record_command_prepared(
+                command_id,
+                "SUBMIT",
+                order,
+                request,
+            )
+        except JournalError as exc:
+            with self.lock:
+                order.mark_rejected_locally("durable_journal_unavailable")
+                self.orders.pop(client_oid, None)
+                self.exposure.update_open_orders(self.orders)
+                self.account.calculate()
                 self._emit_order_update(order)
+            self._fail_closed_on_journal_error(exc, "prepare_internal_submit", intent.symbol)
+            return False
+
+        try:
+            raw_result = self.gateway.send_order(request, client_oid)
+            command = self._normalize_submit_command(raw_result)
+        except Exception as exc:
+            command = GatewayCommandResult(
+                CommandOutcome.UNKNOWN,
+                error_message=f"gateway_send_exception:{exc}",
+            )
+
+        try:
+            self._record_command_result(
+                command_id,
+                "SUBMIT",
+                order,
+                command.outcome,
+                exchange_oid=command.exchange_oid,
+                error_code=command.error_code,
+                error_message=command.error_message,
+            )
+        except JournalError as exc:
+            with self.lock:
+                if order.status == OrderStatus.SUBMITTING:
+                    order.mark_submit_unknown("result_not_durable")
+                self._emit_order_update(order)
+            self._fail_closed_on_journal_error(exc, "result_internal_submit", intent.symbol)
+            self._on_order_truth_check(
+                "Submit result could not be persisted",
+                suspicious_oid=client_oid,
+            )
+            return True
+
+        if command.outcome == CommandOutcome.ACKNOWLEDGED:
+            exchange_oid = command.exchange_oid
+            try:
+                with self.lock:
+                    order.mark_pending_ack(exchange_oid)
+                    self.exchange_id_map[exchange_oid] = order
+                    self._record_order_snapshot(order, f"{snapshot_source}_ack", **audit_extra)
+                    self._emit_order_update(order)
+            except JournalError as exc:
+                self._fail_closed_on_journal_error(exc, "snapshot_internal_submit_ack", intent.symbol)
+                return True
 
             event_data = OrderSubmitted(request, client_oid, time.time())
             self.event_engine.put(Event(EVENT_ORDER_SUBMITTED, event_data))
@@ -506,18 +1249,71 @@ class OMS:
             self._audit(audit_kind, **payload)
             return True
 
-        with self.lock:
-            order.mark_rejected_locally("gateway_send_failed")
-            self._record_order_snapshot(order, f"{snapshot_source}_failed", **audit_extra)
-            self._emit_order_update(order)
-            self.orders.pop(client_oid, None)
-            self.exposure.update_open_orders(self.orders)
-            self.account.calculate()
+        if command.outcome == CommandOutcome.UNKNOWN:
+            try:
+                with self.lock:
+                    order.mark_submit_unknown(command.error_message or "submit_outcome_unknown")
+                    self._record_order_snapshot(
+                        order,
+                        f"{snapshot_source}_unknown",
+                        error_code=command.error_code,
+                        **audit_extra,
+                    )
+                    self._emit_order_update(order)
+            except JournalError as exc:
+                self._fail_closed_on_journal_error(
+                    exc,
+                    "snapshot_internal_submit_unknown",
+                    intent.symbol,
+                )
+                self._on_order_truth_check(
+                    "Submit result could not be persisted",
+                    suspicious_oid=client_oid,
+                )
+                return True
+            self.event_engine.put(
+                Event(
+                    EVENT_ORDER_SUBMITTED,
+                    OrderSubmitted(request, client_oid, time.time(), OrderStatus.SUBMIT_UNKNOWN),
+                )
+            )
+            self.freeze_symbol(
+                intent.symbol,
+                f"order_truth:submit_unknown:{client_oid}",
+                cancel_active_orders=False,
+            )
+            self._audit(
+                f"{audit_kind}_unknown",
+                client_oid=client_oid,
+                symbol=intent.symbol,
+                error_code=command.error_code,
+                error_message=command.error_message,
+                **audit_extra,
+            )
+            self._on_order_truth_check("Order submit outcome unknown", suspicious_oid=client_oid)
+            return True
+
+        try:
+            with self.lock:
+                reject_reason = command.error_message or command.error_code or "gateway_send_rejected"
+                order.mark_rejected_locally(reject_reason)
+                self._record_order_snapshot(order, f"{snapshot_source}_failed", **audit_extra)
+                self._emit_order_update(order)
+                self.orders.pop(client_oid, None)
+                self.exposure.update_open_orders(self.orders)
+                self.account.calculate()
+        except JournalError as exc:
+            self._fail_closed_on_journal_error(
+                exc,
+                "snapshot_internal_submit_rejected",
+                intent.symbol,
+            )
+            return False
         self._write_tombstone(order)
         payload = {
             "client_oid": client_oid,
             "symbol": intent.symbol,
-            "reason": "gateway_send_failed",
+            "reason": reject_reason,
         }
         payload.update(audit_extra)
         self._audit(f"{audit_kind}_failed", **payload)
@@ -1134,10 +1930,18 @@ class OMS:
     def _execute_reconcile(self, suspicious_oid: str):
         self._audit("reconcile_started", suspicious_oid=suspicious_oid)
         try:
+            trade_backfill_ok = self._backfill_trade_history(
+                end_time_ms=time_service.now(),
+            )
             remote_positions = self.query_positions()
             remote_orders = self.query_open_orders()
 
-            if remote_positions is None or remote_orders is None:
+            if (
+                not trade_backfill_ok
+                or remote_positions is None
+                or remote_orders is None
+                or not self._refresh_missing_local_order_terminals(remote_orders)
+            ):
                 self.consecutive_reconcile_api_failures += 1
                 self.last_reconcile_failure_ts = time.monotonic()
                 attempt = self.consecutive_reconcile_api_failures
@@ -1228,19 +2032,143 @@ class OMS:
         except Exception as exc:
             self.halt_system(f"Reconcile critical error: {exc}")
 
+    def _exchange_snapshot_signature(self, account, positions, open_orders):
+        normalized_positions = tuple(
+            sorted(
+                (
+                    str(pos.get("symbol", "") or ""),
+                    float(pos.get("positionAmt", 0.0) or 0.0),
+                    float(pos.get("entryPrice", 0.0) or 0.0),
+                )
+                for pos in positions
+                if pos.get("symbol")
+            )
+        )
+        normalized_orders = tuple(
+            (
+                item["symbol"],
+                item["identifiers"],
+                item["side"],
+            )
+            for item in self._normalize_remote_open_orders(open_orders)
+        )
+        # Exclude mark-to-market fields such as initial margin and available
+        # balance: they legitimately move while prices change. The barrier is
+        # for structural order/position state plus settled wallet balance.
+        account_signature = float(account.get("totalWalletBalance", 0.0) or 0.0)
+        return normalized_positions, normalized_orders, account_signature
+
+    def _capture_stable_exchange_snapshot(self, require_no_open_orders=False):
+        previous_signature = None
+        stable_count = 0
+        last_payload = None
+
+        for attempt in range(1, self.snapshot_max_attempts + 1):
+            account_floor = time_service.now() / 1000.0
+            open_orders = self.query_open_orders()
+            account = self.query_account_info()
+            positions_floor = time_service.now() / 1000.0
+            positions = self.query_positions()
+            snapshot_end_ms = time_service.now()
+            if open_orders is None or not account or positions is None:
+                raise RuntimeError("API failed while acquiring stable exchange snapshot")
+
+            signature = self._exchange_snapshot_signature(account, positions, open_orders)
+            if signature == previous_signature:
+                stable_count += 1
+            else:
+                stable_count = 1
+                previous_signature = signature
+
+            normalized_orders = self._normalize_remote_open_orders(open_orders)
+            last_payload = {
+                "open_orders": open_orders,
+                "account": account,
+                "positions": positions,
+                "account_floor": account_floor,
+                "positions_floor": positions_floor,
+                "end_time_ms": snapshot_end_ms,
+                "attempt": attempt,
+            }
+            if (
+                stable_count >= self.snapshot_stability_required
+                and (not require_no_open_orders or not normalized_orders)
+            ):
+                self._audit(
+                    "stable_snapshot_acquired",
+                    attempts=attempt,
+                    stable_count=stable_count,
+                    end_time_ms=snapshot_end_ms,
+                )
+                return last_payload
+
+            time.sleep(self.snapshot_settle_interval_sec)
+
+        residual = (
+            self._normalize_remote_open_orders(last_payload["open_orders"])
+            if last_payload
+            else []
+        )
+        raise RuntimeError(
+            "exchange snapshot did not stabilize"
+            + (f"; residual open orders={residual}" if residual else "")
+        )
+
     def _perform_full_reset(self):
         logger.info("[OMS] Performing full state reset...")
         self._audit("full_reset_started", symbols=self.config.get("symbols", []))
         try:
+            command_fence_started = time.monotonic()
             for symbol in self.config["symbols"]:
                 self.gateway.cancel_all_orders(symbol)
-            time.sleep(1.0)
 
-            remote_orders = self.query_open_orders()
-            account = self.query_account_info()
-            positions = self.query_positions()
-            if remote_orders is None or not account or positions is None:
-                raise RuntimeError("API failed during reset")
+            initial_snapshot = self._capture_stable_exchange_snapshot(
+                require_no_open_orders=True,
+            )
+            with self.lock:
+                establish_trade_baseline = bool(
+                    self.state == LifecycleState.BOOTSTRAP
+                    and not self.orders
+                    and not self.trade_cursors
+                )
+            if establish_trade_baseline and not self._prime_trade_history_baseline(
+                initial_snapshot["end_time_ms"],
+            ):
+                raise RuntimeError("trade history baseline failed during bootstrap")
+            if not self._backfill_trade_history(
+                end_time_ms=initial_snapshot["end_time_ms"],
+            ):
+                raise RuntimeError("trade history backfill failed during reset")
+
+            fence_remaining = max(
+                0.0,
+                self.command_fence_timeout_sec
+                - (time.monotonic() - command_fence_started),
+            )
+            if fence_remaining > 0:
+                self._audit(
+                    "command_fence_wait",
+                    remaining_sec=fence_remaining,
+                )
+                time.sleep(fence_remaining)
+
+            # A pre-freeze submit may arrive after the first mass cancel but
+            # cannot arrive after its signed recvWindow expires. Cancel again
+            # beyond that fence, then establish the committed snapshot.
+            for symbol in self.config["symbols"]:
+                self.gateway.cancel_all_orders(symbol)
+
+            snapshot = self._capture_stable_exchange_snapshot(
+                require_no_open_orders=True,
+            )
+            if not self._backfill_trade_history(end_time_ms=snapshot["end_time_ms"]):
+                raise RuntimeError("final trade history backfill failed during reset")
+
+            remote_orders = snapshot["open_orders"]
+            account = snapshot["account"]
+            positions = snapshot["positions"]
+            account_snapshot_floor = snapshot["account_floor"]
+            positions_snapshot_floor = snapshot["positions_floor"]
 
             residual_orders = self._normalize_remote_open_orders(remote_orders)
             if residual_orders:
@@ -1249,10 +2177,9 @@ class OMS:
                 )
 
             with self.lock:
+                previously_tracked_symbols = set(self.exposure.net_positions.keys())
                 self.orders.clear()
                 self.exchange_id_map.clear()
-                self.sequence.reset()
-
                 self.exposure.net_positions.clear()
                 self.exposure.avg_prices.clear()
                 self.exposure.open_buy_qty.clear()
@@ -1265,11 +2192,35 @@ class OMS:
                     symbol = pos["symbol"]
                     self.exposure.force_sync(symbol, amount, float(pos["entryPrice"]))
 
+                snapshot_symbols = previously_tracked_symbols | set(self.config.get("symbols", []))
+                snapshot_symbols.update(
+                    str(pos.get("symbol", "") or "")
+                    for pos in positions
+                    if pos.get("symbol")
+                )
+                for symbol in snapshot_symbols:
+                    self._position_state_event_time[symbol] = max(
+                        float(self._position_state_event_time.get(symbol, 0.0) or 0.0),
+                        positions_snapshot_floor,
+                    )
+                    self._exchange_position_event_time[symbol] = max(
+                        float(self._exchange_position_event_time.get(symbol, 0.0) or 0.0),
+                        positions_snapshot_floor,
+                    )
+
                 available_balance = account.get("availableBalance")
                 self.account.force_sync(
                     float(account["totalWalletBalance"]),
                     float(account["totalInitialMargin"]),
                     float(available_balance) if available_balance is not None else None,
+                )
+                self._account_state_event_time = max(
+                    float(self._account_state_event_time or 0.0),
+                    account_snapshot_floor,
+                )
+                self._exchange_account_event_time = max(
+                    float(self._exchange_account_event_time or 0.0),
+                    account_snapshot_floor,
                 )
                 self.order_monitor.monitored_orders.clear()
 
@@ -1351,15 +2302,6 @@ class OMS:
                 f"exposure_limit:{risk_reason}",
             )
 
-        order = Order(client_oid, intent)
-
-        with self.lock:
-            self.orders[client_oid] = order
-            order.mark_submitting()
-            self.exposure.update_open_orders(self.orders)
-            self.account.calculate()
-            self._record_order_snapshot(order, "accepted")
-
         request = OrderRequest(
             symbol=intent.symbol,
             price=intent.price,
@@ -1370,15 +2312,87 @@ class OMS:
             post_only=intent.is_post_only,
             reduce_only=intent.reduce_only,
         )
+        order = Order(client_oid, intent)
+        command_id = f"SUBMIT:{client_oid}"
 
-        exchange_oid = self.gateway.send_order(request, client_oid)
-
-        if exchange_oid:
+        # The order snapshot and command intent must be durable before the first
+        # byte is sent to the venue. A restart can then query by client_oid
+        # without ever blindly resending an ambiguous command.
+        try:
             with self.lock:
-                order.mark_pending_ack(exchange_oid)
-                self.exchange_id_map[exchange_oid] = order
-                self._record_order_snapshot(order, "rest_ack")
+                self.orders[client_oid] = order
+                order.mark_submitting()
+                self.exposure.update_open_orders(self.orders)
+                self.account.calculate()
+                self._record_order_snapshot(order, "accepted")
+            self._record_command_prepared(command_id, "SUBMIT", order, request)
+        except JournalError as exc:
+            with self.lock:
+                order.mark_rejected_locally("durable_journal_unavailable")
+                self.orders.pop(client_oid, None)
+                self.exposure.update_open_orders(self.orders)
+                self.account.calculate()
                 self._emit_order_update(order)
+            self._fail_closed_on_journal_error(exc, "prepare_submit", intent.symbol)
+            return OrderSubmitResult(
+                accepted=False,
+                client_oid=client_oid,
+                reason="durable_journal_unavailable",
+                state=self.state.value,
+            )
+
+        try:
+            raw_result = self.gateway.send_order(request, client_oid)
+            command = self._normalize_submit_command(raw_result)
+        except Exception as exc:
+            command = GatewayCommandResult(
+                CommandOutcome.UNKNOWN,
+                error_message=f"gateway_send_exception:{exc}",
+            )
+
+        try:
+            self._record_command_result(
+                command_id,
+                "SUBMIT",
+                order,
+                command.outcome,
+                exchange_oid=command.exchange_oid,
+                error_code=command.error_code,
+                error_message=command.error_message,
+            )
+        except JournalError as exc:
+            with self.lock:
+                if order.status == OrderStatus.SUBMITTING:
+                    order.mark_submit_unknown("result_not_durable")
+                self._emit_order_update(order)
+            self._fail_closed_on_journal_error(exc, "result_submit", intent.symbol)
+            self._on_order_truth_check(
+                "Submit result could not be persisted",
+                suspicious_oid=client_oid,
+            )
+            return OrderSubmitResult(
+                accepted=True,
+                client_oid=client_oid,
+                reason="submit_outcome_unknown",
+                state=self.state.value,
+            )
+
+        if command.outcome == CommandOutcome.ACKNOWLEDGED:
+            exchange_oid = command.exchange_oid
+            try:
+                with self.lock:
+                    order.mark_pending_ack(exchange_oid)
+                    self.exchange_id_map[exchange_oid] = order
+                    self._record_order_snapshot(order, "rest_ack")
+                    self._emit_order_update(order)
+            except JournalError as exc:
+                self._fail_closed_on_journal_error(exc, "snapshot_submit_ack", intent.symbol)
+                return OrderSubmitResult(
+                    accepted=True,
+                    client_oid=client_oid,
+                    reason="accepted_but_local_snapshot_failed",
+                    state=self.state.value,
+                )
 
             event_data = OrderSubmitted(request, client_oid, time.time())
             self.event_engine.put(Event(EVENT_ORDER_SUBMITTED, event_data))
@@ -1397,24 +2411,83 @@ class OMS:
                 state=self.state.value,
             )
 
-        with self.lock:
-            order.mark_rejected_locally("gateway_send_failed")
-            self._record_order_snapshot(order, "send_failed")
-            self._emit_order_update(order)
-            self.orders.pop(client_oid, None)
-            self.exposure.update_open_orders(self.orders)
-            self.account.calculate()
+        if command.outcome == CommandOutcome.UNKNOWN:
+            try:
+                with self.lock:
+                    order.mark_submit_unknown(command.error_message or "submit_outcome_unknown")
+                    self._record_order_snapshot(
+                        order,
+                        "send_unknown",
+                        error_code=command.error_code,
+                        error_message=command.error_message,
+                    )
+                    self._emit_order_update(order)
+            except JournalError as exc:
+                self._fail_closed_on_journal_error(exc, "snapshot_submit_unknown", intent.symbol)
+                self._on_order_truth_check(
+                    "Submit result could not be persisted",
+                    suspicious_oid=client_oid,
+                )
+                return OrderSubmitResult(
+                    accepted=True,
+                    client_oid=client_oid,
+                    reason="submit_outcome_unknown",
+                    state=self.state.value,
+                )
+            self.event_engine.put(
+                Event(
+                    EVENT_ORDER_SUBMITTED,
+                    OrderSubmitted(request, client_oid, time.time(), OrderStatus.SUBMIT_UNKNOWN),
+                )
+            )
+            self.freeze_symbol(
+                intent.symbol,
+                f"order_truth:submit_unknown:{client_oid}",
+                cancel_active_orders=False,
+            )
+            self._audit(
+                "order_submit_unknown",
+                client_oid=client_oid,
+                symbol=intent.symbol,
+                error_code=command.error_code,
+                error_message=command.error_message,
+            )
+            self._on_order_truth_check("Order submit outcome unknown", suspicious_oid=client_oid)
+            return OrderSubmitResult(
+                accepted=True,
+                client_oid=client_oid,
+                reason="submit_outcome_unknown",
+                state=self.state.value,
+            )
+
+        try:
+            with self.lock:
+                reject_reason = command.error_message or command.error_code or "gateway_send_rejected"
+                order.mark_rejected_locally(reject_reason)
+                self._record_order_snapshot(order, "send_failed")
+                self._emit_order_update(order)
+                self.orders.pop(client_oid, None)
+                self.exposure.update_open_orders(self.orders)
+                self.account.calculate()
+        except JournalError as exc:
+            self._fail_closed_on_journal_error(exc, "snapshot_submit_rejected", intent.symbol)
+            return OrderSubmitResult(
+                accepted=False,
+                client_oid=client_oid,
+                reason="durable_journal_unavailable",
+                state=self.state.value,
+            )
         self._write_tombstone(order)
         self._audit(
             "order_rejected_locally",
             client_oid=client_oid,
             symbol=intent.symbol,
-            reason="gateway_send_failed",
+            reason=reject_reason,
         )
         return OrderSubmitResult(
             accepted=False,
             client_oid=client_oid,
-            reason="gateway_send_failed",
+            reason=reject_reason,
             state=self.state.value,
         )
 
@@ -1448,20 +2521,34 @@ class OMS:
             )
             return False
 
-        with self.lock:
-            order = self.orders.get(client_oid)
-            if not order or not order.is_active():
-                return False
-            target_id = order.exchange_oid if order.exchange_oid else client_oid
-            try:
-                order.mark_cancelling()
-                self._record_order_snapshot(order, "cancel_requested")
-                self._emit_order_update(order)
-            except ValueError:
-                pass
-            request = CancelRequest(order.intent.symbol, target_id)
+        command_id = f"CANCEL:{client_oid}:{uuid.uuid4().hex}"
+        try:
+            with self.lock:
+                order = self.orders.get(client_oid)
+                if not order or not order.is_active():
+                    return False
+                target_id = order.exchange_oid if order.exchange_oid else client_oid
+                try:
+                    order.mark_cancelling()
+                    self._record_order_snapshot(order, "cancel_requested")
+                    self._emit_order_update(order)
+                except ValueError:
+                    pass
+                request = CancelRequest(order.intent.symbol, target_id)
+            self._record_command_prepared(command_id, "CANCEL", order, request)
+        except JournalError as exc:
+            self._fail_closed_on_journal_error(
+                exc,
+                "prepare_cancel",
+                order.intent.symbol if order else "",
+            )
+            return False
 
-        response = self.gateway.cancel_order(request)
+        try:
+            response = self.gateway.cancel_order(request)
+        except Exception as exc:
+            logger.error(f"[OMS] Cancel command raised for {client_oid}: {exc}")
+            response = None
         error_code = ""
         error_message = ""
         if response is not None and getattr(response, "status_code", 0) != 200:
@@ -1474,15 +2561,66 @@ class OMS:
                 error_code = "" if raw_code is None else str(raw_code)
                 error_message = str(payload.get("msg", "") or "")
 
-        if error_code == "-2011":
+        command_outcome = (
+            CommandOutcome.ACKNOWLEDGED
+            if response is not None and getattr(response, "status_code", 0) == 200
+            else CommandOutcome.UNKNOWN
+        )
+        try:
+            self._record_command_result(
+                command_id,
+                "CANCEL",
+                order,
+                command_outcome,
+                exchange_oid=order.exchange_oid,
+                error_code=error_code,
+                error_message=error_message,
+            )
+        except JournalError as exc:
+            with self.lock:
+                current = self.orders.get(client_oid)
+                if current and current.is_active():
+                    try:
+                        current.mark_cancel_unknown("result_not_durable")
+                    except ValueError:
+                        pass
+                    self._emit_order_update(current)
+            self._fail_closed_on_journal_error(exc, "result_cancel", request.symbol)
+            self._on_order_truth_check(
+                "Cancel result could not be persisted",
+                suspicious_oid=client_oid,
+            )
+            return True
+
+        if response is not None and getattr(response, "status_code", 0) == 200:
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {}
+            if isinstance(payload, dict) and payload.get("status"):
+                try:
+                    self._apply_exchange_order_snapshot(payload, source="cancel_rest_ack")
+                except JournalError as exc:
+                    self._fail_closed_on_journal_error(
+                        exc,
+                        "snapshot_cancel_ack",
+                        request.symbol,
+                    )
+                    return True
+            self._audit(
+                "cancel_acknowledged",
+                client_oid=client_oid,
+                target_id=target_id,
+                symbol=request.symbol,
+            )
+            return True
+
+        try:
             with self.lock:
                 order = self.orders.get(client_oid)
-                if order:
+                if order and order.is_active():
                     try:
-                        order.mark_cancelled(
-                            update_time=time.time(),
-                            exchange_status="CANCEL_UNKNOWN",
-                        )
+                        order.mark_cancel_unknown(error_message or error_code or "cancel_outcome_unknown")
                     except ValueError:
                         order.note_exchange_update(
                             exchange_status="CANCEL_UNKNOWN",
@@ -1495,25 +2633,29 @@ class OMS:
                         exchange_error_message=error_message,
                     )
                     self._emit_order_update(order)
-                    self._write_tombstone(order)
-                    self.exposure.update_open_orders(self.orders)
-                    self.account.calculate()
-            self._audit(
-                "cancel_unknown_order",
-                client_oid=client_oid,
-                target_id=target_id,
-                symbol=request.symbol,
-                error_code=error_code,
-                error_message=error_message,
+                    self.order_monitor.on_order_update(order.client_oid, order.status)
+        except JournalError as exc:
+            self._fail_closed_on_journal_error(exc, "snapshot_cancel_unknown", request.symbol)
+            self._on_order_truth_check(
+                "Cancel result could not be persisted",
+                suspicious_oid=client_oid,
             )
             return True
 
+        self.freeze_symbol(
+            request.symbol,
+            f"order_truth:cancel_unknown:{client_oid}",
+            cancel_active_orders=False,
+        )
         self._audit(
-            "cancel_submitted",
+            "cancel_outcome_unknown",
             client_oid=client_oid,
             target_id=target_id,
             symbol=request.symbol,
+            error_code=error_code,
+            error_message=error_message,
         )
+        self._on_order_truth_check("Order cancel outcome unknown", suspicious_oid=client_oid)
         return True
 
     def cancel_all_orders(self, symbol: str):
@@ -1529,7 +2671,11 @@ class OMS:
         return True
 
     def on_exchange_update(self, event):
-        self._append_and_process(event)
+        try:
+            self._append_and_process(event)
+        except JournalError as exc:
+            symbol = str(getattr(event.data, "symbol", "") or "")
+            self._fail_closed_on_journal_error(exc, "exchange_update", symbol)
 
     def on_exchange_account_update(self, event):
         update: ExchangeAccountUpdate = event.data
@@ -1540,46 +2686,102 @@ class OMS:
             if not tracked_symbols or symbol in tracked_symbols
         }
 
-        with self.lock:
-            self.account.sync_exchange_balance(
-                update.wallet_balance,
-                available=update.available_balance,
-                asset=update.asset,
-                balances=update.balances,
-            )
-            position_drift = self._collect_exchange_position_drift_locked(
-                tracked_positions,
-                tracked_symbols,
-            )
-            has_active_orders = self._has_active_orders_locked(tracked_symbols)
+        event_time = float(update.event_time or 0.0)
+        has_balance_update = bool(update.asset or update.balances)
+        corrected_positions = {}
+        corrected_with_active_order = {}
 
-        if not position_drift:
+        with self.lock:
+            # ACCOUNT_UPDATE.P is a partial delta: only symbols changed by this
+            # account event are present. Absence must never be interpreted as a
+            # flat position.
+            for symbol, payload in tracked_positions.items():
+                state_time = float(self._position_state_event_time.get(symbol, 0.0) or 0.0)
+                if event_time and state_time and event_time + 1e-6 < state_time:
+                    self._audit(
+                        "stale_exchange_position_update_ignored",
+                        symbol=symbol,
+                        event_time=event_time,
+                        state_time=state_time,
+                    )
+                    continue
+
+                remote_volume = float(payload.get("volume", 0.0) or 0.0)
+                remote_entry_price = float(payload.get("entry_price", 0.0) or 0.0)
+                local_volume = float(self.exposure.net_positions.get(symbol, 0.0) or 0.0)
+                if abs(local_volume - remote_volume) > 1e-9:
+                    corrected_positions[symbol] = {
+                        "local": local_volume,
+                        "exchange": remote_volume,
+                        "entry_price": remote_entry_price,
+                    }
+                    corrected_with_active_order[symbol] = self._has_active_orders_locked({symbol})
+                    self.exposure.force_sync(symbol, remote_volume, remote_entry_price)
+
+                if event_time:
+                    self._position_state_event_time[symbol] = max(state_time, event_time)
+                    self._exchange_position_event_time[symbol] = max(
+                        float(self._exchange_position_event_time.get(symbol, 0.0) or 0.0),
+                        event_time,
+                    )
+
+            account_state_time = float(self._account_state_event_time or 0.0)
+            account_update_is_stale = bool(
+                event_time
+                and account_state_time
+                and event_time + 1e-6 < account_state_time
+            )
+            if account_update_is_stale:
+                self._audit(
+                    "stale_exchange_account_update_ignored",
+                    event_time=event_time,
+                    state_time=account_state_time,
+                )
+                if corrected_positions:
+                    self.account.calculate()
+            elif has_balance_update:
+                self.account.sync_exchange_balance(
+                    update.wallet_balance,
+                    available=update.available_balance,
+                    asset=update.asset,
+                    balances=update.balances,
+                )
+                if event_time:
+                    self._account_state_event_time = max(account_state_time, event_time)
+                    self._exchange_account_event_time = max(
+                        float(self._exchange_account_event_time or 0.0),
+                        event_time,
+                    )
+
+        if not corrected_positions:
             return
 
         self._audit(
-            "exchange_account_position_drift",
+            "exchange_account_positions_synced",
             reason=update.reason,
-            positions=position_drift,
+            event_time=event_time,
+            positions=corrected_positions,
         )
+
+        for symbol in corrected_positions:
+            self._emit_position_update(symbol)
 
         if self.state in {LifecycleState.HALTED, LifecycleState.RECONCILING}:
             return
 
-        if has_active_orders:
-            logger.error(f"[OMS] Exchange position drift detected while orders are active: {position_drift}")
-        else:
-            logger.error(f"[OMS] Exchange position drift detected without active orders: {position_drift}")
-
-        self.trigger_reconcile("Exchange account position drift")
+        unexpected_positions = {
+            symbol: payload
+            for symbol, payload in corrected_positions.items()
+            if not corrected_with_active_order.get(symbol, False)
+        }
+        if unexpected_positions:
+            logger.error(
+                "[OMS] Exchange position correction without an active local order: "
+                f"{unexpected_positions}"
+            )
+            self.trigger_reconcile("Unexpected exchange account position correction")
 
     def _append_and_process(self, event):
-        if event.type == "eExchangeOrderUpdate":
-            update: ExchangeOrderUpdate = event.data
-            if not self.sequence.check(update.seq):
-                self._audit("sequence_gap", seq=update.seq)
-                self.trigger_reconcile(f"Seq gap {update.seq}")
-                return
-
         self.event_log.append(event)
         self._apply_event(event)
 
@@ -1638,6 +2840,21 @@ class OMS:
                 )
                 return
 
+            if (
+                not update.seq
+                and update.update_time
+                and order.last_exchange_update_time
+                and update.update_time + 1e-6 < order.last_exchange_update_time
+                and update.cum_filled_qty <= order.filled_volume + 1e-9
+            ):
+                self._audit(
+                    "stale_exchange_time_update_ignored",
+                    client_oid=order.client_oid,
+                    update_time=update.update_time,
+                    last_exchange_update_time=order.last_exchange_update_time,
+                )
+                return
+
             if update.cum_filled_qty + 1e-9 < order.filled_volume:
                 self._audit(
                     "cum_fill_regression",
@@ -1651,6 +2868,48 @@ class OMS:
                     daemon=True,
                 ).start()
                 return
+
+            if (
+                update.status in {"CANCELED", "EXPIRED"}
+                and update.cum_filled_qty > order.filled_volume + 1e-9
+            ):
+                recovery_price = update.filled_price or order.avg_price or order.intent.price
+                recovery_status = (
+                    "FILLED"
+                    if update.cum_filled_qty >= order.intent.volume - 1e-8
+                    else "PARTIALLY_FILLED"
+                )
+                self._audit(
+                    "terminal_update_missing_fill_recovered",
+                    client_oid=order.client_oid,
+                    exchange_status=update.status,
+                    local_filled=order.filled_volume,
+                    exchange_filled=update.cum_filled_qty,
+                )
+                self._apply_event(
+                    Event(
+                        EVENT_EXCHANGE_ORDER_UPDATE,
+                        ExchangeOrderUpdate(
+                            client_oid=order.client_oid,
+                            exchange_oid=update.exchange_oid or order.exchange_oid,
+                            symbol=order.intent.symbol,
+                            status=recovery_status,
+                            filled_qty=update.cum_filled_qty - order.filled_volume,
+                            filled_price=recovery_price,
+                            cum_filled_qty=update.cum_filled_qty,
+                            update_time=update.update_time,
+                            seq=update.seq,
+                            commission=update.commission,
+                            commission_asset=update.commission_asset,
+                            realized_pnl=update.realized_pnl,
+                            is_maker=update.is_maker,
+                            trade_id=update.trade_id,
+                        ),
+                    )
+                )
+                order = self.orders.get(order.client_oid, order)
+                if order.status == OrderStatus.FILLED:
+                    return
 
             previous_status = order.status
             had_fill = False
@@ -1689,6 +2948,12 @@ class OMS:
                 elif update.status in ["FILLED", "PARTIALLY_FILLED"]:
                     delta = update.cum_filled_qty - order.filled_volume
                     if delta > 1e-9:
+                        fill_notional = delta * update.filled_price
+                        fee = self._get_fill_commission(update, order, fill_notional)
+                        # Execution truth is committed before mutating order,
+                        # exposure, or account projections. If the process dies
+                        # after this point, replay can finish applying the fill.
+                        self._record_execution(order, update, delta, fee)
                         had_fill = order.add_fill(
                             delta,
                             update.filled_price,
@@ -1696,25 +2961,68 @@ class OMS:
                             seq=update.seq,
                             exchange_status=update.status,
                         )
-                        local_realized_pnl = self.exposure.on_fill(
-                            order.intent.symbol,
-                            order.intent.side,
-                            delta,
-                            update.filled_price,
+                        symbol = order.intent.symbol
+                        exchange_position_time = float(
+                            self._exchange_position_event_time.get(symbol, 0.0) or 0.0
                         )
+                        position_already_synced = bool(
+                            update.update_time
+                            and exchange_position_time + 1e-6 >= update.update_time
+                        )
+                        if position_already_synced:
+                            local_realized_pnl = 0.0
+                            self._audit(
+                                "fill_position_already_covered",
+                                client_oid=order.client_oid,
+                                symbol=symbol,
+                                fill_time=update.update_time,
+                                exchange_position_time=exchange_position_time,
+                            )
+                        else:
+                            local_realized_pnl = self.exposure.on_fill(
+                                symbol,
+                                order.intent.side,
+                                delta,
+                                update.filled_price,
+                            )
+                            if update.update_time:
+                                self._position_state_event_time[symbol] = max(
+                                    float(self._position_state_event_time.get(symbol, 0.0) or 0.0),
+                                    update.update_time,
+                                )
                         realized_pnl = (
                             update.realized_pnl
                             if update.realized_pnl is not None
                             else local_realized_pnl
                         )
-                        fill_notional = delta * update.filled_price
-                        fee = self._get_fill_commission(update, order, fill_notional)
-                        self.account.update_balance(realized_pnl, fee)
+                        account_already_synced = bool(
+                            update.update_time
+                            and float(self._exchange_account_event_time or 0.0) + 1e-6
+                            >= update.update_time
+                        )
+                        if account_already_synced:
+                            self._audit(
+                                "fill_account_already_covered",
+                                client_oid=order.client_oid,
+                                fill_time=update.update_time,
+                                exchange_account_time=self._exchange_account_event_time,
+                            )
+                        else:
+                            self.account.update_balance(realized_pnl, fee)
+                            if update.update_time:
+                                self._account_state_event_time = max(
+                                    float(self._account_state_event_time or 0.0),
+                                    update.update_time,
+                                )
 
                         trade_data = TradeData(
                             symbol=order.intent.symbol,
                             order_id=order.client_oid,
-                            trade_id=f"T{int(update.update_time * 1000)}",
+                            trade_id=(
+                                str(update.trade_id)
+                                if update.trade_id >= 0
+                                else f"T{int(update.update_time * 1000)}"
+                            ),
                             side=order.intent.side.value,
                             price=update.filled_price,
                             volume=delta,
@@ -1732,6 +3040,14 @@ class OMS:
                     if update.status == "FILLED":
                         order.mark_filled(update_time=update.update_time, seq=update.seq)
                         self._write_tombstone(order)
+
+                    if update.trade_id >= 0:
+                        self._advance_trade_cursor(
+                            order.intent.symbol,
+                            update.trade_id,
+                            update.update_time,
+                            source="user_stream",
+                        )
 
                 else:
                     self._audit(
@@ -1778,13 +3094,96 @@ class OMS:
                 if had_fill:
                     self._emit_position_update(order.intent.symbol)
 
+    def _apply_recovered_execution(self, order: Order, payload: dict):
+        execution_id = str(payload.get("execution_id", "") or "")
+        if not execution_id:
+            raise JournalCorruptionError(
+                f"Execution record without execution_id for {order.client_oid}"
+            )
+        self.execution_ids.add(execution_id)
+
+        exchange_oid = str(payload.get("exchange_oid", "") or "")
+        if exchange_oid:
+            order.exchange_oid = exchange_oid
+
+        try:
+            cumulative_qty = float(payload.get("cum_filled_qty", 0.0) or 0.0)
+            fill_price = float(payload.get("fill_price", 0.0) or 0.0)
+            exchange_time = float(payload.get("exchange_time", 0.0) or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise JournalCorruptionError(
+                f"Malformed execution record {execution_id}: {exc}"
+            ) from exc
+
+        delta = cumulative_qty - order.filled_volume
+        if delta <= 1e-9:
+            return
+
+        pre_status = order.status
+        order.add_fill(
+            delta,
+            fill_price,
+            update_time=exchange_time,
+            exchange_status=str(payload.get("exchange_status", "") or "PARTIALLY_FILLED"),
+        )
+        if order.status == OrderStatus.FILLED:
+            return
+        if pre_status == OrderStatus.CANCELLED:
+            order.mark_cancelled(update_time=exchange_time)
+        elif pre_status == OrderStatus.EXPIRED:
+            order.mark_expired(update_time=exchange_time)
+
+    def _apply_recovered_command_result(self, order: Order, payload: dict):
+        command_type = str(payload.get("command_type", "") or "").upper()
+        try:
+            outcome = CommandOutcome(str(payload.get("outcome", "") or ""))
+        except ValueError as exc:
+            raise JournalCorruptionError(
+                f"Invalid command outcome for {order.client_oid}: {payload.get('outcome')}"
+            ) from exc
+
+        error_message = str(
+            payload.get("error_message", "")
+            or payload.get("error_code", "")
+            or "recovered_command_result"
+        )
+        exchange_oid = str(payload.get("exchange_oid", "") or "")
+
+        if command_type == "SUBMIT":
+            if order.status == OrderStatus.CREATED:
+                order.mark_submitting()
+            if order.status != OrderStatus.SUBMITTING:
+                return
+            if outcome == CommandOutcome.ACKNOWLEDGED:
+                order.mark_pending_ack(exchange_oid)
+            elif outcome == CommandOutcome.UNKNOWN:
+                order.mark_submit_unknown(error_message)
+            else:
+                order.mark_rejected_locally(error_message)
+            return
+
+        if command_type == "CANCEL" and order.is_active():
+            if order.status != OrderStatus.CANCELLING:
+                try:
+                    order.mark_cancelling()
+                except ValueError:
+                    pass
+            if order.status == OrderStatus.CANCELLING:
+                order.mark_cancel_unknown(
+                    "recovered_cancel_ack_requires_truth"
+                    if outcome == CommandOutcome.ACKNOWLEDGED
+                    else error_message
+                )
+
     def rebuild_from_log(self):
         records = self.journal.load()
         if not records:
             return {
                 "records": 0,
                 "recovered_orders": 0,
+                "recovered_active_orders": 0,
                 "recovered_terminal_ids": 0,
+                "pending_commands": 0,
                 "last_lifecycle": None,
                 "last_freeze_reason": "",
                 "last_halt_reason": "",
@@ -1797,9 +3196,14 @@ class OMS:
                 "mode_override_reason": "",
                 "clean_shutdown": True,
                 "dirty_shutdown": False,
+                "trade_cursors": {},
+                "trade_scan_end_ms": {},
             }
 
         latest_order_records = {}
+        latest_order_record_indexes = {}
+        commands = {}
+        executions_by_client_oid = {}
         last_lifecycle = None
         last_freeze_reason = ""
         last_halt_reason = ""
@@ -1810,14 +3214,31 @@ class OMS:
         strategy_symbol_guards = {}
         mode_override = ""
         mode_override_reason = ""
+        trade_cursors = {}
+        trade_scan_end_ms = {}
         clean_shutdown = records[-1].get("kind") == "oms_stopped"
-        for record in records:
+        for record_index, record in enumerate(records):
             payload = record.get("payload", {})
             kind = record.get("kind")
             if kind == "order_snapshot":
                 client_oid = payload.get("client_oid")
                 if client_oid:
                     latest_order_records[client_oid] = payload
+                    latest_order_record_indexes[client_oid] = record_index
+            elif kind in {"command_prepared", "command_result"}:
+                command_id = str(payload.get("command_id", "") or "")
+                if command_id:
+                    entry = commands.setdefault(command_id, {})
+                    entry[kind] = {
+                        "index": record_index,
+                        "payload": payload,
+                    }
+            elif kind == "execution_record":
+                client_oid = str(payload.get("client_oid", "") or "")
+                if client_oid:
+                    executions_by_client_oid.setdefault(client_oid, []).append(
+                        {"index": record_index, "payload": payload}
+                    )
             elif kind == "lifecycle":
                 last_lifecycle = payload.get("state")
                 reason = str(payload.get("reason", "") or "")
@@ -1904,27 +3325,119 @@ class OMS:
                     last_lifecycle = state
                 if payload.get("manual_rearm_required") is True:
                     manual_rearm_required = True
+            elif kind == "trade_cursor_advanced":
+                symbol = str(payload.get("symbol", "") or "").upper()
+                trade_id = int(payload.get("trade_id", -1))
+                if symbol:
+                    trade_cursors[symbol] = max(trade_cursors.get(symbol, -1), trade_id)
+            elif kind == "trade_scan_completed":
+                symbol = str(payload.get("symbol", "") or "").upper()
+                end_time_ms = int(payload.get("end_time_ms", 0))
+                if symbol:
+                    trade_scan_end_ms[symbol] = max(
+                        trade_scan_end_ms.get(symbol, 0),
+                        end_time_ms,
+                    )
+
+        latest_command_results = {}
+        pending_commands = 0
+        for entry in commands.values():
+            prepared = entry.get("command_prepared")
+            result = entry.get("command_result")
+            if prepared and not result:
+                prepared_payload = prepared["payload"]
+                client_oid = str(prepared_payload.get("client_oid", "") or "")
+                snapshot = latest_order_records.get(client_oid, {})
+                snapshot_index = latest_order_record_indexes.get(client_oid, -1)
+                snapshot_status = str(snapshot.get("status", "") or "")
+                ambiguous_statuses = {
+                    OrderStatus.SUBMITTING.value,
+                    OrderStatus.SUBMIT_UNKNOWN.value,
+                    OrderStatus.CANCELLING.value,
+                    OrderStatus.CANCEL_UNKNOWN.value,
+                }
+                if (
+                    not snapshot
+                    or snapshot_index <= prepared["index"]
+                    or snapshot_status in ambiguous_statuses
+                ):
+                    pending_commands += 1
+            if not result:
+                continue
+            result_payload = result["payload"]
+            client_oid = str(result_payload.get("client_oid", "") or "")
+            if not client_oid:
+                continue
+            current = latest_command_results.get(client_oid)
+            if current is None or result["index"] > current["index"]:
+                latest_command_results[client_oid] = result
 
         with self.lock:
+            self.orders.clear()
+            self.exchange_id_map.clear()
+            self.execution_ids.clear()
             self.terminated_oids.clear()
             self.terminated_oid_queue.clear()
             recovered_terminal_ids = 0
-            for payload in latest_order_records.values():
-                status = payload.get("status")
-                if status in {state.value for state in TERMINAL_STATUSES}:
-                    client_oid = payload.get("client_oid")
-                    exchange_oid = payload.get("exchange_oid")
-                    if client_oid:
-                        self._remember_terminated_oid(client_oid)
+            recovered_active_orders = 0
+            for client_oid, payload in latest_order_records.items():
+                try:
+                    order = Order.from_record(payload)
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise JournalCorruptionError(
+                        f"Invalid order snapshot for {client_oid}: {exc}"
+                    ) from exc
+
+                trailing_result = latest_command_results.get(client_oid)
+                if (
+                    trailing_result
+                    and trailing_result["index"] > latest_order_record_indexes[client_oid]
+                ):
+                    self._apply_recovered_command_result(
+                        order,
+                        trailing_result["payload"],
+                    )
+
+                for execution in executions_by_client_oid.get(client_oid, []):
+                    self.execution_ids.add(
+                        str(execution["payload"].get("execution_id", "") or "")
+                    )
+                    if execution["index"] > latest_order_record_indexes[client_oid]:
+                        self._apply_recovered_execution(order, execution["payload"])
+
+                # PREPARED/SUBMITTING and PREPARED/CANCELLING are deliberately
+                # ambiguous after a process crash. They must be queried by the
+                # durable idempotency key and never blindly resent.
+                if order.status == OrderStatus.SUBMITTING:
+                    order.mark_submit_unknown("recovered_inflight_submit")
+                elif order.status == OrderStatus.CANCELLING:
+                    order.mark_cancel_unknown("recovered_inflight_cancel")
+
+                if order.is_active():
+                    self.orders[order.client_oid] = order
+                    if order.exchange_oid:
+                        self.exchange_id_map[order.exchange_oid] = order
+                    self.order_monitor.recover_order(order)
+                    recovered_active_orders += 1
+                    continue
+
+                if order.is_terminal():
+                    if order.client_oid:
+                        self._remember_terminated_oid(order.client_oid)
                         recovered_terminal_ids += 1
-                    if exchange_oid:
-                        self._remember_terminated_oid(exchange_oid)
+                    if order.exchange_oid:
+                        self._remember_terminated_oid(order.exchange_oid)
                         recovered_terminal_ids += 1
+
+            self.exposure.update_open_orders(self.orders)
+            self.account.calculate()
 
         summary = {
             "records": len(records),
             "recovered_orders": len(latest_order_records),
+            "recovered_active_orders": recovered_active_orders,
             "recovered_terminal_ids": recovered_terminal_ids,
+            "pending_commands": pending_commands,
             "last_lifecycle": last_lifecycle,
             "last_freeze_reason": last_freeze_reason,
             "last_halt_reason": last_halt_reason,
@@ -1937,6 +3450,8 @@ class OMS:
             "mode_override_reason": mode_override_reason,
             "clean_shutdown": clean_shutdown,
             "dirty_shutdown": not clean_shutdown,
+            "trade_cursors": trade_cursors,
+            "trade_scan_end_ms": trade_scan_end_ms,
         }
         if recovered_terminal_ids:
             logger.info(

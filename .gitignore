@@ -23,3 +23,7 @@ logs/
 # 7. 忽略测试文件
 *.ps1
 tests/
+!tests/
+tests/*
+!tests/test_oms_institutional_recovery.py
+!tests/test_oms_durable_ledger.py
