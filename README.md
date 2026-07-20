@@ -1,6 +1,116 @@
 # ChronosHFT
 An institutional-grade high-frequency trading framework for cryptocurrencies written in Python.
 
+## Paper Trade: production public data, local execution
+
+`config.example.json` defaults to Paper mode. It consumes Binance USDⓈ-M
+**production public** market data (not Binance Testnet), while balances, orders,
+fills, fees and PnL are produced by the local simulator. Paper mode does not
+require an API key or secret and must not call private order, account, user-data
+stream, listen-key or income endpoints.
+
+The local dashboard must display `PAPER · LIVE DATA`. In this mode:
+
+- `BINANCE_MAINNET_PUBLIC` means live production prices from public endpoints.
+- `LOCAL_SIMULATOR` means funds, order acknowledgements, cancels and fills are simulated.
+- `private_api_enabled=false` means no private Binance session is permitted.
+- Paper OMS journals and locks live under `storage/paper/`, separate from live state.
+- The current simulator uses `reset_on_start=true`: balances, positions and
+  venue orders start fresh on every process launch, and older Paper OMS
+  journals are retained for audit but are not replayed into the fresh ledger.
+
+Paper RPI fills are model assumptions only. They do not prove that Binance
+accepted a real RPI order, that it joined a real RPI queue, or that a Binance
+App/Web retail counterparty traded against it. The example therefore keeps
+`paper_trade.rpi_fill_model` set to `disabled` until an explicit, calibrated
+local RPI fill model is chosen.
+
+## Start the engine and local dashboard
+
+For a first Paper run, create `config.json` from the safe example, then start
+the main program. No credential environment variables are needed:
+
+```powershell
+Copy-Item config.example.json config.json
+```
+
+```powershell
+.\.venv\Scripts\python.exe main.py --config config.json
+```
+
+The read-only monitoring page starts with the engine at
+`http://127.0.0.1:8765/`. It covers account, PnL, positions, market data,
+orders, fills, A-S/GLFT/ML strategy telemetry, risk limits, kill/freeze
+states, runtime queues, RPI eligibility/routing/fees, alerts, and logs.
+The service binds to loopback only and exposes no trading action endpoint.
+Before trusting the run, verify the top banner says `PAPER · LIVE DATA`,
+`本地模拟资金与撮合`, and `私有 API 已禁用`. If it says
+`LIVE · REAL MONEY`, stop the process and inspect `execution.mode`.
+
+## Strategy model registry
+
+The engine registers `glft`, `avellaneda_stoikov`, and `ml_sniper`, while
+constructing exactly one order-owning strategy. The current Paper configuration
+uses GLFT as the primary; A-S and ML Sniper are registered choices:
+
+```json
+"strategy": {
+  "primary_model": "glft",
+  "registered_models": ["glft", "avellaneda_stoikov", "ml_sniper"],
+  "execution_policy": "single_primary"
+}
+```
+
+To make A-S primary, change only `primary_model` to
+`avellaneda_stoikov`, then restart the engine. There is no automatic model
+failover. The loader canonicalizes `strategy.name` to the stable OMS/risk ID
+automatically. A-S and GLFT are never concurrent execution owners
+for the same symbol: simultaneous quoting would duplicate orders, split
+inventory ownership, and corrupt per-strategy risk accounting.
+
+GLFT is the architectural primary for continuous multi-symbol market making;
+A-S remains the simpler, interpretable baseline and cold-start fallback. This
+is a Paper-validation choice, not live approval. Both implementations still
+need dimensionally consistent volatility/intensity calibration and walk-forward
+validation, with RPI fill intensity calibrated separately from ordinary public
+trade flow.
+
+## List Binance RPI contracts
+
+Query the public USDⓈ-M `exchangeInfo` endpoint and list every currently
+trading contract whose `permissionSets` contains `RPI`:
+No API key or secret is required.
+
+```powershell
+.\.venv\Scripts\python.exe scripts\list_binance_rpi_contracts.py
+```
+
+Useful filters and export formats:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\list_binance_rpi_contracts.py --quote-asset USDT --contract-type PERPETUAL --format symbols
+.\.venv\Scripts\python.exe scripts\list_binance_rpi_contracts.py --format json --output rpi_contracts.json
+.\.venv\Scripts\python.exe scripts\list_binance_rpi_contracts.py --format csv --output rpi_contracts.csv
+```
+
+## Roadmap / TODO
+
+- [x] Paper Trade on production public market data (not Binance Testnet):
+      consume real live market streams, route every order to a local matching
+      and fill simulator, never call private exchange trading endpoints, and
+      label the UI environment as `PAPER · LIVE DATA`.
+- [ ] Audit the Avellaneda-Stoikov and GLFT implementations against the original
+      papers and top-tier institutional practice: intensity calibration, dynamic risk
+      aversion, volatility estimation, fees/adverse selection, queue and
+      latency models, multi-level quoting, regime switching, and empirical
+      validation.
+- [ ] Remove the TUI completely: delete the Rich Live dashboard, its event/log
+      fan-out wiring, configuration, and runtime dependency so the local web UI
+      becomes the only operator interface. Redesign that web UI around a
+      top-tier institutional trading-console hierarchy with fewer simultaneous
+      panels, stronger prioritization, progressive disclosure, and materially
+      lower visual noise while retaining full telemetry access.
+
 # Key Features:
 🚀 Asynchronous Event-Driven Architecture: Ultra-low latency signal processing.
 

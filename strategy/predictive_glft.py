@@ -20,16 +20,20 @@
 #   修复：将下限提升到 0.4，确保最小价差不低于逆向选择 buffer。
 # ============================================================
 
-import time
 import math
-import numpy as np
-from collections import defaultdict, deque
+import time
+from collections import defaultdict
 
 from .base import StrategyTemplate
 from event.type import (
-    OrderBook, TradeData, OrderIntent, Side,
-    AggTradeData, OrderStateSnapshot,
-    Event, EVENT_STRATEGY_UPDATE, StrategyData
+    EVENT_STRATEGY_UPDATE,
+    AggTradeData,
+    Event,
+    OrderBook,
+    OrderIntent,
+    Side,
+    StrategyData,
+    TIF_GTX,
 )
 
 from alpha.factors import GLFTCalibrator
@@ -188,10 +192,13 @@ class PredictiveGLFTStrategy(StrategyTemplate):
 
         # 资金占用硬风控
         acc = self.oms.account
+        margin_usage = 0.0
+        margin_defense = False
         if acc.equity > 0:
-            usage = acc.used_margin / acc.equity
-            if usage > 0.6:
+            margin_usage = acc.used_margin / acc.equity
+            if margin_usage > 0.6:
                 gamma_final *= 2.0
+                margin_defense = True
 
         # --------------------------------------------------------
         # GLFT 核心计算
@@ -237,12 +244,75 @@ class PredictiveGLFTStrategy(StrategyTemplate):
         # --------------------------------------------------------
         self._update_quotes(symbol, target_bid, target_ask, order_vol)
 
+        quote_state = self.quote_state[symbol]
+        quote_spread_bps = (
+            (target_ask - target_bid) / mid * 10000.0
+            if mid > 0.0
+            else 0.0
+        )
+        params = {
+            "schema": "market_making.v1",
+            "strategy": self.name,
+            "state": "QUOTING",
+            "mode": TIF_GTX,
+            "time_in_force": TIF_GTX,
+            "use_rpi": False,
+            "rpi_supported": ref_data_manager.supports_rpi(symbol),
+            "mid_price": mid,
+            "best_bid": bid_1,
+            "best_ask": ask_1,
+            "market_spread_bps": (
+                (ask_1 - bid_1) / mid * 10000.0
+                if mid > 0.0
+                else 0.0
+            ),
+            "fair_value": fair_mid,
+            "alpha_bps": adjusted_pred_bps,
+            "position_qty": current_pos,
+            "position_notional": current_pos_val,
+            "target_bid": target_bid,
+            "target_ask": target_ask,
+            "quote_spread_bps": quote_spread_bps,
+            "quote_qty": order_vol,
+            "bid_order_id": quote_state["bid_oid"] or "",
+            "ask_order_id": quote_state["ask_oid"] or "",
+            "raw_prediction_bps": raw_pred_bps,
+            "filtered_prediction_bps": pred_bps,
+            "adjusted_prediction_bps": adjusted_pred_bps,
+            "prediction_confidence": confidence,
+            "prediction_horizon_sec": self.pred_conf[
+                "prediction_horizon_sec"
+            ],
+            "fee_threshold_bps": self.pred_conf["fee_threshold_bps"],
+            "inventory_ratio": inventory_ratio,
+            "max_position_notional": max_pos_val,
+            "base_gamma": self.base_gamma,
+            "gamma_beta": beta,
+            "gamma_multiplier": gamma_mult,
+            "gamma": gamma_final,
+            "margin_usage": margin_usage,
+            "margin_defense": margin_defense,
+            "k": k,
+            "A": A,
+            "sigma_bps": sigma_bps,
+            "q_norm": q_norm,
+            "half_spread_bps": half_spread_bps,
+            "inventory_skew_bps": skew_bps,
+            "spread_price": spread_price,
+            "skew_price": skew_price,
+            "effective_min_spread_bps": 5.0,
+            # Compatibility fields consumed by the existing TUI.
+            "State": "QUOTING",
+            "Mode": TIF_GTX,
+            "Spread": f"{quote_spread_bps:.1f}",
+            "Sigma": f"{sigma_bps:.1f}",
+            "Size": f"{order_vol:.8g}",
+        }
         strat_data = StrategyData(
             symbol=symbol,
             fair_value=fair_mid,
             alpha_bps=adjusted_pred_bps,
-            gamma=gamma_final,
-            k=k, A=A, sigma=sigma_bps
+            params=params,
         )
         self.engine.put(Event(EVENT_STRATEGY_UPDATE, strat_data))
         self.feature_engine.reset_interval(symbol)

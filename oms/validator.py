@@ -4,7 +4,7 @@ from collections import deque
 
 from data.cache import data_cache
 from data.ref_data import ref_data_manager
-from event.type import OrderIntent
+from event.type import OrderIntent, TIF_GTX, TIF_RPI
 
 
 class OrderValidator:
@@ -36,12 +36,28 @@ class OrderValidator:
         self._rate_lock = threading.Lock()
 
     def validate_params(self, intent: OrderIntent) -> tuple[bool, str]:
+        if intent.time_in_force == TIF_RPI and intent.order_type != "LIMIT":
+            return False, "rpi_requires_limit_order"
+        if intent.is_post_only and intent.order_type != "LIMIT":
+            return False, "post_only_requires_limit_order"
+        if intent.is_post_only and intent.time_in_force not in {TIF_GTX, TIF_RPI}:
+            return False, (
+                "post_only_incompatible_time_in_force:"
+                f"{intent.time_in_force}"
+            )
+
+        info = ref_data_manager.get_info(intent.symbol)
+        if intent.time_in_force == TIF_RPI:
+            if info is None:
+                return False, f"rpi_capability_unknown:{intent.symbol}"
+            if not info.supports_rpi:
+                return False, f"rpi_unsupported_symbol:{intent.symbol}"
+
         if intent.price <= 0 or intent.volume <= 0:
             return False, "non_positive_price_or_volume"
 
         notional = intent.price * intent.volume
 
-        info = ref_data_manager.get_info(intent.symbol)
         if info and notional < max(info.min_notional, 5.0):
             return False, f"notional_below_min:{notional:.8f}"
 

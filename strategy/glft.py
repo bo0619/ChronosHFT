@@ -2,13 +2,12 @@
 
 import time
 import math
-import numpy as np
 from collections import defaultdict, deque
 
 from .base import StrategyTemplate
 from event.type import (
     OrderBook, TradeData, OrderIntent, Side,
-    AggTradeData, OrderStateSnapshot,
+    AggTradeData, OrderStateSnapshot, OrderStatus,
     Event, EVENT_STRATEGY_UPDATE, StrategyData
 )
 
@@ -22,11 +21,27 @@ from data.cache import data_cache
 from infrastructure.config_scaling import load_root_config
 
 class GLFTStrategy(StrategyTemplate):
-    def __init__(self, engine, oms):
+    def __init__(self, engine, oms, strategy_config=None):
         super().__init__(engine, oms, "GLFT_MultiScale")
 
-        full_config = self._load_full_config()
-        self.strat_conf = full_config.get("strategy", {})
+        if strategy_config is None:
+            full_config = self._load_full_config()
+            self.strat_conf = full_config.get("strategy", {})
+        else:
+            self.strat_conf = dict(strategy_config)
+        glft_conf = self.strat_conf.get("glft", {})
+        self.use_rpi = bool(self.strat_conf.get("use_rpi", False)) and bool(
+            glft_conf.get(
+                "use_rpi",
+                self.strat_conf.get("use_rpi_for_glft", True),
+            )
+        )
+        self.rpi_fallback_to_gtx = bool(
+            glft_conf.get(
+                "rpi_fallback_to_gtx",
+                self.strat_conf.get("rpi_fallback_to_gtx", True),
+            )
+        )
 
         # 基础参数
         self.gamma_base = self.strat_conf.get("gamma", 0.1)
@@ -80,7 +95,8 @@ class GLFTStrategy(StrategyTemplate):
 
     def _calculate_safe_vol(self, symbol, price):
         info = ref_data_manager.get_info(symbol)
-        if not info: return 0.0
+        if not info:
+            return 0.0
         min_vol_by_val = (info.min_notional * 1.1) / price
         base_vol = max(info.min_qty, min_vol_by_val)
         target_vol = base_vol * self.lot_multiplier
@@ -100,13 +116,15 @@ class GLFTStrategy(StrategyTemplate):
 
         # 2. 频率控制
         now = time.time()
-        if now - self.last_run_times[symbol] < self.cycle_interval: return
+        if now - self.last_run_times[symbol] < self.cycle_interval:
+            return
         self.last_run_times[symbol] = now
 
         # 3. 市场切片
         bid_1, _ = ob.get_best_bid()
         ask_1, _ = ob.get_best_ask()
-        if bid_1 == 0: return
+        if bid_1 == 0:
+            return
         mid = (bid_1 + ask_1) / 2.0
 
         # 4. [Multi-Scale ML] 预测
@@ -127,9 +145,10 @@ class GLFTStrategy(StrategyTemplate):
         gamma = self.gamma_base
         
         # A. 资金占用防御
+        margin_usage = 0.0
         if acc.equity > 0:
-            usage = acc.used_margin / acc.equity
-            gamma *= (1 + max(0, (usage - 0.5) * 4))
+            margin_usage = acc.used_margin / acc.equity
+            gamma *= (1 + max(0, (margin_usage - 0.5) * 4))
             
         # B. 订单流失衡防御
         of_imb = abs(self.imbalance_ewma[symbol])
@@ -137,7 +156,8 @@ class GLFTStrategy(StrategyTemplate):
         
         # C. [修复] 刚刚成交后的防御 (Post-Trade Defense)
         # 如果最近 2 秒内有成交，暂时加大 gamma 防止连续被穿
-        if now - self.last_fill_time[symbol] < 2.0:
+        recent_fill_defense = now - self.last_fill_time[symbol] < 2.0
+        if recent_fill_defense:
             gamma *= 1.5
 
         sigma = max(1.0, calibrator.sigma_bps)
@@ -149,7 +169,8 @@ class GLFTStrategy(StrategyTemplate):
         # 7. 计算库存偏移
         current_pos = self.oms.exposure.net_positions.get(symbol, 0.0)
         order_vol = self._calculate_safe_vol(symbol, mid)
-        if order_vol <= 0: return
+        if order_vol <= 0:
+            return
         
         current_pos_usdt = current_pos * mid
         effective_pos_usdt = current_pos_usdt - target_pos_usdt
@@ -170,7 +191,17 @@ class GLFTStrategy(StrategyTemplate):
         info = ref_data_manager.get_info(symbol)
         tick = info.tick_size
         
-        min_half = mid * (self.min_spread_bps / 20000.0)
+        passive_tif = self.resolve_passive_time_in_force(
+            symbol,
+            use_rpi=self.use_rpi,
+            fallback_to_gtx=self.rpi_fallback_to_gtx,
+            route="glft_quote",
+        )
+        effective_min_spread_bps = max(
+            self.min_spread_bps,
+            self.passive_round_trip_fee_bps(symbol, passive_tif),
+        )
+        min_half = mid * (effective_min_spread_bps / 20000.0)
         if (target_ask - target_bid) < min_half * 2:
             center = (target_bid + target_ask) / 2
             target_bid = center - min_half
@@ -179,48 +210,161 @@ class GLFTStrategy(StrategyTemplate):
         target_bid = ref_data_manager.round_price(symbol, target_bid)
         target_ask = ref_data_manager.round_price(symbol, target_ask)
         
-        if target_bid >= ask_1: target_bid = ask_1 - tick
-        if target_ask <= bid_1: target_ask = bid_1 + tick
+        if target_bid >= ask_1:
+            target_bid = ask_1 - tick
+        if target_ask <= bid_1:
+            target_ask = bid_1 + tick
         if target_bid >= target_ask:
             target_bid = mid - tick
             target_ask = mid + tick
 
         # 10. 执行更新 (增量改单)
-        self._update_quotes(symbol, target_bid, target_ask, order_vol)
+        self._update_quotes(
+            symbol,
+            target_bid,
+            target_ask,
+            order_vol,
+            time_in_force=passive_tif,
+        )
 
         # 11. 状态广播
+        quote_state = self.quote_state[symbol]
+        quote_spread_bps = (
+            (target_ask - target_bid) / mid * 10000.0
+            if mid > 0.0
+            else 0.0
+        )
+        params = {
+            "schema": "market_making.v1",
+            "strategy": self.name,
+            "state": "QUOTING",
+            "mode": passive_tif,
+            "time_in_force": passive_tif,
+            "use_rpi": bool(self.use_rpi),
+            "rpi_supported": ref_data_manager.supports_rpi(symbol),
+            "mid_price": mid,
+            "best_bid": bid_1,
+            "best_ask": ask_1,
+            "market_spread_bps": (
+                (ask_1 - bid_1) / mid * 10000.0
+                if mid > 0.0
+                else 0.0
+            ),
+            "fair_value": fair_mid,
+            "alpha_bps": short_signal,
+            "position_qty": current_pos,
+            "position_notional": current_pos_usdt,
+            "target_bid": target_bid,
+            "target_ask": target_ask,
+            "quote_spread_bps": quote_spread_bps,
+            "quote_qty": order_vol,
+            "bid_order_id": quote_state["bid_oid"] or "",
+            "ask_order_id": quote_state["ask_oid"] or "",
+            "gamma_base": float(self.gamma_base),
+            "gamma": gamma,
+            "k_base": k_base,
+            "k": k,
+            "A": A,
+            "sigma_bps": sigma,
+            "margin_usage": margin_usage,
+            "orderflow_imbalance": self.imbalance_ewma[symbol],
+            "recent_fill_defense": recent_fill_defense,
+            "signals": {
+                horizon: float(value)
+                for horizon, value in alphas.items()
+            },
+            "short_signal_bps": short_signal,
+            "mid_signal_strength": mid_signal_strength,
+            "target_position_notional": target_pos_usdt,
+            "effective_position_notional": effective_pos_usdt,
+            "q_norm": q_norm_effective,
+            "base_half_spread_bps": base_half_spread_bps,
+            "inventory_skew_bps": inventory_skew_bps,
+            "base_spread_price": base_spread_price,
+            "skew_price": skew_price,
+            "configured_min_spread_bps": self.min_spread_bps,
+            "passive_fee_bps": self.passive_round_trip_fee_bps(
+                symbol,
+                passive_tif,
+            ),
+            "effective_min_spread_bps": effective_min_spread_bps,
+            # Compatibility fields consumed by the existing TUI.
+            "State": "QUOTING",
+            "Mode": passive_tif,
+            "Spread": f"{quote_spread_bps:.1f}",
+            "Sigma": f"{sigma:.1f}",
+            "Size": f"{order_vol:.8g}",
+        }
         strat_data = StrategyData(
             symbol=symbol,
             fair_value=fair_mid,
-            alpha_bps=short_signal, 
-            gamma=gamma, k=k, A=A, sigma=sigma
+            alpha_bps=short_signal,
+            params=params,
         )
         self.engine.put(Event(EVENT_STRATEGY_UPDATE, strat_data))
         self.feature_engine.reset_interval(symbol)
 
-    def _update_quotes(self, symbol, bid, ask, volume):
+    def _update_quotes(
+        self,
+        symbol,
+        bid,
+        ask,
+        volume,
+        time_in_force=None,
+    ):
         state = self.quote_state[symbol]
         info = ref_data_manager.get_info(symbol)
         tick = info.tick_size
         now = time.time()
+        time_in_force = time_in_force or self.resolve_passive_time_in_force(
+            symbol,
+            use_rpi=self.use_rpi,
+            fallback_to_gtx=self.rpi_fallback_to_gtx,
+            route="glft_quote",
+        )
         
-        if (now - state["last_update"]) * 1000 < self.cooldown_ms: return
+        if (now - state["last_update"]) * 1000 < self.cooldown_ms:
+            return
 
         # Buy Side
         if state["bid_price"] is None or abs(bid - state["bid_price"]) >= tick:
-            if state["bid_oid"]: self.oms.cancel_order(state["bid_oid"])
-            oid = self.send_intent(OrderIntent(self.name, symbol, Side.BUY, bid, volume, is_post_only=True))
-            if oid:
-                state["bid_oid"] = oid
-                state["bid_price"] = bid
+            if state["bid_oid"]:
+                self.cancel_order(state["bid_oid"])
+            else:
+                oid = self.send_intent(
+                    OrderIntent(
+                        self.name,
+                        symbol,
+                        Side.BUY,
+                        bid,
+                        volume,
+                        time_in_force=time_in_force,
+                        is_post_only=True,
+                    )
+                )
+                if oid:
+                    state["bid_oid"] = oid
+                    state["bid_price"] = bid
         
         # Sell Side
         if state["ask_price"] is None or abs(ask - state["ask_price"]) >= tick:
-            if state["ask_oid"]: self.oms.cancel_order(state["ask_oid"])
-            oid = self.send_intent(OrderIntent(self.name, symbol, Side.SELL, ask, volume, is_post_only=True))
-            if oid:
-                state["ask_oid"] = oid
-                state["ask_price"] = ask
+            if state["ask_oid"]:
+                self.cancel_order(state["ask_oid"])
+            else:
+                oid = self.send_intent(
+                    OrderIntent(
+                        self.name,
+                        symbol,
+                        Side.SELL,
+                        ask,
+                        volume,
+                        time_in_force=time_in_force,
+                        is_post_only=True,
+                    )
+                )
+                if oid:
+                    state["ask_oid"] = oid
+                    state["ask_price"] = ask
                 
         state["last_update"] = now
 
@@ -239,8 +383,15 @@ class GLFTStrategy(StrategyTemplate):
 
     def on_order(self, snapshot: OrderStateSnapshot):
         super().on_order(snapshot)
-        # 订单终结时清理 Quote State
-        if snapshot.status in ["FILLED", "CANCELLED", "REJECTED", "EXPIRED"]:
+        # 订单终结时清理 Quote State；下一次行情回调才允许重挂。
+        terminal_statuses = {
+            OrderStatus.FILLED,
+            OrderStatus.CANCELLED,
+            OrderStatus.REJECTED,
+            OrderStatus.REJECTED_LOCALLY,
+            OrderStatus.EXPIRED,
+        }
+        if snapshot.status in terminal_statuses:
             symbol = snapshot.symbol
             state = self.quote_state[symbol]
             if state["bid_oid"] == snapshot.client_oid:

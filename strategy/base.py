@@ -1,6 +1,5 @@
 from event.type import (
     AccountData,
-    CancelRequest,
     Event,
     LifecycleState,
     OrderBook,
@@ -9,6 +8,8 @@ from event.type import (
     OrderStatus,
     PositionData,
     Side,
+    TIF_GTX,
+    TIF_RPI,
     TradeData,
     EVENT_LOG,
 )
@@ -33,6 +34,7 @@ class StrategyTemplate:
         self.last_submit_reject_reason = ""
         self.last_submit_reject_oid = ""
         self.last_submit_reject_by_symbol = {}
+        self._rpi_fallback_warned_routes = set()
 
     def on_orderbook(self, orderbook: OrderBook):
         raise NotImplementedError
@@ -82,6 +84,59 @@ class StrategyTemplate:
 
     def log(self, msg):
         self.engine.put(Event(EVENT_LOG, f"[{self.name}] {msg}"))
+
+    def resolve_passive_time_in_force(
+        self,
+        symbol: str,
+        *,
+        use_rpi: bool,
+        fallback_to_gtx: bool = True,
+        route: str = "passive_quote",
+    ) -> str:
+        """Resolve a passive quote to RPI or GTX using live exchangeInfo data."""
+        if not use_rpi:
+            return TIF_GTX
+        if ref_data_manager.supports_rpi(symbol):
+            return TIF_RPI
+        if not fallback_to_gtx:
+            return TIF_RPI
+
+        symbol = str(symbol or "").upper()
+        warning_key = (symbol, str(route or "passive_quote"))
+        if warning_key not in self._rpi_fallback_warned_routes:
+            self._rpi_fallback_warned_routes.add(warning_key)
+            self.log(
+                f"{symbol} has no RPI permission in exchangeInfo; "
+                f"{warning_key[1]} falls back to GTX"
+            )
+        return TIF_GTX
+
+    def passive_fee_rate(self, symbol: str, time_in_force: str) -> float:
+        """Return maker fee plus the account's symbol-specific RPI surcharge."""
+        fee_config = getattr(self.oms, "config", {}).get("backtest", {})
+        fee_rate = float(fee_config.get("maker_fee", 0.0))
+        if str(time_in_force or "").upper() != TIF_RPI:
+            return fee_rate
+
+        symbol_rates = fee_config.get("rpi_commission_rates", {})
+        symbol_rate = None
+        if isinstance(symbol_rates, dict):
+            normalized_symbol = str(symbol or "").upper()
+            symbol_rate = symbol_rates.get(normalized_symbol)
+            if symbol_rate is None:
+                symbol_rate = symbol_rates.get(str(symbol or ""))
+        return fee_rate + float(
+            symbol_rate
+            if symbol_rate is not None
+            else fee_config.get("rpi_commission_rate", 0.0)
+        )
+
+    def passive_round_trip_fee_bps(
+        self,
+        symbol: str,
+        time_in_force: str,
+    ) -> float:
+        return max(0.0, self.passive_fee_rate(symbol, time_in_force) * 20000.0)
 
     def send_intent(self, intent: OrderIntent):
         intent.price = ref_data_manager.round_price(intent.symbol, intent.price)

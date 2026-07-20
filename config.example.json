@@ -1,15 +1,59 @@
 {
-    "testnet": true,
+    "execution": {
+        "mode": "paper"
+    },
+    "paper_trade": {
+        "_comment": "Production Binance public market data with local-only balances, orders, fills, fees and PnL. No private API credentials are used.",
+        "enabled": true,
+        "market_data_environment": "production",
+        "initial_balance_usdt": 100.0,
+        "maker_fee": 0.0002,
+        "taker_fee": 0.0005,
+        "rpi_commission_rate": 0.0,
+        "rpi_commission_rates": {},
+        "rpi_fill_model": "disabled",
+        "public_trade_proxy": false,
+        "reset_on_start": true,
+        "cancel_ahead_fraction": 0.0,
+        "maintenance_margin_rate": 0.005,
+        "command_timeout_sec": 2.0,
+        "command_queue_size": 10000
+    },
+    "testnet": false,
     "api_key_env": "BINANCE_API_KEY",
     "api_secret_env": "BINANCE_API_SECRET",
-    "symbols": ["SOLUSDT"],
+    "symbols": [
+        "BZUSDT",
+        "CLUSDT",
+        "KORUUSDT",
+        "MUUSDT",
+        "SKHYNIXUSDT",
+        "SKHYUSDT",
+        "SNDKUSDT",
+        "SOXLUSDT",
+        "SOXSUSDT",
+        "SPCXUSDT",
+        "XAGUSDT",
+        "XAUUSDT"
+    ],
     "record_data": true,
     "system": {
-        "dry_run": true,
         "log_level": "INFO",
         "log_path": "logs",
         "log_console": false,
         "web_port": 8000,
+        "web_dashboard": {
+            "_comment": "Loopback-only read-only monitoring UI. It never exposes API credentials or accepts trading commands.",
+            "enabled": true,
+            "host": "127.0.0.1",
+            "port": 8765,
+            "open_browser": false,
+            "refresh_interval_ms": 1000,
+            "history_limit": 600,
+            "orders_limit": 100,
+            "trades_limit": 100,
+            "logs_limit": 200
+        },
         "time_sync": {
             "max_offset_ms": 250.0,
             "halt_offset_ms": 1000.0,
@@ -62,9 +106,13 @@
                 "execution": 1500
             },
             "recovery_checks": 20,
-            "alert_interval_sec": 5
+            "alert_interval_sec": 5,
+            "shutdown_drain_timeout_sec": 5
         },
         "market_data": {
+            "environment": "production",
+            "testnet": false,
+            "public_only": true,
             "publish_depth_levels": 5,
             "emit_full_orderbook_events": false
         },
@@ -112,8 +160,8 @@
     },
     "oms": {
         "journal_enabled": true,
-        "replay_journal_on_startup": true,
-        "journal_path": "storage/oms/oms_journal.jsonl",
+        "replay_journal_on_startup": false,
+        "journal_path": "storage/paper/oms_journal.jsonl",
         "journal_fsync": true,
         "journal_integrity_check": true,
         "tombstone_max": 2000,
@@ -128,7 +176,7 @@
         "snapshot_stability_required": 2,
         "snapshot_max_attempts": 6,
         "snapshot_settle_interval_sec": 0.25,
-        "command_fence_timeout_sec": 5.25,
+        "command_fence_timeout_sec": 0.0,
         "outbound_message_budget": {
             "enabled": true,
             "window_sec": 1.0,
@@ -145,10 +193,10 @@
         },
         "single_writer_fence": {
             "enabled": true,
-            "path": "storage/oms/oms_journal.jsonl.lock"
+            "path": "storage/paper/oms_journal.jsonl.lock"
         },
         "venue_dead_man_switch": {
-            "enabled": true,
+            "enabled": false,
             "countdown_time_ms": 120000,
             "renewal_interval_sec": 30.0,
             "max_renewal_age_sec": 45.0,
@@ -180,7 +228,7 @@
             "enabled": true,
             "require_explicit_strategy": true,
             "budgets": {
-                "ML_Sniper": {
+                "GLFT_MultiScale": {
                     "auto_scale": true,
                     "max_gross_notional": 36.0,
                     "max_symbol_notional": 18.0
@@ -202,8 +250,8 @@
             "recovery_checks": 5
         },
         "cash_flow_truth": {
-            "enabled": true,
-            "require_snapshot": true,
+            "enabled": false,
+            "require_snapshot": false,
             "max_snapshot_age_sec": 45,
             "poll_interval_sec": 30,
             "recovery_checks": 2,
@@ -212,12 +260,10 @@
         "risk_control_heartbeat": {
             "enabled": true,
             "max_age_sec": 2.0,
-            "required_source": "independent_supervisor"
+            "required_source": "risk_manager"
         },
         "independent_supervisor": {
-            "enabled": true,
-            "api_key_env": "BINANCE_RISK_API_KEY",
-            "api_secret_env": "BINANCE_RISK_API_SECRET",
+            "enabled": false,
             "heartbeat_interval_sec": 0.25,
             "parent_heartbeat_timeout_sec": 1.5,
             "status_max_age_sec": 2.0,
@@ -229,7 +275,7 @@
             "emergency_countdown_time_ms": 1000,
             "recovery_checks": 2,
             "gross_kill_multiplier": 1.25,
-            "flatten_enabled": true,
+            "flatten_enabled": false,
             "parent_loss_flatten_delay_sec": 3.0,
             "flatten_retry_sec": 2.0,
             "flat_verification_checks": 2,
@@ -238,7 +284,7 @@
             "state_fsync": true,
             "rearm_prepare_ttl_sec": 10.0,
             "rearm_command_timeout_sec": 5.0,
-            "daily_loss_enabled": true,
+            "daily_loss_enabled": false,
             "daily_loss_reduce_only_fraction": 0.80,
             "cash_flow_income_types": ["TRANSFER"],
             "cash_flow_assets": ["USDT", "USDC", "BUSD", "FDUSD"],
@@ -276,6 +322,9 @@
         "initial_capital": 100.0,
         "taker_fee": 0.0005,
         "maker_fee": 0.0002,
+        "_comment_rpi_commission_rate": "Extra RPI commission rate from GET /fapi/v1/commissionRate; added on top of maker_fee.",
+        "rpi_commission_rate": 0.0,
+        "rpi_commission_rates": {},
         "latency_ms_mean": 20,
         "latency_ms_std": 5,
         "cancel_ahead_prob": 0.5
@@ -285,8 +334,21 @@
         "order_reject_rate": 0.0
     },
     "strategy": {
-        "name": "ML_Sniper",
-        "use_rpi": true,        
+        "name": "GLFT_MultiScale",
+        "primary_model": "glft",
+        "registered_models": [
+            "glft",
+            "avellaneda_stoikov",
+            "ml_sniper"
+        ],
+        "execution_policy": "single_primary",
+        "_comment_model_policy": "All models are selectable, but exactly one primary owns order submission. Change primary_model and restart to switch; automatic failover is not enabled.",
+        "_comment_rpi": "Enable only after exchangeInfo permissionSets confirms RPI for the configured symbol; unsupported symbols fall back to GTX.",
+        "use_rpi": false,
+        "use_rpi_for_avellaneda_stoikov": true,
+        "use_rpi_for_glft": true,
+        "use_rpi_for_passive_exit": false,
+        "rpi_fallback_to_gtx": true,
         "_comment_capital_scaling": "Only change capital_multiplier. Order notional and caps scale together.",
         "capital_multiplier": 1.0,
         "capital_scaling": {
@@ -310,6 +372,22 @@
         "lot_multiplier": 0.18181818,
         "spread_ratio": 0.0005,
         "skew_factor_usdt": 50.0,
-        "max_pos_usdt": 18.0
+        "max_pos_usdt": 18.0,
+        "glft": {
+            "_comment": "Paper-validation primary. A/k and volatility must be calibrated in consistent units before any live promotion.",
+            "gamma": 0.1,
+            "cycle_interval": 1.0,
+            "execution": {
+                "min_spread_bps": 5.0
+            }
+        },
+        "avellaneda_stoikov": {
+            "_comment": "Registered explanatory baseline and manually selected fallback; not a concurrent execution strategy.",
+            "gamma": 0.05,
+            "k": 1.5,
+            "vol_window": 60,
+            "cycle_interval": 1.0,
+            "min_spread_ratio": 0.0002
+        }
     }
 }

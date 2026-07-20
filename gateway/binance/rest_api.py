@@ -8,11 +8,12 @@ import requests
 
 from infrastructure.logger import logger
 from infrastructure.time_service import time_service
-from event.type import CancelRequest, OrderRequest, TIF_GTX
+from event.type import CancelRequest, OrderRequest
 from .constants import (
     EP_ACCOUNT,
     EP_ALL_OPEN_ORDERS,
     EP_ALL_ORDERS,
+    EP_COMMISSION_RATE,
     EP_COUNTDOWN_CANCEL_ALL,
     EP_DEPTH_SNAPSHOT,
     EP_INCOME,
@@ -23,6 +24,7 @@ from .constants import (
     EP_ORDER,
     EP_POSITION_MODE,
     EP_POSITION_RISK,
+    EP_RPI_DEPTH,
     EP_TIME,
     EP_USER_TRADES,
     REST_URL_MAIN,
@@ -44,6 +46,8 @@ class BinanceRestApi:
         self.min_signed_interval_sec = 0.20
         self.min_public_interval_sec = 0.05
         self.endpoint_intervals = {
+            EP_RPI_DEPTH: 1.00,
+            EP_COMMISSION_RATE: 1.00,
             EP_ACCOUNT: 1.00,
             EP_POSITION_RISK: 1.50,
             EP_OPEN_ORDERS: 1.00,
@@ -189,7 +193,35 @@ class BinanceRestApi:
         resp = self.request("GET", EP_DEPTH_SNAPSHOT, {"symbol": symbol, "limit": limit}, signed=False)
         return resp.json() if resp and resp.status_code == 200 else None
 
+    def get_rpi_depth(self, symbol, limit=1000):
+        """Low-frequency diagnostic book with eligible RPI liquidity included."""
+        if int(limit) != 1000:
+            raise ValueError("Binance USD-M rpiDepth only supports limit=1000")
+        resp = self.request(
+            "GET",
+            EP_RPI_DEPTH,
+            {"symbol": str(symbol or "").upper(), "limit": int(limit)},
+            signed=False,
+        )
+        return resp.json() if resp and resp.status_code == 200 else None
+
+    def get_commission_rate(self, symbol):
+        """Return account-specific maker, taker, and RPI commission rates."""
+        return self.request(
+            "GET",
+            EP_COMMISSION_RATE,
+            {"symbol": str(symbol or "").upper()},
+            signed=True,
+        )
+
     def new_order(self, req: OrderRequest, client_oid: str = None):
+        if req.is_rpi and req.order_type != "LIMIT":
+            raise ValueError("Binance RPI requires a LIMIT order")
+        if req.post_only and req.time_in_force not in {"GTX", "RPI"}:
+            raise ValueError(
+                "Binance post-only LIMIT orders require GTX or RPI timeInForce"
+            )
+
         params = {
             "symbol": req.symbol,
             "side": req.side,
@@ -200,7 +232,11 @@ class BinanceRestApi:
         if req.reduce_only:
             params["reduceOnly"] = "true"
 
-        if req.self_trade_prevention_mode:
+        if (
+            req.self_trade_prevention_mode
+            and req.order_type == "LIMIT"
+            and req.time_in_force in {"GTC", "IOC", "GTD"}
+        ):
             params["selfTradePreventionMode"] = (
                 req.self_trade_prevention_mode
             )
@@ -210,7 +246,7 @@ class BinanceRestApi:
 
         if req.order_type == "LIMIT":
             params["price"] = req.price
-            params["timeInForce"] = TIF_GTX if req.post_only else req.time_in_force
+            params["timeInForce"] = req.time_in_force
 
         return self.request("POST", EP_ORDER, params, signed=True)
 

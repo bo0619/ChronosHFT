@@ -3,8 +3,23 @@
 import requests
 import math
 from decimal import Decimal, ROUND_DOWN
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from infrastructure.logger import logger
+
+
+def _flatten_permissions(value) -> frozenset[str]:
+    """Normalize Binance's nested permissionSets payload."""
+    pending = [value]
+    permissions = set()
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            permissions.add(current.upper())
+        elif isinstance(current, dict):
+            pending.extend(current.values())
+        elif isinstance(current, (list, tuple, set)):
+            pending.extend(current)
+    return frozenset(permissions)
 
 @dataclass
 class ContractInfo:
@@ -15,6 +30,14 @@ class ContractInfo:
     min_notional: float # 最小名义价值 (USDT)
     price_precision: int # 价格小数位
     qty_precision: int   # 数量小数位
+
+    status: str = "TRADING"
+    permissions: frozenset[str] = field(default_factory=frozenset)
+
+    @property
+    def supports_rpi(self) -> bool:
+        return self.status == "TRADING" and "RPI" in self.permissions
+
 
 class ReferenceDataManager:
     """
@@ -29,8 +52,9 @@ class ReferenceDataManager:
         return cls._instance
 
     def __init__(self):
-        if hasattr(self, "contracts"): return
-        self.contracts = {} # Symbol -> ContractInfo
+        if hasattr(self, "contracts"):
+            return
+        self.contracts = {}  # Symbol -> ContractInfo
         self.base_url = "https://fapi.binance.com" 
 
     def init(self, testnet=False):
@@ -83,7 +107,9 @@ class ReferenceDataManager:
                     min_qty=min_qty,
                     min_notional=min_notional,
                     price_precision=price_prec,
-                    qty_precision=qty_prec
+                    qty_precision=qty_prec,
+                    status=str(s.get("status", "") or "").upper(),
+                    permissions=_flatten_permissions(s.get("permissionSets", [])),
                 )
             
             logger.info(f"Loaded {len(self.contracts)} contracts info.")
@@ -94,23 +120,30 @@ class ReferenceDataManager:
             raise e
 
     def get_info(self, symbol: str) -> ContractInfo:
-        return self.contracts.get(symbol)
+        return self.contracts.get(str(symbol or "").upper())
+
+    def supports_rpi(self, symbol: str) -> bool:
+        info = self.get_info(symbol)
+        return bool(info and info.supports_rpi)
 
     def round_price(self, symbol, price):
         """将价格修整为符合 tick_size"""
         info = self.get_info(symbol)
-        if not info: return price
+        if not info:
+            return price
         return round(price, info.price_precision)
 
     def round_qty(self, symbol, qty):
         """将数量修整为符合 step_size"""
         info = self.get_info(symbol)
-        if not info: return qty
+        if not info:
+            return qty
         
         # 数量通常向下取整，防止超出余额或持仓
         # 这里使用严谨算法：
         # round(qty - (qty % step_size), precision)
-        if info.step_size == 0: return qty
+        if info.step_size == 0:
+            return qty
 
         # Use decimal arithmetic with a tiny step-relative epsilon so values
         # like 2.4/0.1 do not become 23.999999... and round down to 2.3.

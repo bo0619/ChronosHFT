@@ -2,6 +2,8 @@ import json
 import os
 from copy import deepcopy
 
+from infrastructure.paper_trade import apply_paper_trade_mode, is_paper_trade
+
 
 QUOTE_ASSET_SUFFIXES = ("USDT", "USDC", "BUSD", "FDUSD")
 MARKET_DATA_FRESHNESS_DEFAULTS = {
@@ -408,6 +410,9 @@ def resolve_runtime_secrets(config: dict) -> dict:
         return {}
 
     resolved = deepcopy(config)
+    if is_paper_trade(resolved):
+        return apply_paper_trade_mode(resolved)
+
     for field, default_env_name in (
         ("api_key", "BINANCE_API_KEY"),
         ("api_secret", "BINANCE_API_SECRET"),
@@ -438,6 +443,53 @@ def resolve_runtime_secrets(config: dict) -> dict:
                 if env_value:
                     supervisor[field] = env_value
     return resolved
+
+
+def normalize_strategy_registration(config: dict) -> dict:
+    """Canonicalize one executable primary while preserving registered standbys."""
+    if not isinstance(config, dict):
+        return {}
+
+    from strategy.registry import (
+        canonical_model_key,
+        registered_model_keys,
+        strategy_id_for_model,
+    )
+
+    configured = deepcopy(config)
+    strategy = configured.get("strategy")
+    if not isinstance(strategy, dict):
+        strategy = {}
+        configured["strategy"] = strategy
+
+    execution_policy = str(
+        strategy.get("execution_policy", "single_primary") or "single_primary"
+    ).strip().lower()
+    if execution_policy != "single_primary":
+        raise ValueError(
+            "Only strategy.execution_policy=single_primary is supported; "
+            "multiple execution models would duplicate orders and inventory risk"
+        )
+    strategy["execution_policy"] = "single_primary"
+
+    primary_value = strategy.get("primary_model")
+    if primary_value is None:
+        primary_value = strategy.get("name", "ml_sniper")
+    primary_model = canonical_model_key(primary_value)
+    strategy["primary_model"] = primary_model
+
+    registered_models = strategy.get("registered_models")
+    if not isinstance(registered_models, (list, tuple)) or not registered_models:
+        strategy["registered_models"] = [primary_model]
+    canonical_registered = registered_model_keys(configured)
+    if primary_model not in canonical_registered:
+        raise ValueError(
+            f"Primary strategy model {primary_model!r} is not present in "
+            "strategy.registered_models"
+        )
+    strategy["registered_models"] = list(canonical_registered)
+    strategy["name"] = strategy_id_for_model(primary_model)
+    return configured
 
 
 def finalize_strategy_risk_budgets(config: dict) -> dict:
@@ -494,6 +546,13 @@ def load_root_config(path: str = "config.json") -> dict:
             raw = json.load(handle)
     except Exception:
         return {}
-    configured = apply_capital_scaling(apply_production_safety_defaults(raw))
+    configured = apply_production_safety_defaults(raw)
+    if is_paper_trade(configured):
+        configured = apply_paper_trade_mode(configured)
+    configured = apply_capital_scaling(configured)
+    configured = normalize_strategy_registration(configured)
     configured = finalize_strategy_risk_budgets(configured)
-    return resolve_runtime_secrets(configured)
+    configured = resolve_runtime_secrets(configured)
+    if is_paper_trade(configured):
+        configured = apply_paper_trade_mode(configured)
+    return configured

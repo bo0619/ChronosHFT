@@ -66,8 +66,11 @@ from infrastructure.config_scaling import (
     STRATEGY_RISK_BUDGET_DEFAULTS,
     VENUE_DEAD_MAN_SWITCH_DEFAULTS,
     apply_capital_scaling,
+    finalize_strategy_risk_budgets,
     load_root_config,
+    normalize_strategy_registration,
 )
+from infrastructure.paper_trade import apply_paper_trade_mode, is_paper_trade
 from main import run_live_risk_checks
 from oms.engine import OMS
 from strategy.ml_sniper.config_loader import load_sniper_config
@@ -401,7 +404,10 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
     def test_root_config_creates_explicit_budget_for_configured_strategy(self):
         payload = {
             "symbols": ["BTCUSDT"],
-            "strategy": {"name": "alpha"},
+            "strategy": {
+                "name": "GLFT_MultiScale",
+                "registered_models": ["GLFT", "as", "ML_Sniper"],
+            },
             "risk": {
                 "limits": {
                     "max_pos_notional": 250.0,
@@ -417,12 +423,17 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
         self.assertTrue(budget_config["enabled"])
         self.assertTrue(budget_config["require_explicit_strategy"])
         self.assertEqual(
-            budget_config["budgets"]["alpha"]["max_gross_notional"],
+            budget_config["budgets"]["GLFT_MultiScale"]["max_gross_notional"],
             500.0,
         )
         self.assertEqual(
-            budget_config["budgets"]["alpha"]["max_symbol_notional"],
+            budget_config["budgets"]["GLFT_MultiScale"]["max_symbol_notional"],
             250.0,
+        )
+        self.assertEqual(loaded["strategy"]["primary_model"], "glft")
+        self.assertEqual(
+            loaded["strategy"]["registered_models"],
+            ["glft", "avellaneda_stoikov", "ml_sniper"],
         )
         self.assertEqual(
             {
@@ -434,6 +445,51 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
                 key: value
                 for key, value in STRATEGY_RISK_BUDGET_DEFAULTS.items()
                 if key != "budgets"
+            },
+        )
+
+    def test_strategy_registration_rejects_multiple_execution_owners(self):
+        with self.assertRaisesRegex(ValueError, "single_primary"):
+            normalize_strategy_registration(
+                {
+                    "strategy": {
+                        "primary_model": "glft",
+                        "registered_models": ["glft", "as"],
+                        "execution_policy": "concurrent",
+                    }
+                }
+            )
+
+    def test_strategy_registration_rekeys_budget_to_canonical_primary_id(self):
+        configured = normalize_strategy_registration(
+            {
+                "strategy": {
+                    "name": "as",
+                    "registered_models": ["GLFT", "as"],
+                },
+                "risk": {
+                    "limits": {
+                        "max_pos_notional": 25.0,
+                        "max_account_gross_notional": 50.0,
+                    },
+                    "strategy_risk_budgets": {
+                        "enabled": True,
+                        "budgets": {},
+                    },
+                },
+            }
+        )
+        configured = finalize_strategy_risk_budgets(configured)
+
+        self.assertEqual(configured["strategy"]["name"], "AvellanedaStoikov")
+        self.assertEqual(
+            configured["risk"]["strategy_risk_budgets"]["budgets"][
+                "AvellanedaStoikov"
+            ],
+            {
+                "auto_scale": True,
+                "max_gross_notional": 50.0,
+                "max_symbol_notional": 25.0,
             },
         )
 
@@ -717,6 +773,80 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             self.assertEqual(rest.set_margin_type.call_args_list, [call("BTCUSDT", "ISOLATED"), call("ETHUSDT", "ISOLATED")])
             ws.start_market_stream.assert_called_once_with(["BTCUSDT", "ETHUSDT"])
             gateway.close()
+
+
+class PaperTradeConfigTests(unittest.TestCase):
+    def test_paper_mode_is_type_selected_and_scrubs_every_private_credential(self):
+        raw = {
+            "execution": {"mode": "paper"},
+            "testnet": True,
+            "api_key": "live-key-must-disappear",
+            "api_secret": "live-secret-must-disappear",
+            "api_key_env": "BINANCE_API_KEY",
+            "api_secret_env": "BINANCE_API_SECRET",
+            "system": {"market_data": {}},
+            "oms": {
+                "journal_path": "storage/oms/live.jsonl",
+                "single_writer_fence": {"path": "storage/oms/live.lock"},
+            },
+            "risk": {
+                "cash_flow_truth": {"enabled": True},
+                "independent_supervisor": {
+                    "enabled": True,
+                    "api_key": "risk-key-must-disappear",
+                    "api_secret": "risk-secret-must-disappear",
+                },
+            },
+        }
+
+        configured = apply_paper_trade_mode(raw)
+
+        self.assertTrue(is_paper_trade(configured))
+        self.assertFalse(configured["testnet"])
+        self.assertEqual(configured["api_key"], "")
+        self.assertEqual(configured["api_secret"], "")
+        self.assertEqual(configured["api_key_env"], "")
+        self.assertEqual(configured["api_secret_env"], "")
+        self.assertEqual(
+            configured["system"]["market_data"]["environment"],
+            "production",
+        )
+        self.assertEqual(
+            configured["oms"]["journal_path"],
+            "storage/paper/oms_journal.jsonl",
+        )
+        self.assertEqual(
+            configured["oms"]["single_writer_fence"]["path"],
+            "storage/paper/oms_journal.jsonl.lock",
+        )
+        self.assertFalse(configured["oms"]["replay_journal_on_startup"])
+        self.assertTrue(configured["paper_trade"]["reset_on_start"])
+        self.assertFalse(configured["risk"]["independent_supervisor"]["enabled"])
+        self.assertFalse(configured["risk"]["cash_flow_truth"]["enabled"])
+        self.assertEqual(
+            configured["risk"]["risk_control_heartbeat"]["required_source"],
+            "risk_manager",
+        )
+        rendered = json.dumps(configured)
+        self.assertNotIn("must-disappear", rendered)
+
+    def test_live_mode_cannot_be_combined_with_legacy_dry_run(self):
+        with self.assertRaisesRegex(ValueError, "Conflicting execution"):
+            is_paper_trade(
+                {
+                    "execution": {"mode": "live"},
+                    "system": {"dry_run": True},
+                }
+            )
+
+    def test_paper_mode_rejects_unsupported_persistent_venue_state(self):
+        with self.assertRaisesRegex(ValueError, "reset_on_start must be true"):
+            apply_paper_trade_mode(
+                {
+                    "execution": {"mode": "paper"},
+                    "paper_trade": {"reset_on_start": False},
+                }
+            )
 
 
 if __name__ == "__main__":

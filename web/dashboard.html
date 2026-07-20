@@ -1,0 +1,691 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>ChronosHFT · 本地实时监控台</title>
+  <style>
+    :root {
+      --bg: #070b10;
+      --panel: #0d131b;
+      --panel-2: #111a24;
+      --line: #243140;
+      --line-soft: #182330;
+      --text: #e7edf4;
+      --muted: #8da0b3;
+      --cyan: #45d7e8;
+      --blue: #63a7ff;
+      --green: #42d392;
+      --amber: #f4be55;
+      --red: #ff6b78;
+      --purple: #a993ff;
+      --mono: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: Inter, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      min-width: 1180px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 14px;
+    }
+    button, select { font: inherit; }
+    button:focus-visible, select:focus-visible, a:focus-visible, summary:focus-visible {
+      outline: 2px solid var(--cyan);
+      outline-offset: 2px;
+    }
+    .mono, .num, td:not(:first-child), .metric-value { font-family: var(--mono); }
+    .num { font-variant-numeric: tabular-nums; }
+    .muted { color: var(--muted); }
+    .positive { color: var(--green) !important; }
+    .negative { color: var(--red) !important; }
+    .warning { color: var(--amber) !important; }
+    .accent { color: var(--cyan) !important; }
+    .unavailable { color: #6f8091 !important; font-style: italic; }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      height: 68px;
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      padding: 0 24px;
+      background: #090e14;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand { display: flex; align-items: center; gap: 13px; min-width: 275px; }
+    .brand-mark {
+      width: 34px; height: 34px; display: grid; place-items: center;
+      border: 1px solid var(--cyan); color: var(--cyan); font: 700 15px var(--mono);
+      box-shadow: inset 0 0 0 3px #0c1b22;
+    }
+    .brand h1 { margin: 0; font-size: 18px; line-height: 1.05; letter-spacing: .03em; }
+    .brand p { margin: 5px 0 0; color: var(--muted); font-size: 11px; letter-spacing: .12em; }
+    .top-status { display: flex; align-items: center; gap: 9px; flex: 1; }
+    .state-box {
+      min-width: 112px; padding: 7px 10px; border-left: 2px solid var(--line);
+      background: #0c1219;
+    }
+    .state-box:first-child { min-width: 168px; }
+    .state-box span { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .11em; }
+    .state-box strong { display: block; margin-top: 3px; font: 700 12px var(--mono); color: var(--text); }
+    .top-actions { display: flex; align-items: center; gap: 9px; }
+    .control {
+      height: 34px; padding: 0 11px; color: var(--text); background: #101923;
+      border: 1px solid var(--line); border-radius: 4px;
+    }
+    button.control { cursor: pointer; }
+    button.control:hover { border-color: var(--cyan); color: var(--cyan); }
+    .connection { display: flex; align-items: center; gap: 7px; color: var(--muted); white-space: nowrap; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #627182; }
+    .dot.live { background: var(--green); box-shadow: 0 0 10px rgba(66, 211, 146, .65); }
+    .dot.warn { background: var(--amber); box-shadow: 0 0 10px rgba(244, 190, 85, .55); }
+    .dot.bad { background: var(--red); box-shadow: 0 0 10px rgba(255, 107, 120, .6); }
+
+    .paper-banner {
+      display: none; position: sticky; top: 68px; z-index: 20; min-height: 38px;
+      align-items: center; justify-content: center; gap: 14px; padding: 8px 24px;
+      color: #ffe1a1; background: #251b0c; border-bottom: 1px solid #815d20;
+      font: 700 11px var(--mono); letter-spacing: .035em;
+    }
+    .paper-banner strong { color: var(--amber); font-size: 12px; }
+    .paper-banner span { color: #d8c7a1; }
+    .paper-banner i { width: 1px; height: 14px; background: #76551f; }
+    body.paper-mode .paper-banner { display: flex; }
+
+    .subnav {
+      position: sticky; top: 68px; z-index: 19; display: flex; gap: 3px; align-items: center;
+      height: 38px; padding: 0 24px; background: #0a1017; border-bottom: 1px solid var(--line-soft);
+    }
+    body.paper-mode .subnav { top: 106px; }
+    .subnav a { color: var(--muted); text-decoration: none; padding: 8px 11px; font-size: 12px; }
+    .subnav a:hover { color: var(--cyan); background: #111a23; }
+    .subnav .spacer { flex: 1; }
+    #asOf { font: 11px var(--mono); color: var(--muted); }
+
+    main { padding: 18px 24px 38px; }
+    section { scroll-margin-top: 118px; margin-bottom: 18px; }
+    body.paper-mode section { scroll-margin-top: 156px; }
+    .section-head { display: flex; align-items: end; justify-content: space-between; margin: 4px 0 10px; }
+    .section-head h2 { margin: 0; font-size: 14px; letter-spacing: .08em; text-transform: uppercase; }
+    .section-head p { margin: 0; color: var(--muted); font-size: 11px; }
+    .grid { display: grid; gap: 10px; }
+    .status-grid { grid-template-columns: repeat(8, minmax(120px, 1fr)); }
+    .account-grid { grid-template-columns: repeat(10, minmax(105px, 1fr)); }
+    .chart-grid { grid-template-columns: 1.25fr 1fr .75fr; }
+    .split { grid-template-columns: 1.1fr .9fr; }
+    .triple { grid-template-columns: repeat(3, 1fr); }
+    .quad { grid-template-columns: repeat(4, 1fr); }
+    .panel, .metric {
+      background: var(--panel); border: 1px solid var(--line-soft); border-top-color: var(--line);
+      border-radius: 6px;
+    }
+    .panel { min-width: 0; overflow: hidden; }
+    .panel-head {
+      min-height: 42px; display: flex; align-items: center; justify-content: space-between;
+      padding: 0 13px; border-bottom: 1px solid var(--line-soft); background: #0f1720;
+    }
+    .panel-head h3 { margin: 0; font-size: 12px; letter-spacing: .07em; text-transform: uppercase; }
+    .panel-head small { color: var(--muted); }
+    .panel-body { padding: 12px 13px; }
+    .metric { min-height: 77px; padding: 11px 12px; border-left: 2px solid var(--line); }
+    .metric-label { color: var(--muted); font-size: 10px; letter-spacing: .07em; text-transform: uppercase; white-space: nowrap; }
+    .metric-value { margin-top: 9px; font-size: 18px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .metric-note { margin-top: 4px; color: var(--muted); font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .metric.good { border-left-color: var(--green); }
+    .metric.warn { border-left-color: var(--amber); }
+    .metric.bad { border-left-color: var(--red); }
+    .metric.info { border-left-color: var(--cyan); }
+
+    .table-wrap { overflow: auto; max-height: 430px; }
+    table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    th {
+      position: sticky; top: 0; z-index: 2; padding: 8px 9px; text-align: right;
+      color: var(--muted); background: #111923; border-bottom: 1px solid var(--line);
+      font: 600 10px var(--sans); letter-spacing: .05em; white-space: nowrap;
+    }
+    th:first-child, td:first-child { text-align: left; }
+    td { padding: 8px 9px; text-align: right; border-bottom: 1px solid #17212c; white-space: nowrap; }
+    tbody tr:hover { background: #111b25; }
+    tbody tr:last-child td { border-bottom: 0; }
+    .empty { text-align: center !important; color: var(--muted); padding: 28px !important; font-family: var(--sans) !important; }
+    .badge {
+      display: inline-block; padding: 2px 6px; border: 1px solid #364657; border-radius: 3px;
+      color: #b6c3cf; font: 700 9px var(--mono); letter-spacing: .05em;
+    }
+    .badge.rpi { border-color: #685ec7; color: #bcb0ff; background: #17152a; }
+    .badge.gtx { border-color: #287a84; color: #63dce7; background: #0c2024; }
+    .badge.ioc { border-color: #a86e27; color: #ffc36a; background: #241a0d; }
+    .badge.live, .badge.filled, .badge.ready { border-color: #257553; color: #65e0a3; background: #0e2119; }
+    .badge.rejected, .badge.halted, .badge.error { border-color: #8a3440; color: #ff8c96; background: #271115; }
+    .badge.frozen, .badge.cancelling, .badge.degraded { border-color: #9c742d; color: #f8c767; background: #241c0e; }
+    .simulation-badge { display: none; margin-left: 7px; border-color: #9c742d; color: #f8c767; background: #241c0e; }
+    body.paper-mode .simulation-badge { display: inline-block; }
+
+    .chart { width: 100%; height: 220px; display: block; }
+    .chart-legend { display: flex; gap: 16px; color: var(--muted); font-size: 10px; }
+    .legend-key::before { content: ""; display: inline-block; width: 10px; height: 2px; margin: 0 5px 3px 0; background: currentColor; }
+
+    .kv-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
+    .kv { min-width: 0; display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid #18222d; }
+    .kv span:first-child { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+    .kv span:last-child { font: 11px var(--mono); text-align: right; overflow: hidden; text-overflow: ellipsis; }
+    .progress-row { margin: 10px 0; }
+    .progress-label { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; }
+    .progress { height: 4px; margin-top: 5px; background: #1c2732; overflow: hidden; }
+    .progress > i { display: block; height: 100%; width: 0; background: var(--cyan); }
+
+    .strategy-list { display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 360px; }
+    .strategy-tabs { border-right: 1px solid var(--line-soft); background: #0b1118; }
+    .strategy-tab { width: 100%; padding: 11px 13px; text-align: left; border: 0; border-bottom: 1px solid var(--line-soft); color: var(--text); background: transparent; cursor: pointer; }
+    .strategy-tab:hover, .strategy-tab.active { background: #14202b; color: var(--cyan); }
+    .strategy-tab small { display: block; margin-top: 4px; color: var(--muted); font-family: var(--mono); }
+    .strategy-detail { padding: 14px; overflow: auto; }
+    .strategy-detail h4 { margin: 0 0 12px; }
+
+    .notice { padding: 11px 12px; border-left: 3px solid var(--amber); background: #19160f; color: #d8c9a9; line-height: 1.55; }
+    .notice strong { color: var(--amber); }
+    .log-list { height: 320px; overflow: auto; padding: 7px 12px; background: #080d12; }
+    .log-line { display: grid; grid-template-columns: 86px 72px 1fr; gap: 10px; padding: 5px 0; border-bottom: 1px solid #121b24; font: 11px/1.45 var(--mono); }
+    .log-line .time { color: #637486; }
+    .log-line .level { color: var(--blue); }
+    .log-line.warn .level { color: var(--amber); }
+    .log-line.error .level { color: var(--red); }
+
+    details { border-top: 1px solid var(--line-soft); }
+    summary { cursor: pointer; padding: 11px 13px; color: var(--muted); font-size: 11px; }
+    summary:hover { color: var(--cyan); }
+    pre { margin: 0; padding: 14px; max-height: 520px; overflow: auto; background: #080d12; color: #b8c7d5; font: 10px/1.5 var(--mono); white-space: pre-wrap; }
+    .footer { display: flex; justify-content: space-between; padding: 16px 2px 0; color: #617183; font-size: 10px; }
+    .fatal-overlay {
+      display: none; position: fixed; inset: 0; z-index: 100; place-items: center; background: rgba(4, 7, 10, .92);
+    }
+    .fatal-overlay.visible { display: grid; }
+    .fatal-card { width: 560px; padding: 26px; background: #101720; border: 1px solid #75333b; }
+    .fatal-card h2 { color: var(--red); margin-top: 0; }
+
+    @media (max-width: 1500px) {
+      .status-grid { grid-template-columns: repeat(4, 1fr); }
+      .account-grid { grid-template-columns: repeat(5, 1fr); }
+      .chart-grid { grid-template-columns: 1fr 1fr; }
+      .chart-grid > :last-child { grid-column: 1 / -1; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">CH</div>
+      <div><h1>ChronosHFT</h1><p>LOCAL OPERATIONS CONSOLE</p></div>
+    </div>
+    <div class="top-status">
+      <div class="state-box"><span>环境</span><strong id="envState">启动中</strong></div>
+      <div class="state-box"><span>OMS</span><strong id="omsState">—</strong></div>
+      <div class="state-box"><span>能力模式</span><strong id="capabilityState">—</strong></div>
+      <div class="state-box"><span>网关</span><strong id="gatewayState">—</strong></div>
+      <div class="state-box"><span>独立风控</span><strong id="supervisorState">—</strong></div>
+    </div>
+    <div class="top-actions">
+      <label class="connection"><span id="connectionDot" class="dot"></span><span id="connectionText">连接中</span></label>
+      <select id="symbolSelect" class="control" aria-label="选择焦点标的"><option>等待数据</option></select>
+      <select id="refreshSelect" class="control" aria-label="刷新频率"><option value="500">0.5 秒</option><option value="1000" selected>1 秒</option><option value="2000">2 秒</option><option value="5000">5 秒</option></select>
+      <button id="pauseButton" class="control" type="button">暂停刷新</button>
+    </div>
+  </header>
+
+  <div id="paperBanner" class="paper-banner" role="status" aria-live="polite">
+    <strong>PAPER · LIVE DATA</strong><i></i>
+    <span>BINANCE 主网公开行情</span><i></i>
+    <span>本地模拟资金与撮合</span><i></i>
+    <span>私有 API 已禁用</span>
+  </div>
+
+  <nav class="subnav" aria-label="页面区域">
+    <a href="#overview">总览</a><a href="#market">市场</a><a href="#execution">执行</a><a href="#strategy">策略</a><a href="#risk">风控</a><a href="#runtime">运行时</a><a href="#rpi">RPI</a><a href="#logs">日志</a>
+    <span class="spacer"></span><span id="asOf">尚未收到快照</span>
+  </nav>
+
+  <main>
+    <section id="overview">
+      <div class="section-head"><h2>系统总览</h2><p id="overviewModeText">只读本地遥测 · 无交易操作入口</p></div>
+      <div id="statusMetrics" class="grid status-grid"></div>
+      <div style="height:10px"></div>
+      <div id="accountMetrics" class="grid account-grid"></div>
+      <div style="height:10px"></div>
+      <div class="grid chart-grid">
+        <article class="panel">
+          <div class="panel-head"><h3>权益 / 现金流调整后 PnL</h3><div class="chart-legend"><span class="legend-key accent">Equity</span><span class="legend-key positive">PnL</span></div></div>
+          <canvas id="equityChart" class="chart" aria-label="权益与损益曲线"></canvas>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><h3 id="marketChartTitle">焦点行情</h3><div class="chart-legend"><span class="legend-key accent">Mid</span><span class="legend-key warning">Fair</span></div></div>
+          <canvas id="marketChart" class="chart" aria-label="焦点标的行情曲线"></canvas>
+        </article>
+        <article class="panel"><div class="panel-head"><h3>关键保护状态</h3></div><div id="guardSummary" class="panel-body kv-grid"></div></article>
+      </div>
+    </section>
+
+    <section id="market">
+      <div class="section-head"><h2>全标的市场与头寸</h2><p>普通 API L2 行情；延迟、深度、基差、资金费率、策略和 RPI 能力同屏</p></div>
+      <article class="panel"><div class="table-wrap"><table>
+        <thead><tr><th>标的</th><th>Bid × Qty</th><th>Ask × Qty</th><th>Mid</th><th>Mark</th><th>点差 bp</th><th>L1 Imb</th><th>Microprice</th><th>Basis bp</th><th>Funding</th><th>Book age</th><th>Trade age</th><th>仓位</th><th>名义敞口</th><th>未实现 PnL</th><th>Alpha bp</th><th>策略状态</th><th>RPI</th></tr></thead>
+        <tbody id="marketRows"><tr><td colspan="18" class="empty">等待市场数据</td></tr></tbody>
+      </table></div></article>
+      <div style="height:10px"></div>
+      <div class="grid split">
+        <article class="panel"><div class="panel-head"><h3>持仓明细</h3><small>本地 OMS + Mark 派生</small></div><div class="table-wrap"><table>
+          <thead><tr><th>标的</th><th>方向</th><th>数量</th><th>均价</th><th>Mark</th><th>名义价值</th><th>未实现 PnL</th><th>买挂单</th><th>卖挂单</th><th>Reduce-only</th></tr></thead><tbody id="positionRows"></tbody>
+        </table></div></article>
+        <article class="panel"><div class="panel-head"><h3>合约规则</h3><small>exchangeInfo 启动快照</small></div><div class="table-wrap"><table>
+          <thead><tr><th>标的</th><th>状态</th><th>Tick</th><th>Step</th><th>最小数量</th><th>最小名义</th><th>价格精度</th><th>数量精度</th><th>RPI 权限</th></tr></thead><tbody id="contractRows"></tbody>
+        </table></div></article>
+      </div>
+    </section>
+
+    <section id="execution">
+      <div class="section-head"><h2>订单与成交执行</h2><p id="executionModeText">所有 TIF、RPI 路由、状态、成交率、拒单与延迟</p></div>
+      <div id="executionMetrics" class="grid status-grid"></div>
+      <div style="height:10px"></div>
+      <article class="panel"><div class="panel-head"><h3>最近订单 <span class="badge simulation-badge">PAPER 模拟</span></h3><small id="orderCountText">0 条</small></div><div class="table-wrap"><table>
+        <thead><tr><th>更新时间</th><th>标的</th><th>策略</th><th>方向</th><th>路由</th><th>状态</th><th>价格</th><th>数量</th><th>已成交</th><th>均价</th><th>Fill %</th><th>Reduce</th><th>Client ID</th><th>Exchange ID</th><th>错误</th></tr></thead><tbody id="orderRows"></tbody>
+      </table></div></article>
+      <div style="height:10px"></div>
+      <article class="panel"><div class="panel-head"><h3>最近成交 <span class="badge simulation-badge">PAPER 模拟</span></h3><small id="tradeCountText">0 条</small></div><div class="table-wrap"><table>
+        <thead><tr><th>时间</th><th>标的</th><th>策略</th><th>方向</th><th>路由</th><th>价格</th><th>数量</th><th>名义价值</th><th>Maker</th><th>手续费</th><th>已实现 PnL</th><th>Trade ID</th><th>Order ID</th></tr></thead><tbody id="tradeRows"></tbody>
+      </table></div></article>
+    </section>
+
+    <section id="strategy">
+      <div class="section-head"><h2>策略全量遥测</h2><p>A-S / GLFT / ML Sniper 参数动态展开；未识别字段也不会丢失</p></div>
+      <article class="panel strategy-list"><div id="strategyTabs" class="strategy-tabs"></div><div id="strategyDetail" class="strategy-detail"><p class="muted">等待策略数据</p></div></article>
+    </section>
+
+    <section id="risk">
+      <div class="section-head"><h2>风险与保护平面</h2><p>限额、利用率、熔断、冻结、真值核对与独立进程监督</p></div>
+      <div id="riskMetrics" class="grid account-grid"></div>
+      <div style="height:10px"></div>
+      <div class="grid triple">
+        <article class="panel"><div class="panel-head"><h3>限额与利用率</h3></div><div id="riskLimits" class="panel-body"></div></article>
+        <article class="panel"><div class="panel-head"><h3>冻结 / Kill Switch</h3></div><div id="riskGuards" class="panel-body kv-grid"></div></article>
+        <article class="panel"><div class="panel-head"><h3>独立风险进程</h3></div><div id="independentRisk" class="panel-body kv-grid"></div></article>
+      </div>
+    </section>
+
+    <section id="runtime">
+      <div class="section-head"><h2>运行时与基础设施</h2><p>事件队列、handler、策略 worker、时钟、真值、场所恢复与 OMS 预算</p></div>
+      <div class="grid triple">
+        <article class="panel"><div class="panel-head"><h3>Event Engine</h3></div><div id="eventRuntime" class="panel-body"></div></article>
+        <article class="panel"><div class="panel-head"><h3>Strategy Runtime</h3></div><div id="strategyRuntime" class="panel-body"></div></article>
+        <article class="panel"><div class="panel-head"><h3>OMS 出站消息预算</h3></div><div id="messageBudget" class="panel-body"></div></article>
+      </div>
+      <div style="height:10px"></div>
+      <div class="grid quad">
+        <article class="panel"><div class="panel-head"><h3>时间同步</h3></div><div id="timeRuntime" class="panel-body kv-grid"></div></article>
+        <article class="panel"><div class="panel-head"><h3>Truth Monitor</h3></div><div id="truthRuntime" class="panel-body kv-grid"></div></article>
+        <article class="panel"><div class="panel-head"><h3>Venue Supervisor</h3></div><div id="venueRuntime" class="panel-body kv-grid"></div></article>
+        <article class="panel"><div class="panel-head"><h3>Gateway / API</h3></div><div id="gatewayRuntime" class="panel-body kv-grid"></div></article>
+      </div>
+    </section>
+
+    <section id="rpi">
+      <div class="section-head"><h2>RPI 专项监控</h2><p>资格、路由、成交与费用；明确 API 可见性边界</p></div>
+      <div id="rpiNotice" class="notice"><strong>重要：</strong>标准 Binance API 深度不会展示 RPI 聚合流动性；本页普通 Bid/Ask 也不代表 RPI 排队位置。RPI 真实队列位置、前方数量与零售对手方身份不可从订单回报推导。这里仅展示 exchangeInfo 资格、已发 RPI 订单及可验证成交/费用。</div>
+      <div style="height:10px"></div>
+      <div id="rpiMetrics" class="grid status-grid"></div>
+      <div style="height:10px"></div>
+      <div class="grid split">
+        <article class="panel"><div class="panel-head"><h3>逐标的 RPI 状态</h3></div><div class="table-wrap"><table><thead><tr><th>标的</th><th>交易状态</th><th>exchangeInfo 支持</th><th>策略启用</th><th>回退 GTX</th><th>活动 RPI</th><th>累计 RPI</th><th>成交</th><th>Commission Rate</th></tr></thead><tbody id="rpiRows"></tbody></table></div></article>
+        <article class="panel"><div class="panel-head"><h3>RPI 诊断边界</h3></div><div id="rpiAvailability" class="panel-body kv-grid"></div></article>
+      </div>
+    </section>
+
+    <section id="logs">
+      <div class="section-head"><h2>日志与告警</h2><p>环形内存窗口；完整日志仍写入本地 logs 目录</p></div>
+      <div class="grid split">
+        <article class="panel"><div class="panel-head"><h3>运行日志</h3><small id="logCountText">0 条</small></div><div id="logList" class="log-list"></div></article>
+        <article class="panel"><div class="panel-head"><h3>告警</h3><small id="alertCountText">0 条</small></div><div id="alertList" class="log-list"></div></article>
+      </div>
+      <div style="height:10px"></div>
+      <article class="panel"><div class="panel-head"><h3>全量原始遥测</h3><small>便于审计新增字段；服务端已做凭证白名单隔离</small></div><details><summary>展开当前 JSON 快照（可能较大）</summary><pre id="rawTelemetry">{}</pre></details></article>
+    </section>
+
+    <div class="footer"><span>ChronosHFT Local Dashboard · Read-only · Loopback only</span><span id="schemaVersion">schema —</span></div>
+  </main>
+
+  <div id="fatalOverlay" class="fatal-overlay"><div class="fatal-card"><h2>本地监控服务不可达</h2><p id="fatalMessage">无法读取 /api/snapshot。</p><button id="retryButton" class="control" type="button">立即重试</button></div></div>
+
+  <script>
+    "use strict";
+    const state = {
+      paused: false, timer: null, failures: 0, data: null, selectedSymbol: "",
+      history: { account: [], symbols: {} }, maxHistory: 600
+    };
+    const $ = (id) => document.getElementById(id);
+    const path = (obj, dotted, fallback = null) => dotted.split(".").reduce((v, k) => v != null ? v[k] : undefined, obj) ?? fallback;
+    const first = (...values) => values.find(v => v !== undefined && v !== null);
+    const arr = (value) => Array.isArray(value) ? value : [];
+    const obj = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+    const finite = (v) => v !== null && v !== "" && Number.isFinite(Number(v));
+    const fmt = (v, digits = 2, suffix = "") => finite(v) ? `${Number(v).toLocaleString("zh-CN", {minimumFractionDigits: digits, maximumFractionDigits: digits})}${suffix}` : '<span class="unavailable">不可用</span>';
+    const fmtCompact = (v, digits = 2) => {
+      if (!finite(v)) return '<span class="unavailable">不可用</span>';
+      const n = Number(v), a = Math.abs(n);
+      if (a >= 1e9) return `${(n / 1e9).toFixed(digits)}B`;
+      if (a >= 1e6) return `${(n / 1e6).toFixed(digits)}M`;
+      if (a >= 1e3) return `${(n / 1e3).toFixed(digits)}K`;
+      return n.toLocaleString("zh-CN", {maximumFractionDigits: digits});
+    };
+    const fmtPrice = (v) => {
+      if (!finite(v)) return '<span class="unavailable">不可用</span>';
+      const n = Math.abs(Number(v));
+      return Number(v).toLocaleString("zh-CN", {minimumFractionDigits: n < 1 ? 5 : 2, maximumFractionDigits: n < 1 ? 8 : 6});
+    };
+    const fmtPct = (v, isRatio = true) => finite(v) ? `${(Number(v) * (isRatio ? 100 : 1)).toFixed(2)}%` : '<span class="unavailable">不可用</span>';
+    const fmtTime = (v, includeDate = false) => {
+      if (!v) return '<span class="unavailable">不可用</span>';
+      let d = typeof v === "number" ? new Date(v > 1e12 ? v : v * 1000) : new Date(v);
+      if (Number.isNaN(d.getTime())) return esc(v);
+      return d.toLocaleString("zh-CN", includeDate ? {hour12:false} : {hour12:false, hour:"2-digit", minute:"2-digit", second:"2-digit"});
+    };
+    const boolText = (v, yes = "是", no = "否") => v === true ? `<span class="positive">${yes}</span>` : v === false ? `<span class="negative">${no}</span>` : '<span class="unavailable">不可用</span>';
+    const valueClass = (v, inverse = false) => !finite(v) || Number(v) === 0 ? "" : ((Number(v) > 0) !== inverse ? "positive" : "negative");
+    const statusClass = (s) => {
+      const x = String(s || "").toUpperCase();
+      if (["LIVE","READY","HEALTHY","CLEAN","FILLED","NEW","RUNNING"].includes(x)) return "positive";
+      if (/HALT|ERROR|REJECT|LOCKDOWN|KILL|DISCONNECT|UNHEALTHY/.test(x)) return "negative";
+      if (/FROZEN|DEGRADED|PASSIVE|CANCEL|RECONCIL|WARN|BOOTSTRAP/.test(x)) return "warning";
+      return "muted";
+    };
+    const routeBadge = (tif, isRpi) => {
+      const x = isRpi ? "RPI" : String(tif || "—").toUpperCase();
+      const cls = x === "RPI" ? "rpi" : x === "GTX" ? "gtx" : x === "IOC" ? "ioc" : "";
+      return `<span class="badge ${cls}">${esc(x)}</span>`;
+    };
+    const statusBadge = (s) => `<span class="badge ${esc(String(s || "").toLowerCase())}">${esc(s || "—")}</span>`;
+    const metric = (label, value, note = "", tone = "") => `<div class="metric ${tone}"><div class="metric-label">${esc(label)}</div><div class="metric-value">${value}</div><div class="metric-note">${note}</div></div>`;
+    const kv = (label, value) => `<div class="kv"><span title="${esc(label)}">${esc(label)}</span><span>${value}</span></div>`;
+    const emptyRow = (cols, text = "暂无数据") => `<tr><td colspan="${cols}" class="empty">${esc(text)}</td></tr>`;
+
+    function normalizeSymbols(data) {
+      const raw = data.symbols;
+      if (Array.isArray(raw)) return raw;
+      if (raw && typeof raw === "object") return Object.entries(raw).map(([symbol, value]) => ({symbol, ...obj(value)}));
+      return [];
+    }
+
+    function executionContext(data) {
+      const meta=obj(data.meta), environment=obj(data.environment);
+      const code=String(first(meta.environment,environment.code,"") || "").toUpperCase();
+      let mode=String(first(meta.execution_mode,environment.mode,"") || "").toLowerCase();
+      const simulated=Boolean(first(meta.simulated_execution,environment.execution?.simulated,data.account?.simulated,false));
+      if (!mode) mode=simulated || code==="PAPER_LIVE_DATA" ? "paper" : Boolean(meta.testnet) || code==="TESTNET" ? "testnet" : "live";
+      const isPaper=mode==="paper" || simulated;
+      const isTestnet=!isPaper && (mode==="testnet" || Boolean(meta.testnet));
+      const label=String(first(meta.environment_label,environment.label,isPaper?"PAPER · LIVE DATA":isTestnet?"TESTNET":"LIVE · REAL MONEY"));
+      return {
+        mode,isPaper,isTestnet,label,
+        privateApiEnabled:Boolean(first(meta.private_api_enabled,environment.private_api_enabled,!isPaper)),
+        executionVenue:first(meta.execution_venue,environment.execution?.venue,isPaper?"LOCAL_SIMULATOR":"BINANCE"),
+        marketDataEnvironment:first(meta.market_data_environment,environment.market_data?.environment,isPaper?"BINANCE_MAINNET_PUBLIC":isTestnet?"BINANCE_TESTNET":"BINANCE_MAINNET")
+      };
+    }
+
+    function setTop(data) {
+      const meta = obj(data.meta), system = obj(data.system);
+      const gateway = obj(system.gateway), oms = obj(system.oms), supervisor = obj(system.risk_supervisor || system.independent_risk_supervisor);
+      const context=executionContext(data);
+      document.body.classList.toggle("paper-mode",context.isPaper);
+      $("envState").textContent = context.label;
+      $("envState").className = context.isPaper || context.isTestnet ? "warning" : "negative";
+      $("overviewModeText").textContent = context.isPaper
+        ? "BINANCE 主网公开行情 · 本地模拟账户/订单/成交 · 私有 API 禁用"
+        : "只读本地遥测 · 无交易操作入口";
+      $("executionModeText").textContent = context.isPaper
+        ? "所有订单、成交、费用与 PnL 均为本地模拟结果"
+        : "所有 TIF、RPI 路由、状态、成交率、拒单与延迟";
+      const omsState = first(oms.state, path(data, "risk.status.kill_state"), "—");
+      $("omsState").textContent = omsState; $("omsState").className = statusClass(omsState);
+      const cap = first(oms.capability_mode, oms.mode, path(oms, "capability.mode"), "—");
+      $("capabilityState").textContent = cap; $("capabilityState").className = statusClass(cap);
+      const gw = first(gateway.state, gateway.status, gateway.active === true ? "READY" : null, "—");
+      $("gatewayState").textContent = gw; $("gatewayState").className = statusClass(gw);
+      const sup = supervisor.enabled === false ? "DISABLED" : supervisor.healthy === true ? "HEALTHY" : supervisor.healthy === false ? "UNHEALTHY" : "—";
+      $("supervisorState").textContent = sup; $("supervisorState").className = statusClass(sup);
+      $("asOf").innerHTML = `快照 #${esc(first(meta.sequence, "—"))} · ${fmtTime(first(meta.generated_at, meta.generated_at_iso), true)} · 前端延迟 ${state.failures ? "—" : "< 1 refresh"}`;
+      $("schemaVersion").textContent = `schema ${first(meta.schema_version, "—")}`;
+    }
+
+    function renderOverview(data, symbols) {
+      const system = obj(data.system), account = obj(data.account), risk = obj(data.risk), rs = obj(risk.status), oms = obj(system.oms), gw = obj(system.gateway), sup = obj(system.risk_supervisor || system.independent_risk_supervisor);
+      const context=executionContext(data), accountKind=context.isPaper?"本地模拟":"交易所";
+      const uptime = first(data.meta?.uptime_sec, system.uptime_sec);
+      const bookAges = symbols.map(s => first(s.market?.book_age_ms, s.market?.book_age_sec != null ? s.market.book_age_sec * 1000 : null)).filter(finite);
+      const worstAge = bookAges.length ? Math.max(...bookAges) : null;
+      const frozenCount = Object.keys(obj(first(oms.frozen_symbols, rs.frozen_symbols, {}))).length;
+      const apiWeight = first(path(data,"runtime.api_limit.weight_used_1m"), path(gw,"api_weight"));
+      $("statusMetrics").innerHTML = [
+        metric("运行时间", finite(uptime) ? duration(uptime) : '<span class="unavailable">不可用</span>', "当前进程", "info"),
+        metric("配置标的", fmt(symbols.length, 0), `${symbols.filter(s => s.contract?.supports_rpi).length} 个支持 RPI`),
+        metric("Gateway", `<span class="${statusClass(first(gw.state, gw.status))}">${esc(first(gw.state, gw.status, "不可用"))}</span>`, `${first(gw.gateway_name, data.meta?.venue, "BINANCE")}`),
+        metric("最差 Book age", fmt(worstAge, 0, " ms"), "跨全部标的", finite(worstAge) && worstAge > 1000 ? "bad" : "good"),
+        metric("冻结标的", fmt(frozenCount, 0), frozenCount ? "需检查冻结原因" : "无标的冻结", frozenCount ? "bad" : "good"),
+        metric("独立风控", `<span class="${sup.enabled === false ? "muted" : sup.healthy === true ? "positive" : "negative"}">${sup.enabled === false ? "DISABLED" : sup.healthy === true ? "HEALTHY" : sup.healthy === false ? "UNHEALTHY" : "不可用"}</span>`, context.isPaper&&sup.enabled===false?"Paper 模式不连接私有风控 API":finite(sup.status_age_sec) ? `age ${Number(sup.status_age_sec).toFixed(2)}s` : "status age 不可用", sup.healthy === false ? "bad" : "good"),
+        metric("API Weight / 1m", fmt(apiWeight, 0), "无生产者时显示不可用", finite(apiWeight) ? "" : "warn"),
+        metric("Kill Switch", rs.kill_switch_triggered === true ? '<span class="negative">TRIGGERED</span>' : rs.kill_switch_triggered === false ? '<span class="positive">ARMED</span>' : '<span class="unavailable">不可用</span>', esc(rs.kill_reason || "无触发原因"), rs.kill_switch_triggered ? "bad" : "good")
+      ].join("");
+
+      const equity = first(account.equity, rs.equity), balance = account.balance, available = account.available;
+      const used = account.used_margin, marginUsage = first(account.margin_usage, finite(equity) && finite(used) && Number(equity) ? Number(used)/Number(equity) : null);
+      const daily = first(account.daily_pnl, rs.cash_flow_adjusted_daily_pnl, rs.daily_pnl);
+      const unreal = first(account.unrealized_pnl, finite(equity) && finite(balance) ? Number(equity)-Number(balance) : null);
+      const gross = first(account.gross_notional, data.performance?.gross_notional);
+      $("accountMetrics").innerHTML = [
+        metric("Equity", fmt(equity, 4), `${accountKind}账户权益`, "info"), metric("Wallet Balance", fmt(balance, 4), `${accountKind}钱包余额`),
+        metric("Available", fmt(available, 4), `${accountKind}可用资金`), metric("Used Margin", fmt(used, 4), `${accountKind}已用保证金`),
+        metric("Margin Usage", fmtPct(marginUsage), `维持率 ${strip(fmtPct(account.maintenance_margin_ratio))}`, finite(marginUsage) && marginUsage > .7 ? "bad" : ""),
+        metric("Daily PnL", `<span class="${valueClass(daily)}">${fmt(daily, 4)}</span>`, context.isPaper?"本地模拟 PnL":"现金流调整", valueClass(daily)==="negative" ? "bad":"good"),
+        metric("Unrealized", `<span class="${valueClass(unreal)}">${fmt(unreal, 4)}</span>`, context.isPaper?"模拟 mark-to-market":"mark-to-market"),
+        metric("Peak Drawdown", fmtPct(rs.peak_drawdown_pct), `上限 ${strip(fmtPct(rs.max_drawdown_pct))}`, finite(rs.peak_drawdown_pct) && finite(rs.max_drawdown_pct) && Number(rs.peak_drawdown_pct) >= Number(rs.max_drawdown_pct) ? "bad":""),
+        metric("Budget Available", fmt(account.budget_available, 4), `预算 ${strip(fmt(account.budget_balance,2))}`),
+        metric("Gross Exposure", fmt(gross, 4), "账户总名义敞口")
+      ].join("");
+
+      const guards = {
+        "OMS 状态": first(oms.state, "不可用"), "能力原因": first(oms.capability_reason, oms.reason, "无"),
+        "手动 Rearm": boolWord(oms.manual_rearm_required), "最后 Halt": first(oms.last_halt_reason, "无"),
+        "最后 Freeze": first(oms.last_freeze_reason, "无"), "风险日": first(rs.risk_day, "不可用"),
+        "Margin 快照": freshness(rs.margin_snapshot_synced, rs.margin_snapshot_age_sec), "Cash-flow 快照": freshness(rs.cash_flow_snapshot_synced, rs.cash_flow_snapshot_age_sec)
+      };
+      $("guardSummary").innerHTML = kvEntries(guards);
+    }
+
+    function renderMarket(symbols) {
+      $("marketRows").innerHTML = symbols.length ? symbols.map(s => {
+        const m=obj(s.market), p=obj(s.position), st=obj(s.strategy), c=obj(s.contract);
+        const pos=first(p.volume,p.quantity,p.net_position), notional=first(p.notional, finite(pos)&&finite(m.mark_price)?Math.abs(Number(pos)*Number(m.mark_price)):null);
+        return `<tr><td><strong>${esc(s.symbol)}</strong></td><td>${fmtPrice(m.best_bid)} × ${fmtCompact(m.best_bid_qty,3)}</td><td>${fmtPrice(m.best_ask)} × ${fmtCompact(m.best_ask_qty,3)}</td><td>${fmtPrice(m.mid_price)}</td><td>${fmtPrice(m.mark_price)}</td><td>${fmt(m.spread_bps,2)}</td><td>${fmt(m.imbalance,3)}</td><td>${fmtPrice(m.microprice)}</td><td>${fmt(m.basis_bps,2)}</td><td>${fmtPct(m.funding_rate)}</td><td>${fmtAge(first(m.book_age_ms, finite(m.book_age_sec)?m.book_age_sec*1000:null))}</td><td>${fmtAge(first(m.trade_age_ms, finite(m.trade_age_sec)?m.trade_age_sec*1000:null))}</td><td class="${valueClass(pos)}">${fmt(pos,4)}</td><td>${fmt(notional,3)}</td><td class="${valueClass(p.unrealized_pnl)}">${fmt(p.unrealized_pnl,4)}</td><td class="${valueClass(st.alpha_bps)}">${fmt(st.alpha_bps,2)}</td><td>${statusBadge(first(st.params?.state,st.state,"—"))}</td><td>${c.supports_rpi === true ? '<span class="badge rpi">YES</span>' : c.supports_rpi === false ? '<span class="muted">NO</span>' : '<span class="unavailable">未知</span>'}</td></tr>`;
+      }).join("") : emptyRow(18,"等待市场事件");
+      $("positionRows").innerHTML = symbols.length ? symbols.map(s => {
+        const p=obj(s.position), e=obj(s.exposure), m=obj(s.market), q=first(p.volume,p.quantity,p.net_position);
+        return `<tr><td><strong>${esc(s.symbol)}</strong></td><td class="${valueClass(q)}">${finite(q) ? Number(q)>0?"LONG":Number(q)<0?"SHORT":"FLAT" : "不可用"}</td><td>${fmt(q,5)}</td><td>${fmtPrice(first(p.avg_price,p.entry_price,e.avg_price))}</td><td>${fmtPrice(m.mark_price)}</td><td>${fmt(first(p.notional,e.notional),3)}</td><td class="${valueClass(p.unrealized_pnl)}">${fmt(p.unrealized_pnl,4)}</td><td>${fmt(first(e.open_buy_qty,p.open_buy_qty),5)}</td><td>${fmt(first(e.open_sell_qty,p.open_sell_qty),5)}</td><td>${fmt(first(e.reduce_only_qty,p.reduce_only_qty),5)}</td></tr>`;
+      }).join("") : emptyRow(10);
+      $("contractRows").innerHTML = symbols.length ? symbols.map(s=>{const c=obj(s.contract); return `<tr><td><strong>${esc(s.symbol)}</strong></td><td>${statusBadge(c.status)}</td><td>${fmt(c.tick_size,8)}</td><td>${fmt(c.step_size,8)}</td><td>${fmt(c.min_qty,8)}</td><td>${fmt(c.min_notional,2)}</td><td>${fmt(c.price_precision,0)}</td><td>${fmt(c.qty_precision,0)}</td><td>${boolText(c.supports_rpi)}</td></tr>`}).join("") : emptyRow(9);
+    }
+
+    function renderExecution(data) {
+      const ordersObj=obj(data.orders), perf=obj(data.performance), stats=obj(first(ordersObj.stats,ordersObj.status_counts,{}));
+      const orders=arr(first(ordersObj.recent, data.recent_orders, [])), trades=arr(first(data.trades?.recent,data.recent_trades,[]));
+      const context=executionContext(data), simulated=context.isPaper||ordersObj.simulated===true||data.trades?.simulated===true;
+      const active=first(ordersObj.active_count, Array.isArray(ordersObj.active)?ordersObj.active.length:null, perf.active_orders);
+      const total=first(ordersObj.total_count,perf.total_orders,orders.length), filled=first(stats.FILLED,perf.filled_orders), rejected=first(stats.REJECTED,perf.rejected_orders);
+      const fillRatio=first(perf.fill_ratio, finite(total)&&Number(total)>0&&finite(filled)?Number(filled)/Number(total):null);
+      const rejectRatio=first(perf.reject_ratio, finite(total)&&Number(total)>0&&finite(rejected)?Number(rejected)/Number(total):null);
+      $("executionMetrics").innerHTML = [
+        metric("Active Orders",fmt(active,0),simulated?"本地模拟活动单":"本地活动单"), metric("Total Orders",fmt(total,0),simulated?"本地模拟会话":"当前内存/会话"),
+        metric("Fill Ratio",fmtPct(fillRatio),simulated?"本地填充模型结果":"有可靠分母时计算",finite(fillRatio)?"good":"warn"), metric("Reject Ratio",fmtPct(rejectRatio),simulated?"本地模拟拒绝":"本地 + 交易所拒绝",finite(rejectRatio)&&rejectRatio>0?"bad":""),
+        metric("RPI Orders",fmt(first(perf.rpi_orders,data.rpi?.total_orders),0),simulated?"模拟 TIF=RPI":"TIF=RPI","info"), metric("GTX Orders",fmt(first(perf.gtx_orders,data.rpi?.gtx_orders),0),simulated?"本地模拟被动单":"被动 API 流动性"),
+        metric("IOC Orders",fmt(first(perf.ioc_orders,data.rpi?.ioc_orders),0),simulated?"本地模拟主动单":"主动成交"), metric("Cancel / ACK latency",fmt(first(perf.cancel_latency_ms,perf.ack_latency_ms),1," ms"),simulated?"模拟延迟":"无埋点时不可用")
+      ].join("");
+      $("orderCountText").textContent=`${simulated?"PAPER 模拟 · ":""}${orders.length} 条`;
+      $("orderRows").innerHTML=orders.length?orders.map(o=>{
+        const qty=first(o.volume,o.quantity), filledQty=first(o.filled_volume,o.executed_qty), ratio=finite(qty)&&Number(qty)>0&&finite(filledQty)?Number(filledQty)/Number(qty):null;
+        return `<tr><td>${fmtTime(first(o.update_time,o.updated_at,o.timestamp))}</td><td><strong>${esc(o.symbol)}</strong></td><td>${esc(first(o.strategy_id,o.strategy,"—"))}</td><td class="${String(o.side).toUpperCase()==="BUY"?"positive":"negative"}">${esc(o.side||"—")}</td><td>${routeBadge(first(o.time_in_force,o.tif),o.is_rpi)}</td><td>${statusBadge(first(o.status,o.state))}</td><td>${fmtPrice(o.price)}</td><td>${fmt(qty,6)}</td><td>${fmt(filledQty,6)}</td><td>${fmtPrice(first(o.avg_price,o.average_price))}</td><td>${fmtPct(ratio)}</td><td>${boolText(first(o.reduce_only,o.is_reduce_only))}</td><td title="${esc(o.client_oid)}">${esc(shortId(o.client_oid))}</td><td title="${esc(o.exchange_oid)}">${esc(shortId(o.exchange_oid))}</td><td class="negative" title="${esc(first(o.error_msg,o.error_message,""))}">${esc(shortText(first(o.error_msg,o.error_message,"—"),28))}</td></tr>`;
+      }).join(""):emptyRow(15);
+      $("tradeCountText").textContent=`${simulated?"PAPER 模拟 · ":""}${trades.length} 条`;
+      $("tradeRows").innerHTML=trades.length?trades.map(t=>{
+        const notional=first(t.notional,finite(t.price)&&finite(t.volume)?Number(t.price)*Number(t.volume):null);
+        return `<tr><td>${fmtTime(first(t.datetime,t.timestamp,t.time))}</td><td><strong>${esc(t.symbol)}</strong></td><td>${esc(first(t.strategy_id,t.strategy,"—"))}</td><td class="${String(t.side).toUpperCase()==="BUY"?"positive":"negative"}">${esc(t.side||"—")}</td><td>${routeBadge(first(t.time_in_force,t.tif),t.is_rpi)}</td><td>${fmtPrice(t.price)}</td><td>${fmt(first(t.volume,t.quantity),6)}</td><td>${fmt(notional,4)}</td><td>${boolText(first(t.is_maker,t.maker))}</td><td>${fmt(t.commission,8)} ${esc(t.commission_asset||"")}</td><td class="${valueClass(t.realized_pnl)}">${fmt(t.realized_pnl,6)}</td><td>${esc(shortId(t.trade_id))}</td><td>${esc(shortId(first(t.order_id,t.client_oid)))}</td></tr>`;
+      }).join(""):emptyRow(13,"尚无成交");
+    }
+
+    function renderStrategy(symbols) {
+      const selected=state.selectedSymbol || symbols[0]?.symbol || "";
+      $("strategyTabs").innerHTML=symbols.length?symbols.map(s=>{const st=obj(s.strategy), active=s.symbol===selected?"active":""; return `<button class="strategy-tab ${active}" data-symbol="${esc(s.symbol)}"><strong>${esc(s.symbol)}</strong><small>${esc(first(st.params?.strategy,st.name,"strategy —"))} · α ${strip(fmt(st.alpha_bps,2))} bp</small></button>`}).join(""):'<p class="empty">暂无标的</p>';
+      document.querySelectorAll(".strategy-tab").forEach(button=>button.addEventListener("click",()=>{state.selectedSymbol=button.dataset.symbol; syncSymbolSelect(); renderStrategy(normalizeSymbols(state.data)); drawCharts(state.data,normalizeSymbols(state.data));}));
+      const row=symbols.find(s=>s.symbol===selected)||symbols[0];
+      if(!row){$("strategyDetail").innerHTML='<p class="muted">等待策略数据</p>';return;}
+      const st=obj(row.strategy), params=obj(st.params);
+      const header={"策略":first(params.strategy,st.name,"不可用"),"状态":first(params.state,st.state,"不可用"),"模式":first(params.mode,st.mode,"不可用"),"TIF":first(params.tif,params.time_in_force,"不可用"),"Fair Value":fmtPrice(st.fair_value),"Alpha (bp)":fmt(st.alpha_bps,3),"更新时间":fmtTime(first(st.timestamp,st.update_time),true)};
+      $("strategyDetail").innerHTML=`<h4>${esc(row.symbol)} · 策略状态</h4><div class="kv-grid">${kvEntries(header,true)}</div><h4 style="margin-top:20px">完整 params</h4>${renderObject(params)}`;
+    }
+
+    function renderRisk(data) {
+      const r=obj(data.risk), s=obj(r.status), limits=obj(r.limits), a=obj(data.account), sys=obj(data.system), sup=obj(sys.risk_supervisor||sys.independent_risk_supervisor);
+      const daily=first(s.cash_flow_adjusted_daily_pnl,s.daily_pnl), gross=first(a.gross_notional,data.performance?.gross_notional), margin=first(a.margin_usage,s.maintenance_margin_ratio);
+      $("riskMetrics").innerHTML=[
+        metric("Adjusted Daily PnL",`<span class="${valueClass(daily)}">${fmt(daily,4)}</span>`,`止损 ${strip(fmt(s.max_daily_loss,2))}`),
+        metric("Peak Drawdown",fmtPct(s.peak_drawdown_pct),`上限 ${strip(fmtPct(s.max_drawdown_pct))}`),
+        metric("Gross Notional",fmt(gross,4),`上限 ${strip(fmt(first(limits.max_account_gross_notional,limits.max_gross_notional),2))}`),
+        metric("Margin Usage",fmtPct(margin),"账户利用率"), metric("Max Order Notional",fmt(limits.max_order_notional,2),"单笔上限"),
+        metric("Max Position",fmt(first(limits.max_pos_notional,limits.max_position_notional),2),"单标的上限"),
+        metric("Frozen Symbols",fmt(Object.keys(obj(s.frozen_symbols)).length,0),"Risk Manager"),
+        metric("Supervisor",sup.healthy===true?'<span class="positive">HEALTHY</span>':sup.healthy===false?'<span class="negative">UNHEALTHY</span>':'<span class="unavailable">不可用</span>',esc(sup.reason||"无原因"))
+      ].join("");
+      const usages=arr(r.utilization);
+      if(usages.length){$("riskLimits").innerHTML=usages.map(x=>progress(first(x.label,x.name),x.value,x.limit)).join("");}
+      else {const rows=[["账户 Gross",gross,first(limits.max_account_gross_notional,limits.max_gross_notional)],["当日亏损",finite(daily)?Math.max(0,-Number(daily)):null,s.max_daily_loss],["回撤",s.peak_drawdown_pct,s.max_drawdown_pct],["Margin",margin,1]]; $("riskLimits").innerHTML=rows.map(x=>progress(...x)).join("")+`<details><summary>完整 limits</summary><pre>${esc(JSON.stringify(limits,null,2))}</pre></details>`;}
+      $("riskGuards").innerHTML=kvEntries({"Kill triggered":boolWord(s.kill_switch_triggered),"Kill state":first(s.kill_state,"不可用"),"Kill reason":first(s.kill_reason,"无"),"Frozen symbols":formatMap(s.frozen_symbols),"Frozen venues":formatMap(s.frozen_venues),"Margin snapshot":freshness(s.margin_snapshot_synced,s.margin_snapshot_age_sec),"Cash-flow snapshot":freshness(s.cash_flow_snapshot_synced,s.cash_flow_snapshot_age_sec),"External cash-flow":fmt(first(a.external_cash_flow_total,s.external_cash_flow_total),4)},true);
+      $("independentRisk").innerHTML=kvEntries(flatSummary(sup,{max:18}),true);
+    }
+
+    function renderRuntime(data) {
+      const sys=obj(data.system), rt=obj(data.runtime), event=obj(first(sys.event_engine,rt.event_engine,{})), strat=obj(first(sys.strategy_runtime,rt.strategy_runtime,{}));
+      const oms=obj(sys.oms), budget=obj(first(oms.outbound_message_budget,path(oms,"capability.outbound_message_budget"),rt.outbound_message_budget,{}));
+      $("eventRuntime").innerHTML=renderLaneRuntime(event);
+      $("strategyRuntime").innerHTML=renderObject(strat,2);
+      $("messageBudget").innerHTML=renderBudget(budget);
+      $("timeRuntime").innerHTML=kvEntries(flatSummary(first(sys.time_service,rt.time_service,{available:false}),{max:16}),true);
+      $("truthRuntime").innerHTML=kvEntries(flatSummary(first(sys.truth_monitor,rt.truth_monitor,{available:false}),{max:16}),true);
+      $("venueRuntime").innerHTML=kvEntries(flatSummary(first(sys.venue_supervisor,rt.venue_supervisor,{available:false}),{max:16}),true);
+      $("gatewayRuntime").innerHTML=kvEntries(flatSummary({...obj(sys.gateway),...obj(rt.api_limit)},{max:18,exclude:["listen_key","api_key","api_secret"]}),true);
+    }
+
+    function renderRpi(data,symbols) {
+      const r=obj(data.rpi), supported=symbols.filter(s=>s.contract?.supports_rpi===true).length, context=executionContext(data), simulated=context.isPaper||r.simulated===true;
+      $("rpiNotice").innerHTML=simulated
+        ? "<strong>Paper RPI：</strong>RPI 订单、成交、费用与 PnL 均来自本地模拟模型；它们不代表 Binance 已接受 RPI 订单，也不能证明 Binance App/Web 零售对手方参与。生产公开 API L2 仍不会展示 RPI 聚合流动性或排队位置。"
+        : "<strong>重要：</strong>标准 Binance API 深度不会展示 RPI 聚合流动性；本页普通 Bid/Ask 也不代表 RPI 排队位置。RPI 真实队列位置、前方数量与零售对手方身份不可从订单回报推导。这里仅展示 exchangeInfo 资格、已发 RPI 订单及可验证成交/费用。";
+      $("rpiMetrics").innerHTML=[
+        metric("策略总开关",r.enabled===true?'<span class="positive">ENABLED</span>':r.enabled===false?'<span class="muted">DISABLED</span>':'<span class="unavailable">不可用</span>',"strategy.use_rpi","info"),
+        metric("支持标的",fmt(first(r.supported_symbols_count,supported),0),`共 ${symbols.length} 个配置标的`), metric("活动 RPI",fmt(first(r.active_orders,r.active_order_count),0),simulated?"本地模拟挂单":"当前挂单"),
+        metric("累计 RPI",fmt(first(r.total_orders,r.order_count),0),simulated?"本地模拟会话":"当前会话/缓存"), metric("RPI 成交",fmt(first(r.filled_orders,r.fill_count),0),simulated?"本地撮合假设":"可验证路由"),
+        metric("RPI Fill Ratio",fmtPct(r.fill_ratio),simulated?"模拟填充模型":"有完整分母时"), metric("RPI Commission",fmt(first(r.total_commission,r.commission),8),simulated?"模拟费率/费用":"实际回报优先"),
+        metric("Fallback GTX",r.fallback_to_gtx===true?'<span class="warning">ON</span>':r.fallback_to_gtx===false?'<span>OFF</span>':'<span class="unavailable">不可用</span>',"不支持 RPI 时")
+      ].join("");
+      $("rpiRows").innerHTML=symbols.length?symbols.map(s=>{const c=obj(s.contract), x=obj(s.execution), sr=obj(s.rpi), st=obj(s.strategy), per=obj(first(r.by_symbol?.[s.symbol],{})); return `<tr><td><strong>${esc(s.symbol)}</strong></td><td>${statusBadge(c.status)}</td><td>${boolText(c.supports_rpi)}</td><td>${boolText(first(sr.enabled,st.params?.use_rpi,r.enabled))}</td><td>${boolText(first(sr.fallback_to_gtx,r.fallback_to_gtx))}</td><td>${fmt(first(sr.active_orders,x.rpi_active_orders,per.active_orders),0)}</td><td>${fmt(first(sr.total_orders,x.rpi_orders,per.total_orders),0)}</td><td>${fmt(first(sr.fills,x.rpi_fills,per.fills),0)}</td><td>${fmt(first(sr.commission_rate,per.commission_rate,r.commission_rates?.[s.symbol],r.commission_rate),8)}</td></tr>`}).join(""):emptyRow(9);
+      $("rpiAvailability").innerHTML=kvEntries({"执行环境": simulated?"LOCAL_SIMULATOR":"BINANCE", "标准 API L2 含 RPI": "否", "RPI 排队位置": availability(r.queue_position_available), "前方队列量": availability(r.ahead_quantity_available), "零售对手方身份": availability(r.counterparty_identity_available), "RPI depth 诊断": availability(first(r.depth_available,r.rpi_depth_available)), "真实成交路由可推断": simulated?"否（本地模拟）":availability(r.fill_route_available), "真实零售对手方已验证": r.real_binance_retail_counterparty_verified===true?"是":"否", "手续费来源": simulated?"本地模拟":availability(r.commission_available), "撮合范围": first(r.matching_scope,simulated?"本地填充模型":"Binance RPI"), "数据说明": first(r.visibility_note,"普通订单簿不包含 RPI 流动性")},true);
+    }
+
+    function renderLogs(data) {
+      const logs=arr(data.logs), alerts=arr(data.alerts);
+      $("logCountText").textContent=`${logs.length} 条`; $("alertCountText").textContent=`${alerts.length} 条`;
+      $("logList").innerHTML=logs.length?logs.slice().reverse().map(logLine).join(""):'<div class="empty">暂无日志</div>';
+      $("alertList").innerHTML=alerts.length?alerts.slice().reverse().map(x=>logLine(typeof x==="string"?{message:x,level:"ALERT"}:x)).join(""):'<div class="empty">暂无告警</div>';
+    }
+
+    function render(data) {
+      state.data=data; const symbols=normalizeSymbols(data); ensureSymbol(symbols);
+      setTop(data); renderOverview(data,symbols); renderMarket(symbols); renderExecution(data); renderStrategy(symbols); renderRisk(data); renderRuntime(data); renderRpi(data,symbols); renderLogs(data); updateHistory(data,symbols); drawCharts(data,symbols);
+      $("rawTelemetry").textContent=JSON.stringify(data,null,2);
+    }
+
+    function ensureSymbol(symbols){
+      const names=symbols.map(x=>x.symbol); if(!names.includes(state.selectedSymbol))state.selectedSymbol=names[0]||"";
+      const select=$("symbolSelect"); const current=Array.from(select.options).map(o=>o.value);
+      if(JSON.stringify(current)!==JSON.stringify(names)){select.innerHTML=names.length?names.map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join(""):'<option value="">等待数据</option>';}
+      syncSymbolSelect();
+    }
+    function syncSymbolSelect(){if($("symbolSelect").value!==state.selectedSymbol)$("symbolSelect").value=state.selectedSymbol;}
+    function updateHistory(data,symbols){
+      const now=Date.now(), a=obj(data.account), rs=obj(data.risk?.status); const equity=first(a.equity,rs.equity), pnl=first(a.daily_pnl,rs.cash_flow_adjusted_daily_pnl,rs.daily_pnl);
+      pushSeries(state.history.account,{t:now,equity:numOrNull(equity),pnl:numOrNull(pnl)});
+      symbols.forEach(s=>{if(!state.history.symbols[s.symbol])state.history.symbols[s.symbol]=[]; const m=obj(s.market),st=obj(s.strategy); pushSeries(state.history.symbols[s.symbol],{t:now,mid:numOrNull(m.mid_price),fair:numOrNull(st.fair_value),spread:numOrNull(m.spread_bps),alpha:numOrNull(st.alpha_bps)});});
+    }
+    function pushSeries(series,point){const prev=series[series.length-1]; if(!prev||JSON.stringify({...prev,t:0})!==JSON.stringify({...point,t:0}))series.push(point); if(series.length>state.maxHistory)series.splice(0,series.length-state.maxHistory);}
+    function drawCharts(data,symbols){
+      drawCanvas($("equityChart"),state.history.account,[{key:"equity",color:"#45d7e8"},{key:"pnl",color:"#42d392",separate:true}]);
+      const sym=state.selectedSymbol, points=state.history.symbols[sym]||[]; $("marketChartTitle").textContent=`${sym||"焦点标的"} · Mid / Fair`;
+      drawCanvas($("marketChart"),points,[{key:"mid",color:"#45d7e8"},{key:"fair",color:"#f4be55"}]);
+    }
+    function drawCanvas(canvas,points,series){
+      const ratio=window.devicePixelRatio||1, rect=canvas.getBoundingClientRect(),w=Math.max(100,rect.width),h=Math.max(100,rect.height); canvas.width=w*ratio; canvas.height=h*ratio; const c=canvas.getContext("2d"); c.scale(ratio,ratio); c.clearRect(0,0,w,h); c.fillStyle="#0b1118"; c.fillRect(0,0,w,h);
+      c.strokeStyle="#1d2935"; c.lineWidth=1; for(let i=1;i<5;i++){const y=10+(h-30)*i/5;c.beginPath();c.moveTo(0,y);c.lineTo(w,y);c.stroke();}
+      const valid=series.flatMap(s=>points.map(p=>p[s.key]).filter(finite).map(Number)); if(valid.length<2){c.fillStyle="#718295";c.font="12px Segoe UI";c.textAlign="center";c.fillText("等待形成历史曲线",w/2,h/2);return;}
+      series.forEach(s=>{const vals=points.map(p=>finite(p[s.key])?Number(p[s.key]):null);const own=vals.filter(v=>v!==null); if(own.length<2)return; let min=Math.min(...(s.separate?own:valid)),max=Math.max(...(s.separate?own:valid)); if(max===min){max+=1;min-=1;} c.strokeStyle=s.color;c.lineWidth=1.6;c.beginPath();let started=false;vals.forEach((v,i)=>{if(v===null)return;const x=8+i*(w-16)/Math.max(1,points.length-1),y=10+(max-v)*(h-28)/(max-min);if(!started){c.moveTo(x,y);started=true;}else c.lineTo(x,y);});c.stroke();});
+    }
+
+    function renderLaneRuntime(event){
+      const lanes=obj(event.lanes),queues=obj(event.queues); if(!Object.keys(lanes).length&&!Object.keys(queues).length)return renderObject(event,2);
+      return Object.entries(lanes).map(([name,x])=>{x=obj(x);return `<div class="progress-row"><div class="progress-label"><span>${esc(name.toUpperCase())} · depth ${esc(first(x.depth,queues[name+"_depth"],"—"))}</span><span>backlog ${strip(fmt(first(x.oldest_queued_ms,x.last_backlog_ms),1,"ms"))} · max ${strip(fmt(x.max_backlog_ms,1,"ms"))}</span></div><div class="progress"><i style="width:${Math.min(100,Number(x.depth||0)*2)}%;background:${Number(x.depth||0)>50?'var(--red)':'var(--cyan)'}"></i></div></div>`}).join("")+`<details><summary>完整 Event Engine 指标</summary><pre>${esc(JSON.stringify(event,null,2))}</pre></details>`;
+    }
+    function renderBudget(b){
+      if(!Object.keys(obj(b)).length)return '<span class="unavailable">不可用</span>';
+      const counts=obj(first(b.counts,b.current,{})),limits=obj(first(b.limits,b.config,{})); const keys=new Set([...Object.keys(counts),...Object.keys(limits)]);
+      let html=kv("Enabled",boolWord(b.enabled))+kv("Window",fmt(first(b.window_sec,b.window_seconds),2," s")); keys.forEach(k=>html+=progress(k,counts[k],limits[k])); return html+`<details><summary>完整消息预算</summary><pre>${esc(JSON.stringify(b,null,2))}</pre></details>`;
+    }
+    function renderObject(value,depth=3){
+      if(!value||typeof value!=="object"||!Object.keys(value).length)return '<span class="unavailable">暂无可用指标</span>';
+      const flat=flatten(value,depth); return `<div class="kv-grid">${Object.entries(flat).map(([k,v])=>kv(k,formatAny(v))).join("")}</div>`;
+    }
+    function flatten(value,maxDepth,prefix="",out={}){Object.entries(obj(value)).forEach(([k,v])=>{const key=prefix?`${prefix}.${k}`:k;if(v&&typeof v==="object"&&!Array.isArray(v)&&maxDepth>0)flatten(v,maxDepth-1,key,out);else out[key]=v;});return out;}
+    function flatSummary(value,{max=20,exclude=[]}={}){const flat=flatten(obj(value),2),out={};Object.entries(flat).filter(([k])=>!exclude.some(x=>k.toLowerCase().includes(x))).slice(0,max).forEach(([k,v])=>out[k]=v);if(!Object.keys(out).length)out.available=false;return out;}
+    function kvEntries(map,valuesMayHtml=false){return Object.entries(obj(map)).map(([k,v])=>kv(k,valuesMayHtml&&typeof v==="string"&&v.includes("<")?v:formatAny(v))).join("");}
+    function formatAny(v){if(v===null||v===undefined)return '<span class="unavailable">不可用</span>';if(typeof v==="boolean")return boolText(v);if(typeof v==="number")return fmt(v,Math.abs(v)<1?6:2);if(Array.isArray(v))return v.length?esc(v.join(", ")):'<span class="muted">空</span>';if(typeof v==="object")return esc(JSON.stringify(v));return esc(v);}
+    function progress(label,value,limit){const pct=finite(value)&&finite(limit)&&Number(limit)>0?Math.max(0,Math.min(100,Number(value)/Number(limit)*100)):null;const color=pct===null?'#526273':pct>90?'var(--red)':pct>70?'var(--amber)':'var(--cyan)';return `<div class="progress-row"><div class="progress-label"><span>${esc(label)}</span><span>${strip(fmt(value,3))} / ${strip(fmt(limit,3))}${pct===null?'':` · ${pct.toFixed(1)}%`}</span></div><div class="progress"><i style="width:${pct??0}%;background:${color}"></i></div></div>`;}
+    function logLine(x){if(typeof x==="string")x={message:x};const level=String(first(x.level,x.severity,"INFO")).toUpperCase(),cls=/ERROR|CRITICAL|ALERT/.test(level)?"error":/WARN/.test(level)?"warn":"";return `<div class="log-line ${cls}"><span class="time">${fmtTime(first(x.timestamp,x.time,x.datetime))}</span><span class="level">${esc(level)}</span><span>${esc(first(x.message,x.msg,x.text,""))}</span></div>`;}
+    function duration(sec){if(!finite(sec))return "不可用";sec=Math.floor(Number(sec));const d=Math.floor(sec/86400),h=Math.floor(sec%86400/3600),m=Math.floor(sec%3600/60),s=sec%60;return d?`${d}d ${h}h ${m}m`:`${h.toString().padStart(2,"0")}:${m.toString().padStart(2,"0")}:${s.toString().padStart(2,"0")}`;}
+    function fmtAge(ms){if(!finite(ms))return '<span class="unavailable">不可用</span>';const n=Number(ms);return `<span class="${n>2000?'negative':n>800?'warning':''}">${n<1000?n.toFixed(0)+'ms':(n/1000).toFixed(2)+'s'}</span>`;}
+    function freshness(synced,age){if(synced===false)return "未同步";if(synced===true)return finite(age)?`已同步 · ${Number(age).toFixed(1)}s`:"已同步";return "不可用";}
+    function availability(v){return v===true?"可用":v===false?"不可用":"未提供";}
+    function boolWord(v){return v===true?"是":v===false?"否":"不可用";}
+    function formatMap(v){const entries=Object.entries(obj(v));return entries.length?entries.map(([k,x])=>`${k}: ${x}`).join(" | "):"无";}
+    function shortId(v){const x=String(v??"");return x.length>14?`${x.slice(0,6)}…${x.slice(-5)}`:x||"—";}
+    function shortText(v,n){const x=String(v??"");return x.length>n?x.slice(0,n-1)+"…":x;}
+    function numOrNull(v){return finite(v)?Number(v):null;}
+    function strip(v){const d=document.createElement("div");d.innerHTML=String(v);return d.textContent||d.innerText||"";}
+
+    async function fetchSnapshot(){
+      if(state.paused)return;
+      try{
+        const response=await fetch("/api/snapshot",{cache:"no-store",headers:{"Accept":"application/json"}}); if(!response.ok)throw new Error(`HTTP ${response.status}`);
+        const data=await response.json(); state.failures=0; $("connectionDot").className="dot live"; $("connectionText").textContent="实时"; $("fatalOverlay").classList.remove("visible"); render(data);
+      }catch(error){state.failures++; $("connectionDot").className=`dot ${state.failures>2?'bad':'warn'}`; $("connectionText").textContent=state.failures>2?"已断开":"重连中"; if(state.failures>5){$("fatalMessage").textContent=`连续 ${state.failures} 次读取失败：${error.message}。交易主程序可能未启动，或本地端口已关闭。`;$("fatalOverlay").classList.add("visible");}}
+    }
+    function schedule(){clearInterval(state.timer);state.timer=setInterval(fetchSnapshot,Number($("refreshSelect").value));}
+    $("pauseButton").addEventListener("click",()=>{state.paused=!state.paused;$("pauseButton").textContent=state.paused?"继续刷新":"暂停刷新";$("connectionDot").className=state.paused?"dot warn":"dot live";$("connectionText").textContent=state.paused?"已暂停":"实时";if(!state.paused)fetchSnapshot();});
+    $("refreshSelect").addEventListener("change",schedule);
+    $("symbolSelect").addEventListener("change",e=>{state.selectedSymbol=e.target.value;if(state.data){renderStrategy(normalizeSymbols(state.data));drawCharts(state.data,normalizeSymbols(state.data));}});
+    $("retryButton").addEventListener("click",()=>{state.failures=0;$("fatalOverlay").classList.remove("visible");fetchSnapshot();});
+    window.addEventListener("resize",()=>{if(state.data)drawCharts(state.data,normalizeSymbols(state.data));});
+    schedule(); fetchSnapshot();
+  </script>
+</body>
+</html>

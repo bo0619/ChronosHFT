@@ -98,6 +98,9 @@ TIF_GTC = "GTC"
 TIF_IOC = "IOC"
 TIF_FOK = "FOK"
 TIF_GTX = "GTX"
+TIF_RPI = "RPI"
+
+POST_ONLY_TIME_IN_FORCE = frozenset({TIF_GTX, TIF_RPI})
 
 
 class ExecutionPolicy(Enum):
@@ -136,6 +139,24 @@ class OrderIntent:
     policy: ExecutionPolicy = ExecutionPolicy.PASSIVE
     tag: str = ""
 
+    def __post_init__(self):
+        self.order_type = str(self.order_type or "LIMIT").upper()
+        self.time_in_force = str(self.time_in_force or TIF_GTC).upper()
+        if self.time_in_force in POST_ONLY_TIME_IN_FORCE:
+            self.is_post_only = True
+        elif (
+            self.is_post_only
+            and self.order_type == "LIMIT"
+            and self.time_in_force == TIF_GTC
+        ):
+            # Binance represents legacy post-only LIMIT orders as GTX. Keep
+            # the OMS/journal value identical to the value sent on the wire.
+            self.time_in_force = TIF_GTX
+
+    @property
+    def is_rpi(self) -> bool:
+        return self.time_in_force == TIF_RPI
+
 
 @dataclass
 class OrderRequest:
@@ -148,6 +169,27 @@ class OrderRequest:
     post_only: bool = False
     reduce_only: bool = False
     self_trade_prevention_mode: str = ""
+
+    def __post_init__(self):
+        self.order_type = str(self.order_type or "LIMIT").upper()
+        self.time_in_force = str(self.time_in_force or TIF_GTC).upper()
+        if self.time_in_force in POST_ONLY_TIME_IN_FORCE:
+            self.post_only = True
+        elif (
+            self.post_only
+            and self.order_type == "LIMIT"
+            and self.time_in_force == TIF_GTC
+        ):
+            self.time_in_force = TIF_GTX
+        if not (
+            self.order_type == "LIMIT"
+            and self.time_in_force in {TIF_GTC, TIF_IOC, "GTD"}
+        ):
+            self.self_trade_prevention_mode = ""
+
+    @property
+    def is_rpi(self) -> bool:
+        return self.time_in_force == TIF_RPI
 
 
 @dataclass
@@ -267,6 +309,8 @@ class ExchangeOrderUpdate:
     realized_pnl: Optional[float] = None
     is_maker: Optional[bool] = None
     trade_id: int = -1
+    order_type: str = ""
+    time_in_force: str = ""
 
 
 @dataclass
@@ -281,6 +325,9 @@ class OrderStateSnapshot:
     avg_price: float
     update_time: float
     error_msg: str = ""
+    time_in_force: str = TIF_GTC
+    is_post_only: bool = False
+    is_rpi: bool = False
 
 
 @dataclass

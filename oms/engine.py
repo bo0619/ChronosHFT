@@ -38,6 +38,7 @@ from event.type import (
     TIF_GTC,
     TIF_GTX,
     TIF_IOC,
+    TIF_RPI,
 )
 
 from .account_manager import AccountManager
@@ -1215,6 +1216,21 @@ class OMS:
             error_message="gateway_send_failed",
         )
 
+    def _commit_gateway_submission(self, client_oid: str) -> None:
+        """Release gateways which stage exchange events until the OMS ACK is durable.
+
+        Live gateways do not implement this hook.  A local paper venue does: its
+        ``send_order`` call returns an acknowledgement without publishing NEW or
+        fill events, then this hook releases those events only after the OMS has
+        persisted the ACK and installed the exchange-order mapping.
+        """
+        commit = getattr(self.gateway, "commit_order_submission", None)
+        if not callable(commit):
+            return
+        committed = commit(client_oid)
+        if committed is False:
+            raise RuntimeError("gateway rejected the submit commit barrier")
+
     def _record_command_prepared(
         self,
         command_id: str,
@@ -1503,7 +1519,8 @@ class OMS:
             volume=volume,
             order_type=str(remote.get("type", "LIMIT") or "LIMIT"),
             time_in_force=str(remote.get("timeInForce", TIF_GTC) or TIF_GTC),
-            is_post_only=str(remote.get("timeInForce", "") or "") == TIF_GTX,
+            is_post_only=str(remote.get("timeInForce", "") or "").upper()
+            in {TIF_GTX, TIF_RPI},
             reduce_only=bool(remote.get("reduceOnly", False)),
             policy=ExecutionPolicy.PASSIVE,
             tag="exchange_recovered",
@@ -1544,6 +1561,8 @@ class OMS:
         executed_qty = float(remote.get("executedQty", 0.0) or 0.0)
         avg_price = float(remote.get("avgPrice", 0.0) or remote.get("price", 0.0) or 0.0)
         update_time_ms = remote.get("updateTime") or remote.get("time") or time_service.now()
+        remote_order_type = str(remote.get("type", "") or "").upper()
+        remote_time_in_force = str(remote.get("timeInForce", "") or "").upper()
         if (
             status in {"CANCELED", "EXPIRED"}
             and executed_qty > order.filled_volume + 1e-9
@@ -1567,6 +1586,8 @@ class OMS:
                 cum_filled_qty=executed_qty,
                 update_time=float(update_time_ms) / 1000.0,
                 seq=0,
+                order_type=remote_order_type,
+                time_in_force=remote_time_in_force,
             )
             self._apply_event(Event(EVENT_EXCHANGE_ORDER_UPDATE, fill_update))
 
@@ -1580,6 +1601,8 @@ class OMS:
             cum_filled_qty=executed_qty,
             update_time=float(update_time_ms) / 1000.0,
             seq=0,
+            order_type=remote_order_type,
+            time_in_force=remote_time_in_force,
         )
         self._apply_event(Event(EVENT_EXCHANGE_ORDER_UPDATE, update))
         self._audit(
@@ -2155,6 +2178,21 @@ class OMS:
 
             event_data = OrderSubmitted(request, client_oid, time.time())
             self.event_engine.put(Event(EVENT_ORDER_SUBMITTED, event_data))
+            try:
+                self._commit_gateway_submission(client_oid)
+            except Exception as exc:
+                logger.error(
+                    f"[OMS] Gateway submit commit failed for {client_oid}: {exc}"
+                )
+                self.freeze_symbol(
+                    intent.symbol,
+                    f"order_truth:submit_commit_failed:{client_oid}",
+                    cancel_active_orders=False,
+                )
+                self._on_order_truth_check(
+                    "Gateway submit commit failed",
+                    suspicious_oid=client_oid,
+                )
             payload = {
                 "client_oid": client_oid,
                 "exchange_oid": exchange_oid,
@@ -2856,6 +2894,10 @@ class OMS:
             if resting.intent.side == intent.side:
                 continue
             if resting.intent.volume - resting.filled_volume <= 1e-12:
+                continue
+            # RPI orders only match App/Web retail flow. They cannot execute
+            # against this OMS's API orders, even at crossed prices.
+            if intent.is_rpi or resting.intent.is_rpi:
                 continue
 
             resting_is_market = (
@@ -3704,6 +3746,21 @@ class OMS:
 
             event_data = OrderSubmitted(request, client_oid, time.time())
             self.event_engine.put(Event(EVENT_ORDER_SUBMITTED, event_data))
+            try:
+                self._commit_gateway_submission(client_oid)
+            except Exception as exc:
+                logger.error(
+                    f"[OMS] Gateway submit commit failed for {client_oid}: {exc}"
+                )
+                self.freeze_symbol(
+                    intent.symbol,
+                    f"order_truth:submit_commit_failed:{client_oid}",
+                    cancel_active_orders=False,
+                )
+                self._on_order_truth_check(
+                    "Gateway submit commit failed",
+                    suspicious_oid=client_oid,
+                )
             self._audit(
                 "order_submitted",
                 client_oid=client_oid,
@@ -4160,6 +4217,9 @@ class OMS:
             return
 
         update: ExchangeOrderUpdate = event.data
+        update.status = str(update.status or "").upper()
+        if update.status == "EXPIRED_IN_MATCH":
+            update.status = "EXPIRED"
         with self.lock:
             order = self.orders.get(update.client_oid)
             if not order and update.exchange_oid:
@@ -4200,6 +4260,38 @@ class OMS:
                     daemon=True,
                 ).start()
                 return
+
+            semantic_mismatches = {}
+            if (
+                update.order_type
+                and update.order_type != order.intent.order_type
+            ):
+                semantic_mismatches["order_type"] = {
+                    "expected": order.intent.order_type,
+                    "actual": update.order_type,
+                }
+            if (
+                update.time_in_force
+                and order.intent.order_type == "LIMIT"
+                and update.time_in_force != order.intent.time_in_force
+            ):
+                semantic_mismatches["time_in_force"] = {
+                    "expected": order.intent.time_in_force,
+                    "actual": update.time_in_force,
+                }
+            if semantic_mismatches:
+                reason = f"exchange_order_semantics_mismatch:{order.client_oid}"
+                self._audit(
+                    "exchange_order_semantics_mismatch",
+                    client_oid=order.client_oid,
+                    symbol=order.intent.symbol,
+                    mismatches=semantic_mismatches,
+                )
+                threading.Thread(
+                    target=self.freeze_symbol,
+                    args=(order.intent.symbol, reason),
+                    daemon=True,
+                ).start()
 
             if update.seq and update.seq <= order.last_update_seq:
                 self._audit(
@@ -5073,12 +5165,25 @@ class OMS:
 
     def _get_fee_rate(self, order: Order, is_maker: bool = None) -> float:
         fee_config = self.config.get("backtest", {})
+        maker_fee = float(fee_config.get("maker_fee", 0.0))
+        if order.intent.is_rpi:
+            symbol_rates = fee_config.get("rpi_commission_rates", {})
+            symbol_rate = (
+                symbol_rates.get(order.intent.symbol)
+                if isinstance(symbol_rates, dict)
+                else None
+            )
+            maker_fee += float(
+                symbol_rate
+                if symbol_rate is not None
+                else fee_config.get("rpi_commission_rate", 0.0)
+            )
         if is_maker is True:
-            return fee_config.get("maker_fee", 0.0)
+            return maker_fee
         if is_maker is False:
             return fee_config.get("taker_fee", 0.0005)
         if order.intent.is_post_only:
-            return fee_config.get("maker_fee", 0.0)
+            return maker_fee
         return fee_config.get("taker_fee", 0.0005)
 
     def _serialize_intent(self, intent: OrderIntent) -> dict:

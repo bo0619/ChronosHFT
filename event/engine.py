@@ -1,6 +1,6 @@
 from collections import defaultdict, deque
 from queue import Empty, Queue
-from threading import Lock, Thread
+from threading import Condition, Lock, Thread
 import time
 
 from infrastructure.logger import logger
@@ -40,8 +40,10 @@ class EventEngine:
             for lane in self.ALL_LANES
         }
         self._pending_cold = {}
+        self._pending_work = 0
         self._dispatch_seq = 0
         self._lock = Lock()
+        self._idle_condition = Condition(self._lock)
         self._alert_lock = Lock()
         self._last_depth_alert_at = {}
         self._last_backlog_alert_at = {}
@@ -122,6 +124,24 @@ class EventEngine:
                 thread.join()
         logger.info(">>> [EventEngine] stopped")
 
+    def wait_until_idle(self, timeout_sec: float) -> bool:
+        """Wait until every queued or in-flight lane dispatch has completed.
+
+        Work handed off from a hot lane to the cold lane remains part of the
+        same pending-work barrier. New work may still be accepted while this
+        method waits; callers that need shutdown quiescence should stop their
+        producers before invoking it.
+        """
+        timeout_sec = max(0.0, float(timeout_sec))
+        deadline = time.monotonic() + timeout_sec
+        with self._idle_condition:
+            while self._pending_work:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._idle_condition.wait(timeout=remaining)
+            return True
+
     def put(self, event):
         dispatch_id = self._next_dispatch_id()
         hot_lanes = [lane for lane in self.HOT_LANES if event.type in self._handlers[lane]]
@@ -161,11 +181,14 @@ class EventEngine:
         market_depth = self._queues["market"].qsize()
         execution_depth = self._queues["execution"].qsize()
         cold_depth = self._queues["cold"].qsize()
+        with self._lock:
+            pending_work = self._pending_work
         return {
             "market_depth": market_depth,
             "execution_depth": execution_depth,
             "hot_depth": market_depth + execution_depth,
             "cold_depth": cold_depth,
+            "pending_work": pending_work,
         }
 
     def get_metrics_snapshot(self):
@@ -231,8 +254,9 @@ class EventEngine:
 
     def _enqueue(self, lane: str, dispatch_id: int, event):
         enqueued_at = time.perf_counter()
-        with self._lock:
+        with self._idle_condition:
             self._queue_timestamps[lane].append(enqueued_at)
+            self._pending_work += 1
         self._queues[lane].put((dispatch_id, enqueued_at, event))
         self._maybe_alert_queue_depth(lane)
 
@@ -244,10 +268,19 @@ class EventEngine:
                 try:
                     self._process_lane(lane, event, enqueued_at)
                 finally:
-                    if lane in self.HOT_LANES:
-                        self._handoff_to_cold(dispatch_id)
+                    try:
+                        if lane in self.HOT_LANES:
+                            self._handoff_to_cold(dispatch_id)
+                    finally:
+                        self._mark_work_complete()
             except Empty:
                 pass
+
+    def _mark_work_complete(self):
+        with self._idle_condition:
+            self._pending_work -= 1
+            if self._pending_work == 0:
+                self._idle_condition.notify_all()
 
     def _note_dequeue(self, lane: str):
         with self._lock:
@@ -408,17 +441,27 @@ class EventEngine:
             while not self._queues[lane].empty():
                 try:
                     dispatch_id, enqueued_at, event = self._queues[lane].get_nowait()
-                    self._note_dequeue(lane)
-                    self._process_lane(lane, event, enqueued_at)
-                    self._handoff_to_cold(dispatch_id)
                 except Empty:
                     break
+                self._note_dequeue(lane)
+                try:
+                    self._process_lane(lane, event, enqueued_at)
+                finally:
+                    try:
+                        self._handoff_to_cold(dispatch_id)
+                    finally:
+                        self._mark_work_complete()
 
         while not self._queues["cold"].empty():
             try:
                 dispatch_id, enqueued_at, event = self._queues["cold"].get_nowait()
-                self._note_dequeue("cold")
-                self._process_lane("cold", event, enqueued_at)
-                self._handoff_to_cold(dispatch_id)
             except Empty:
                 break
+            self._note_dequeue("cold")
+            try:
+                self._process_lane("cold", event, enqueued_at)
+            finally:
+                try:
+                    self._handoff_to_cold(dispatch_id)
+                finally:
+                    self._mark_work_complete()

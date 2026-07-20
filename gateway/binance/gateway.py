@@ -141,7 +141,7 @@ class BinanceGateway(BaseGateway):
                 )
             sym = req.symbol.replace("USDC", "").replace("USDT", "").lower()
             side_str = "long" if req.side == "BUY" else "short"
-            tif_str = "GTX" if req.post_only else "IOC"
+            tif_str = req.time_in_force
 
             if client_oid and client_oid.startswith("EXIT_"):
                 action = "exit "
@@ -228,6 +228,13 @@ class BinanceGateway(BaseGateway):
 
     def get_depth_snapshot(self, symbol):
         return self.rest.get_depth_snapshot(symbol)
+
+    def get_rpi_depth(self, symbol: str, limit: int = 1000):
+        return self.rest.get_rpi_depth(symbol, limit=limit)
+
+    def get_commission_rate(self, symbol: str):
+        resp = self.rest.get_commission_rate(symbol)
+        return resp.json() if resp and resp.status_code == 200 else None
 
     def _start_streams(self):
         self.ws.start_market_stream(self.symbols)
@@ -378,6 +385,8 @@ class BinanceGateway(BaseGateway):
             realized_pnl=self._parse_optional_float(order.get("rp")),
             is_maker=bool(order.get("m")) if "m" in order else None,
             trade_id=self._parse_optional_int(order.get("t"), default=-1),
+            order_type=str(order.get("o", "") or "").upper(),
+            time_in_force=str(order.get("f", "") or "").upper(),
         )
         self.on_order_update(update)
 

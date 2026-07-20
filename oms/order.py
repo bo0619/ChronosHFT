@@ -148,6 +148,9 @@ class Order:
             avg_price=self.avg_price,
             update_time=self.updated_at,
             error_msg=self.error_msg,
+            time_in_force=self.intent.time_in_force,
+            is_post_only=self.intent.is_post_only,
+            is_rpi=self.intent.is_rpi,
         )
 
     def to_record(self) -> dict:

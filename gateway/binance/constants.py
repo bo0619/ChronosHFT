@@ -10,6 +10,7 @@ WS_URL_TEST = "wss://stream.binancefuture.com/ws"
 
 # Endpoints
 EP_DEPTH_SNAPSHOT = "/fapi/v1/depth"
+EP_RPI_DEPTH = "/fapi/v1/rpiDepth"
 EP_ORDER = "/fapi/v1/order"
 EP_LISTEN_KEY = "/fapi/v1/listenKey"
 EP_TIME = "/fapi/v1/time"
@@ -27,3 +28,4 @@ EP_ALL_ORDERS = "/fapi/v1/allOrders"
 EP_USER_TRADES = "/fapi/v1/userTrades"
 EP_INCOME = "/fapi/v1/income"
 EP_COUNTDOWN_CANCEL_ALL = "/fapi/v1/countdownCancelAll"
+EP_COMMISSION_RATE = "/fapi/v1/commissionRate"

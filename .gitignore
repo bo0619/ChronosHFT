@@ -27,3 +27,4 @@ tests/
 tests/*
 !tests/test_oms_institutional_recovery.py
 !tests/test_oms_durable_ledger.py
+!tests/test_paper_gateway.py

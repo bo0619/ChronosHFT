@@ -9,7 +9,7 @@ if "requests" not in sys.modules:
     requests_stub.get = lambda *args, **kwargs: None
     sys.modules["requests"] = requests_stub
 
-from event.type import LifecycleState, Side, TradeData
+from event.type import LifecycleState, Side, TIF_GTX, TIF_IOC, TIF_RPI, TradeData
 from strategy.ml_sniper.ml_sniper import MLSniperStrategy
 
 
@@ -151,7 +151,7 @@ class MLSniperAdaptationTests(unittest.TestCase):
 
     def test_warmup_is_tracked_per_symbol(self):
         btc_predictor = self.strategy._get_predictor("BTCUSDT")
-        eth_predictor = self.strategy._get_predictor("ETHUSDT")
+        self.strategy._get_predictor("ETHUSDT")
 
         for model in btc_predictor.models.values():
             model.n_updates = 2
@@ -164,6 +164,81 @@ class MLSniperAdaptationTests(unittest.TestCase):
     def test_comment_entries_are_filtered_out_of_weights(self):
         self.assertEqual(set(self.strategy.weights.keys()), {"1s", "10s", "30s"})
         self.assertTrue(all(isinstance(weight, float) for weight in self.strategy.weights.values()))
+
+    def test_rpi_entry_routing_is_capability_gated_per_symbol(self):
+        self.strategy.use_rpi_for_entry = True
+        self.strategy.use_rpi = True
+        self.strategy.rpi_fallback_to_gtx = True
+
+        with patch.object(
+            self.strategy,
+            "send_intent",
+            return_value="rpi-entry",
+        ) as send_intent, patch(
+            "strategy.ml_sniper.ml_sniper.ref_data_manager.supports_rpi",
+            return_value=True,
+        ):
+            mode = self.strategy._passive_time_in_force("LTCUSDT")
+            self.strategy._entry("LTCUSDT", Side.BUY, 100.0, 0.1, mode)
+
+        intent = send_intent.call_args.args[0]
+        self.assertEqual(intent.time_in_force, TIF_RPI)
+        self.assertTrue(intent.is_post_only)
+
+        with patch(
+            "strategy.ml_sniper.ml_sniper.ref_data_manager.supports_rpi",
+            return_value=False,
+        ):
+            self.assertEqual(
+                self.strategy._passive_time_in_force("SOLUSDT"),
+                TIF_GTX,
+            )
+
+    def test_passive_exit_uses_separate_rpi_switch(self):
+        self.strategy.use_rpi_for_entry = True
+        self.strategy.use_rpi_for_passive_exit = False
+
+        with patch.object(
+            self.strategy,
+            "send_intent",
+            return_value="gtx-exit",
+        ) as send_intent, patch(
+            "strategy.ml_sniper.ml_sniper.ref_data_manager.supports_rpi",
+            return_value=True,
+        ):
+            self.strategy._place_exit("LTCUSDT", Side.SELL, 101.0, 0.1)
+
+        intent = send_intent.call_args.args[0]
+        self.assertEqual(intent.time_in_force, TIF_GTX)
+        self.assertTrue(intent.reduce_only)
+
+    def test_force_exit_is_ioc_reduce_only(self):
+        sym = "LTCUSDT"
+        self.strategy.state[sym] = "HOLDING"
+        self.strategy.pos_entry_ts[sym] = 0.0
+        self.strategy.latest_preds[sym] = {}
+        self.oms.exposure.net_positions[sym] = 0.1
+
+        with patch.object(
+            self.strategy,
+            "send_intent",
+            return_value="ioc-exit",
+        ) as send_intent, patch.object(self.strategy, "cancel_all"):
+            self.strategy._run_fsm(
+                sym,
+                mid=100.0,
+                bid_1=99.9,
+                ask_1=100.1,
+                signal=0.0,
+                confidence=1.0,
+                velocity=0.0,
+                now=self.strategy.max_hold_sec + 1.0,
+            )
+
+        intent = send_intent.call_args.args[0]
+        self.assertEqual(intent.time_in_force, TIF_IOC)
+        self.assertFalse(intent.is_post_only)
+        self.assertTrue(intent.reduce_only)
 
     @patch("strategy.ml_sniper.ml_sniper.ref_data_manager.round_price", side_effect=lambda symbol, price: price)
     def test_consensus_filter_blocks_conflicts_and_allows_alignment(self, _round_price):

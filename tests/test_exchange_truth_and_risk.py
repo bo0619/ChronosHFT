@@ -946,7 +946,7 @@ class RiskExecutionTests(unittest.TestCase):
 
         self.assertEqual(
             oms.risk_heartbeats,
-            [("risk_live_loop", True, "")],
+            [("risk_manager", True, "risk_live_loop")],
         )
         self.assertEqual(oms.dead_man_renewals, 1)
 

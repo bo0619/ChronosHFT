@@ -211,7 +211,16 @@ class RiskManager:
         publish = getattr(self.oms, "record_risk_control_heartbeat", None)
         if not callable(publish):
             return False
-        return bool(publish(source=source, healthy=True))
+        # Keep the producer identity stable so the OMS source allow-list does
+        # not reject heartbeats merely because the risk loop changed phase.
+        # The former call-site label remains available as diagnostic context.
+        return bool(
+            publish(
+                source="risk_manager",
+                healthy=True,
+                reason=str(source or "risk_live_loop"),
+            )
+        )
 
     def get_status_snapshot(self) -> dict:
         account = getattr(self.oms, "account", None)

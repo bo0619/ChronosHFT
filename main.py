@@ -3,6 +3,7 @@ import multiprocessing
 import os
 import sys
 import time
+import webbrowser
 
 from rich.live import Live
 
@@ -13,8 +14,11 @@ from event.engine import EventEngine
 from event.type import (
     EVENT_ACCOUNT_UPDATE,
     EVENT_AGG_TRADE,
+    EVENT_ALERT,
+    EVENT_API_LIMIT,
     EVENT_EXCHANGE_ACCOUNT_UPDATE,
     EVENT_EXCHANGE_ORDER_UPDATE,
+    EVENT_LOG,
     EVENT_MARK_PRICE,
     EVENT_ORDERBOOK,
     EVENT_ORDER_SUBMITTED,
@@ -33,6 +37,7 @@ from infrastructure.admin_control import (
 )
 from infrastructure.config_scaling import load_root_config
 from infrastructure.logger import logger
+from infrastructure.paper_trade import apply_paper_trade_mode, is_paper_trade
 from infrastructure.system_health import handle_system_health_event
 from infrastructure.time_service import time_service
 from infrastructure.truth_monitor import TruthMonitor
@@ -45,13 +50,14 @@ from infrastructure.watchdog import (
 from oms.engine import OMS
 from risk.independent_supervisor import IndependentRiskSupervisor
 from risk.manager import RiskManager
-from strategy.ml_sniper.ml_sniper import MLSniperStrategy
+from strategy.registry import create_primary_strategy
 from strategy.runtime import StrategyRuntime
 from ui.dashboard import TUIDashboard
+from ui.web_dashboard import LocalWebDashboard
 
 
 def parse_cli_args(argv=None):
-    parser = argparse.ArgumentParser(description="ChronosHFT live engine")
+    parser = argparse.ArgumentParser(description="ChronosHFT trading engine")
     parser.add_argument(
         "--config",
         default="config.json",
@@ -129,6 +135,41 @@ def run_live_risk_checks(risk_controller, independent_supervisor=None):
     return supervisor_healthy and risk_healthy
 
 
+def build_gateway_bundle(engine, config, market_data_config):
+    """Build mutually exclusive live or paper exchange capabilities."""
+    if is_paper_trade(config):
+        from gateway.binance.paper_gateway import (
+            BinancePaperGateway,
+            PaperTruthSnapshotProvider,
+        )
+
+        paper_config = apply_paper_trade_mode(config)
+        paper_market_data_config = paper_config.get("system", {}).get(
+            "market_data",
+            market_data_config,
+        )
+        gateway = BinancePaperGateway(
+            engine,
+            paper_config,
+            paper_market_data_config,
+        )
+        return gateway, PaperTruthSnapshotProvider(gateway)
+
+    gateway = BinanceGateway(
+        engine,
+        config["api_key"],
+        config["api_secret"],
+        testnet=config["testnet"],
+        market_data_config=market_data_config,
+    )
+    truth_provider = BinanceTruthSnapshotProvider(
+        config["api_key"],
+        config["api_secret"],
+        testnet=config["testnet"],
+    )
+    return gateway, truth_provider
+
+
 # P0 TODO: Replace the host-local OMS file lock with replicated leader election
 # and a monotonic fencing token before supporting multi-host active/passive OMS.
 def main(argv=None):
@@ -137,12 +178,16 @@ def main(argv=None):
     if not config:
         return
 
+    paper_trade = is_paper_trade(config)
+    if paper_trade:
+        config = apply_paper_trade_mode(config)
+
     missing_credentials = [
         field
         for field in ("api_key", "api_secret")
         if not str(config.get(field, "") or "").strip()
     ]
-    if missing_credentials and not args.admin_command:
+    if missing_credentials and not paper_trade and not args.admin_command:
         env_names = [
             str(config.get(f"{field}_env", "") or "")
             for field in missing_credentials
@@ -184,17 +229,10 @@ def main(argv=None):
     logger.set_ui_callback(dashboard.add_log)
 
     market_data_config = config.get("system", {}).get("market_data", {})
-    gateway = BinanceGateway(
+    gateway, truth_provider = build_gateway_bundle(
         engine,
-        config["api_key"],
-        config["api_secret"],
-        testnet=config["testnet"],
-        market_data_config=market_data_config,
-    )
-    truth_provider = BinanceTruthSnapshotProvider(
-        config["api_key"],
-        config["api_secret"],
-        testnet=config["testnet"],
+        config,
+        market_data_config,
     )
     oms_system = OMS(engine, gateway, config)
     risk_controller = RiskManager(engine, config, oms=oms_system, gateway=gateway)
@@ -203,6 +241,8 @@ def main(argv=None):
         config,
         risk_manager=risk_controller,
     )
+    if paper_trade and risk_supervisor.enabled:
+        raise RuntimeError("Paper Trade must not enable IndependentRiskSupervisor")
     alpha_process_config = (
         config.get("system", {})
         .get("strategy_runtime", {})
@@ -210,7 +250,18 @@ def main(argv=None):
     )
     alpha_process_config = dict(alpha_process_config or {})
     alpha_process_config.setdefault("processes", min(4, max(1, len(config.get("symbols", [])))))
-    strategy = MLSniperStrategy(engine, oms_system, alpha_process_config=alpha_process_config)
+    strategy = create_primary_strategy(
+        engine,
+        oms_system,
+        config,
+        alpha_process_config=alpha_process_config,
+    )
+    logger.info(
+        "[StrategyRegistry] "
+        f"primary={strategy.model_key} strategy_id={strategy.name} "
+        f"registered={','.join(strategy.registered_models)} "
+        "execution_policy=single_primary"
+    )
     strategy_runtime = StrategyRuntime(
         strategy,
         config.get("system", {}).get("strategy_runtime", {}),
@@ -225,6 +276,27 @@ def main(argv=None):
         risk_manager=risk_controller,
         risk_supervisor=risk_supervisor,
     )
+    web_dashboard_config = config.get("system", {}).get("web_dashboard", {}) or {}
+    web_dashboard = None
+    if bool(web_dashboard_config.get("enabled", True)):
+        web_dashboard = LocalWebDashboard(
+            oms=oms_system,
+            gateway=gateway,
+            risk_manager=risk_controller,
+            risk_supervisor=risk_supervisor,
+            config=config,
+            time_service=time_service,
+            truth_monitor=truth_monitor,
+            venue_supervisor=venue_supervisor,
+            event_engine=engine,
+            strategy_runtime=strategy_runtime,
+        )
+
+        def on_dashboard_log(message):
+            dashboard.add_log(message)
+            web_dashboard.add_log(message)
+
+        logger.set_ui_callback(on_dashboard_log)
 
     def on_time_service_health(severity, reason, details):
         if severity == "freeze":
@@ -273,27 +345,89 @@ def main(argv=None):
         lambda e: handle_system_health_event(e, risk_controller, oms_system),
     )
 
+    def on_orderbook_cold(event):
+        strategy_runtime.on_orderbook(event.data)
+        dashboard.update_market(event.data)
+        if web_dashboard is not None:
+            web_dashboard.update_market(event.data)
+
+    def on_market_trade_cold(event):
+        strategy_runtime.on_market_trade(event.data)
+        if web_dashboard is not None:
+            web_dashboard.update_market_trade(event.data)
+
+    def on_order_cold(event):
+        strategy_runtime.on_order(event.data)
+        if web_dashboard is not None:
+            web_dashboard.update_order(event.data)
+
+    def on_trade_cold(event):
+        strategy_runtime.on_trade(event.data)
+        if web_dashboard is not None:
+            web_dashboard.update_trade(event.data)
+
+    def on_position_cold(event):
+        strategy_runtime.on_position(event.data)
+        dashboard.update_position(event.data)
+        if web_dashboard is not None:
+            web_dashboard.update_position(event.data)
+
+    def on_account_cold(event):
+        strategy_runtime.on_account_update(event.data)
+        dashboard.update_account(event.data)
+        if web_dashboard is not None:
+            web_dashboard.update_account(event.data)
+
+    def on_strategy_cold(event):
+        dashboard.update_strategy(event.data)
+        if web_dashboard is not None:
+            web_dashboard.update_strategy(event.data)
+
+    def on_system_health_cold(event):
+        strategy_runtime.on_system_health(event.data)
+        if web_dashboard is not None:
+            web_dashboard.update_system_health(event.data)
+
+    register_cold(EVENT_ORDERBOOK, on_orderbook_cold)
     register_cold(
-        EVENT_ORDERBOOK,
-        lambda e: [strategy_runtime.on_orderbook(e.data), dashboard.update_market(e.data)],
+        EVENT_MARK_PRICE,
+        lambda e: web_dashboard.update_mark_price(e.data) if web_dashboard else None,
     )
-    register_cold(EVENT_AGG_TRADE, lambda e: strategy_runtime.on_market_trade(e.data))
-    register_cold(EVENT_ORDER_UPDATE, lambda e: strategy_runtime.on_order(e.data))
-    register_cold(EVENT_TRADE_UPDATE, lambda e: strategy_runtime.on_trade(e.data))
+    register_cold(EVENT_AGG_TRADE, on_market_trade_cold)
     register_cold(
-        EVENT_POSITION_UPDATE,
-        lambda e: [strategy_runtime.on_position(e.data), dashboard.update_position(e.data)],
+        EVENT_EXCHANGE_ORDER_UPDATE,
+        lambda e: web_dashboard.update_exchange_order(e.data) if web_dashboard else None,
+    )
+    register_cold(EVENT_ORDER_UPDATE, on_order_cold)
+    register_cold(EVENT_TRADE_UPDATE, on_trade_cold)
+    register_cold(EVENT_POSITION_UPDATE, on_position_cold)
+    register_cold(EVENT_ACCOUNT_UPDATE, on_account_cold)
+    register_cold(EVENT_STRATEGY_UPDATE, on_strategy_cold)
+    register_cold(EVENT_SYSTEM_HEALTH, on_system_health_cold)
+    register_cold(
+        EVENT_API_LIMIT,
+        lambda e: web_dashboard.update_api_limit(e.data) if web_dashboard else None,
     )
     register_cold(
-        EVENT_ACCOUNT_UPDATE,
-        lambda e: [strategy_runtime.on_account_update(e.data), dashboard.update_account(e.data)],
+        EVENT_ALERT,
+        lambda e: web_dashboard.update_alert(e.data) if web_dashboard else None,
     )
-    register_cold(EVENT_STRATEGY_UPDATE, lambda e: dashboard.update_strategy(e.data))
-    register_cold(EVENT_SYSTEM_HEALTH, lambda e: strategy_runtime.on_system_health(e.data))
+    register_cold(
+        EVENT_LOG,
+        lambda e: web_dashboard.add_log(e.data) if web_dashboard else None,
+    )
 
     engine.start()
     strategy_runtime.start()
     risk_supervisor.start()
+    if web_dashboard is not None:
+        try:
+            dashboard_url = web_dashboard.start()
+            logger.info(f"Local dashboard ready: {dashboard_url}")
+            if bool(web_dashboard_config.get("open_browser", False)):
+                webbrowser.open(dashboard_url)
+        except OSError as exc:
+            logger.error(f"Local dashboard failed to start: {exc}")
     gateway.connect(config["symbols"])
 
     warmup_deadline = time.monotonic() + 3.0
@@ -314,7 +448,13 @@ def main(argv=None):
     truth_monitor.start()
     venue_supervisor.start()
 
-    logger.info("ChronosHFT Core Engine LIVE. (Minimalist Mode)")
+    if paper_trade:
+        logger.info(
+            "ChronosHFT PAPER · LIVE DATA: Binance production public market "
+            "data, local simulated execution, private API disabled."
+        )
+    else:
+        logger.info("ChronosHFT Core Engine LIVE · REAL MONEY.")
 
     try:
         with Live(dashboard.render(), refresh_per_second=4, screen=True) as live:
@@ -341,12 +481,14 @@ def main(argv=None):
                     main.strategy_runtime_watchdog_state,
                     config.get("system", {}).get("strategy_runtime", {}),
                 )
-                dashboard.update_runtime_metrics(
-                    {
-                        "event_engine": engine.get_metrics_snapshot(),
-                        "strategy_runtime": strategy_runtime.get_metrics_snapshot(),
-                    }
-                )
+                runtime_metrics = {
+                    "event_engine": engine.get_metrics_snapshot(),
+                    "event_handlers": engine.get_handler_metrics_snapshot(limit=50),
+                    "strategy_runtime": strategy_runtime.get_metrics_snapshot(),
+                }
+                dashboard.update_runtime_metrics(runtime_metrics)
+                if web_dashboard is not None:
+                    web_dashboard.update_runtime_metrics(runtime_metrics)
                 admin_control.poll_once()
     except KeyboardInterrupt:
         logger.info("Shutdown signal received.")
@@ -358,9 +500,28 @@ def main(argv=None):
         truth_provider.close()
         time_service.stop()
         risk_supervisor.stop(cancel_orders=True)
-        oms_system.stop()
-        engine.stop()
-        gateway.close()
+        if paper_trade:
+            # Keep OMS/execution handlers alive while the local venue emits
+            # final cancel acknowledgements and stops its matching worker.
+            gateway.close()
+            shutdown_drain_timeout_sec = max(
+                0.0,
+                float(event_engine_config.get("shutdown_drain_timeout_sec", 5.0)),
+            )
+            if not engine.wait_until_idle(shutdown_drain_timeout_sec):
+                logger.warning(
+                    "[Paper] EventEngine shutdown drain timed out: "
+                    f"{engine.get_queue_snapshot()}"
+                )
+            oms_system.stop()
+            engine.stop()
+        else:
+            oms_system.stop()
+            engine.stop()
+            gateway.close()
+        if web_dashboard is not None:
+            web_dashboard.publish_snapshot(force=True)
+            web_dashboard.stop()
         logger.info("ChronosHFT Shutdown Complete.")
         sys.exit(0)
 

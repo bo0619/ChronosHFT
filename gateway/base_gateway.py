@@ -30,7 +30,7 @@ class BaseGateway(ABC):
         pass
 
     @abstractmethod
-    def send_order(self, req) -> str:
+    def send_order(self, req, client_oid: str = None):
         pass
 
     @abstractmethod
@@ -60,6 +60,12 @@ class BaseGateway(ABC):
         return None
 
     def get_user_trades(self, symbol: str, **kwargs):
+        return None
+
+    def get_rpi_depth(self, symbol: str, limit: int = 1000):
+        return None
+
+    def get_commission_rate(self, symbol: str):
         return None
 
     @abstractmethod

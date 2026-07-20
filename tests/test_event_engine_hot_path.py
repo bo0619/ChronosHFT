@@ -97,6 +97,52 @@ class EventEngineHotPathTests(unittest.TestCase):
         finally:
             engine.stop()
 
+    def test_wait_until_idle_includes_inflight_cold_handoff(self):
+        engine = EventEngine()
+        cold_started = threading.Event()
+        release_cold = threading.Event()
+
+        def execution_handler(_event):
+            return None
+
+        def cold_handler(_event):
+            cold_started.set()
+            release_cold.wait(timeout=1.0)
+
+        engine.register_execution("eDrain", execution_handler)
+        engine.register_cold("eDrain", cold_handler)
+        engine.start()
+        try:
+            engine.put(Event("eDrain", "cancel-ack"))
+            self.assertTrue(cold_started.wait(timeout=0.5))
+            self.assertEqual(engine.get_queue_snapshot()["cold_depth"], 0)
+            self.assertFalse(engine.wait_until_idle(timeout_sec=0.01))
+
+            release_cold.set()
+            self.assertTrue(engine.wait_until_idle(timeout_sec=0.5))
+            self.assertEqual(engine.get_queue_snapshot()["pending_work"], 0)
+        finally:
+            release_cold.set()
+            engine.stop()
+
+    def test_wait_until_idle_includes_work_enqueued_by_handler(self):
+        engine = EventEngine()
+        seen = []
+
+        def execution_handler(event):
+            seen.append(event.data)
+            if event.data == "first":
+                engine.put(Event("eCascade", "second"))
+
+        engine.register_execution("eCascade", execution_handler)
+        engine.start()
+        try:
+            engine.put(Event("eCascade", "first"))
+            self.assertTrue(engine.wait_until_idle(timeout_sec=0.5))
+            self.assertEqual(seen, ["first", "second"])
+        finally:
+            engine.stop()
+
 
 if __name__ == "__main__":
     unittest.main()
