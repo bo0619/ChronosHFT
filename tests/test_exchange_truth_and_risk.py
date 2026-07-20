@@ -1,8 +1,14 @@
+import json
+import multiprocessing
+import os
+import queue
 import sys
+import tempfile
 import threading
+import time
 import types
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 if "requests" not in sys.modules:
     requests_module = types.ModuleType("requests")
@@ -44,6 +50,7 @@ from event.type import (
     ExchangeOrderUpdate,
     ExecutionPolicy,
     GatewayState,
+    LifecycleState,
     MarkPriceData,
     OMSCapabilityMode,
     OrderBook,
@@ -57,7 +64,14 @@ from event.type import (
 )
 from gateway.binance.gateway import BinanceGateway
 from oms.engine import OMS
+from oms.journal import OMSJournal
 from oms.order import Order
+from risk.independent_supervisor import (
+    BinanceRiskSidecarExchange,
+    IndependentRiskSupervisor,
+    RiskSidecarCore,
+    run_sidecar_loop,
+)
 from risk.manager import RiskManager
 
 
@@ -117,6 +131,10 @@ class DummyOMS:
         self.trading_modes = []
         self.cleared_trading_modes = []
         self.flatten_reasons = []
+        self.risk_heartbeats = []
+        self.dead_man_renewals = 0
+        self.mode_override = None
+        self.mode_override_reason = ""
 
     def halt_system(self, reason):
         self.halt_reasons.append(reason)
@@ -137,14 +155,162 @@ class DummyOMS:
 
     def set_trading_mode(self, mode, reason):
         self.trading_modes.append((mode, reason))
+        self.mode_override = mode
+        self.mode_override_reason = reason
 
     def clear_trading_mode(self, reason="", prefixes=()):
+        if prefixes and not any(self.mode_override_reason.startswith(prefix) for prefix in prefixes):
+            return False
         self.cleared_trading_modes.append((reason, tuple(prefixes or ())))
+        self.mode_override = None
+        self.mode_override_reason = ""
         return True
+
+    def has_trading_mode_constraint(self, prefixes=()):
+        if self.mode_override is None:
+            return False
+        if not prefixes:
+            return True
+        return any(
+            self.mode_override_reason.startswith(prefix) for prefix in prefixes
+        )
 
     def emergency_reduce_only_flatten(self, reason):
         self.flatten_reasons.append(reason)
         return 0
+
+    def record_risk_control_heartbeat(
+        self,
+        source="risk_manager",
+        healthy=True,
+        reason="",
+    ):
+        self.risk_heartbeats.append((source, healthy, reason))
+        return healthy
+
+    def renew_venue_dead_man_switch(self):
+        self.dead_man_renewals += 1
+        return True
+
+
+class DummySidecarExchange:
+    def __init__(self, healthy=True, reason="", risk_snapshot=None):
+        self.healthy = healthy
+        self.reason = reason
+        self.risk_snapshot = risk_snapshot or {
+            "account": {
+                "totalMaintMargin": "0",
+                "totalMarginBalance": "1000",
+            },
+            "positions": [],
+            "open_orders": [],
+        }
+        self.health_checks = 0
+        self.cancel_calls = []
+        self.flatten_calls = 0
+        self.closed = False
+
+    def check_account_channel(self):
+        self.health_checks += 1
+        return self.healthy, self.reason
+
+    def get_risk_snapshot(self):
+        self.health_checks += 1
+        return self.healthy, self.risk_snapshot, self.reason
+
+    def emergency_cancel(self, symbols, countdown_time_ms):
+        self.cancel_calls.append((tuple(symbols), countdown_time_ms))
+        self.risk_snapshot["open_orders"] = []
+        return True, ""
+
+    def emergency_flatten(self):
+        self.flatten_calls += 1
+        submitted = sum(
+            1
+            for position in self.risk_snapshot.get("positions", [])
+            if abs(float(position.get("positionAmt", 0.0) or 0.0)) > 1e-9
+        )
+        self.risk_snapshot["positions"] = []
+        return True, submitted, ""
+
+    def close(self):
+        self.closed = True
+
+
+class DummyResponse:
+    def __init__(self, payload, status_code=200):
+        self.payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self.payload
+
+
+class DummyRiskSidecarRest:
+    def __init__(
+        self,
+        account=None,
+        positions=None,
+        open_orders=None,
+        income_rows=None,
+        server_time_ms=None,
+        server_time_status=200,
+    ):
+        self.account = account or {
+            "totalMaintMargin": "0",
+            "totalMarginBalance": "1000",
+        }
+        self.positions = list(positions or [])
+        self.open_orders = list(open_orders or [])
+        self.income_rows = list(income_rows or [])
+        self.server_time_ms = int(server_time_ms or time.time() * 1000)
+        self.server_time_status = server_time_status
+        self.new_orders = []
+
+    def get_account(self):
+        return DummyResponse(self.account)
+
+    def get_positions(self):
+        return DummyResponse(self.positions)
+
+    def get_open_orders(self):
+        return DummyResponse(self.open_orders)
+
+    def get_income_history(self, **kwargs):
+        return DummyResponse(self.income_rows)
+
+    def get_server_time(self):
+        return DummyResponse(
+            {"serverTime": self.server_time_ms},
+            status_code=self.server_time_status,
+        )
+
+    def new_order(self, request, client_oid):
+        self.new_orders.append((request, client_oid))
+        return DummyResponse({"orderId": len(self.new_orders)})
+
+
+class DummyRiskManager:
+    def __init__(self):
+        self.kill_reasons = []
+
+    def trigger_kill_switch(self, reason):
+        self.kill_reasons.append(reason)
+
+
+class ThreadProcessHandle:
+    def __init__(self, worker):
+        self.worker = worker
+        self.pid = None
+
+    def is_alive(self):
+        return self.worker.is_alive()
+
+    def join(self, timeout=None):
+        self.worker.join(timeout)
+
+    def terminate(self):
+        return None
 
 
 class ExchangeTruthTests(unittest.TestCase):
@@ -391,6 +557,46 @@ class ExchangeTruthTests(unittest.TestCase):
 
             self.assertAlmostEqual(oms.exposure.net_positions["BTCUSDT"], 0.25)
             self.assertAlmostEqual(oms.account.balance, 1000.0)
+        finally:
+            oms.stop()
+
+    def test_transfer_account_update_invalidates_cash_flow_truth_immediately(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        config = self.make_config()
+        config["risk"]["cash_flow_truth"] = {
+            "enabled": True,
+            "require_snapshot": True,
+        }
+        oms = OMS(engine, gateway, config)
+        try:
+            self.assertTrue(
+                oms.account.sync_external_cash_flow_truth(
+                    0.0,
+                    snapshot_time=time.time(),
+                )
+            )
+            self.assertTrue(oms.account.cash_flow_snapshot_synced)
+
+            update = ExchangeAccountUpdate(
+                asset="USDT",
+                wallet_balance=1100.0,
+                available_balance=1100.0,
+                balances={
+                    "USDT": {
+                        "wallet_balance": 1100.0,
+                        "available_balance": 1100.0,
+                    }
+                },
+                positions={},
+                reason="TRANSFER",
+                event_time=time.time(),
+            )
+            oms.on_exchange_account_update(
+                Event(EVENT_EXCHANGE_ACCOUNT_UPDATE, update)
+            )
+
+            self.assertFalse(oms.account.cash_flow_snapshot_synced)
         finally:
             oms.stop()
 
@@ -661,6 +867,261 @@ class RiskExecutionTests(unittest.TestCase):
         self.assertTrue(risk.kill_switch_triggered)
         self.assertIn("Drawdown", risk.kill_reason)
 
+    def test_daily_loss_adjusts_for_external_cash_flow(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        config = self.make_risk_config()
+        config["risk"]["limits"]["max_daily_loss"] = 50.0
+        config["risk"]["cash_flow_truth"] = {
+            "enabled": True,
+            "require_snapshot": True,
+            "max_snapshot_age_sec": 60.0,
+            "recovery_checks": 1,
+        }
+        risk = RiskManager(engine, config, oms=oms, gateway=gateway)
+
+        def account(equity, external_flow):
+            return AccountData(
+                balance=equity,
+                equity=equity,
+                available=equity,
+                used_margin=0.0,
+                datetime=datetime.now(),
+                external_cash_flow_total=external_flow,
+                cash_flow_snapshot_time=time.time(),
+                cash_flow_snapshot_synced=True,
+            )
+
+        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account(1000.0, 0.0)))
+        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account(1100.0, 100.0)))
+        self.assertFalse(risk.kill_switch_triggered)
+
+        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account(1040.0, 100.0)))
+        self.assertTrue(risk.kill_switch_triggered)
+        self.assertIn("Daily loss", risk.kill_reason)
+
+    def test_missing_cash_flow_truth_enters_reduce_only_until_recovered(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        config = self.make_risk_config()
+        config["risk"]["cash_flow_truth"] = {
+            "enabled": True,
+            "require_snapshot": True,
+            "max_snapshot_age_sec": 60.0,
+            "recovery_checks": 2,
+        }
+        risk = RiskManager(engine, config, oms=oms, gateway=gateway)
+
+        missing = AccountData(1000.0, 1000.0, 1000.0, 0.0, datetime.now())
+        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, missing))
+        self.assertEqual(oms.trading_modes[-1][0], OMSCapabilityMode.REDUCE_ONLY)
+        self.assertTrue(oms.trading_modes[-1][1].startswith("daily_pnl_truth:"))
+
+        healthy = AccountData(
+            1000.0,
+            1000.0,
+            1000.0,
+            0.0,
+            datetime.now(),
+            cash_flow_snapshot_time=time.time(),
+            cash_flow_snapshot_synced=True,
+        )
+        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, healthy))
+        self.assertFalse(oms.cleared_trading_modes)
+        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, healthy))
+        self.assertTrue(oms.cleared_trading_modes)
+
+    def test_live_risk_cycle_renews_oms_heartbeat_lease(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        config = self.make_risk_config()
+        config["risk"]["market_data_freshness"] = {"enabled": False}
+        risk = RiskManager(engine, config, oms=oms, gateway=gateway)
+        oms.risk_heartbeats.clear()
+
+        self.assertTrue(risk.check_market_data_freshness())
+
+        self.assertEqual(
+            oms.risk_heartbeats,
+            [("risk_live_loop", True, "")],
+        )
+        self.assertEqual(oms.dead_man_renewals, 1)
+
+    def test_risk_status_snapshot_exposes_cash_flow_adjusted_pnl_and_margin(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        oms.account = types.SimpleNamespace(
+            equity=980.0,
+            external_cash_flow_total=105.0,
+            maintenance_margin_ratio=0.12,
+            margin_snapshot_synced=True,
+            margin_snapshot_time=time.time(),
+            cash_flow_snapshot_synced=True,
+            cash_flow_snapshot_time=time.time(),
+        )
+        risk = RiskManager(
+            engine,
+            self.make_risk_config(),
+            oms=oms,
+            gateway=gateway,
+        )
+        risk.risk_day = "2026-07-20"
+        risk.initial_equity = 1000.0
+        risk.initial_external_cash_flow_total = 100.0
+        risk.peak_equity = 1010.0
+
+        snapshot = risk.get_status_snapshot()
+
+        self.assertEqual(snapshot["risk_day"], "2026-07-20")
+        self.assertEqual(snapshot["cash_flow_adjusted_equity"], 975.0)
+        self.assertEqual(snapshot["cash_flow_adjusted_daily_pnl"], -25.0)
+        self.assertAlmostEqual(snapshot["peak_drawdown_pct"], 35.0 / 1010.0)
+        self.assertEqual(snapshot["maintenance_margin_ratio"], 0.12)
+        self.assertTrue(snapshot["margin_snapshot_synced"])
+
+    def test_margin_health_degrades_then_enters_reduce_only_and_recovers(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        config = self.make_risk_config()
+        config["risk"]["margin_health"] = {
+            "enabled": True,
+            "degraded_ratio": 0.50,
+            "reduce_only_ratio": 0.70,
+            "kill_ratio": 0.90,
+            "recovery_ratio": 0.40,
+            "max_snapshot_age_sec": 15.0,
+            "recovery_checks": 2,
+        }
+        risk = RiskManager(engine, config, oms=oms, gateway=gateway)
+
+        def account_at(ratio):
+            return AccountData(
+                balance=1000.0,
+                equity=1000.0,
+                available=500.0,
+                used_margin=500.0,
+                datetime=datetime.now(),
+                maintenance_margin=ratio * 1000.0,
+                margin_balance=1000.0,
+                maintenance_margin_ratio=ratio,
+                margin_snapshot_time=time.time(),
+                margin_snapshot_synced=True,
+            )
+
+        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account_at(0.55)))
+        self.assertEqual(oms.trading_modes[-1][0], OMSCapabilityMode.DEGRADED)
+
+        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account_at(0.75)))
+        self.assertEqual(oms.trading_modes[-1][0], OMSCapabilityMode.REDUCE_ONLY)
+
+        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account_at(0.30)))
+        self.assertEqual(oms.cleared_trading_modes, [])
+        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account_at(0.30)))
+        self.assertTrue(oms.cleared_trading_modes)
+
+    def test_stale_margin_snapshot_enters_reduce_only(self):
+        oms = DummyOMS()
+        risk = RiskManager(
+            DummyEngine(),
+            self.make_risk_config(),
+            oms=oms,
+            gateway=DummyGateway(),
+        )
+        account = AccountData(
+            balance=1000.0,
+            equity=1000.0,
+            available=900.0,
+            used_margin=100.0,
+            datetime=datetime.now(),
+            maintenance_margin=100.0,
+            margin_balance=1000.0,
+            maintenance_margin_ratio=0.10,
+            margin_snapshot_time=time.time() - 60.0,
+            margin_snapshot_synced=True,
+        )
+
+        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account))
+
+        self.assertEqual(oms.trading_modes[-1][0], OMSCapabilityMode.REDUCE_ONLY)
+        self.assertTrue(oms.trading_modes[-1][1].startswith("margin_health:stale_snapshot:"))
+
+    def test_margin_recovery_clears_only_its_composable_constraint(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        config = {
+            "symbols": ["BTCUSDT"],
+            "account": {"initial_balance_usdt": 1000.0, "leverage": 10},
+            "backtest": {"taker_fee": 0.0, "maker_fee": 0.0},
+            "oms": {"journal_enabled": False, "replay_journal_on_startup": False},
+            "risk": self.make_risk_config()["risk"],
+        }
+        config["risk"]["margin_health"] = {
+            "enabled": True,
+            "degraded_ratio": 0.50,
+            "reduce_only_ratio": 0.70,
+            "kill_ratio": 0.90,
+            "recovery_ratio": 0.40,
+            "recovery_checks": 2,
+        }
+        oms = OMS(engine, gateway, config)
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.set_trading_mode(OMSCapabilityMode.DEGRADED, "margin_health:test")
+            oms.set_trading_mode(OMSCapabilityMode.PASSIVE_ONLY, "processing_lag:test")
+            risk = RiskManager(engine, config, oms=oms, gateway=gateway)
+            healthy = AccountData(
+                balance=1000.0,
+                equity=1000.0,
+                available=900.0,
+                used_margin=100.0,
+                datetime=datetime.now(),
+                maintenance_margin=300.0,
+                margin_balance=1000.0,
+                maintenance_margin_ratio=0.30,
+                margin_snapshot_time=time.time(),
+                margin_snapshot_synced=True,
+            )
+
+            risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, healthy))
+            risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, healthy))
+
+            self.assertFalse(oms.has_trading_mode_constraint(("margin_health:",)))
+            self.assertTrue(oms.has_trading_mode_constraint(("processing_lag:",)))
+            self.assertEqual(oms.capability_mode, OMSCapabilityMode.PASSIVE_ONLY)
+        finally:
+            oms.stop()
+
+    def test_critical_maintenance_margin_ratio_triggers_kill_switch(self):
+        oms = DummyOMS()
+        risk = RiskManager(
+            DummyEngine(),
+            self.make_risk_config(),
+            oms=oms,
+            gateway=DummyGateway(),
+        )
+        account = AccountData(
+            balance=1000.0,
+            equity=1000.0,
+            available=100.0,
+            used_margin=900.0,
+            datetime=datetime.now(),
+            maintenance_margin=950.0,
+            margin_balance=1000.0,
+            maintenance_margin_ratio=0.95,
+            margin_snapshot_time=time.time(),
+            margin_snapshot_synced=True,
+        )
+
+        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account))
+
+        self.assertTrue(risk.kill_switch_triggered)
+        self.assertIn("Maintenance margin ratio", risk.kill_reason)
+
     def test_volatility_threshold_triggers_kill_switch(self):
         engine = DummyEngine()
         gateway = DummyGateway()
@@ -862,6 +1323,1213 @@ class RiskExecutionTests(unittest.TestCase):
 
         self.assertTrue(oms.halt_reasons)
         self.assertEqual(oms.flatten_reasons, ["KillSwitch: test_kill"])
+
+    def test_recovered_kill_sequence_resumes_to_flat_verified(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.make_risk_config()
+            config["oms"] = {
+                "journal_enabled": True,
+                "replay_journal_on_startup": True,
+                "journal_fsync": True,
+                "journal_integrity_check": True,
+                "journal_path": os.path.join(tmpdir, "oms_journal.jsonl"),
+            }
+            writer = OMSJournal(config)
+            writer.append(
+                "risk_state",
+                {
+                    "risk_day": "2026-07-20",
+                    "day_start_equity": 1000.0,
+                    "peak_equity": 1000.0,
+                    "last_equity": 900.0,
+                    "kill_switch_triggered": True,
+                    "kill_state": "CANCEL_PENDING",
+                    "kill_reason": "restart_test",
+                    "reason": "process_crashed",
+                },
+            )
+
+            oms = DummyOMS()
+            oms.journal = OMSJournal(config)
+            risk = RiskManager(
+                DummyEngine(),
+                config,
+                oms=oms,
+                gateway=DummyGateway(),
+            )
+
+            self.assertTrue(risk.kill_switch_triggered)
+            self.assertEqual(risk.kill_state, "CANCEL_PENDING")
+            self.assertTrue(risk.resume_kill_switch_supervision())
+            self.assertEqual(risk.kill_state, "FLAT_VERIFIED")
+            self.assertTrue(risk.kill_switch_triggered)
+
+            recovered_records = oms.journal.load()
+            self.assertEqual(recovered_records[-1]["kind"], "risk_state")
+            self.assertEqual(
+                recovered_records[-1]["payload"]["kill_state"],
+                "FLAT_VERIFIED",
+            )
+
+    def test_rearm_cannot_clear_kill_before_flat_verified(self):
+        oms = DummyOMS()
+        oms.state = types.SimpleNamespace(value="LIVE")
+        oms.manual_rearm_required = False
+        risk = RiskManager(
+            DummyEngine(),
+            self.make_risk_config(),
+            oms=oms,
+            gateway=DummyGateway(),
+        )
+        risk.kill_switch_triggered = True
+        risk.kill_reason = "test_kill"
+        risk.kill_state = "FLATTENING"
+
+        risk._refresh_rearm_state()
+
+        self.assertTrue(risk.kill_switch_triggered)
+        self.assertEqual(risk.kill_state, "FLATTENING")
+
+        risk.kill_state = "FLAT_VERIFIED"
+        risk._refresh_rearm_state()
+
+        self.assertFalse(risk.kill_switch_triggered)
+        self.assertEqual(risk.kill_state, "ARMED")
+
+
+class IndependentRiskSupervisorTests(unittest.TestCase):
+    def make_settings(self, **overrides):
+        settings = {
+            "symbols": ["BTCUSDT", "ETHUSDT"],
+            "parent_heartbeat_timeout_sec": 1.0,
+            "exchange_poll_interval_sec": 1.0,
+            "exchange_max_age_sec": 2.0,
+            "cancel_retry_sec": 1.0,
+            "orphan_exit_sec": 2.0,
+            "emergency_countdown_time_ms": 1000,
+            "max_account_gross_notional": 500.0,
+            "gross_kill_multiplier": 1.25,
+            "margin_reduce_only_ratio": 0.70,
+            "margin_kill_ratio": 0.90,
+            "flatten_enabled": True,
+            "parent_loss_flatten_delay_sec": 0.5,
+            "flatten_retry_sec": 0.5,
+            "flat_verification_checks": 1,
+        }
+        settings.update(overrides)
+        return settings
+
+    @staticmethod
+    def make_daily_snapshot(equity, cash_flow, captured_at):
+        return {
+            "account": {
+                "totalMaintMargin": "0",
+                "totalMarginBalance": str(equity),
+            },
+            "positions": [],
+            "open_orders": [],
+            "external_cash_flow_total": cash_flow,
+            "captured_at": captured_at,
+        }
+
+    def test_sidecar_stale_parent_cancels_and_exits_after_orphan_window(self):
+        exchange = DummySidecarExchange(healthy=True)
+        core = RiskSidecarCore(exchange, self.make_settings(), now=100.0)
+        self.assertTrue(core.receive_parent_heartbeat(1, now=100.1))
+
+        healthy, keep_running = core.step(now=100.1)
+        self.assertTrue(healthy["healthy"])
+        self.assertTrue(keep_running)
+        self.assertFalse(exchange.cancel_calls)
+
+        stale, keep_running = core.step(now=101.2)
+        self.assertFalse(stale["healthy"])
+        self.assertEqual(stale["reason"], "parent_heartbeat_stale")
+        self.assertTrue(keep_running)
+        self.assertEqual(
+            exchange.cancel_calls,
+            [(("BTCUSDT", "ETHUSDT"), 1000)],
+        )
+
+        final, keep_running = core.step(now=103.3)
+        self.assertFalse(final["healthy"])
+        self.assertFalse(keep_running)
+        self.assertEqual(final["risk_action"], "KILL")
+        self.assertTrue(final["kill_latched"])
+        self.assertEqual(final["stage"], "FLAT_VERIFIED")
+        self.assertEqual(len(exchange.cancel_calls), 2)
+
+    def test_sidecar_exchange_failure_is_unhealthy_and_cancels_immediately(self):
+        exchange = DummySidecarExchange(False, "account_status=503")
+        core = RiskSidecarCore(exchange, self.make_settings(), now=200.0)
+        core.receive_parent_heartbeat(1, now=200.1)
+
+        status, keep_running = core.step(now=200.1)
+
+        self.assertFalse(status["healthy"])
+        self.assertEqual(status["reason"], "account_status=503")
+        self.assertTrue(keep_running)
+        self.assertEqual(len(exchange.cancel_calls), 1)
+
+    def test_sidecar_projected_gross_breach_enters_reduce_only(self):
+        exchange = DummySidecarExchange(
+            risk_snapshot={
+                "account": {
+                    "totalMaintMargin": "10",
+                    "totalMarginBalance": "1000",
+                },
+                "positions": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "positionAmt": "3",
+                        "markPrice": "100",
+                    }
+                ],
+                "open_orders": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "origQty": "2",
+                        "executedQty": "0",
+                        "price": "100",
+                        "reduceOnly": False,
+                    }
+                ],
+            }
+        )
+        core = RiskSidecarCore(
+            exchange,
+            self.make_settings(max_account_gross_notional=450.0),
+            now=250.0,
+        )
+        core.receive_parent_heartbeat(1, now=250.1)
+
+        status, keep_running = core.step(now=250.1)
+
+        self.assertFalse(status["healthy"])
+        self.assertTrue(keep_running)
+        self.assertEqual(status["risk_action"], "REDUCE_ONLY")
+        self.assertIn("gross_notional_reduce_only", status["reason"])
+        self.assertEqual(
+            status["risk_metrics"]["projected_gross_notional"],
+            500.0,
+        )
+        self.assertEqual(len(exchange.cancel_calls), 1)
+        self.assertEqual(exchange.flatten_calls, 0)
+
+    def test_sidecar_margin_kill_flattens_and_verifies_exchange_truth(self):
+        exchange = DummySidecarExchange(
+            risk_snapshot={
+                "account": {
+                    "totalMaintMargin": "95",
+                    "totalMarginBalance": "100",
+                },
+                "positions": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "positionAmt": "1.5",
+                        "markPrice": "100",
+                    }
+                ],
+                "open_orders": [
+                    {
+                        "symbol": "ETHUSDT",
+                        "origQty": "1",
+                        "executedQty": "0",
+                        "price": "50",
+                        "reduceOnly": False,
+                    }
+                ],
+            }
+        )
+        core = RiskSidecarCore(exchange, self.make_settings(), now=300.0)
+        core.receive_parent_heartbeat(1, now=300.1)
+
+        triggered, keep_running = core.step(now=300.1)
+
+        self.assertFalse(triggered["healthy"])
+        self.assertTrue(keep_running)
+        self.assertEqual(triggered["risk_action"], "KILL")
+        self.assertTrue(triggered["kill_latched"])
+        self.assertEqual(triggered["stage"], "FLATTENING")
+        self.assertEqual(exchange.flatten_calls, 1)
+        self.assertEqual(triggered["last_flatten_count"], 1)
+
+        verified, keep_running = core.step(now=301.2)
+
+        self.assertTrue(keep_running)
+        self.assertEqual(verified["risk_action"], "KILL")
+        self.assertEqual(verified["stage"], "FLAT_VERIFIED")
+        self.assertEqual(verified["flat_verification_count"], 1)
+        self.assertEqual(exchange.flatten_calls, 1)
+
+    def test_sidecar_reopens_flattening_if_exposure_reappears(self):
+        exchange = DummySidecarExchange(
+            risk_snapshot={
+                "account": {
+                    "totalMaintMargin": "95",
+                    "totalMarginBalance": "100",
+                },
+                "positions": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "positionAmt": "1",
+                        "markPrice": "100",
+                    }
+                ],
+                "open_orders": [],
+            }
+        )
+        core = RiskSidecarCore(exchange, self.make_settings(), now=350.0)
+        core.receive_parent_heartbeat(1, now=350.1)
+        core.step(now=350.1)
+        verified, _ = core.step(now=351.2)
+        self.assertEqual(verified["stage"], "FLAT_VERIFIED")
+
+        exchange.risk_snapshot["positions"] = [
+            {
+                "symbol": "ETHUSDT",
+                "positionAmt": "-2",
+                "markPrice": "50",
+            }
+        ]
+        reopened, _ = core.step(now=352.3)
+
+        self.assertEqual(reopened["stage"], "FLATTENING")
+        self.assertEqual(exchange.flatten_calls, 2)
+
+    def test_sidecar_parent_loss_escalates_from_cancel_to_flatten(self):
+        exchange = DummySidecarExchange(
+            risk_snapshot={
+                "account": {
+                    "totalMaintMargin": "0",
+                    "totalMarginBalance": "1000",
+                },
+                "positions": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "positionAmt": "1",
+                        "markPrice": "100",
+                    }
+                ],
+                "open_orders": [],
+            }
+        )
+        core = RiskSidecarCore(exchange, self.make_settings(), now=400.0)
+        core.receive_parent_heartbeat(1, now=400.1)
+        core.step(now=400.1)
+
+        stale, _ = core.step(now=401.2)
+        self.assertEqual(stale["risk_action"], "REDUCE_ONLY")
+        self.assertEqual(exchange.flatten_calls, 0)
+
+        killed, _ = core.step(now=401.8)
+        self.assertEqual(killed["risk_action"], "KILL")
+        self.assertEqual(killed["reason"], "parent_heartbeat_stale_flatten")
+        self.assertEqual(exchange.flatten_calls, 1)
+
+        verified, keep_running = core.step(now=403.3)
+        self.assertEqual(verified["stage"], "FLAT_VERIFIED")
+        self.assertFalse(keep_running)
+
+    def test_sidecar_rejects_non_finite_risk_limits(self):
+        with self.assertRaisesRegex(ValueError, "gross_kill_multiplier"):
+            RiskSidecarCore(
+                DummySidecarExchange(),
+                self.make_settings(gross_kill_multiplier=float("inf")),
+            )
+
+    def test_sidecar_daily_loss_is_adjusted_for_external_cash_flow(self):
+        day_time = datetime(
+            2026,
+            7,
+            20,
+            1,
+            tzinfo=timezone.utc,
+        ).timestamp()
+        exchange = DummySidecarExchange(
+            risk_snapshot=self.make_daily_snapshot(1000.0, 0.0, day_time)
+        )
+        core = RiskSidecarCore(
+            exchange,
+            self.make_settings(
+                daily_loss_enabled=True,
+                max_daily_loss=100.0,
+                max_drawdown_pct=0.0,
+                daily_loss_reduce_only_fraction=0.5,
+            ),
+            now=700.0,
+        )
+        core.receive_parent_heartbeat(1, now=700.1)
+        initial, _ = core.step(now=700.1)
+        self.assertTrue(initial["healthy"])
+
+        exchange.risk_snapshot.update(
+            self.make_daily_snapshot(1040.0, 100.0, day_time + 60)
+        )
+        core.receive_parent_heartbeat(2, now=701.1)
+        reduced, _ = core.step(now=701.2)
+        self.assertEqual(reduced["risk_action"], "REDUCE_ONLY")
+        self.assertEqual(
+            reduced["risk_metrics"]["cash_flow_adjusted_equity"],
+            940.0,
+        )
+        self.assertEqual(
+            reduced["risk_metrics"]["cash_flow_adjusted_daily_loss"],
+            60.0,
+        )
+
+        exchange.risk_snapshot.update(
+            self.make_daily_snapshot(1090.0, 200.0, day_time + 120)
+        )
+        core.receive_parent_heartbeat(3, now=702.1)
+        killed, _ = core.step(now=702.3)
+        self.assertEqual(killed["risk_action"], "KILL")
+        self.assertIn("daily_loss_kill", killed["reason"])
+        self.assertTrue(killed["kill_latched"])
+
+    def test_sidecar_peak_drawdown_triggers_from_intraday_high(self):
+        day_time = datetime(
+            2026,
+            7,
+            20,
+            1,
+            tzinfo=timezone.utc,
+        ).timestamp()
+        exchange = DummySidecarExchange(
+            risk_snapshot=self.make_daily_snapshot(1000.0, 0.0, day_time)
+        )
+        core = RiskSidecarCore(
+            exchange,
+            self.make_settings(
+                daily_loss_enabled=True,
+                max_daily_loss=1000.0,
+                max_drawdown_pct=0.05,
+                daily_loss_reduce_only_fraction=0.8,
+            ),
+            now=720.0,
+        )
+        core.receive_parent_heartbeat(1, now=720.1)
+        core.step(now=720.1)
+        exchange.risk_snapshot.update(
+            self.make_daily_snapshot(1100.0, 0.0, day_time + 60)
+        )
+        core.receive_parent_heartbeat(2, now=721.1)
+        core.step(now=721.2)
+        exchange.risk_snapshot.update(
+            self.make_daily_snapshot(1040.0, 0.0, day_time + 120)
+        )
+        core.receive_parent_heartbeat(3, now=722.1)
+
+        killed, _ = core.step(now=722.3)
+
+        self.assertEqual(killed["risk_action"], "KILL")
+        self.assertIn("peak_drawdown_kill", killed["reason"])
+        self.assertAlmostEqual(
+            killed["risk_metrics"]["peak_drawdown_pct"],
+            60.0 / 1100.0,
+        )
+
+    def test_sidecar_daily_baseline_resets_at_utc_day_boundary(self):
+        day_one = datetime(
+            2026,
+            7,
+            20,
+            23,
+            59,
+            tzinfo=timezone.utc,
+        ).timestamp()
+        day_two = datetime(
+            2026,
+            7,
+            21,
+            0,
+            1,
+            tzinfo=timezone.utc,
+        ).timestamp()
+        exchange = DummySidecarExchange(
+            risk_snapshot=self.make_daily_snapshot(1000.0, 0.0, day_one)
+        )
+        core = RiskSidecarCore(
+            exchange,
+            self.make_settings(
+                daily_loss_enabled=True,
+                max_daily_loss=50.0,
+                max_drawdown_pct=0.0,
+            ),
+            now=740.0,
+        )
+        core.receive_parent_heartbeat(1, now=740.1)
+        core.step(now=740.1)
+        exchange.risk_snapshot.update(
+            self.make_daily_snapshot(900.0, 0.0, day_two)
+        )
+        core.receive_parent_heartbeat(2, now=741.1)
+
+        reset, _ = core.step(now=741.2)
+
+        self.assertTrue(reset["healthy"])
+        self.assertEqual(reset["risk_metrics"]["risk_day"], "2026-07-21")
+        self.assertEqual(core.day_start_equity, 900.0)
+
+    def test_sidecar_daily_baseline_and_peak_survive_restart(self):
+        day_time = datetime(
+            2026,
+            7,
+            20,
+            1,
+            tzinfo=timezone.utc,
+        ).timestamp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "sidecar-state.json")
+            settings = self.make_settings(
+                state_path=state_path,
+                state_required=True,
+                daily_loss_enabled=True,
+                max_daily_loss=100.0,
+                max_drawdown_pct=0.0,
+            )
+            exchange = DummySidecarExchange(
+                risk_snapshot=self.make_daily_snapshot(
+                    1000.0,
+                    0.0,
+                    day_time,
+                )
+            )
+            first = RiskSidecarCore(exchange, settings, now=760.0)
+            first.receive_parent_heartbeat(1, now=760.1)
+            first.step(now=760.1)
+            exchange.risk_snapshot.update(
+                self.make_daily_snapshot(980.0, 0.0, day_time + 60)
+            )
+            first.receive_parent_heartbeat(2, now=761.1)
+            first.step(now=761.2)
+
+            exchange.risk_snapshot.update(
+                self.make_daily_snapshot(890.0, 0.0, day_time + 120)
+            )
+            recovered = RiskSidecarCore(exchange, settings, now=762.0)
+            recovered.receive_parent_heartbeat(1, now=762.1)
+            killed, _ = recovered.step(now=762.1)
+
+            self.assertTrue(recovered.state_recovered)
+            self.assertEqual(recovered.day_start_equity, 1000.0)
+            self.assertEqual(killed["risk_action"], "KILL")
+            self.assertIn("daily_loss_kill", killed["reason"])
+
+    def test_sidecar_daily_risk_fails_closed_without_cash_flow_truth(self):
+        snapshot = {
+            "account": {
+                "totalMaintMargin": "0",
+                "totalMarginBalance": "1000",
+            },
+            "positions": [],
+            "open_orders": [],
+            "captured_at": time.time(),
+        }
+        exchange = DummySidecarExchange(risk_snapshot=snapshot)
+        core = RiskSidecarCore(
+            exchange,
+            self.make_settings(daily_loss_enabled=True),
+            now=780.0,
+        )
+        core.receive_parent_heartbeat(1, now=780.1)
+
+        status, _ = core.step(now=780.1)
+
+        self.assertEqual(status["risk_action"], "REDUCE_ONLY")
+        self.assertEqual(status["reason"], "daily_equity_snapshot_invalid")
+
+    def test_sidecar_clock_offset_has_soft_and_hard_risk_stages(self):
+        base_snapshot = {
+            "account": {
+                "totalMaintMargin": "0",
+                "totalMarginBalance": "1000",
+            },
+            "positions": [],
+            "open_orders": [],
+            "clock_rtt_ms": 10.0,
+        }
+        settings = self.make_settings(
+            clock_sync_enabled=True,
+            clock_reduce_only_offset_ms=250.0,
+            clock_kill_offset_ms=1000.0,
+            clock_max_rtt_ms=1500.0,
+        )
+        soft_exchange = DummySidecarExchange(
+            risk_snapshot={**base_snapshot, "clock_offset_ms": 300.0}
+        )
+        soft = RiskSidecarCore(soft_exchange, settings, now=800.0)
+        soft.receive_parent_heartbeat(1, now=800.1)
+        soft_status, _ = soft.step(now=800.1)
+        self.assertEqual(soft_status["risk_action"], "REDUCE_ONLY")
+        self.assertIn("clock_offset_reduce_only", soft_status["reason"])
+
+        hard_exchange = DummySidecarExchange(
+            risk_snapshot={**base_snapshot, "clock_offset_ms": -1200.0}
+        )
+        hard = RiskSidecarCore(hard_exchange, settings, now=810.0)
+        hard.receive_parent_heartbeat(1, now=810.1)
+        hard_status, _ = hard.step(now=810.1)
+        self.assertEqual(hard_status["risk_action"], "KILL")
+        self.assertIn("clock_offset_kill", hard_status["reason"])
+
+    def test_sidecar_clock_rtt_or_missing_snapshot_fails_closed(self):
+        settings = self.make_settings(
+            clock_sync_enabled=True,
+            clock_reduce_only_offset_ms=250.0,
+            clock_kill_offset_ms=1000.0,
+            clock_max_rtt_ms=1500.0,
+        )
+        high_rtt_exchange = DummySidecarExchange(
+            risk_snapshot={
+                "account": {
+                    "totalMaintMargin": "0",
+                    "totalMarginBalance": "1000",
+                },
+                "positions": [],
+                "open_orders": [],
+                "clock_offset_ms": 10.0,
+                "clock_rtt_ms": 2000.0,
+            }
+        )
+        high_rtt = RiskSidecarCore(
+            high_rtt_exchange,
+            settings,
+            now=820.0,
+        )
+        high_rtt.receive_parent_heartbeat(1, now=820.1)
+        high_rtt_status, _ = high_rtt.step(now=820.1)
+        self.assertEqual(high_rtt_status["risk_action"], "REDUCE_ONLY")
+        self.assertIn("clock_rtt_reduce_only", high_rtt_status["reason"])
+
+        missing_exchange = DummySidecarExchange()
+        missing = RiskSidecarCore(missing_exchange, settings, now=830.0)
+        missing.receive_parent_heartbeat(1, now=830.1)
+        missing_status, _ = missing.step(now=830.1)
+        self.assertEqual(missing_status["risk_action"], "REDUCE_ONLY")
+        self.assertEqual(missing_status["reason"], "clock_snapshot_invalid")
+
+    def test_sidecar_long_liquidation_proximity_enters_reduce_only(self):
+        exchange = DummySidecarExchange(
+            risk_snapshot={
+                "account": {
+                    "totalMaintMargin": "10",
+                    "totalMarginBalance": "1000",
+                },
+                "positions": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "positionAmt": "1",
+                        "markPrice": "100",
+                        "liquidationPrice": "96",
+                    }
+                ],
+                "open_orders": [],
+            }
+        )
+        core = RiskSidecarCore(
+            exchange,
+            self.make_settings(
+                liquidation_proximity_enabled=True,
+                require_liquidation_price=True,
+                liquidation_reduce_only_distance_pct=0.05,
+                liquidation_kill_distance_pct=0.02,
+            ),
+            now=840.0,
+        )
+        core.receive_parent_heartbeat(1, now=840.1)
+
+        status, _ = core.step(now=840.1)
+
+        self.assertEqual(status["risk_action"], "REDUCE_ONLY")
+        self.assertIn("liquidation_distance_reduce_only", status["reason"])
+        self.assertAlmostEqual(
+            status["risk_metrics"]["minimum_liquidation_distance_pct"],
+            0.04,
+        )
+
+    def test_sidecar_short_liquidation_proximity_triggers_kill(self):
+        exchange = DummySidecarExchange(
+            risk_snapshot={
+                "account": {
+                    "totalMaintMargin": "10",
+                    "totalMarginBalance": "1000",
+                },
+                "positions": [
+                    {
+                        "symbol": "ETHUSDT",
+                        "positionAmt": "-2",
+                        "markPrice": "100",
+                        "liquidationPrice": "101.5",
+                    }
+                ],
+                "open_orders": [],
+            }
+        )
+        core = RiskSidecarCore(
+            exchange,
+            self.make_settings(
+                liquidation_proximity_enabled=True,
+                require_liquidation_price=True,
+                liquidation_reduce_only_distance_pct=0.05,
+                liquidation_kill_distance_pct=0.02,
+            ),
+            now=850.0,
+        )
+        core.receive_parent_heartbeat(1, now=850.1)
+
+        status, _ = core.step(now=850.1)
+
+        self.assertEqual(status["risk_action"], "KILL")
+        self.assertIn("liquidation_distance_kill:ETHUSDT", status["reason"])
+        self.assertEqual(exchange.flatten_calls, 1)
+
+    def test_sidecar_missing_required_liquidation_price_fails_closed(self):
+        exchange = DummySidecarExchange(
+            risk_snapshot={
+                "account": {
+                    "totalMaintMargin": "10",
+                    "totalMarginBalance": "1000",
+                },
+                "positions": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "positionAmt": "1",
+                        "markPrice": "100",
+                        "liquidationPrice": "0",
+                    }
+                ],
+                "open_orders": [],
+            }
+        )
+        core = RiskSidecarCore(
+            exchange,
+            self.make_settings(
+                liquidation_proximity_enabled=True,
+                require_liquidation_price=True,
+            ),
+            now=860.0,
+        )
+        core.receive_parent_heartbeat(1, now=860.1)
+
+        status, _ = core.step(now=860.1)
+
+        self.assertEqual(status["risk_action"], "REDUCE_ONLY")
+        self.assertEqual(
+            status["reason"],
+            "liquidation_price_unavailable:BTCUSDT",
+        )
+        self.assertEqual(
+            status["risk_metrics"]["nonzero_position_count"],
+            1,
+        )
+
+    def test_sidecar_notional_overflow_kills_without_non_finite_metrics(self):
+        exchange = DummySidecarExchange(
+            risk_snapshot={
+                "account": {
+                    "totalMaintMargin": "0",
+                    "totalMarginBalance": "1000",
+                },
+                "positions": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "positionAmt": "1e308",
+                        "markPrice": "1e308",
+                    }
+                ],
+                "open_orders": [],
+            }
+        )
+        core = RiskSidecarCore(exchange, self.make_settings(), now=870.0)
+        core.receive_parent_heartbeat(1, now=870.1)
+
+        status, _ = core.step(now=870.1)
+
+        self.assertEqual(status["risk_action"], "KILL")
+        self.assertEqual(
+            status["reason"],
+            "position_notional_overflow:BTCUSDT",
+        )
+        json.dumps(status, allow_nan=False)
+
+    def test_sidecar_kill_latch_survives_restart_until_two_phase_rearm(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "sidecar-state.json")
+            settings = self.make_settings(
+                state_path=state_path,
+                state_required=True,
+                state_fsync=True,
+            )
+            exchange = DummySidecarExchange(
+                risk_snapshot={
+                    "account": {
+                        "totalMaintMargin": "95",
+                        "totalMarginBalance": "100",
+                    },
+                    "positions": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "positionAmt": "1",
+                            "markPrice": "100",
+                        }
+                    ],
+                    "open_orders": [],
+                }
+            )
+            first = RiskSidecarCore(exchange, settings, now=500.0)
+            first.receive_parent_heartbeat(1, now=500.1)
+            triggered, _ = first.step(now=500.1)
+
+            self.assertTrue(triggered["kill_latched"])
+            self.assertTrue(os.path.exists(state_path))
+            with open(state_path, "r", encoding="utf-8") as handle:
+                persisted = json.load(handle)
+            self.assertTrue(persisted["payload"]["kill_latched"])
+
+            exchange.risk_snapshot["account"] = {
+                "totalMaintMargin": "0",
+                "totalMarginBalance": "1000",
+            }
+            recovered = RiskSidecarCore(exchange, settings, now=501.0)
+            self.assertTrue(recovered.state_recovered)
+            self.assertTrue(recovered.kill_latched)
+            self.assertEqual(recovered.stage, "FLATTENING")
+            recovered.receive_parent_heartbeat(1, now=501.1)
+            verified, _ = recovered.step(now=501.1)
+            self.assertEqual(verified["stage"], "FLAT_VERIFIED")
+
+            prepared, token, reason = recovered.prepare_rearm(
+                "prepare-1",
+                "operator_ack",
+                now=501.2,
+            )
+            self.assertTrue(prepared, reason)
+            committed, reason = recovered.commit_rearm(
+                "commit-1",
+                token,
+                now=501.3,
+            )
+            self.assertTrue(committed, reason)
+            self.assertFalse(recovered.kill_latched)
+            self.assertEqual(recovered.stage, "ARMED")
+
+            clean_restart = RiskSidecarCore(exchange, settings, now=502.0)
+            self.assertTrue(clean_restart.state_recovered)
+            self.assertFalse(clean_restart.kill_latched)
+            self.assertEqual(clean_restart.stage, "ARMED")
+
+    def test_sidecar_commit_rechecks_exchange_and_refuses_new_position(self):
+        exchange = DummySidecarExchange(
+            risk_snapshot={
+                "account": {
+                    "totalMaintMargin": "95",
+                    "totalMarginBalance": "100",
+                },
+                "positions": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "positionAmt": "1",
+                        "markPrice": "100",
+                    }
+                ],
+                "open_orders": [],
+            }
+        )
+        core = RiskSidecarCore(exchange, self.make_settings(), now=550.0)
+        core.receive_parent_heartbeat(1, now=550.1)
+        core.step(now=550.1)
+        exchange.risk_snapshot["account"] = {
+            "totalMaintMargin": "0",
+            "totalMarginBalance": "1000",
+        }
+        core.receive_parent_heartbeat(2, now=551.15)
+        core.step(now=551.2)
+        prepared, token, reason = core.prepare_rearm(
+            "prepare-2",
+            "operator_ack",
+            now=551.3,
+        )
+        self.assertTrue(prepared, reason)
+
+        exchange.risk_snapshot["positions"] = [
+            {
+                "symbol": "ETHUSDT",
+                "positionAmt": "1",
+                "markPrice": "50",
+            }
+        ]
+        committed, reason = core.commit_rearm(
+            "commit-2",
+            token,
+            now=551.4,
+        )
+
+        self.assertFalse(committed)
+        self.assertEqual(reason, "positions_remain")
+        self.assertTrue(core.kill_latched)
+
+    def test_sidecar_corrupt_durable_state_recovers_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "sidecar-state.json")
+            with open(state_path, "w", encoding="utf-8") as handle:
+                handle.write('{"payload":{"kill_latched":false}}')
+            settings = self.make_settings(
+                state_path=state_path,
+                state_required=True,
+            )
+
+            core = RiskSidecarCore(
+                DummySidecarExchange(),
+                settings,
+                now=600.0,
+            )
+
+            self.assertTrue(core.kill_latched)
+            self.assertEqual(core.stage, "FAILED")
+            self.assertIn("state_checksum_mismatch", core.state_load_error)
+            self.assertTrue(
+                any(".corrupt." in name for name in os.listdir(tmpdir))
+            )
+
+    def test_binance_sidecar_snapshot_and_reduce_only_flatten(self):
+        rest = DummyRiskSidecarRest(
+            positions=[
+                {
+                    "symbol": "BTCUSDT",
+                    "positionAmt": "2",
+                    "markPrice": "100",
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "positionAmt": "-3",
+                    "markPrice": "50",
+                },
+            ],
+            open_orders=[{"symbol": "BTCUSDT", "orderId": 1}],
+        )
+        exchange = BinanceRiskSidecarExchange.__new__(
+            BinanceRiskSidecarExchange
+        )
+        exchange.rest = rest
+
+        ok, snapshot, reason = exchange.get_risk_snapshot()
+        self.assertTrue(ok, reason)
+        self.assertEqual(len(snapshot["positions"]), 2)
+        self.assertEqual(len(snapshot["open_orders"]), 1)
+        self.assertIn("captured_at", snapshot)
+
+        ok, submitted, reason = exchange.emergency_flatten()
+        self.assertTrue(ok, reason)
+        self.assertEqual(submitted, 2)
+        self.assertEqual(len(rest.new_orders), 2)
+        long_close, long_oid = rest.new_orders[0]
+        short_close, short_oid = rest.new_orders[1]
+        self.assertEqual(long_close.side, "SELL")
+        self.assertEqual(long_close.volume, 2.0)
+        self.assertEqual(short_close.side, "BUY")
+        self.assertEqual(short_close.volume, 3.0)
+        for request, client_oid in rest.new_orders:
+            self.assertEqual(request.order_type, "MARKET")
+            self.assertTrue(request.reduce_only)
+            self.assertLessEqual(len(client_oid), 36)
+        self.assertNotEqual(long_oid, short_oid)
+
+    def test_binance_sidecar_cash_flow_truth_deduplicates_transfers(self):
+        rest = DummyRiskSidecarRest(
+            income_rows=[
+                {
+                    "incomeType": "TRANSFER",
+                    "tranId": 101,
+                    "asset": "USDT",
+                    "income": "100",
+                    "time": 1,
+                },
+                {
+                    "incomeType": "TRANSFER",
+                    "tranId": 101,
+                    "asset": "USDT",
+                    "income": "100",
+                    "time": 1,
+                },
+                {
+                    "incomeType": "FUNDING_FEE",
+                    "tranId": 102,
+                    "asset": "USDT",
+                    "income": "-2",
+                    "time": 2,
+                },
+            ]
+        )
+        exchange = BinanceRiskSidecarExchange.__new__(
+            BinanceRiskSidecarExchange
+        )
+        exchange.rest = rest
+        exchange.daily_loss_enabled = True
+        exchange.cash_flow_income_types = {"TRANSFER"}
+        exchange.cash_flow_assets = {"USDT"}
+        exchange.cash_flow_max_pages = 2
+
+        ok, snapshot, reason = exchange.get_risk_snapshot()
+
+        self.assertTrue(ok, reason)
+        self.assertEqual(snapshot["external_cash_flow_total"], 100.0)
+
+    def test_binance_sidecar_syncs_clock_before_emergency_flatten(self):
+        from infrastructure.time_service import time_service
+
+        original_offset = time_service.offset
+        server_time_ms = int(time.time() * 1000) + 750
+        rest = DummyRiskSidecarRest(
+            positions=[
+                {
+                    "symbol": "BTCUSDT",
+                    "positionAmt": "1",
+                }
+            ],
+            server_time_ms=server_time_ms,
+        )
+        exchange = BinanceRiskSidecarExchange.__new__(
+            BinanceRiskSidecarExchange
+        )
+        exchange.rest = rest
+        exchange.clock_sync_enabled = True
+        exchange.clock_sync_interval_sec = 30.0
+        exchange.last_clock_sync_monotonic = 0.0
+        exchange.clock_offset_ms = 0.0
+        exchange.clock_rtt_ms = 0.0
+        exchange.clock_reason = "clock_sync_missing"
+        try:
+            ok, submitted, reason = exchange.emergency_flatten()
+
+            self.assertTrue(ok, reason)
+            self.assertEqual(submitted, 1)
+            self.assertGreater(exchange.last_clock_sync_monotonic, 0.0)
+            self.assertAlmostEqual(
+                time_service.offset,
+                exchange.clock_offset_ms,
+            )
+            self.assertGreater(exchange.clock_offset_ms, 500.0)
+        finally:
+            time_service.offset = original_offset
+
+    def test_binance_sidecar_clock_sync_failure_blocks_risk_snapshot(self):
+        rest = DummyRiskSidecarRest(server_time_status=503)
+        exchange = BinanceRiskSidecarExchange.__new__(
+            BinanceRiskSidecarExchange
+        )
+        exchange.rest = rest
+        exchange.clock_sync_enabled = True
+        exchange.clock_sync_interval_sec = 30.0
+        exchange.last_clock_sync_monotonic = 0.0
+        exchange.clock_offset_ms = 0.0
+        exchange.clock_rtt_ms = 0.0
+        exchange.clock_reason = "clock_sync_missing"
+
+        ok, snapshot, reason = exchange.get_risk_snapshot()
+
+        self.assertFalse(ok)
+        self.assertEqual(snapshot, {})
+        self.assertEqual(reason, "server_time_status=503")
+
+    def test_sidecar_loop_consumes_heartbeats_then_cancels_when_they_stop(self):
+        exchange = DummySidecarExchange(healthy=True)
+        command_queue = queue.Queue()
+        status_queue = queue.Queue()
+        settings = self.make_settings(
+            session_id="test-session",
+            status_interval_sec=0.02,
+            parent_heartbeat_timeout_sec=0.10,
+            cancel_retry_sec=0.05,
+            orphan_exit_sec=0.20,
+        )
+        command_queue.put(
+            {
+                "type": "HEARTBEAT",
+                "session_id": "test-session",
+                "sequence": 1,
+            }
+        )
+        worker = threading.Thread(
+            target=run_sidecar_loop,
+            args=(command_queue, status_queue, settings, exchange),
+            daemon=True,
+        )
+        worker.start()
+
+        healthy_seen = False
+        deadline = time.time() + 1.0
+        while time.time() < deadline and worker.is_alive():
+            try:
+                status = status_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            healthy_seen = healthy_seen or bool(status.get("healthy"))
+
+        worker.join(1.0)
+        self.assertTrue(healthy_seen)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(exchange.cancel_calls)
+        self.assertTrue(exchange.closed)
+
+    def test_sidecar_loop_runs_across_a_spawned_process_boundary(self):
+        context = multiprocessing.get_context("spawn")
+        command_queue = context.Queue(maxsize=8)
+        status_queue = context.Queue(maxsize=8)
+        settings = self.make_settings(
+            session_id="spawn-session",
+            status_interval_sec=0.05,
+            parent_heartbeat_timeout_sec=1.0,
+            orphan_exit_sec=2.0,
+        )
+        command_queue.put(
+            {
+                "type": "HEARTBEAT",
+                "session_id": "spawn-session",
+                "sequence": 1,
+            }
+        )
+        process = context.Process(
+            target=run_sidecar_loop,
+            args=(
+                command_queue,
+                status_queue,
+                settings,
+                DummySidecarExchange(healthy=True),
+            ),
+        )
+        process.start()
+        try:
+            status = status_queue.get(timeout=5.0)
+            self.assertTrue(status["healthy"])
+            self.assertEqual(status["parent_sequence"], 1)
+            command_queue.put(
+                {
+                    "type": "STOP",
+                    "session_id": "spawn-session",
+                    "cancel_orders": False,
+                }
+            )
+            process.join(5.0)
+            self.assertFalse(process.is_alive())
+            self.assertEqual(process.exitcode, 0)
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(2.0)
+            command_queue.close()
+            status_queue.close()
+
+    def test_parent_supervisor_requires_distinct_healthy_recovery_statuses(self):
+        oms = DummyOMS()
+        config = {
+            "symbols": ["BTCUSDT"],
+            "risk": {
+                "risk_control_heartbeat": {
+                    "enabled": True,
+                    "required_source": "independent_supervisor",
+                },
+                "independent_supervisor": {
+                    "enabled": True,
+                    "recovery_checks": 2,
+                },
+            },
+        }
+        supervisor = IndependentRiskSupervisor(oms, config)
+
+        self.assertFalse(
+            supervisor._apply_oms_health(False, "supervisor_process_down")
+        )
+        self.assertEqual(oms.mode_override, OMSCapabilityMode.REDUCE_ONLY)
+
+        supervisor.last_status = {"sequence": 1}
+        self.assertFalse(supervisor._apply_oms_health(True, ""))
+        self.assertEqual(oms.mode_override, OMSCapabilityMode.REDUCE_ONLY)
+
+        supervisor.last_status = {"sequence": 2}
+        self.assertTrue(supervisor._apply_oms_health(True, ""))
+        self.assertIsNone(oms.mode_override)
+        self.assertEqual(
+            oms.risk_heartbeats[-1],
+            ("independent_supervisor", True, ""),
+        )
+
+    def test_parent_supervisor_propagates_hard_breach_to_kill_switch(self):
+        oms = DummyOMS()
+        risk_manager = DummyRiskManager()
+        config = {
+            "symbols": ["BTCUSDT"],
+            "risk": {
+                "risk_control_heartbeat": {
+                    "enabled": True,
+                    "required_source": "independent_supervisor",
+                },
+                "independent_supervisor": {"enabled": True},
+            },
+        }
+        supervisor = IndependentRiskSupervisor(
+            oms,
+            config,
+            risk_manager=risk_manager,
+        )
+        supervisor.last_status = {
+            "sequence": 7,
+            "risk_action": "KILL",
+        }
+
+        self.assertFalse(
+            supervisor._apply_oms_health(
+                False,
+                "maintenance_margin_kill:0.950000",
+            )
+        )
+        self.assertEqual(len(risk_manager.kill_reasons), 1)
+        self.assertIn("maintenance_margin_kill", risk_manager.kill_reasons[0])
+        self.assertEqual(oms.mode_override, OMSCapabilityMode.REDUCE_ONLY)
+
+    def test_parent_supervisor_executes_two_phase_rearm_over_sidecar_channel(self):
+        oms = DummyOMS()
+        config = {
+            "symbols": ["BTCUSDT"],
+            "risk": {
+                "risk_control_heartbeat": {
+                    "enabled": True,
+                    "required_source": "independent_supervisor",
+                },
+                "independent_supervisor": {
+                    "enabled": True,
+                    "status_interval_sec": 0.02,
+                    "rearm_command_timeout_sec": 1.0,
+                },
+            },
+        }
+        supervisor = IndependentRiskSupervisor(oms, config)
+        supervisor.command_queue = queue.Queue()
+        supervisor.status_queue = queue.Queue()
+        settings = dict(supervisor.settings)
+        exchange = DummySidecarExchange()
+        worker = threading.Thread(
+            target=run_sidecar_loop,
+            args=(
+                supervisor.command_queue,
+                supervisor.status_queue,
+                settings,
+                exchange,
+            ),
+            daemon=True,
+        )
+        worker.start()
+        supervisor.process = ThreadProcessHandle(worker)
+
+        prepared = supervisor.prepare_rearm("operator_ack")
+        self.assertTrue(prepared["accepted"], prepared["reason"])
+        self.assertTrue(prepared["token"])
+        committed = supervisor.commit_rearm(prepared["token"])
+        self.assertTrue(committed["accepted"], committed["reason"])
+
+        supervisor.stop(cancel_orders=False)
+        worker.join(1.0)
+        self.assertFalse(worker.is_alive())
 
 if __name__ == "__main__":
     unittest.main()

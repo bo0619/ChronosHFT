@@ -1,7 +1,7 @@
 {
     "testnet": true,
-    "api_key": "BhluoNoQGdkMMganGvAtvunZXhqEDjRSqoiinlg4BFoBxOizNgMuTfFoTJjJEqzW",
-    "api_secret": "rjKqzfsmoMd7pA8XukdtDZ7qYFapl39eRu073pcliZFPf5jinoMAs580TQS358X0",
+    "api_key_env": "BINANCE_API_KEY",
+    "api_secret_env": "BINANCE_API_SECRET",
     "symbols": ["SOLUSDT"],
     "record_data": true,
     "system": {
@@ -129,6 +129,31 @@
         "snapshot_max_attempts": 6,
         "snapshot_settle_interval_sec": 0.25,
         "command_fence_timeout_sec": 5.25,
+        "outbound_message_budget": {
+            "enabled": true,
+            "window_sec": 1.0,
+            "max_total_messages_per_window": 20,
+            "max_new_orders_per_window": 10,
+            "max_reduce_orders_per_window": 10,
+            "max_cancel_messages_per_window": 20,
+            "reserved_risk_messages_per_window": 5
+        },
+        "self_trade_prevention": {
+            "enabled": true,
+            "local_cross_check": true,
+            "exchange_mode": "EXPIRE_MAKER"
+        },
+        "single_writer_fence": {
+            "enabled": true,
+            "path": "storage/oms/oms_journal.jsonl.lock"
+        },
+        "venue_dead_man_switch": {
+            "enabled": true,
+            "countdown_time_ms": 120000,
+            "renewal_interval_sec": 30.0,
+            "max_renewal_age_sec": 45.0,
+            "recovery_checks": 2
+        },
         "truth_monitor": {
             "poll_interval_sec": 5.0,
             "api_freeze_threshold": 2,
@@ -151,9 +176,92 @@
             "max_daily_loss": 4.0,
             "max_drawdown_pct": 0.05
         },
+        "strategy_risk_budgets": {
+            "enabled": true,
+            "require_explicit_strategy": true,
+            "budgets": {
+                "ML_Sniper": {
+                    "auto_scale": true,
+                    "max_gross_notional": 36.0,
+                    "max_symbol_notional": 18.0
+                }
+            }
+        },
         "price_sanity": {
             "max_deviation_pct": 0.02,
             "max_spread_pct": 0.01
+        },
+        "market_data_freshness": {
+            "enabled": true,
+            "require_mark_price": true,
+            "require_book": true,
+            "max_mark_age_ms": 3000,
+            "max_book_age_ms": 1500,
+            "poll_interval_sec": 0.25,
+            "breach_checks": 2,
+            "recovery_checks": 5
+        },
+        "cash_flow_truth": {
+            "enabled": true,
+            "require_snapshot": true,
+            "max_snapshot_age_sec": 45,
+            "poll_interval_sec": 30,
+            "recovery_checks": 2,
+            "external_income_types": ["TRANSFER"]
+        },
+        "risk_control_heartbeat": {
+            "enabled": true,
+            "max_age_sec": 2.0,
+            "required_source": "independent_supervisor"
+        },
+        "independent_supervisor": {
+            "enabled": true,
+            "api_key_env": "BINANCE_RISK_API_KEY",
+            "api_secret_env": "BINANCE_RISK_API_SECRET",
+            "heartbeat_interval_sec": 0.25,
+            "parent_heartbeat_timeout_sec": 1.5,
+            "status_max_age_sec": 2.0,
+            "exchange_poll_interval_sec": 5.0,
+            "exchange_max_age_sec": 10.0,
+            "cancel_retry_sec": 2.0,
+            "orphan_exit_sec": 30.0,
+            "stop_timeout_sec": 10.0,
+            "emergency_countdown_time_ms": 1000,
+            "recovery_checks": 2,
+            "gross_kill_multiplier": 1.25,
+            "flatten_enabled": true,
+            "parent_loss_flatten_delay_sec": 3.0,
+            "flatten_retry_sec": 2.0,
+            "flat_verification_checks": 2,
+            "state_path": "storage/risk/independent_supervisor_state.json",
+            "state_required": true,
+            "state_fsync": true,
+            "rearm_prepare_ttl_sec": 10.0,
+            "rearm_command_timeout_sec": 5.0,
+            "daily_loss_enabled": true,
+            "daily_loss_reduce_only_fraction": 0.80,
+            "cash_flow_income_types": ["TRANSFER"],
+            "cash_flow_assets": ["USDT", "USDC", "BUSD", "FDUSD"],
+            "cash_flow_max_pages": 5,
+            "clock_sync_enabled": true,
+            "clock_sync_interval_sec": 30.0,
+            "clock_reduce_only_offset_ms": 250.0,
+            "clock_kill_offset_ms": 1000.0,
+            "clock_max_rtt_ms": 1500.0,
+            "liquidation_proximity_enabled": true,
+            "require_liquidation_price": true,
+            "liquidation_reduce_only_distance_pct": 0.05,
+            "liquidation_kill_distance_pct": 0.02
+        },
+        "margin_health": {
+            "enabled": true,
+            "require_snapshot": true,
+            "degraded_ratio": 0.50,
+            "reduce_only_ratio": 0.70,
+            "kill_ratio": 0.90,
+            "recovery_ratio": 0.40,
+            "max_snapshot_age_sec": 15,
+            "recovery_checks": 3
         },
         "tech_health": {
             "max_latency_ms": 500,
@@ -177,6 +285,7 @@
         "order_reject_rate": 0.0
     },
     "strategy": {
+        "name": "ML_Sniper",
         "use_rpi": true,        
         "_comment_capital_scaling": "Only change capital_multiplier. Order notional and caps scale together.",
         "capital_multiplier": 1.0,

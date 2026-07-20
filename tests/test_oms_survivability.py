@@ -1,8 +1,12 @@
 import os
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
+
+from data.cache import data_cache
 
 if "requests" not in sys.modules:
     requests_stub = types.ModuleType("requests")
@@ -16,6 +20,7 @@ from event.type import (
     ExchangeOrderUpdate,
     ExecutionPolicy,
     EVENT_EXCHANGE_ORDER_UPDATE,
+    EVENT_ACCOUNT_UPDATE,
     LifecycleState,
     OMSCapabilityMode,
     OrderIntent,
@@ -23,8 +28,13 @@ from event.type import (
     Side,
 )
 from infrastructure.system_health import handle_system_health_event
+from infrastructure.single_writer_fence import (
+    SingleWriterFence,
+    SingleWriterFenceError,
+)
 from infrastructure.truth_monitor import TruthMonitor
 from oms.engine import OMS
+from oms.journal import OMSJournal
 from oms.order import Order
 
 
@@ -52,6 +62,8 @@ class DummyGateway:
         self.cancel_requests = []
         self.sent_orders = []
         self.cancel_response = None
+        self.dead_man_requests = []
+        self.dead_man_status_code = 200
 
     def send_order(self, req, client_oid):
         self.sent_orders.append((req, client_oid))
@@ -64,6 +76,10 @@ class DummyGateway:
     def cancel_all_orders(self, symbol):
         self.cancelled_symbols.append(symbol)
         return None
+
+    def set_countdown_cancel_all(self, symbol, countdown_time_ms):
+        self.dead_man_requests.append((symbol, countdown_time_ms))
+        return types.SimpleNamespace(status_code=self.dead_man_status_code)
 
     def get_account_info(self):
         return self.account
@@ -148,6 +164,47 @@ class OMSSurvivabilityTests(unittest.TestCase):
             "journal_path": journal_path,
         }
         return config
+
+    def test_single_writer_fence_rejects_second_owner_and_releases(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fence_path = os.path.join(temp_dir, "oms.lock")
+            first = SingleWriterFence(
+                fence_path,
+                owner_metadata={"component": "writer-one"},
+            )
+            second = SingleWriterFence(
+                fence_path,
+                owner_metadata={"component": "writer-two"},
+            )
+            self.assertTrue(first.acquire())
+            self.assertTrue(first.health_snapshot()["held"])
+
+            with self.assertRaisesRegex(
+                SingleWriterFenceError,
+                "writer-one",
+            ):
+                second.acquire()
+
+            self.assertTrue(first.release())
+            self.assertTrue(second.acquire())
+            self.assertTrue(second.release())
+
+    def test_oms_holds_single_writer_fence_until_stop(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_config()
+            config["oms"]["single_writer_fence"] = {
+                "enabled": True,
+                "path": os.path.join(temp_dir, "oms.lock"),
+            }
+            first = OMS(DummyEngine(), DummyGateway(), config)
+            try:
+                with self.assertRaises(SingleWriterFenceError):
+                    OMS(DummyEngine(), DummyGateway(), config)
+            finally:
+                first.stop()
+
+            replacement = OMS(DummyEngine(), DummyGateway(), config)
+            replacement.stop()
 
     def test_filled_close_books_realized_pnl_into_balance(self):
         gateway = DummyGateway()
@@ -532,6 +589,945 @@ class OMSSurvivabilityTests(unittest.TestCase):
         finally:
             oms.stop()
 
+    def test_reduce_only_mode_blocks_opening_risk_and_allows_position_reduction(self):
+        gateway = DummyGateway()
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.exposure.force_sync("BTCUSDT", 1.0, 100.0)
+            oms.account.force_sync(1000.0, 0.0, available=1000.0)
+            oms.set_trading_mode(OMSCapabilityMode.REDUCE_ONLY, "margin_health:test")
+            self.assertFalse(
+                oms.set_trading_mode(OMSCapabilityMode.DEGRADED, "processing_lag:test")
+            )
+
+            blocked = oms.submit_order(
+                OrderIntent(
+                    "alpha",
+                    "BTCUSDT",
+                    Side.BUY,
+                    100.0,
+                    0.5,
+                    is_post_only=True,
+                    policy=ExecutionPolicy.PASSIVE,
+                )
+            )
+            allowed = oms.submit_order(
+                OrderIntent(
+                    "alpha",
+                    "BTCUSDT",
+                    Side.SELL,
+                    100.0,
+                    0.5,
+                    order_type="MARKET",
+                    time_in_force="IOC",
+                    is_post_only=False,
+                    reduce_only=True,
+                    policy=ExecutionPolicy.AGGRESSIVE,
+                )
+            )
+
+            self.assertFalse(blocked.accepted)
+            self.assertEqual(blocked.reason, "oms_mode_reduce_only")
+            self.assertTrue(allowed.accepted)
+            self.assertEqual(oms.capability_mode, OMSCapabilityMode.REDUCE_ONLY)
+            sent_req, _client_oid = gateway.sent_orders[-1]
+            self.assertTrue(sent_req.reduce_only)
+
+            self.assertTrue(
+                oms.clear_trading_mode(
+                    reason="margin recovered",
+                    prefixes=("margin_health:",),
+                )
+            )
+            self.assertEqual(oms.capability_mode, OMSCapabilityMode.DEGRADED)
+            self.assertTrue(oms.mode_override_reason.startswith("processing_lag:"))
+        finally:
+            oms.stop()
+
+    def test_entering_reduce_only_cancels_existing_opening_orders(self):
+        gateway = DummyGateway()
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.exposure.check_risk = lambda *args, **kwargs: (True, "")
+            submitted = oms.submit_order(
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 0.5)
+            )
+            self.assertTrue(submitted.accepted)
+
+            oms.set_trading_mode(OMSCapabilityMode.REDUCE_ONLY, "margin_health:test")
+
+            self.assertTrue(gateway.cancel_requests)
+            self.assertEqual(gateway.cancel_requests[-1].symbol, "BTCUSDT")
+        finally:
+            oms.stop()
+
+    def test_restart_restores_composable_trading_mode_constraints(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal_path = os.path.join(tmpdir, "oms_journal.jsonl")
+            config = self.make_journaled_config(journal_path)
+            oms = OMS(DummyEngine(), DummyGateway(), config)
+            oms.state = LifecycleState.LIVE
+            oms.set_trading_mode(OMSCapabilityMode.REDUCE_ONLY, "margin_health:test")
+            oms.set_trading_mode(OMSCapabilityMode.PASSIVE_ONLY, "processing_lag:test")
+            oms.stop()
+
+            recovered = OMS(DummyEngine(), DummyGateway(), config)
+            try:
+                self.assertEqual(len(recovered.mode_constraints), 2)
+                self.assertEqual(recovered.mode_override, OMSCapabilityMode.REDUCE_ONLY)
+
+                recovered.state = LifecycleState.LIVE
+                recovered._sync_capability_mode("test_live")
+                self.assertTrue(
+                    recovered.clear_trading_mode(
+                        reason="margin recovered",
+                        prefixes=("margin_health:",),
+                    )
+                )
+
+                self.assertEqual(recovered.capability_mode, OMSCapabilityMode.PASSIVE_ONLY)
+                self.assertTrue(recovered.mode_override_reason.startswith("processing_lag:"))
+            finally:
+                recovered.stop()
+
+    def test_margin_snapshot_gate_is_fail_closed_but_allows_reduction(self):
+        gateway = DummyGateway()
+        config = self.make_config()
+        config["risk"]["margin_health"] = {
+            "enabled": True,
+            "require_snapshot": True,
+            "reduce_only_ratio": 0.70,
+            "max_snapshot_age_sec": 1.0,
+        }
+        oms = OMS(DummyEngine(), gateway, config)
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.exposure.force_sync("BTCUSDT", 1.0, 100.0)
+            oms.account.force_sync(1000.0, 0.0, available=1000.0)
+
+            blocked = oms.submit_order(
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 0.5)
+            )
+            reduction = oms.submit_order(
+                OrderIntent(
+                    "alpha",
+                    "BTCUSDT",
+                    Side.SELL,
+                    100.0,
+                    0.5,
+                    order_type="MARKET",
+                    time_in_force="IOC",
+                    reduce_only=True,
+                    policy=ExecutionPolicy.AGGRESSIVE,
+                )
+            )
+
+            self.assertFalse(blocked.accepted)
+            self.assertEqual(blocked.reason, "margin_health_unavailable")
+            self.assertTrue(reduction.accepted)
+        finally:
+            oms.stop()
+
+    def test_stale_margin_snapshot_blocks_new_risk_at_submit_boundary(self):
+        config = self.make_config()
+        config["risk"]["margin_health"] = {
+            "enabled": True,
+            "require_snapshot": True,
+            "reduce_only_ratio": 0.70,
+            "max_snapshot_age_sec": 1.0,
+        }
+        oms = OMS(DummyEngine(), DummyGateway(), config)
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.account.sync_margin_health(
+                100.0,
+                1000.0,
+                snapshot_time=time.time() - 5.0,
+            )
+
+            result = oms.submit_order(
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 0.5)
+            )
+
+            self.assertFalse(result.accepted)
+            self.assertTrue(result.reason.startswith("margin_health_stale:"))
+        finally:
+            oms.stop()
+
+    def test_risk_heartbeat_lease_fails_closed_but_allows_reduction(self):
+        gateway = DummyGateway()
+        config = self.make_config()
+        config["risk"]["risk_control_heartbeat"] = {
+            "enabled": True,
+            "max_age_sec": 0.05,
+        }
+        oms = OMS(DummyEngine(), gateway, config)
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.exposure.force_sync("BTCUSDT", 1.0, 100.0)
+            oms.account.force_sync(1000.0, 0.0, available=1000.0)
+            data_cache.update_mark_price(
+                types.SimpleNamespace(
+                    symbol="BTCUSDT",
+                    mark_price=100.0,
+                    datetime=None,
+                )
+            )
+
+            missing = oms.submit_order(
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 0.1)
+            )
+            self.assertFalse(missing.accepted)
+            self.assertEqual(missing.reason, "risk_control_heartbeat_missing")
+
+            self.assertTrue(oms.record_risk_control_heartbeat("test_risk_loop"))
+            healthy = oms.submit_order(
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 101.0, 0.1)
+            )
+            self.assertTrue(healthy.accepted)
+            self.assertTrue(oms.get_risk_control_heartbeat_snapshot()["valid"])
+
+            oms.last_risk_control_heartbeat_monotonic -= 1.0
+            stale = oms.submit_order(
+                OrderIntent("beta", "BTCUSDT", Side.BUY, 102.0, 0.1)
+            )
+            self.assertFalse(stale.accepted)
+            self.assertTrue(stale.reason.startswith("risk_control_heartbeat_stale:"))
+
+            reduction = oms.submit_order(
+                OrderIntent(
+                    "alpha",
+                    "BTCUSDT",
+                    Side.SELL,
+                    100.0,
+                    0.5,
+                    order_type="MARKET",
+                    time_in_force="IOC",
+                    reduce_only=True,
+                    policy=ExecutionPolicy.AGGRESSIVE,
+                )
+            )
+            self.assertTrue(reduction.accepted)
+        finally:
+            oms.stop()
+            with data_cache._lock:
+                data_cache.mark_prices.pop("BTCUSDT", None)
+                data_cache.mark_update_times.pop("BTCUSDT", None)
+
+    def test_risk_heartbeat_rejects_untrusted_in_process_source(self):
+        config = self.make_config()
+        config["risk"]["risk_control_heartbeat"] = {
+            "enabled": True,
+            "max_age_sec": 2.0,
+            "required_source": "independent_supervisor",
+        }
+        oms = OMS(DummyEngine(), DummyGateway(), config)
+        try:
+            self.assertFalse(
+                oms.record_risk_control_heartbeat(
+                    source="risk_manager",
+                    healthy=True,
+                )
+            )
+            rejected = oms.get_risk_control_heartbeat_snapshot()
+            self.assertFalse(rejected["valid"])
+            self.assertEqual(rejected["status"], "missing")
+            self.assertEqual(
+                rejected["required_source"],
+                "independent_supervisor",
+            )
+
+            self.assertTrue(
+                oms.record_risk_control_heartbeat(
+                    source="independent_supervisor",
+                    healthy=True,
+                )
+            )
+            accepted = oms.get_risk_control_heartbeat_snapshot()
+            self.assertTrue(accepted["valid"])
+            self.assertEqual(accepted["source"], "independent_supervisor")
+        finally:
+            oms.stop()
+
+    def test_venue_dead_man_switch_fails_closed_and_recovers(self):
+        gateway = DummyGateway()
+        config = self.make_config()
+        config["oms"]["venue_dead_man_switch"] = {
+            "enabled": True,
+            "countdown_time_ms": 1000,
+            "renewal_interval_sec": 0.05,
+            "max_renewal_age_sec": 0.10,
+            "recovery_checks": 2,
+        }
+        oms = OMS(DummyEngine(), gateway, config)
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.exposure.force_sync("BTCUSDT", 1.0, 100.0)
+            oms.account.force_sync(1000.0, 0.0, available=1000.0)
+            data_cache.update_mark_price(
+                types.SimpleNamespace(
+                    symbol="BTCUSDT",
+                    mark_price=100.0,
+                    datetime=None,
+                )
+            )
+
+            missing = oms.submit_order(
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 0.1)
+            )
+            self.assertFalse(missing.accepted)
+            self.assertTrue(
+                missing.reason.startswith("venue_dead_man_switch:unarmed_symbols:")
+            )
+
+            self.assertTrue(oms.renew_venue_dead_man_switch(force=True))
+            self.assertEqual(gateway.dead_man_requests, [("BTCUSDT", 1000)])
+            healthy = oms.submit_order(
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 101.0, 0.1)
+            )
+            self.assertTrue(healthy.accepted)
+            self.assertTrue(
+                oms.get_venue_dead_man_switch_snapshot()["valid"]
+            )
+
+            oms.last_venue_dead_man_success_monotonic -= 1.0
+            stale = oms.submit_order(
+                OrderIntent("beta", "BTCUSDT", Side.BUY, 102.0, 0.1)
+            )
+            self.assertFalse(stale.accepted)
+            self.assertTrue(
+                stale.reason.startswith("venue_dead_man_switch:renewal_stale:")
+            )
+
+            reduction = oms.submit_order(
+                OrderIntent(
+                    "alpha",
+                    "BTCUSDT",
+                    Side.SELL,
+                    100.0,
+                    0.5,
+                    order_type="MARKET",
+                    time_in_force="IOC",
+                    reduce_only=True,
+                    policy=ExecutionPolicy.AGGRESSIVE,
+                )
+            )
+            self.assertTrue(reduction.accepted)
+
+            gateway.dead_man_status_code = 500
+            self.assertFalse(oms.renew_venue_dead_man_switch(force=True))
+            self.assertEqual(oms.capability_mode, OMSCapabilityMode.REDUCE_ONLY)
+            self.assertTrue(
+                oms.has_trading_mode_constraint(("venue_dead_man_switch:",))
+            )
+
+            gateway.dead_man_status_code = 200
+            self.assertTrue(oms.renew_venue_dead_man_switch(force=True))
+            self.assertTrue(
+                oms.has_trading_mode_constraint(("venue_dead_man_switch:",))
+            )
+            self.assertTrue(oms.renew_venue_dead_man_switch(force=True))
+            self.assertFalse(
+                oms.has_trading_mode_constraint(("venue_dead_man_switch:",))
+            )
+            self.assertEqual(oms.capability_mode, OMSCapabilityMode.LIVE)
+        finally:
+            oms.stop()
+            with data_cache._lock:
+                data_cache.mark_prices.pop("BTCUSDT", None)
+                data_cache.mark_update_times.pop("BTCUSDT", None)
+
+    def test_bootstrap_dead_man_failure_halts_and_retries_mass_cancel(self):
+        gateway = DummyGateway()
+        gateway.dead_man_status_code = 500
+        config = self.make_config()
+        config["oms"]["venue_dead_man_switch"] = {
+            "enabled": True,
+            "countdown_time_ms": 1000,
+            "renewal_interval_sec": 0.05,
+            "max_renewal_age_sec": 0.10,
+            "recovery_checks": 2,
+        }
+        oms = OMS(DummyEngine(), gateway, config)
+        try:
+            self.assertFalse(oms.bootstrap())
+            self.assertEqual(oms.state, LifecycleState.HALTED)
+            self.assertTrue(oms.manual_rearm_required)
+            self.assertEqual(gateway.dead_man_requests, [("BTCUSDT", 1000)])
+            self.assertIn("BTCUSDT", gateway.cancelled_symbols)
+
+            gateway.cancelled_symbols.clear()
+            oms.halt_system("dead_man_still_unavailable")
+            self.assertEqual(gateway.cancelled_symbols, ["BTCUSDT"])
+        finally:
+            oms.stop()
+
+    def test_message_budget_reserves_capacity_for_reduce_and_cancel(self):
+        gateway = DummyGateway()
+        gateway.cancel_response = DummyResponse(200, {})
+        config = self.make_config()
+        config["oms"]["outbound_message_budget"] = {
+            "enabled": True,
+            "window_sec": 1.0,
+            "max_total_messages_per_window": 4,
+            "max_new_orders_per_window": 10,
+            "max_reduce_orders_per_window": 4,
+            "max_cancel_messages_per_window": 4,
+            "reserved_risk_messages_per_window": 2,
+        }
+        oms = OMS(DummyEngine(), gateway, config)
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.exposure.force_sync("BTCUSDT", 1.0, 100.0)
+            oms.account.force_sync(1000.0, 0.0, available=1000.0)
+            data_cache.update_mark_price(
+                types.SimpleNamespace(
+                    symbol="BTCUSDT",
+                    mark_price=100.0,
+                    datetime=None,
+                )
+            )
+
+            first = oms.submit_order(
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 0.1)
+            )
+            second = oms.submit_order(
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 101.0, 0.1)
+            )
+            blocked = oms.submit_order(
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 102.0, 0.1)
+            )
+
+            self.assertTrue(first.accepted)
+            self.assertTrue(second.accepted)
+            self.assertFalse(blocked.accepted)
+            self.assertTrue(
+                blocked.reason.startswith(
+                    "outbound_message_budget:risk_capacity_reserved:"
+                )
+            )
+
+            reduction = oms.submit_order(
+                OrderIntent(
+                    "alpha",
+                    "BTCUSDT",
+                    Side.SELL,
+                    100.0,
+                    0.5,
+                    order_type="MARKET",
+                    time_in_force="IOC",
+                    reduce_only=True,
+                    policy=ExecutionPolicy.AGGRESSIVE,
+                )
+            )
+            self.assertTrue(reduction.accepted)
+            self.assertTrue(oms.cancel_order(first.client_oid))
+
+            snapshot = oms.get_outbound_message_budget_snapshot()
+            self.assertEqual(snapshot["counts"][OMS.OUTBOUND_NEW_ORDER], 2)
+            self.assertEqual(snapshot["counts"][OMS.OUTBOUND_REDUCE_ORDER], 1)
+            self.assertEqual(snapshot["counts"][OMS.OUTBOUND_CANCEL], 1)
+            self.assertEqual(len(gateway.cancel_requests), 1)
+        finally:
+            oms.stop()
+            with data_cache._lock:
+                data_cache.mark_prices.pop("BTCUSDT", None)
+                data_cache.mark_update_times.pop("BTCUSDT", None)
+
+    def test_strategy_budget_reservation_is_atomic_across_concurrent_submits(self):
+        gateway = DummyGateway()
+        config = self.make_config()
+        config["oms"]["duplicate_intent_window_sec"] = 0.0
+        config["risk"]["strategy_risk_budgets"] = {
+            "enabled": True,
+            "require_explicit_strategy": True,
+            "budgets": {
+                "alpha": {
+                    "max_gross_notional": 500.0,
+                    "max_symbol_notional": 500.0,
+                }
+            },
+        }
+        oms = OMS(DummyEngine(), gateway, config)
+        results = []
+        result_lock = threading.Lock()
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.account.force_sync(1000.0, 0.0, available=1000.0)
+            data_cache.update_mark_price(
+                types.SimpleNamespace(
+                    symbol="BTCUSDT",
+                    mark_price=100.0,
+                    datetime=None,
+                )
+            )
+
+            def submit(index):
+                result = oms.submit_order(
+                    OrderIntent(
+                        "alpha",
+                        "BTCUSDT",
+                        Side.BUY,
+                        100.0 + index * 0.01,
+                        1.0,
+                    )
+                )
+                with result_lock:
+                    results.append(result)
+
+            workers = [
+                threading.Thread(target=submit, args=(index,))
+                for index in range(20)
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+
+            accepted = [result for result in results if result.accepted]
+            rejected = [result for result in results if not result.accepted]
+            self.assertEqual(len(accepted), 5)
+            self.assertEqual(len(rejected), 15)
+            self.assertTrue(
+                all(
+                    result.reason.startswith("strategy_budget_limit:")
+                    for result in rejected
+                )
+            )
+            snapshot = oms.get_strategy_risk_budget_snapshot()
+            self.assertEqual(
+                snapshot["ledger"]["alpha"]["BTCUSDT"]["open_buy_qty"],
+                5.0,
+            )
+        finally:
+            oms.stop()
+            with data_cache._lock:
+                data_cache.mark_prices.pop("BTCUSDT", None)
+                data_cache.mark_update_times.pop("BTCUSDT", None)
+
+    def test_unconfigured_strategy_is_rejected_but_reduce_only_remains_allowed(self):
+        gateway = DummyGateway()
+        config = self.make_config()
+        config["risk"]["strategy_risk_budgets"] = {
+            "enabled": True,
+            "require_explicit_strategy": True,
+            "budgets": {
+                "alpha": {
+                    "max_gross_notional": 500.0,
+                    "max_symbol_notional": 500.0,
+                }
+            },
+        }
+        oms = OMS(DummyEngine(), gateway, config)
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.exposure.force_sync("BTCUSDT", 1.0, 100.0)
+            oms.exposure.on_strategy_fill(
+                "alpha",
+                "BTCUSDT",
+                Side.BUY,
+                1.0,
+                100.0,
+            )
+            oms.account.force_sync(1000.0, 0.0, available=1000.0)
+            data_cache.update_mark_price(
+                types.SimpleNamespace(
+                    symbol="BTCUSDT",
+                    mark_price=100.0,
+                    datetime=None,
+                )
+            )
+
+            opening = oms.submit_order(
+                OrderIntent("beta", "BTCUSDT", Side.BUY, 100.0, 0.1)
+            )
+            self.assertFalse(opening.accepted)
+            self.assertEqual(opening.reason, "strategy_budget_unconfigured:beta")
+
+            reduction = oms.submit_order(
+                OrderIntent(
+                    "beta",
+                    "BTCUSDT",
+                    Side.SELL,
+                    100.0,
+                    0.5,
+                    order_type="MARKET",
+                    time_in_force="IOC",
+                    reduce_only=True,
+                    policy=ExecutionPolicy.AGGRESSIVE,
+                )
+            )
+            self.assertTrue(reduction.accepted)
+        finally:
+            oms.stop()
+            with data_cache._lock:
+                data_cache.mark_prices.pop("BTCUSDT", None)
+                data_cache.mark_update_times.pop("BTCUSDT", None)
+
+    def test_strategy_gross_budget_aggregates_across_symbols(self):
+        gateway = DummyGateway()
+        config = self.make_config()
+        config["symbols"] = ["BTCUSDT", "ETHUSDT"]
+        config["risk"]["strategy_risk_budgets"] = {
+            "enabled": True,
+            "require_explicit_strategy": True,
+            "budgets": {
+                "alpha": {
+                    "max_gross_notional": 500.0,
+                    "max_symbol_notional": 500.0,
+                }
+            },
+        }
+        oms = OMS(DummyEngine(), gateway, config)
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.account.force_sync(1000.0, 0.0, available=1000.0)
+            for symbol in config["symbols"]:
+                data_cache.update_mark_price(
+                    types.SimpleNamespace(
+                        symbol=symbol,
+                        mark_price=100.0,
+                        datetime=None,
+                    )
+                )
+
+            btc = oms.submit_order(
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 3.0)
+            )
+            eth = oms.submit_order(
+                OrderIntent("alpha", "ETHUSDT", Side.BUY, 100.0, 3.0)
+            )
+
+            self.assertTrue(btc.accepted)
+            self.assertFalse(eth.accepted)
+            self.assertIn("Strategy Gross Exposure", eth.reason)
+        finally:
+            oms.stop()
+            with data_cache._lock:
+                for symbol in config["symbols"]:
+                    data_cache.mark_prices.pop(symbol, None)
+                    data_cache.mark_update_times.pop(symbol, None)
+
+    def test_strategy_fill_attribution_replays_from_durable_execution_log(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            journal_path = os.path.join(temp_dir, "oms_journal.jsonl")
+            config = self.make_journaled_config(journal_path)
+            config["risk"]["strategy_risk_budgets"] = {
+                "enabled": True,
+                "require_explicit_strategy": True,
+                "budgets": {
+                    "alpha": {
+                        "max_gross_notional": 500.0,
+                        "max_symbol_notional": 500.0,
+                    }
+                },
+            }
+            gateway = DummyGateway()
+            oms = OMS(DummyEngine(), gateway, config)
+            recovered = None
+            try:
+                oms.state = LifecycleState.LIVE
+                oms.account.force_sync(1000.0, 0.0, available=1000.0)
+                data_cache.update_mark_price(
+                    types.SimpleNamespace(
+                        symbol="BTCUSDT",
+                        mark_price=100.0,
+                        datetime=None,
+                    )
+                )
+                submitted = oms.submit_order(
+                    OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 1.0)
+                )
+                self.assertTrue(submitted.accepted)
+                oms._apply_event(
+                    Event(
+                        EVENT_EXCHANGE_ORDER_UPDATE,
+                        ExchangeOrderUpdate(
+                            client_oid=submitted.client_oid,
+                            exchange_oid="ex-order-1",
+                            symbol="BTCUSDT",
+                            status="FILLED",
+                            filled_qty=1.0,
+                            filled_price=100.0,
+                            cum_filled_qty=1.0,
+                            update_time=1000.0,
+                            seq=1,
+                            trade_id=901,
+                        ),
+                    )
+                )
+                self.assertEqual(
+                    oms.exposure.strategy_net_positions[("alpha", "BTCUSDT")],
+                    1.0,
+                )
+                oms.stop()
+
+                recovered = OMS(DummyEngine(), DummyGateway(), config)
+                self.assertEqual(
+                    recovered.exposure.strategy_net_positions[
+                        ("alpha", "BTCUSDT")
+                    ],
+                    1.0,
+                )
+                self.assertEqual(
+                    recovered.exposure.strategy_avg_prices[
+                        ("alpha", "BTCUSDT")
+                    ],
+                    100.0,
+                )
+            finally:
+                if recovered is not None:
+                    recovered.stop()
+                elif getattr(oms, "_stopped", False) is False:
+                    oms.stop()
+                with data_cache._lock:
+                    data_cache.mark_prices.pop("BTCUSDT", None)
+                    data_cache.mark_update_times.pop("BTCUSDT", None)
+
+    def test_unattributed_position_residual_is_assigned_to_recovery_bucket(self):
+        owner = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        exposure = owner.exposure
+        try:
+            exposure.on_strategy_fill(
+                "alpha",
+                "BTCUSDT",
+                Side.BUY,
+                1.0,
+                100.0,
+            )
+            residual = exposure.reconcile_strategy_position(
+                "BTCUSDT",
+                account_position=2.0,
+                price=101.0,
+            )
+            self.assertEqual(residual, 1.0)
+            self.assertEqual(
+                exposure.strategy_net_positions[("exchange_recovery", "BTCUSDT")],
+                1.0,
+            )
+
+            residual = exposure.reconcile_strategy_position(
+                "BTCUSDT",
+                account_position=0.0,
+                price=102.0,
+            )
+            self.assertEqual(residual, -1.0)
+        finally:
+            owner.stop()
+
+    def test_execution_without_local_order_replays_into_recovery_strategy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            journal_path = os.path.join(temp_dir, "oms_journal.jsonl")
+            config = self.make_journaled_config(journal_path)
+            journal = OMSJournal(config)
+            journal.append(
+                "execution_record",
+                {
+                    "execution_id": "BINANCE:BTCUSDT:external-1",
+                    "venue": "BINANCE",
+                    "client_oid": "",
+                    "exchange_oid": "external-order",
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "fill_qty": 0.25,
+                    "fill_price": 100.0,
+                    "cum_filled_qty": 0.25,
+                    "exchange_status": "FILLED",
+                    "exchange_time": 1000.0,
+                    "trade_id": 902,
+                },
+            )
+
+            recovered = OMS(DummyEngine(), DummyGateway(), config)
+            try:
+                self.assertEqual(
+                    recovered.exposure.strategy_net_positions[
+                        ("exchange_recovery", "BTCUSDT")
+                    ],
+                    0.25,
+                )
+                self.assertIn(
+                    "BINANCE:BTCUSDT:external-1",
+                    recovered.execution_ids,
+                )
+            finally:
+                recovered.stop()
+
+    def test_message_budget_is_atomic_under_concurrent_submits(self):
+        gateway = DummyGateway()
+        config = self.make_config()
+        config["oms"]["duplicate_intent_window_ms"] = 0.0
+        config["oms"]["outbound_message_budget"] = {
+            "enabled": True,
+            "window_sec": 1.0,
+            "max_total_messages_per_window": 100,
+            "max_new_orders_per_window": 5,
+            "max_reduce_orders_per_window": 10,
+            "max_cancel_messages_per_window": 20,
+            "reserved_risk_messages_per_window": 0,
+        }
+        oms = OMS(DummyEngine(), gateway, config)
+        results = []
+        barrier = threading.Barrier(20)
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.account.force_sync(1000.0, 0.0, available=1000.0)
+            data_cache.update_mark_price(
+                types.SimpleNamespace(
+                    symbol="BTCUSDT",
+                    mark_price=100.0,
+                    datetime=None,
+                )
+            )
+
+            def submit(index):
+                barrier.wait()
+                results.append(
+                    oms.submit_order(
+                        OrderIntent(
+                            f"strategy-{index}",
+                            "BTCUSDT",
+                            Side.BUY,
+                            100.0 + index * 0.01,
+                            0.01,
+                        )
+                    )
+                )
+
+            workers = [
+                threading.Thread(target=submit, args=(index,))
+                for index in range(20)
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=5.0)
+
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+            self.assertEqual(sum(result.accepted for result in results), 5)
+            self.assertEqual(len(gateway.sent_orders), 5)
+            self.assertEqual(
+                oms.get_outbound_message_budget_snapshot()["counts"][
+                    OMS.OUTBOUND_NEW_ORDER
+                ],
+                5,
+            )
+        finally:
+            oms.stop()
+            with data_cache._lock:
+                data_cache.mark_prices.pop("BTCUSDT", None)
+                data_cache.mark_update_times.pop("BTCUSDT", None)
+
+    def test_cancel_is_deferred_and_retried_when_budget_is_temporarily_full(self):
+        gateway = DummyGateway()
+        gateway.cancel_response = DummyResponse(200, {})
+        config = self.make_config()
+        config["oms"]["outbound_message_budget"] = {
+            "enabled": True,
+            "window_sec": 0.05,
+            "max_total_messages_per_window": 1,
+            "max_new_orders_per_window": 1,
+            "max_reduce_orders_per_window": 1,
+            "max_cancel_messages_per_window": 1,
+            "reserved_risk_messages_per_window": 0,
+        }
+        oms = OMS(DummyEngine(), gateway, config)
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.account.force_sync(1000.0, 0.0, available=1000.0)
+            data_cache.update_mark_price(
+                types.SimpleNamespace(
+                    symbol="BTCUSDT",
+                    mark_price=100.0,
+                    datetime=None,
+                )
+            )
+            submitted = oms.submit_order(
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 0.1)
+            )
+            self.assertTrue(submitted.accepted)
+
+            self.assertTrue(oms.cancel_order(submitted.client_oid))
+            self.assertEqual(gateway.cancel_requests, [])
+
+            deadline = time.time() + 1.0
+            while not gateway.cancel_requests and time.time() < deadline:
+                time.sleep(0.01)
+
+            self.assertEqual(len(gateway.cancel_requests), 1)
+            self.assertNotIn(
+                submitted.client_oid,
+                oms._deferred_cancel_oids,
+            )
+        finally:
+            oms.stop()
+            with data_cache._lock:
+                data_cache.mark_prices.pop("BTCUSDT", None)
+                data_cache.mark_update_times.pop("BTCUSDT", None)
+
+    def test_local_stp_rejects_crossing_order_and_sets_exchange_guard(self):
+        gateway = DummyGateway()
+        config = self.make_config()
+        config["oms"]["self_trade_prevention"] = {
+            "enabled": True,
+            "local_cross_check": True,
+            "exchange_mode": "EXPIRE_MAKER",
+        }
+        oms = OMS(DummyEngine(), gateway, config)
+        try:
+            oms.state = LifecycleState.LIVE
+            oms.account.force_sync(1000.0, 0.0, available=1000.0)
+            data_cache.update_mark_price(
+                types.SimpleNamespace(
+                    symbol="BTCUSDT",
+                    mark_price=100.0,
+                    datetime=None,
+                )
+            )
+
+            resting_bid = oms.submit_order(
+                OrderIntent("maker", "BTCUSDT", Side.BUY, 100.0, 0.1)
+            )
+            crossing_ask = oms.submit_order(
+                OrderIntent("taker", "BTCUSDT", Side.SELL, 99.0, 0.1)
+            )
+            non_crossing_ask = oms.submit_order(
+                OrderIntent("maker-2", "BTCUSDT", Side.SELL, 101.0, 0.1)
+            )
+
+            self.assertTrue(resting_bid.accepted)
+            self.assertFalse(crossing_ask.accepted)
+            self.assertTrue(
+                crossing_ask.reason.startswith(
+                    "self_trade_prevention:crossing_active_order:"
+                )
+            )
+            self.assertTrue(non_crossing_ask.accepted)
+            self.assertEqual(len(gateway.sent_orders), 2)
+            self.assertTrue(
+                all(
+                    request.self_trade_prevention_mode == "EXPIRE_MAKER"
+                    for request, _client_oid in gateway.sent_orders
+                )
+            )
+        finally:
+            oms.stop()
+            with data_cache._lock:
+                data_cache.mark_prices.pop("BTCUSDT", None)
+                data_cache.mark_update_times.pop("BTCUSDT", None)
+
+    def test_invalid_exchange_stp_mode_fails_during_oms_construction(self):
+        config = self.make_config()
+        config["oms"]["self_trade_prevention"] = {
+            "enabled": True,
+            "exchange_mode": "NONE",
+        }
+
+        with self.assertRaisesRegex(ValueError, "Unsupported Binance STP mode"):
+            OMS(DummyEngine(), DummyGateway(), config)
+
     def test_emergency_flatten_submits_reduce_only_market_order(self):
         gateway = DummyGateway()
         gateway.positions = [{"symbol": "BTCUSDT", "positionAmt": "1.5", "entryPrice": "100.0"}]
@@ -743,6 +1739,8 @@ class DummyTruthProvider:
         }
         self.positions = []
         self.open_orders = []
+        self.incomes = []
+        self.income_queries = []
 
     def get_account_info(self):
         return self.account
@@ -752,6 +1750,10 @@ class DummyTruthProvider:
 
     def get_open_orders(self):
         return self.open_orders
+
+    def get_income_history(self, **kwargs):
+        self.income_queries.append(dict(kwargs))
+        return list(self.incomes)
 
 
 class TruthMonitorTests(unittest.TestCase):
@@ -841,6 +1843,77 @@ class TruthMonitorTests(unittest.TestCase):
 
             monitor.poll_once()
             self.assertEqual(oms.state, LifecycleState.HALTED)
+        finally:
+            oms.stop()
+
+    def test_truth_monitor_syncs_exchange_maintenance_margin_truth(self):
+        engine = DummyEngine()
+        config = self.make_config()
+        oms = OMS(engine, DummyGateway(), config)
+        provider = DummyTruthProvider()
+        provider.account.update(
+            {
+                "totalMaintMargin": "250.0",
+                "totalMarginBalance": "500.0",
+            }
+        )
+        monitor = TruthMonitor(oms, provider, config, start_thread=False)
+        try:
+            oms.state = LifecycleState.LIVE
+
+            self.assertTrue(monitor.poll_once())
+
+            self.assertTrue(oms.account.margin_snapshot_synced)
+            self.assertAlmostEqual(oms.account.maintenance_margin, 250.0)
+            self.assertAlmostEqual(oms.account.margin_balance, 500.0)
+            self.assertAlmostEqual(oms.account.maintenance_margin_ratio, 0.5)
+            account_events = [event for event in engine.events if event.type == EVENT_ACCOUNT_UPDATE]
+            self.assertTrue(account_events)
+            self.assertTrue(account_events[-1].data.margin_snapshot_synced)
+        finally:
+            oms.stop()
+
+    def test_truth_monitor_syncs_external_cash_flow_through_independent_provider(self):
+        engine = DummyEngine()
+        config = self.make_config()
+        config["risk"]["cash_flow_truth"] = {
+            "enabled": True,
+            "require_snapshot": True,
+            "poll_interval_sec": 30.0,
+            "external_income_types": ["TRANSFER"],
+        }
+        oms = OMS(engine, DummyGateway(), config)
+        provider = DummyTruthProvider()
+        provider.incomes = [
+            {
+                "incomeType": "TRANSFER",
+                "tranId": "truth-plane-transfer-1",
+                "asset": "USDT",
+                "income": "125.0",
+                "time": int(time.time() * 1000),
+            }
+        ]
+        monitor = TruthMonitor(oms, provider, config, start_thread=False)
+        try:
+            oms.state = LifecycleState.LIVE
+
+            self.assertTrue(monitor.poll_once())
+            self.assertAlmostEqual(oms.account.external_cash_flow_total, 125.0)
+            self.assertTrue(oms.account.cash_flow_snapshot_synced)
+            self.assertEqual(len(provider.income_queries), 1)
+
+            self.assertTrue(monitor.poll_once())
+            self.assertEqual(len(provider.income_queries), 1)
+        finally:
+            oms.stop()
+
+    def test_account_margin_health_rejects_non_finite_snapshot(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            self.assertFalse(
+                oms.account.sync_margin_health(float("nan"), 1000.0)
+            )
+            self.assertFalse(oms.account.margin_snapshot_synced)
         finally:
             oms.stop()
 

@@ -186,6 +186,9 @@ class BinanceGateway(BaseGateway):
     def cancel_all_orders(self, symbol: str):
         return self.rest.cancel_all_orders(symbol)
 
+    def set_countdown_cancel_all(self, symbol: str, countdown_time_ms: int):
+        return self.rest.set_countdown_cancel_all(symbol, countdown_time_ms)
+
     def get_account_info(self):
         resp = self.rest.get_account()
         return resp.json() if resp and resp.status_code == 200 else None
@@ -219,6 +222,10 @@ class BinanceGateway(BaseGateway):
         resp = self.rest.get_user_trades(symbol, **kwargs)
         return resp.json() if resp and resp.status_code == 200 else None
 
+    def get_income_history(self, **kwargs):
+        resp = self.rest.get_income_history(**kwargs)
+        return resp.json() if resp and resp.status_code == 200 else None
+
     def get_depth_snapshot(self, symbol):
         return self.rest.get_depth_snapshot(symbol)
 
@@ -245,6 +252,12 @@ class BinanceGateway(BaseGateway):
         target_position_mode = str(
             getattr(self, "target_position_mode", "ONE_WAY") or "ONE_WAY"
         ).upper()
+        if target_position_mode != "ONE_WAY":
+            logger.critical(
+                f"[{self.gateway_name}] Refusing unsupported position mode "
+                f"{target_position_mode}; OMS ledger is ONE_WAY only"
+            )
+            return False
 
         response = self.rest.set_position_mode(target_position_mode)
         if not self.rest.response_succeeded(response, accepted_error_codes={"-4059"}):

@@ -55,7 +55,20 @@ if "websocket" not in sys.modules:
 
 from event.type import LifecycleState
 from gateway.binance.gateway import BinanceGateway
-from infrastructure.config_scaling import apply_capital_scaling
+from infrastructure.config_scaling import (
+    CASH_FLOW_TRUTH_DEFAULTS,
+    INDEPENDENT_RISK_SUPERVISOR_DEFAULTS,
+    MARKET_DATA_FRESHNESS_DEFAULTS,
+    OUTBOUND_MESSAGE_BUDGET_DEFAULTS,
+    RISK_CONTROL_HEARTBEAT_DEFAULTS,
+    SELF_TRADE_PREVENTION_DEFAULTS,
+    SINGLE_WRITER_FENCE_DEFAULTS,
+    STRATEGY_RISK_BUDGET_DEFAULTS,
+    VENUE_DEAD_MAN_SWITCH_DEFAULTS,
+    apply_capital_scaling,
+    load_root_config,
+)
+from main import run_live_risk_checks
 from oms.engine import OMS
 from strategy.ml_sniper.config_loader import load_sniper_config
 from strategy.ml_sniper.ml_sniper import MLSniperStrategy
@@ -106,6 +119,324 @@ class DummySession:
 
 
 class LeverageAndLotMultiplierTests(unittest.TestCase):
+    def test_live_risk_checks_poll_market_data_freshness(self):
+        risk = SimpleNamespace(freshness_checks=0)
+
+        def check_market_data_freshness():
+            risk.freshness_checks += 1
+
+        risk.check_market_data_freshness = check_market_data_freshness
+
+        run_live_risk_checks(risk)
+
+        self.assertEqual(risk.freshness_checks, 1)
+
+    def test_live_risk_checks_ticks_independent_supervisor_first(self):
+        calls = []
+        supervisor = SimpleNamespace(tick=lambda: calls.append("supervisor") or True)
+        risk = SimpleNamespace(
+            check_market_data_freshness=lambda: calls.append("risk") or True
+        )
+
+        self.assertTrue(run_live_risk_checks(risk, supervisor))
+        self.assertEqual(calls, ["supervisor", "risk"])
+
+    def test_root_config_injects_fail_closed_market_freshness_defaults(self):
+        payload = {"symbols": ["BTCUSDT"], "risk": {"limits": {}}}
+
+        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            loaded = load_root_config("config.json")
+
+        self.assertEqual(
+            loaded["risk"]["market_data_freshness"],
+            MARKET_DATA_FRESHNESS_DEFAULTS,
+        )
+
+    def test_root_config_preserves_explicit_market_freshness_overrides(self):
+        payload = {
+            "risk": {
+                "market_data_freshness": {
+                    "enabled": False,
+                    "max_book_age_ms": 750.0,
+                    "breach_checks": 4,
+                }
+            }
+        }
+
+        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            loaded = load_root_config("config.json")
+
+        freshness = loaded["risk"]["market_data_freshness"]
+        self.assertFalse(freshness["enabled"])
+        self.assertEqual(freshness["max_book_age_ms"], 750.0)
+        self.assertEqual(freshness["breach_checks"], 4)
+        self.assertEqual(freshness["require_mark_price"], True)
+        self.assertEqual(freshness["recovery_checks"], 5)
+
+    def test_root_config_injects_fail_closed_cash_flow_truth_defaults(self):
+        payload = {"symbols": ["BTCUSDT"], "risk": {"limits": {}}}
+
+        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            loaded = load_root_config("config.json")
+
+        self.assertEqual(
+            loaded["risk"]["cash_flow_truth"],
+            CASH_FLOW_TRUTH_DEFAULTS,
+        )
+
+    def test_root_config_preserves_explicit_cash_flow_truth_overrides(self):
+        payload = {
+            "risk": {
+                "cash_flow_truth": {
+                    "enabled": False,
+                    "max_snapshot_age_sec": 10.0,
+                    "external_income_types": ["TRANSFER", "WELCOME_BONUS"],
+                }
+            }
+        }
+
+        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            loaded = load_root_config("config.json")
+
+        cash_flow = loaded["risk"]["cash_flow_truth"]
+        self.assertFalse(cash_flow["enabled"])
+        self.assertEqual(cash_flow["max_snapshot_age_sec"], 10.0)
+        self.assertEqual(
+            cash_flow["external_income_types"],
+            ["TRANSFER", "WELCOME_BONUS"],
+        )
+        self.assertTrue(cash_flow["require_snapshot"])
+        self.assertEqual(cash_flow["recovery_checks"], 2)
+
+    def test_root_config_injects_fail_closed_risk_heartbeat_defaults(self):
+        payload = {"symbols": ["BTCUSDT"], "risk": {"limits": {}}}
+
+        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            loaded = load_root_config("config.json")
+
+        self.assertEqual(
+            loaded["risk"]["risk_control_heartbeat"],
+            RISK_CONTROL_HEARTBEAT_DEFAULTS,
+        )
+
+    def test_root_config_preserves_explicit_risk_heartbeat_overrides(self):
+        payload = {
+            "risk": {
+                "risk_control_heartbeat": {
+                    "enabled": False,
+                    "max_age_sec": 10.0,
+                }
+            }
+        }
+
+        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            loaded = load_root_config("config.json")
+
+        heartbeat = loaded["risk"]["risk_control_heartbeat"]
+        self.assertFalse(heartbeat["enabled"])
+        self.assertEqual(heartbeat["max_age_sec"], 10.0)
+
+    def test_root_config_enables_independent_risk_supervisor(self):
+        payload = {"symbols": ["BTCUSDT"], "risk": {"limits": {}}}
+
+        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            loaded = load_root_config("config.json")
+
+        self.assertEqual(
+            loaded["risk"]["independent_supervisor"],
+            INDEPENDENT_RISK_SUPERVISOR_DEFAULTS,
+        )
+        self.assertEqual(
+            loaded["risk"]["risk_control_heartbeat"]["required_source"],
+            "independent_supervisor",
+        )
+
+    def test_disabling_independent_supervisor_restores_local_heartbeat_source(self):
+        payload = {
+            "risk": {
+                "independent_supervisor": {"enabled": False},
+            }
+        }
+
+        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            loaded = load_root_config("config.json")
+
+        self.assertEqual(
+            loaded["risk"]["risk_control_heartbeat"]["required_source"],
+            "risk_manager",
+        )
+
+    def test_root_config_resolves_binance_credentials_from_environment(self):
+        payload = {
+            "api_key_env": "CHRONOS_TEST_API_KEY",
+            "api_secret_env": "CHRONOS_TEST_API_SECRET",
+            "api_key": "file-key",
+            "api_secret": "file-secret",
+        }
+
+        with patch.dict(
+            "os.environ",
+            {
+                "CHRONOS_TEST_API_KEY": "environment-key",
+                "CHRONOS_TEST_API_SECRET": "environment-secret",
+            },
+        ), patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            loaded = load_root_config("config.json")
+
+        self.assertEqual(loaded["api_key"], "environment-key")
+        self.assertEqual(loaded["api_secret"], "environment-secret")
+
+    def test_root_config_resolves_separate_risk_sidecar_credentials(self):
+        payload = {
+            "risk": {
+                "independent_supervisor": {
+                    "api_key_env": "CHRONOS_TEST_RISK_KEY",
+                    "api_secret_env": "CHRONOS_TEST_RISK_SECRET",
+                }
+            }
+        }
+
+        with patch.dict(
+            "os.environ",
+            {
+                "CHRONOS_TEST_RISK_KEY": "risk-only-key",
+                "CHRONOS_TEST_RISK_SECRET": "risk-only-secret",
+            },
+        ), patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            loaded = load_root_config("config.json")
+
+        supervisor = loaded["risk"]["independent_supervisor"]
+        self.assertEqual(supervisor["api_key"], "risk-only-key")
+        self.assertEqual(supervisor["api_secret"], "risk-only-secret")
+
+    def test_example_config_does_not_embed_api_credentials(self):
+        with open("config.example.json", "r", encoding="utf-8") as handle:
+            example = json.load(handle)
+
+        self.assertNotIn("api_key", example)
+        self.assertNotIn("api_secret", example)
+        self.assertEqual(example["api_key_env"], "BINANCE_API_KEY")
+        self.assertEqual(example["api_secret_env"], "BINANCE_API_SECRET")
+
+    def test_root_config_injects_outbound_message_budget_defaults(self):
+        payload = {"symbols": ["BTCUSDT"], "oms": {}, "risk": {}}
+
+        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            loaded = load_root_config("config.json")
+
+        self.assertEqual(
+            loaded["oms"]["outbound_message_budget"],
+            OUTBOUND_MESSAGE_BUDGET_DEFAULTS,
+        )
+
+    def test_root_config_preserves_message_budget_overrides(self):
+        payload = {
+            "oms": {
+                "outbound_message_budget": {
+                    "enabled": False,
+                    "max_new_orders_per_window": 3,
+                }
+            }
+        }
+
+        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            loaded = load_root_config("config.json")
+
+        budget = loaded["oms"]["outbound_message_budget"]
+        self.assertFalse(budget["enabled"])
+        self.assertEqual(budget["max_new_orders_per_window"], 3)
+        self.assertEqual(budget["reserved_risk_messages_per_window"], 5)
+
+    def test_root_config_injects_self_trade_prevention_defaults(self):
+        payload = {"symbols": ["BTCUSDT"], "oms": {}, "risk": {}}
+
+        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            loaded = load_root_config("config.json")
+
+        self.assertEqual(
+            loaded["oms"]["self_trade_prevention"],
+            SELF_TRADE_PREVENTION_DEFAULTS,
+        )
+
+    def test_root_config_preserves_self_trade_prevention_overrides(self):
+        payload = {
+            "oms": {
+                "self_trade_prevention": {
+                    "enabled": False,
+                    "exchange_mode": "EXPIRE_BOTH",
+                }
+            }
+        }
+
+        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            loaded = load_root_config("config.json")
+
+        stp = loaded["oms"]["self_trade_prevention"]
+        self.assertFalse(stp["enabled"])
+        self.assertEqual(stp["exchange_mode"], "EXPIRE_BOTH")
+        self.assertTrue(stp["local_cross_check"])
+
+    def test_root_config_enables_single_writer_fence(self):
+        payload = {"symbols": ["BTCUSDT"], "oms": {}, "risk": {}}
+
+        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            loaded = load_root_config("config.json")
+
+        self.assertEqual(
+            loaded["oms"]["single_writer_fence"],
+            SINGLE_WRITER_FENCE_DEFAULTS,
+        )
+
+    def test_root_config_enables_venue_dead_man_switch(self):
+        payload = {"symbols": ["BTCUSDT"], "oms": {}, "risk": {}}
+
+        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            loaded = load_root_config("config.json")
+
+        self.assertEqual(
+            loaded["oms"]["venue_dead_man_switch"],
+            VENUE_DEAD_MAN_SWITCH_DEFAULTS,
+        )
+
+    def test_root_config_creates_explicit_budget_for_configured_strategy(self):
+        payload = {
+            "symbols": ["BTCUSDT"],
+            "strategy": {"name": "alpha"},
+            "risk": {
+                "limits": {
+                    "max_pos_notional": 250.0,
+                    "max_account_gross_notional": 500.0,
+                }
+            },
+        }
+
+        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            loaded = load_root_config("config.json")
+
+        budget_config = loaded["risk"]["strategy_risk_budgets"]
+        self.assertTrue(budget_config["enabled"])
+        self.assertTrue(budget_config["require_explicit_strategy"])
+        self.assertEqual(
+            budget_config["budgets"]["alpha"]["max_gross_notional"],
+            500.0,
+        )
+        self.assertEqual(
+            budget_config["budgets"]["alpha"]["max_symbol_notional"],
+            250.0,
+        )
+        self.assertEqual(
+            {
+                key: budget_config[key]
+                for key in STRATEGY_RISK_BUDGET_DEFAULTS
+                if key != "budgets"
+            },
+            {
+                key: value
+                for key, value in STRATEGY_RISK_BUDGET_DEFAULTS.items()
+                if key != "budgets"
+            },
+        )
+
     def test_load_sniper_config_inherits_top_level_strategy_fields(self):
         payload = {
             "strategy": {
@@ -328,6 +659,42 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             self.assertEqual(oms.max_account_gross_notional, 4321.0)
         finally:
             oms.stop()
+
+    def test_oms_rejects_hedge_mode_before_mutating_gateway(self):
+        config = {
+            "symbols": ["BTCUSDT"],
+            "account": {
+                "initial_balance_usdt": 1000.0,
+                "leverage": 7,
+                "margin_type": "ISOLATED",
+                "position_mode": "HEDGE",
+            },
+            "risk": {"limits": {"max_pos_notional": 1234.0}},
+            "oms": {
+                "journal_enabled": False,
+                "replay_journal_on_startup": False,
+            },
+        }
+        gateway = DummyGateway()
+
+        with self.assertRaisesRegex(ValueError, "one-way net-position ledger"):
+            OMS(DummyEngine(), gateway, config)
+
+        self.assertFalse(hasattr(gateway, "target_position_mode"))
+
+    def test_gateway_refuses_hedge_mode_before_exchange_configuration(self):
+        gateway = BinanceGateway.__new__(BinanceGateway)
+        gateway.gateway_name = "BINANCE"
+        gateway.target_position_mode = "HEDGE"
+        gateway.target_margin_type = "ISOLATED"
+        gateway.target_leverage = 10
+        gateway.symbols = ["BTCUSDT"]
+        gateway.rest = MagicMock()
+
+        self.assertFalse(gateway._apply_account_trading_configuration())
+        gateway.rest.set_position_mode.assert_not_called()
+        gateway.rest.set_margin_type.assert_not_called()
+        gateway.rest.set_leverage.assert_not_called()
 
     def test_gateway_connect_applies_target_leverage_to_each_symbol(self):
         with patch("gateway.binance.gateway.requests.Session", return_value=DummySession()), patch(

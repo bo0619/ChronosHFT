@@ -43,6 +43,7 @@ class RecoveryGateway:
         self.cancel_response = DummyResponse(200, {"status": "CANCELED"})
         self.order_snapshot = None
         self.trades = []
+        self.incomes = []
         self.positions = []
         self.open_orders = []
         self.account = {
@@ -69,6 +70,9 @@ class RecoveryGateway:
         if from_id is None:
             return list(self.trades)
         return [trade for trade in self.trades if int(trade["id"]) >= int(from_id)]
+
+    def get_income_history(self, **_kwargs):
+        return list(self.incomes)
 
     def get_account_info(self):
         return dict(self.account)
@@ -436,6 +440,45 @@ class InstitutionalRecoveryTests(unittest.TestCase):
                 self.assertEqual(second.trade_cursors["BTCUSDT"], 77)
             finally:
                 second.stop()
+
+    def test_external_cash_flow_is_idempotent_and_recovered_from_journal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_config()
+            config["risk"]["cash_flow_truth"] = {
+                "enabled": True,
+                "require_snapshot": True,
+            }
+            config["oms"].update(
+                {
+                    "journal_enabled": True,
+                    "replay_journal_on_startup": True,
+                    "journal_path": f"{temp_dir}/oms.jsonl",
+                }
+            )
+            gateway = RecoveryGateway()
+            gateway.incomes = [
+                {
+                    "incomeType": "TRANSFER",
+                    "tranId": "transfer-1",
+                    "asset": "USDT",
+                    "income": "100.0",
+                    "time": 2000,
+                }
+            ]
+            first = OMS(DummyEngine(), gateway, config)
+            first.state = LifecycleState.LIVE
+            first._sync_capability_mode("test_live")
+            self.assertTrue(first.backfill_external_cash_flow_history(end_time_ms=3000))
+            self.assertAlmostEqual(first.account.external_cash_flow_total, 100.0)
+            self.assertTrue(first.account.cash_flow_snapshot_synced)
+            first.stop()
+
+            second = OMS(DummyEngine(), gateway, config)
+            self.assertAlmostEqual(second.account.external_cash_flow_total, 100.0)
+            self.assertFalse(second.account.cash_flow_snapshot_synced)
+            self.assertTrue(second.backfill_external_cash_flow_history(end_time_ms=4000))
+            self.assertAlmostEqual(second.account.external_cash_flow_total, 100.0)
+            second.stop()
 
 
 if __name__ == "__main__":

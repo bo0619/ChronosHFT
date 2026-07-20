@@ -1,12 +1,15 @@
+import hashlib
+import math
 import threading
 import time
 import uuid
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 
 from data.cache import data_cache
 from data.ref_data import ref_data_manager
 from infrastructure.logger import logger
+from infrastructure.single_writer_fence import SingleWriterFence
 from infrastructure.time_service import time_service
 
 from event.type import (
@@ -32,6 +35,7 @@ from event.type import (
     EVENT_POSITION_UPDATE,
     EVENT_SYSTEM_HEALTH,
     EVENT_TRADE_UPDATE,
+    TIF_GTC,
     TIF_GTX,
     TIF_IOC,
 )
@@ -39,7 +43,7 @@ from event.type import (
 from .account_manager import AccountManager
 from .exposure import ExposureManager
 from .journal import JournalCorruptionError, JournalError, OMSJournal
-from .order import Order, TERMINAL_STATUSES
+from .order import Order
 from .order_manager import OrderManager
 from .validator import OrderValidator
 
@@ -47,10 +51,114 @@ from .validator import OrderValidator
 class OMS:
     """Deterministic OMS for a single Binance perpetual account."""
 
+    SUPPORTED_POSITION_MODES = frozenset({"ONE_WAY"})
+    OUTBOUND_NEW_ORDER = "NEW_ORDER"
+    OUTBOUND_REDUCE_ORDER = "REDUCE_ORDER"
+    OUTBOUND_CANCEL = "CANCEL"
+
+    CASH_FLOW_DIRTY_REASONS = frozenset(
+        {
+            "TRANSFER",
+            "DEPOSIT",
+            "WITHDRAW",
+            "MARGIN_TRANSFER",
+            "CROSS_COLLATERAL_TRANSFER",
+            "ASSET_TRANSFER",
+        }
+    )
+
     def __init__(self, event_engine, gateway, config):
         self.event_engine = event_engine
         self.gateway = gateway
         self.config = config
+        oms_cfg = config.get("oms", {})
+
+        target_position_mode = str(
+            config.get("account", {}).get("position_mode", "ONE_WAY")
+            or "ONE_WAY"
+        ).upper()
+        if target_position_mode not in self.SUPPORTED_POSITION_MODES:
+            raise ValueError(
+                "Unsupported position mode "
+                f"{target_position_mode!r}: the OMS uses a one-way net-position "
+                "ledger and must not configure Binance Hedge Mode"
+            )
+
+        self_trade_prevention = oms_cfg.get("self_trade_prevention", {})
+        self.self_trade_prevention_enabled = bool(
+            self_trade_prevention.get("enabled", False)
+        )
+        self.local_self_cross_check_enabled = bool(
+            self_trade_prevention.get("local_cross_check", True)
+        )
+        configured_stp_mode = str(
+            self_trade_prevention.get("exchange_mode", "EXPIRE_MAKER") or ""
+        ).upper()
+        allowed_stp_modes = {
+            "EXPIRE_TAKER",
+            "EXPIRE_MAKER",
+            "EXPIRE_BOTH",
+        }
+        if (
+            self.self_trade_prevention_enabled
+            and configured_stp_mode not in allowed_stp_modes
+        ):
+            raise ValueError(
+                f"Unsupported Binance STP mode: {configured_stp_mode or '<empty>'}"
+            )
+        self.exchange_self_trade_prevention_mode = (
+            configured_stp_mode if self.self_trade_prevention_enabled else ""
+        )
+
+        venue_dead_man_switch = oms_cfg.get("venue_dead_man_switch", {})
+        self.venue_dead_man_switch_enabled = bool(
+            venue_dead_man_switch.get("enabled", False)
+        )
+        self.venue_dead_man_switch_countdown_time_ms = int(
+            venue_dead_man_switch.get("countdown_time_ms", 120_000) or 0
+        )
+        self.venue_dead_man_switch_renewal_interval_sec = float(
+            venue_dead_man_switch.get("renewal_interval_sec", 30.0) or 0.0
+        )
+        self.venue_dead_man_switch_max_renewal_age_sec = float(
+            venue_dead_man_switch.get("max_renewal_age_sec", 45.0) or 0.0
+        )
+        self.venue_dead_man_switch_recovery_checks = max(
+            1,
+            int(venue_dead_man_switch.get("recovery_checks", 2) or 1),
+        )
+        self.venue_dead_man_switch_symbols = frozenset(
+            str(symbol or "").upper()
+            for symbol in config.get("symbols", [])
+            if str(symbol or "").strip()
+        )
+        if self.venue_dead_man_switch_enabled:
+            countdown_sec = self.venue_dead_man_switch_countdown_time_ms / 1000.0
+            if self.venue_dead_man_switch_countdown_time_ms <= 0:
+                raise ValueError(
+                    "venue_dead_man_switch.countdown_time_ms must be positive"
+                )
+            if self.venue_dead_man_switch_renewal_interval_sec <= 0.0:
+                raise ValueError(
+                    "venue_dead_man_switch.renewal_interval_sec must be positive"
+                )
+            if (
+                self.venue_dead_man_switch_max_renewal_age_sec
+                <= self.venue_dead_man_switch_renewal_interval_sec
+            ):
+                raise ValueError(
+                    "venue_dead_man_switch.max_renewal_age_sec must be greater "
+                    "than renewal_interval_sec"
+                )
+            if self.venue_dead_man_switch_max_renewal_age_sec >= countdown_sec:
+                raise ValueError(
+                    "venue_dead_man_switch.max_renewal_age_sec must be less "
+                    "than the exchange countdown"
+                )
+            if not self.venue_dead_man_switch_symbols:
+                raise ValueError(
+                    "venue_dead_man_switch requires at least one configured symbol"
+                )
 
         self.state = LifecycleState.BOOTSTRAP
 
@@ -73,6 +181,7 @@ class OMS:
         self.capability_reason = "startup_bootstrap"
         self.mode_override = None
         self.mode_override_reason = ""
+        self.mode_constraints = {}
 
         target_leverage = int(config.get("account", {}).get("leverage", 0) or 0)
         if target_leverage > 0:
@@ -81,9 +190,6 @@ class OMS:
             config.get("account", {}).get("margin_type", "CROSSED") or "CROSSED"
         ).upper()
         self.gateway.target_margin_type = target_margin_type
-        target_position_mode = str(
-            config.get("account", {}).get("position_mode", "ONE_WAY") or "ONE_WAY"
-        ).upper()
         self.gateway.target_position_mode = target_position_mode
 
         self.max_pos_notional = (
@@ -96,6 +202,134 @@ class OMS:
             .get("limits", {})
             .get("max_account_gross_notional", 0.0)
         )
+        strategy_budget_config = (
+            config.get("risk", {}).get("strategy_risk_budgets", {}) or {}
+        )
+        self.strategy_risk_budgets_enabled = bool(
+            strategy_budget_config.get("enabled", False)
+        )
+        self.require_explicit_strategy_budget = bool(
+            strategy_budget_config.get("require_explicit_strategy", True)
+        )
+        self.strategy_risk_budgets = {}
+        configured_strategy_budgets = strategy_budget_config.get("budgets", {})
+        if not isinstance(configured_strategy_budgets, dict):
+            configured_strategy_budgets = {}
+        for strategy_id, raw_budget in configured_strategy_budgets.items():
+            strategy_id = str(strategy_id or "").strip()
+            if not strategy_id or not isinstance(raw_budget, dict):
+                continue
+            max_gross = float(raw_budget.get("max_gross_notional", 0.0) or 0.0)
+            max_symbol = float(raw_budget.get("max_symbol_notional", 0.0) or 0.0)
+            if (
+                not math.isfinite(max_gross)
+                or not math.isfinite(max_symbol)
+                or max_gross <= 0.0
+                or max_symbol <= 0.0
+                or max_symbol > max_gross
+            ):
+                raise ValueError(
+                    f"Invalid strategy risk budget for {strategy_id!r}: "
+                    "require 0 < max_symbol_notional <= max_gross_notional"
+                )
+            self.strategy_risk_budgets[strategy_id] = {
+                "max_gross_notional": max_gross,
+                "max_symbol_notional": max_symbol,
+            }
+        margin_health = config.get("risk", {}).get("margin_health", {})
+        self.margin_health_enabled = bool(margin_health.get("enabled", False))
+        self.margin_health_require_snapshot = bool(
+            margin_health.get("require_snapshot", True)
+        )
+        self.margin_snapshot_max_age_sec = max(
+            0.0,
+            float(margin_health.get("max_snapshot_age_sec", 15.0) or 0.0),
+        )
+        self.margin_reduce_only_ratio = max(
+            0.0,
+            float(margin_health.get("reduce_only_ratio", 0.70) or 0.0),
+        )
+
+        cash_flow_truth = config.get("risk", {}).get("cash_flow_truth", {})
+        self.external_cash_flow_truth_enabled = bool(
+            cash_flow_truth.get("enabled", False)
+        )
+        self.external_cash_flow_require_snapshot = bool(
+            cash_flow_truth.get("require_snapshot", True)
+        )
+        self.external_cash_flow_max_age_sec = max(
+            0.0,
+            float(cash_flow_truth.get("max_snapshot_age_sec", 45.0) or 0.0),
+        )
+        configured_income_types = cash_flow_truth.get(
+            "external_income_types",
+            ["TRANSFER"],
+        )
+        if not isinstance(configured_income_types, (list, tuple, set)):
+            configured_income_types = ["TRANSFER"]
+        self.external_income_types = frozenset(
+            str(item or "").upper()
+            for item in configured_income_types
+            if str(item or "").strip()
+        )
+        self.external_cash_flow_assets = self._tracked_quote_assets(
+            config.get("symbols", [])
+        )
+        self.external_cash_flow_ids = set()
+        self.external_cash_flow_scan_end_ms = 0
+
+        risk_control_heartbeat = (
+            config.get("risk", {}).get("risk_control_heartbeat", {})
+        )
+        self.risk_control_heartbeat_enabled = bool(
+            risk_control_heartbeat.get("enabled", False)
+        )
+        self.risk_control_heartbeat_max_age_sec = max(
+            0.05,
+            float(risk_control_heartbeat.get("max_age_sec", 2.0) or 2.0),
+        )
+        self.risk_control_heartbeat_required_source = str(
+            risk_control_heartbeat.get("required_source", "") or ""
+        ).strip()
+        self.last_risk_control_heartbeat_monotonic = 0.0
+        self.last_risk_control_heartbeat_time = 0.0
+        self.risk_control_heartbeat_status = "missing"
+        self.risk_control_heartbeat_source = ""
+        self.risk_control_heartbeat_reason = ""
+        self.rejected_risk_control_heartbeat_sources = set()
+        self.last_venue_dead_man_attempt_monotonic = 0.0
+        self.last_venue_dead_man_success_monotonic = 0.0
+        self.last_venue_dead_man_success_time = 0.0
+        self.venue_dead_man_armed_symbols = set()
+        self.venue_dead_man_failure_count = 0
+        self.venue_dead_man_recovery_count = 0
+        self.venue_dead_man_last_error = ""
+
+        single_writer_cfg = oms_cfg.get("single_writer_fence", {})
+        self.single_writer_fence = None
+        if bool(single_writer_cfg.get("enabled", False)):
+            journal_path = str(
+                oms_cfg.get(
+                    "journal_path",
+                    "storage/oms/oms_journal.jsonl",
+                )
+            )
+            fence_path = str(
+                single_writer_cfg.get("path", "") or f"{journal_path}.lock"
+            )
+            self.single_writer_fence = SingleWriterFence(
+                fence_path,
+                owner_metadata={
+                    "component": "ChronosHFT.OMS",
+                    "gateway": str(
+                        getattr(self.gateway, "gateway_name", "UNKNOWN")
+                        or "UNKNOWN"
+                    ),
+                    "symbols": sorted(str(symbol) for symbol in config.get("symbols", [])),
+                    "journal_path": journal_path,
+                },
+            )
+            self.single_writer_fence.acquire()
 
         self.validator = OrderValidator(config)
         self.exposure = ExposureManager()
@@ -124,7 +358,6 @@ class OMS:
         self.rebuild_summary = self.rebuild_from_log()
         self._apply_rebuild_summary()
 
-        oms_cfg = config.get("oms", {})
         self.reconcile_min_interval_sec = float(oms_cfg.get("reconcile_min_interval_sec", 5.0))
         self.reconcile_api_failure_threshold = int(oms_cfg.get("reconcile_api_failure_threshold", 3))
         self.reconcile_api_cooldown_sec = float(oms_cfg.get("reconcile_api_cooldown_sec", 10.0))
@@ -144,6 +377,24 @@ class OMS:
             0,
             int(oms_cfg.get("trade_recovery_overlap_ms", 60_000)),
         )
+        cash_flow_truth = config.get("risk", {}).get("cash_flow_truth", {})
+        self.external_cash_flow_recovery_lookback_ms = max(
+            86_400_000,
+            int(cash_flow_truth.get("recovery_lookback_ms", 86_400_000) or 86_400_000),
+        )
+        self.external_cash_flow_recovery_overlap_ms = max(
+            0,
+            int(cash_flow_truth.get("recovery_overlap_ms", 60_000) or 60_000),
+        )
+        self.external_cash_flow_max_pages = max(
+            1,
+            int(cash_flow_truth.get("max_pages", 20) or 20),
+        )
+        self.external_cash_flow_poll_interval_sec = max(
+            1.0,
+            float(cash_flow_truth.get("poll_interval_sec", 30.0) or 30.0),
+        )
+        self.last_external_cash_flow_poll_at = 0.0
         self.snapshot_stability_required = max(
             2,
             int(oms_cfg.get("snapshot_stability_required", 2)),
@@ -176,6 +427,43 @@ class OMS:
             0.0,
             float(oms_cfg.get("duplicate_intent_window_ms", 250.0) or 0.0) / 1000.0,
         )
+        outbound_budget = oms_cfg.get("outbound_message_budget", {})
+        self.outbound_message_budget_enabled = bool(
+            outbound_budget.get("enabled", False)
+        )
+        self.outbound_message_window_sec = max(
+            0.05,
+            float(outbound_budget.get("window_sec", 1.0) or 1.0),
+        )
+        self.max_total_messages_per_window = max(
+            0,
+            int(outbound_budget.get("max_total_messages_per_window", 20) or 0),
+        )
+        self.max_new_orders_per_window = max(
+            0,
+            int(outbound_budget.get("max_new_orders_per_window", 10) or 0),
+        )
+        self.max_reduce_orders_per_window = max(
+            0,
+            int(outbound_budget.get("max_reduce_orders_per_window", 10) or 0),
+        )
+        self.max_cancel_messages_per_window = max(
+            0,
+            int(outbound_budget.get("max_cancel_messages_per_window", 20) or 0),
+        )
+        configured_reserved = max(
+            0,
+            int(outbound_budget.get("reserved_risk_messages_per_window", 5) or 0),
+        )
+        self.reserved_risk_messages_per_window = (
+            min(configured_reserved, self.max_total_messages_per_window)
+            if self.max_total_messages_per_window > 0
+            else configured_reserved
+        )
+        self.outbound_message_history = deque()
+        self._deferred_cancel_oids = set()
+        self._deferred_cancel_all_symbols = set()
+        self._stopped = False
         self.degraded_aggressive_to_passive = bool(
             oms_cfg.get("degraded_aggressive_to_passive", True)
         )
@@ -192,6 +480,10 @@ class OMS:
         logger.info("OMS: Bootstrapping state...")
         self._audit("bootstrap_requested", recovered=self.rebuild_summary)
         if self.manual_rearm_required or self.state == LifecycleState.HALTED:
+            if not self._ensure_venue_dead_man_switch_armed(
+                "bootstrap_read_only"
+            ):
+                return False
             self._sync_capability_mode("manual_rearm_required")
             self._refresh_read_only_account_snapshot()
             logger.error("[OMS] Bootstrap blocked: manual rearm required after recovered HALT")
@@ -203,6 +495,10 @@ class OMS:
             return False
 
         if self.state == LifecycleState.FROZEN or self._has_active_guards():
+            if not self._ensure_venue_dead_man_switch_armed(
+                "bootstrap_guarded"
+            ):
+                return False
             logger.warning("[OMS] Bootstrapping into guarded reconcile mode")
             self.state = LifecycleState.FROZEN
             self._sync_capability_mode("bootstrap_guarded")
@@ -218,7 +514,7 @@ class OMS:
             return True
 
         self._perform_full_reset()
-        return True
+        return self.state == LifecycleState.LIVE
 
     def _refresh_read_only_account_snapshot(self):
         if not self.can_query_exchange():
@@ -254,6 +550,9 @@ class OMS:
             float(account.get("totalInitialMargin", self.account.used_margin) or 0.0),
             float(available_balance) if available_balance is not None else None,
             balances=balances or None,
+            maintenance_margin=account.get("totalMaintMargin"),
+            margin_balance=account.get("totalMarginBalance"),
+            margin_snapshot_time=time.time(),
         )
         self._audit(
             "read_only_account_sync",
@@ -274,6 +573,19 @@ class OMS:
             str(symbol).upper(): int(end_time_ms)
             for symbol, end_time_ms in summary.get("trade_scan_end_ms", {}).items()
         }
+        self.external_cash_flow_ids = set(
+            str(income_id)
+            for income_id in summary.get("external_cash_flow_ids", [])
+            if str(income_id or "")
+        )
+        self.external_cash_flow_scan_end_ms = int(
+            summary.get("external_cash_flow_scan_end_ms", 0) or 0
+        )
+        self.account.external_cash_flow_total = float(
+            summary.get("external_cash_flow_total", 0.0) or 0.0
+        )
+        self.account.cash_flow_snapshot_synced = False
+        self.account.cash_flow_snapshot_time = 0.0
         self.symbol_guards = dict(summary.get("symbol_guards", {}))
         self.venue_guards = dict(summary.get("venue_guards", {}))
         self.strategy_guards = dict(summary.get("strategy_guards", {}))
@@ -282,9 +594,30 @@ class OMS:
             for key, value in summary.get("strategy_symbol_guards", {}).items()
             if "|" in key
         }
+        self.mode_constraints = {}
+        for constraint_key, payload in (summary.get("mode_constraints", {}) or {}).items():
+            mode_value = str((payload or {}).get("mode", "") or "")
+            reason = str((payload or {}).get("reason", "") or "")
+            if not mode_value or not reason:
+                continue
+            try:
+                mode = OMSCapabilityMode(mode_value)
+            except ValueError:
+                continue
+            self.mode_constraints[str(constraint_key)] = (mode, reason)
+
         override_mode = str(summary.get("mode_override", "") or "")
-        self.mode_override = OMSCapabilityMode(override_mode) if override_mode else None
-        self.mode_override_reason = str(summary.get("mode_override_reason", "") or "")
+        override_reason = str(summary.get("mode_override_reason", "") or "")
+        if not self.mode_constraints and override_mode and override_reason:
+            try:
+                legacy_mode = OMSCapabilityMode(override_mode)
+            except ValueError:
+                legacy_mode = None
+            if legacy_mode is not None:
+                self.mode_constraints[
+                    self._mode_constraint_key(override_reason)
+                ] = (legacy_mode, override_reason)
+        self._refresh_selected_mode_constraint()
 
         self.last_freeze_reason = str(summary.get("last_freeze_reason", "") or "")
         self.last_halt_reason = str(summary.get("last_halt_reason", "") or "")
@@ -369,11 +702,32 @@ class OMS:
             OMSCapabilityMode.LIVE: 0,
             OMSCapabilityMode.DEGRADED: 1,
             OMSCapabilityMode.PASSIVE_ONLY: 2,
-            OMSCapabilityMode.CANCEL_ONLY: 3,
-            OMSCapabilityMode.READ_ONLY: 4,
-            OMSCapabilityMode.LOCKDOWN: 5,
+            OMSCapabilityMode.REDUCE_ONLY: 3,
+            OMSCapabilityMode.CANCEL_ONLY: 4,
+            OMSCapabilityMode.READ_ONLY: 5,
+            OMSCapabilityMode.LOCKDOWN: 6,
         }
         return ranks.get(mode, 99)
+
+    @staticmethod
+    def _mode_constraint_key(reason: str) -> str:
+        reason = str(reason or "").strip()
+        if not reason:
+            return "unspecified"
+        prefix, separator, _detail = reason.partition(":")
+        return f"{prefix}:" if separator else reason
+
+    def _refresh_selected_mode_constraint(self):
+        if not self.mode_constraints:
+            self.mode_override = None
+            self.mode_override_reason = ""
+            return
+        _key, (mode, reason) = max(
+            self.mode_constraints.items(),
+            key=lambda item: (self._mode_rank(item[1][0]), item[0]),
+        )
+        self.mode_override = mode
+        self.mode_override_reason = reason
 
     def _capability_mode_for_state(self) -> OMSCapabilityMode:
         if self.state == LifecycleState.LIVE:
@@ -394,42 +748,70 @@ class OMS:
     def set_trading_mode(self, mode, reason: str):
         if isinstance(mode, str):
             mode = OMSCapabilityMode(mode)
-        if mode not in {OMSCapabilityMode.DEGRADED, OMSCapabilityMode.PASSIVE_ONLY}:
+        if mode not in {
+            OMSCapabilityMode.DEGRADED,
+            OMSCapabilityMode.PASSIVE_ONLY,
+            OMSCapabilityMode.REDUCE_ONLY,
+        }:
             raise ValueError(f"Unsupported trading mode override: {mode}")
-        if self.mode_override == mode and self.mode_override_reason == reason:
-            return
-
         previous_mode = self.mode_override.value if self.mode_override else ""
         previous_reason = self.mode_override_reason
-        self.mode_override = mode
-        self.mode_override_reason = reason
-        self._sync_capability_mode(reason)
+        constraint_key = self._mode_constraint_key(reason)
+        if self.mode_constraints.get(constraint_key) == (mode, reason):
+            return self.mode_override == mode and self.mode_override_reason == reason
+
+        self.mode_constraints[constraint_key] = (mode, reason)
+        self._refresh_selected_mode_constraint()
+        self._sync_capability_mode(self.mode_override_reason or reason)
         self._audit(
             "trading_mode_override_set",
             mode=mode.value,
             reason=reason,
+            constraint_key=constraint_key,
+            selected=(self.mode_override == mode and self.mode_override_reason == reason),
             previous_mode=previous_mode,
             previous_reason=previous_reason,
         )
+        if self.mode_override == OMSCapabilityMode.REDUCE_ONLY:
+            self._cancel_orders_matching(lambda order: not order.intent.reduce_only)
+        return self.mode_override == mode and self.mode_override_reason == reason
 
     def clear_trading_mode(self, reason: str = "", prefixes=()):
-        if not self.mode_override:
-            return False
-        if prefixes and not any(self.mode_override_reason.startswith(prefix) for prefix in prefixes):
+        if not self.mode_constraints:
             return False
 
-        previous_mode = self.mode_override.value
+        matching_keys = [
+            key
+            for key, (_mode, constraint_reason) in self.mode_constraints.items()
+            if not prefixes or any(constraint_reason.startswith(prefix) for prefix in prefixes)
+        ]
+        if not matching_keys:
+            return False
+
+        previous_mode = self.mode_override.value if self.mode_override else ""
         previous_reason = self.mode_override_reason
-        self.mode_override = None
-        self.mode_override_reason = ""
-        self._sync_capability_mode(reason or "trading_mode_cleared")
+        for key in matching_keys:
+            self.mode_constraints.pop(key, None)
+        self._refresh_selected_mode_constraint()
+        self._sync_capability_mode(
+            self.mode_override_reason or reason or "trading_mode_cleared"
+        )
         self._audit(
             "trading_mode_override_cleared",
             reason=reason or previous_reason,
+            cleared_constraint_keys=matching_keys,
             previous_mode=previous_mode,
             previous_reason=previous_reason,
         )
         return True
+
+    def has_trading_mode_constraint(self, prefixes=()) -> bool:
+        if not prefixes:
+            return bool(self.mode_constraints)
+        return any(
+            any(constraint_reason.startswith(prefix) for prefix in prefixes)
+            for _mode, constraint_reason in self.mode_constraints.values()
+        )
 
     def can_query_exchange(self) -> bool:
         self._ensure_capability_mode_consistent()
@@ -441,6 +823,7 @@ class OMS:
             OMSCapabilityMode.LIVE,
             OMSCapabilityMode.DEGRADED,
             OMSCapabilityMode.PASSIVE_ONLY,
+            OMSCapabilityMode.REDUCE_ONLY,
             OMSCapabilityMode.CANCEL_ONLY,
         }
 
@@ -452,15 +835,265 @@ class OMS:
             OMSCapabilityMode.PASSIVE_ONLY,
         }
 
+    def record_risk_control_heartbeat(
+        self,
+        source: str = "risk_manager",
+        healthy: bool = True,
+        reason: str = "",
+    ) -> bool:
+        if not self.risk_control_heartbeat_enabled:
+            return False
+
+        status = "healthy" if healthy else "unhealthy"
+        source = str(source or "risk_manager")
+        reason = str(reason or "")
+        if (
+            self.risk_control_heartbeat_required_source
+            and source != self.risk_control_heartbeat_required_source
+        ):
+            should_audit = False
+            with self.lock:
+                if source not in self.rejected_risk_control_heartbeat_sources:
+                    self.rejected_risk_control_heartbeat_sources.add(source)
+                    should_audit = True
+            if should_audit:
+                self._audit(
+                    "risk_control_heartbeat_source_rejected",
+                    source=source,
+                    required_source=self.risk_control_heartbeat_required_source,
+                )
+            return False
+        with self.lock:
+            previous_status = self.risk_control_heartbeat_status
+            previous_reason = self.risk_control_heartbeat_reason
+            self.last_risk_control_heartbeat_monotonic = time.monotonic()
+            self.last_risk_control_heartbeat_time = time.time()
+            self.risk_control_heartbeat_status = status
+            self.risk_control_heartbeat_source = source
+            self.risk_control_heartbeat_reason = reason
+
+        if status != previous_status or reason != previous_reason:
+            self._audit(
+                "risk_control_heartbeat_status",
+                status=status,
+                source=source,
+                reason=reason,
+            )
+        return healthy
+
+    def get_risk_control_heartbeat_snapshot(self) -> dict:
+        with self.lock:
+            monotonic_timestamp = self.last_risk_control_heartbeat_monotonic
+            status = self.risk_control_heartbeat_status
+            source = self.risk_control_heartbeat_source
+            reason = self.risk_control_heartbeat_reason
+            wall_time = self.last_risk_control_heartbeat_time
+        age_sec = (
+            max(0.0, time.monotonic() - monotonic_timestamp)
+            if monotonic_timestamp > 0.0
+            else None
+        )
+        return {
+            "enabled": self.risk_control_heartbeat_enabled,
+            "status": status,
+            "source": source,
+            "reason": reason,
+            "last_heartbeat_time": wall_time,
+            "age_sec": age_sec,
+            "max_age_sec": self.risk_control_heartbeat_max_age_sec,
+            "required_source": self.risk_control_heartbeat_required_source,
+            "valid": bool(
+                not self.risk_control_heartbeat_enabled
+                or (
+                    status == "healthy"
+                    and age_sec is not None
+                    and age_sec <= self.risk_control_heartbeat_max_age_sec
+                )
+            ),
+        }
+
+    def _venue_dead_man_switch_health_locked(self, now: float = None):
+        if not self.venue_dead_man_switch_enabled:
+            return True, ""
+        missing_symbols = sorted(
+            self.venue_dead_man_switch_symbols
+            - self.venue_dead_man_armed_symbols
+        )
+        if missing_symbols:
+            return False, f"unarmed_symbols:{','.join(missing_symbols)}"
+        if self.last_venue_dead_man_success_monotonic <= 0.0:
+            return False, "renewal_missing"
+        if self.venue_dead_man_last_error:
+            return False, self.venue_dead_man_last_error
+
+        now = time.monotonic() if now is None else float(now)
+        age_sec = max(
+            0.0,
+            now - self.last_venue_dead_man_success_monotonic,
+        )
+        if age_sec > self.venue_dead_man_switch_max_renewal_age_sec:
+            return (
+                False,
+                f"renewal_stale:{age_sec:.3f}s>"
+                f"{self.venue_dead_man_switch_max_renewal_age_sec:.3f}s",
+            )
+        return True, ""
+
+    def get_venue_dead_man_switch_snapshot(self) -> dict:
+        with self.lock:
+            now = time.monotonic()
+            healthy, reason = self._venue_dead_man_switch_health_locked(now)
+            success_monotonic = self.last_venue_dead_man_success_monotonic
+            return {
+                "enabled": self.venue_dead_man_switch_enabled,
+                "valid": healthy,
+                "reason": reason,
+                "countdown_time_ms": self.venue_dead_man_switch_countdown_time_ms,
+                "renewal_interval_sec": (
+                    self.venue_dead_man_switch_renewal_interval_sec
+                ),
+                "max_renewal_age_sec": (
+                    self.venue_dead_man_switch_max_renewal_age_sec
+                ),
+                "last_success_time": self.last_venue_dead_man_success_time,
+                "age_sec": (
+                    max(0.0, now - success_monotonic)
+                    if success_monotonic > 0.0
+                    else None
+                ),
+                "armed_symbols": sorted(self.venue_dead_man_armed_symbols),
+                "required_symbols": sorted(self.venue_dead_man_switch_symbols),
+                "failure_count": self.venue_dead_man_failure_count,
+                "recovery_count": self.venue_dead_man_recovery_count,
+                "recovery_checks": self.venue_dead_man_switch_recovery_checks,
+                "last_error": self.venue_dead_man_last_error,
+            }
+
+    def renew_venue_dead_man_switch(self, force: bool = False) -> bool:
+        if not self.venue_dead_man_switch_enabled:
+            return True
+
+        now = time.monotonic()
+        with self.lock:
+            since_attempt = now - self.last_venue_dead_man_attempt_monotonic
+            if (
+                not force
+                and self.last_venue_dead_man_attempt_monotonic > 0.0
+                and since_attempt < self.venue_dead_man_switch_renewal_interval_sec
+            ):
+                healthy, _reason = self._venue_dead_man_switch_health_locked(now)
+                return healthy
+            self.last_venue_dead_man_attempt_monotonic = now
+
+        renew = getattr(self.gateway, "set_countdown_cancel_all", None)
+        renewed_symbols = set()
+        failures = []
+        if not callable(renew):
+            failures.append("gateway_method_unavailable")
+        else:
+            for symbol in sorted(self.venue_dead_man_switch_symbols):
+                try:
+                    response = renew(
+                        symbol,
+                        self.venue_dead_man_switch_countdown_time_ms,
+                    )
+                    status_code = getattr(response, "status_code", None)
+                    if response is True or status_code == 200:
+                        renewed_symbols.add(symbol)
+                        continue
+                    failures.append(
+                        f"{symbol}:status={status_code if status_code is not None else 'unknown'}"
+                    )
+                except Exception as exc:
+                    failures.append(f"{symbol}:{type(exc).__name__}:{exc}")
+
+        if failures:
+            failure_reason = "renewal_failed:" + ";".join(failures)
+            with self.lock:
+                self.venue_dead_man_armed_symbols = renewed_symbols
+                self.venue_dead_man_failure_count += 1
+                self.venue_dead_man_recovery_count = 0
+                self.venue_dead_man_last_error = failure_reason
+            self.set_trading_mode(
+                OMSCapabilityMode.REDUCE_ONLY,
+                f"venue_dead_man_switch:{failure_reason}",
+            )
+            self._audit(
+                "venue_dead_man_switch_renewal_failed",
+                reason=failure_reason,
+                renewed_symbols=sorted(renewed_symbols),
+                required_symbols=sorted(self.venue_dead_man_switch_symbols),
+            )
+            return False
+
+        had_constraint = self.has_trading_mode_constraint(
+            ("venue_dead_man_switch:",)
+        )
+        with self.lock:
+            first_success = self.last_venue_dead_man_success_monotonic <= 0.0
+            recovered_from_error = bool(self.venue_dead_man_last_error)
+            self.venue_dead_man_armed_symbols = renewed_symbols
+            self.last_venue_dead_man_success_monotonic = now
+            self.last_venue_dead_man_success_time = time.time()
+            self.venue_dead_man_failure_count = 0
+            self.venue_dead_man_last_error = ""
+            if had_constraint:
+                self.venue_dead_man_recovery_count += 1
+            else:
+                self.venue_dead_man_recovery_count = 0
+            recovery_count = self.venue_dead_man_recovery_count
+
+        cleared = False
+        if (
+            had_constraint
+            and recovery_count >= self.venue_dead_man_switch_recovery_checks
+        ):
+            cleared = self.clear_trading_mode(
+                reason="venue dead-man switch renewal recovered",
+                prefixes=("venue_dead_man_switch:",),
+            )
+            with self.lock:
+                self.venue_dead_man_recovery_count = 0
+
+        if first_success or recovered_from_error or cleared:
+            self._audit(
+                "venue_dead_man_switch_renewed",
+                armed_symbols=sorted(renewed_symbols),
+                recovered=bool(cleared),
+                recovery_count=recovery_count,
+            )
+        return True
+
+    def _ensure_venue_dead_man_switch_armed(self, context: str) -> bool:
+        if self.renew_venue_dead_man_switch(force=True):
+            return True
+        reason = f"venue_dead_man_switch_unavailable:{context}"
+        logger.critical(f"[OMS] {reason}")
+        self.halt_system(reason)
+        return False
+
     def get_capability_snapshot(self) -> dict:
         return {
             "mode": self.capability_mode.value,
             "reason": self.capability_reason,
             "override_mode": self.mode_override.value if self.mode_override else "",
             "override_reason": self.mode_override_reason,
+            "mode_constraints": {
+                key: {"mode": mode.value, "reason": reason}
+                for key, (mode, reason) in self.mode_constraints.items()
+            },
             "can_query": self.can_query_exchange(),
             "can_cancel": self.can_cancel_orders(),
             "can_open_risk": self.can_open_new_risk(),
+            "risk_control_heartbeat": self.get_risk_control_heartbeat_snapshot(),
+            "venue_dead_man_switch": self.get_venue_dead_man_switch_snapshot(),
+            "outbound_message_budget": self.get_outbound_message_budget_snapshot(),
+            "strategy_risk_budgets": self.get_strategy_risk_budget_snapshot(),
+            "single_writer_fence": (
+                self.single_writer_fence.health_snapshot()
+                if self.single_writer_fence is not None
+                else {"held": False, "enabled": False}
+            ),
         }
 
     def _get_capability_block_reason(self, action: str) -> str:
@@ -474,6 +1107,57 @@ class OMS:
             self._audit("query_rejected", query="account", reason=self._get_capability_block_reason("query"))
             return None
         return self.gateway.get_account_info()
+
+    def sync_account_margin_health(self, account: dict, snapshot_time: float = None) -> bool:
+        if not isinstance(account, dict):
+            return False
+        maintenance_margin = account.get("totalMaintMargin")
+        margin_balance = account.get("totalMarginBalance")
+        if maintenance_margin is None or margin_balance is None:
+            return False
+        try:
+            maintenance_margin = float(maintenance_margin)
+            margin_balance = float(margin_balance)
+        except (TypeError, ValueError):
+            self._audit(
+                "account_margin_health_invalid",
+                maintenance_margin=maintenance_margin,
+                margin_balance=margin_balance,
+            )
+            return False
+        if not math.isfinite(maintenance_margin) or not math.isfinite(margin_balance):
+            self._audit(
+                "account_margin_health_invalid",
+                maintenance_margin=maintenance_margin,
+                margin_balance=margin_balance,
+                reason="non_finite",
+            )
+            return False
+        if maintenance_margin < 0.0:
+            self._audit(
+                "account_margin_health_invalid",
+                maintenance_margin=maintenance_margin,
+                margin_balance=margin_balance,
+                reason="negative_maintenance_margin",
+            )
+            return False
+
+        snapshot_time = float(snapshot_time or time.time())
+        with self.lock:
+            synced = self.account.sync_margin_health(
+                maintenance_margin,
+                margin_balance,
+                snapshot_time=snapshot_time,
+            )
+        if synced:
+            self._audit(
+                "account_margin_health_synced",
+                maintenance_margin=maintenance_margin,
+                margin_balance=margin_balance,
+                ratio=self.account.maintenance_margin_ratio,
+                snapshot_time=snapshot_time,
+            )
+        return synced
 
     def query_positions(self):
         if not self.can_query_exchange():
@@ -502,6 +1186,19 @@ class OMS:
         if not callable(query):
             return None
         return query(symbol, **kwargs)
+
+    def query_income_history(self, **kwargs):
+        if not self.can_query_exchange():
+            self._audit(
+                "query_rejected",
+                query="income_history",
+                reason=self._get_capability_block_reason("query"),
+            )
+            return None
+        query = getattr(self.gateway, "get_income_history", None)
+        if not callable(query):
+            return None
+        return query(**kwargs)
 
     def _normalize_submit_command(self, raw_result) -> GatewayCommandResult:
         if isinstance(raw_result, GatewayCommandResult):
@@ -535,6 +1232,7 @@ class OMS:
                 "time_in_force": request.time_in_force,
                 "post_only": request.post_only,
                 "reduce_only": request.reduce_only,
+                "self_trade_prevention_mode": request.self_trade_prevention_mode,
             }
         else:
             request_payload = {
@@ -609,6 +1307,7 @@ class OMS:
                 ).upper(),
                 "client_oid": order.client_oid,
                 "exchange_oid": update.exchange_oid or order.exchange_oid,
+                "strategy_id": order.intent.strategy_id,
                 "symbol": order.intent.symbol,
                 "side": order.intent.side.value,
                 "fill_qty": fill_qty,
@@ -650,7 +1349,11 @@ class OMS:
         self.event_engine.put(Event(EVENT_SYSTEM_HEALTH, f"HALT:{reason}"))
         try:
             for target_symbol in self.config.get("symbols", []):
-                self.gateway.cancel_all_orders(target_symbol)
+                self._cancel_all_orders_unchecked(
+                    target_symbol,
+                    source="journal_failure",
+                    audit=False,
+                )
         except Exception as cancel_exc:
             logger.critical(
                 f"[OMS] Failed to cancel orders after journal failure: {cancel_exc}"
@@ -1074,6 +1777,197 @@ class OMS:
             )
         return True
 
+    @staticmethod
+    def _utc_day_start_ms(now_ms: int = None) -> int:
+        now = datetime.fromtimestamp(
+            float(now_ms or time_service.now()) / 1000.0,
+            tz=timezone.utc,
+        )
+        return int(
+            now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            * 1000
+        )
+
+    def _external_cash_flow_income_id(self, income: dict) -> str:
+        income_type = str(
+            income.get("incomeType", income.get("income_type", "")) or ""
+        ).upper()
+        transaction_id = income.get("tranId", income.get("trandId"))
+        if transaction_id not in (None, ""):
+            return f"{income_type}:{transaction_id}"
+        fingerprint = "|".join(
+            str(income.get(key, "") or "")
+            for key in ("time", "asset", "income", "symbol", "info")
+        )
+        digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+        return f"{income_type}:hash:{digest}"
+
+    def _apply_external_cash_flow_rows(self, rows, source: str) -> int:
+        if not isinstance(rows, (list, tuple)):
+            raise ValueError("income_history_not_a_list")
+
+        normalized_rows = sorted(
+            (row for row in rows if isinstance(row, dict)),
+            key=lambda row: (
+                int(row.get("time", 0) or 0),
+                str(row.get("incomeType", row.get("income_type", "")) or ""),
+                self._external_cash_flow_income_id(row),
+            ),
+        )
+        applied = 0
+        with self.lock:
+            for income in normalized_rows:
+                income_type = str(
+                    income.get("incomeType", income.get("income_type", "")) or ""
+                ).upper()
+                if income_type not in self.external_income_types:
+                    continue
+                asset = str(income.get("asset", "") or "").upper()
+                if asset not in self.external_cash_flow_assets:
+                    raise ValueError(f"unsupported_external_cash_flow_asset:{asset}")
+                try:
+                    amount = float(income.get("income", 0.0) or 0.0)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("invalid_external_cash_flow_amount") from exc
+                if not math.isfinite(amount):
+                    raise ValueError("non_finite_external_cash_flow_amount")
+
+                income_id = self._external_cash_flow_income_id(income)
+                if income_id in self.external_cash_flow_ids:
+                    continue
+                self.journal.append(
+                    "external_cash_flow_record",
+                    {
+                        "income_id": income_id,
+                        "income_type": income_type,
+                        "asset": asset,
+                        "amount": amount,
+                        "income_time_ms": int(income.get("time", 0) or 0),
+                        "symbol": str(income.get("symbol", "") or ""),
+                        "source": source,
+                    },
+                )
+                self.external_cash_flow_ids.add(income_id)
+                self.account.external_cash_flow_total += amount
+                applied += 1
+        return applied
+
+    def mark_external_cash_flow_truth_unavailable(self, reason: str = ""):
+        if not self.external_cash_flow_truth_enabled:
+            return
+        with self.lock:
+            self.account.mark_external_cash_flow_truth_unavailable()
+        self._audit(
+            "external_cash_flow_truth_unavailable",
+            reason=reason or "income_history_unavailable",
+        )
+
+    def backfill_external_cash_flow_history(
+        self,
+        query=None,
+        end_time_ms: int = None,
+        source: str = "rest_income_history",
+    ) -> bool:
+        if not self.external_cash_flow_truth_enabled:
+            return True
+        query = query or self.query_income_history
+        if not callable(query):
+            self.mark_external_cash_flow_truth_unavailable("income_query_unavailable")
+            return False
+
+        end_time_ms = int(end_time_ms or time_service.now())
+        day_start_ms = self._utc_day_start_ms(end_time_ms)
+        if self.external_cash_flow_scan_end_ms:
+            start_time_ms = max(
+                day_start_ms,
+                self.external_cash_flow_scan_end_ms
+                - self.external_cash_flow_recovery_overlap_ms,
+            )
+        else:
+            start_time_ms = max(
+                day_start_ms,
+                end_time_ms - self.external_cash_flow_recovery_lookback_ms,
+            )
+
+        limit = 1000
+        page = 1
+        last_page_full = False
+        total_rows = 0
+        try:
+            while page <= self.external_cash_flow_max_pages:
+                rows = query(
+                    start_time=start_time_ms,
+                    end_time=end_time_ms,
+                    page=page,
+                    limit=limit,
+                )
+                if rows is None:
+                    self.mark_external_cash_flow_truth_unavailable(
+                        "income_history_request_failed"
+                    )
+                    return False
+                if not isinstance(rows, list):
+                    raise ValueError("income_history_not_a_list")
+                total_rows += len(rows)
+                self._apply_external_cash_flow_rows(rows, source=source)
+                last_page_full = len(rows) >= limit
+                if not last_page_full:
+                    break
+                page += 1
+
+            if last_page_full and page > self.external_cash_flow_max_pages:
+                self.mark_external_cash_flow_truth_unavailable(
+                    "income_history_page_limit_exceeded"
+                )
+                return False
+
+            with self.lock:
+                self.journal.append(
+                    "cash_flow_scan_completed",
+                    {
+                        "start_time_ms": start_time_ms,
+                        "end_time_ms": end_time_ms,
+                        "rows": total_rows,
+                        "source": source,
+                    },
+                )
+                self.external_cash_flow_scan_end_ms = end_time_ms
+                self.account.sync_external_cash_flow_truth(
+                    self.account.external_cash_flow_total,
+                    snapshot_time=time.time(),
+                )
+            self._audit(
+                "external_cash_flow_truth_synced",
+                rows=total_rows,
+                total=self.account.external_cash_flow_total,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+                source=source,
+            )
+            return True
+        except (JournalError, ValueError, TypeError) as exc:
+            self.mark_external_cash_flow_truth_unavailable(str(exc))
+            fail_closed = getattr(self, "_fail_closed_on_journal_error", None)
+            if isinstance(exc, JournalError) and callable(fail_closed):
+                fail_closed(exc, "external_cash_flow_history")
+            return False
+
+    def poll_external_cash_flow_truth(self, query=None, now: float = None) -> bool:
+        if not self.external_cash_flow_truth_enabled:
+            return True
+        now = time.monotonic() if now is None else float(now)
+        if (
+            now - self.last_external_cash_flow_poll_at
+            < self.external_cash_flow_poll_interval_sec
+        ):
+            return bool(self.account.cash_flow_snapshot_synced)
+        self.last_external_cash_flow_poll_at = now
+        return self.backfill_external_cash_flow_history(
+            query=query,
+            end_time_ms=int(time.time() * 1000),
+            source="live_loop_income_history",
+        )
+
     def _refresh_missing_local_order_terminals(self, remote_orders) -> bool:
         query = getattr(self.gateway, "get_order", None)
         if not callable(query):
@@ -1108,6 +2002,10 @@ class OMS:
 
     def adapt_intent_for_trading_mode(self, intent: OrderIntent):
         self._ensure_capability_mode_consistent()
+        if self.capability_mode == OMSCapabilityMode.REDUCE_ONLY:
+            if not intent.reduce_only:
+                return None, "oms_mode_reduce_only"
+            return intent, ""
         if self.capability_mode == OMSCapabilityMode.PASSIVE_ONLY:
             if not intent.is_post_only:
                 return None, "oms_mode_passive_only"
@@ -1168,6 +2066,26 @@ class OMS:
     ) -> bool:
         order = Order(client_oid, intent)
         command_id = f"SUBMIT:{client_oid}"
+
+        with self.lock:
+            message_kind = (
+                self.OUTBOUND_REDUCE_ORDER
+                if request.reduce_only
+                else self.OUTBOUND_NEW_ORDER
+            )
+            budget_rejection = self._reserve_outbound_message_locked(message_kind)
+        if budget_rejection:
+            logger.error(
+                f"[OMS] Internal order blocked by message budget: {budget_rejection}"
+            )
+            self._audit(
+                "internal_order_message_budget_rejected",
+                client_oid=client_oid,
+                symbol=intent.symbol,
+                reduce_only=request.reduce_only,
+                reason=budget_rejection,
+            )
+            return False
 
         try:
             with self.lock:
@@ -1387,6 +2305,9 @@ class OMS:
                 time_in_force=TIF_IOC,
                 post_only=False,
                 reduce_only=True,
+                self_trade_prevention_mode=(
+                    self.exchange_self_trade_prevention_mode
+                ),
             )
             if self._submit_internal_order(
                 intent,
@@ -1659,9 +2580,168 @@ class OMS:
         for client_oid in client_oids:
             self.cancel_order(client_oid)
 
-    def _get_order_block_reason(self, strategy_id: str = "", symbol: str = "") -> str:
+    def _prune_outbound_message_history_locked(self, now: float = None) -> float:
+        now = time.monotonic() if now is None else float(now)
+        cutoff = now - self.outbound_message_window_sec
+        while (
+            self.outbound_message_history
+            and self.outbound_message_history[0][0] <= cutoff
+        ):
+            self.outbound_message_history.popleft()
+        return now
+
+    def _outbound_message_counts_locked(self) -> dict:
+        counts = {
+            self.OUTBOUND_NEW_ORDER: 0,
+            self.OUTBOUND_REDUCE_ORDER: 0,
+            self.OUTBOUND_CANCEL: 0,
+        }
+        for _timestamp, message_kind in self.outbound_message_history:
+            if message_kind in counts:
+                counts[message_kind] += 1
+        counts["TOTAL"] = len(self.outbound_message_history)
+        return counts
+
+    def _reserve_outbound_message_locked(
+        self,
+        message_kind: str,
+        now: float = None,
+    ) -> str:
+        if not self.outbound_message_budget_enabled:
+            return ""
+        if message_kind not in {
+            self.OUTBOUND_NEW_ORDER,
+            self.OUTBOUND_REDUCE_ORDER,
+            self.OUTBOUND_CANCEL,
+        }:
+            raise ValueError(f"unsupported_outbound_message_kind:{message_kind}")
+
+        now = self._prune_outbound_message_history_locked(now)
+        counts = self._outbound_message_counts_locked()
+        class_limits = {
+            self.OUTBOUND_NEW_ORDER: self.max_new_orders_per_window,
+            self.OUTBOUND_REDUCE_ORDER: self.max_reduce_orders_per_window,
+            self.OUTBOUND_CANCEL: self.max_cancel_messages_per_window,
+        }
+        class_limit = class_limits[message_kind]
+        if class_limit > 0 and counts[message_kind] >= class_limit:
+            return (
+                f"outbound_message_budget:{message_kind.lower()}_limit:"
+                f"{counts[message_kind]}>={class_limit}"
+            )
+
+        total_count = counts["TOTAL"]
+        if self.max_total_messages_per_window > 0:
+            if message_kind == self.OUTBOUND_NEW_ORDER:
+                opening_risk_ceiling = max(
+                    0,
+                    self.max_total_messages_per_window
+                    - self.reserved_risk_messages_per_window,
+                )
+                if total_count >= opening_risk_ceiling:
+                    return (
+                        "outbound_message_budget:risk_capacity_reserved:"
+                        f"{total_count}>={opening_risk_ceiling}"
+                    )
+            elif total_count >= self.max_total_messages_per_window:
+                return (
+                    "outbound_message_budget:total_limit:"
+                    f"{total_count}>={self.max_total_messages_per_window}"
+                )
+
+        self.outbound_message_history.append((now, message_kind))
+        return ""
+
+    def get_outbound_message_budget_snapshot(self) -> dict:
+        with self.lock:
+            self._prune_outbound_message_history_locked()
+            counts = self._outbound_message_counts_locked()
+            opening_risk_ceiling = (
+                max(
+                    0,
+                    self.max_total_messages_per_window
+                    - self.reserved_risk_messages_per_window,
+                )
+                if self.max_total_messages_per_window > 0
+                else None
+            )
+            return {
+                "enabled": self.outbound_message_budget_enabled,
+                "window_sec": self.outbound_message_window_sec,
+                "counts": counts,
+                "limits": {
+                    "total": self.max_total_messages_per_window,
+                    "new_orders": self.max_new_orders_per_window,
+                    "reduce_orders": self.max_reduce_orders_per_window,
+                    "cancels": self.max_cancel_messages_per_window,
+                    "reserved_risk_messages": self.reserved_risk_messages_per_window,
+                    "opening_risk_ceiling": opening_risk_ceiling,
+                },
+            }
+
+    def _schedule_cancel_order_retry(self, client_oid: str) -> bool:
+        with self.lock:
+            if self._stopped or client_oid in self._deferred_cancel_oids:
+                return False
+            self._deferred_cancel_oids.add(client_oid)
+
+        def retry():
+            with self.lock:
+                self._deferred_cancel_oids.discard(client_oid)
+                stopped = self._stopped
+            if not stopped:
+                self.cancel_order(client_oid)
+
+        timer = threading.Timer(
+            self.outbound_message_window_sec + 0.01,
+            retry,
+        )
+        timer.daemon = True
+        timer.start()
+        return True
+
+    def _schedule_cancel_all_retry(self, symbol: str, source: str) -> bool:
+        symbol = str(symbol or "").upper()
+        with self.lock:
+            if self._stopped or symbol in self._deferred_cancel_all_symbols:
+                return False
+            self._deferred_cancel_all_symbols.add(symbol)
+
+        def retry():
+            with self.lock:
+                self._deferred_cancel_all_symbols.discard(symbol)
+                stopped = self._stopped
+            if stopped:
+                return
+            retry_source = (
+                source
+                if source.startswith("deferred:")
+                else f"deferred:{source}"
+            )
+            self._cancel_all_orders_unchecked(
+                symbol,
+                source=retry_source,
+            )
+
+        timer = threading.Timer(
+            self.outbound_message_window_sec + 0.01,
+            retry,
+        )
+        timer.daemon = True
+        timer.start()
+        return True
+
+    def _get_order_block_reason(
+        self,
+        strategy_id: str = "",
+        symbol: str = "",
+        reduce_only: bool = False,
+    ) -> str:
         if not self.can_open_new_risk():
-            return self._get_capability_block_reason("open_risk")
+            if self.capability_mode != OMSCapabilityMode.REDUCE_ONLY:
+                return self._get_capability_block_reason("open_risk")
+            if not reduce_only:
+                return "oms_mode_reduce_only"
 
         venue_reason = self.get_venue_freeze_reason()
         if venue_reason:
@@ -1678,6 +2758,28 @@ class OMS:
         return ""
 
     def _get_submission_safety_reason_locked(self, intent: OrderIntent) -> str:
+        dead_man_rejection = (
+            self._get_venue_dead_man_switch_rejection_locked(intent)
+        )
+        if dead_man_rejection:
+            return dead_man_rejection
+
+        heartbeat_rejection = self._get_risk_control_heartbeat_rejection_locked(
+            intent
+        )
+        if heartbeat_rejection:
+            return heartbeat_rejection
+
+        margin_rejection = self._get_margin_health_rejection_locked(intent)
+        if margin_rejection:
+            return margin_rejection
+
+        self_cross_rejection = self._get_self_trade_prevention_rejection_locked(
+            intent
+        )
+        if self_cross_rejection:
+            return self_cross_rejection
+
         total_active = 0
         symbol_active = 0
         strategy_active = 0
@@ -1737,6 +2839,133 @@ class OMS:
             )
         return ""
 
+    def _get_self_trade_prevention_rejection_locked(
+        self,
+        intent: OrderIntent,
+    ) -> str:
+        if (
+            not self.self_trade_prevention_enabled
+            or not self.local_self_cross_check_enabled
+        ):
+            return ""
+
+        incoming_is_market = str(intent.order_type or "").upper() == "MARKET"
+        for resting in self.orders.values():
+            if not resting.is_active() or resting.intent.symbol != intent.symbol:
+                continue
+            if resting.intent.side == intent.side:
+                continue
+            if resting.intent.volume - resting.filled_volume <= 1e-12:
+                continue
+
+            resting_is_market = (
+                str(resting.intent.order_type or "").upper() == "MARKET"
+            )
+            crosses = incoming_is_market or resting_is_market
+            if not crosses and intent.side == Side.BUY:
+                crosses = intent.price >= resting.intent.price
+            elif not crosses and intent.side == Side.SELL:
+                crosses = intent.price <= resting.intent.price
+            if not crosses:
+                continue
+
+            return (
+                "self_trade_prevention:crossing_active_order:"
+                f"{resting.client_oid}:{resting.intent.side.value}:"
+                f"{resting.intent.price:.12g}"
+            )
+        return ""
+
+    def _get_risk_control_heartbeat_rejection_locked(
+        self,
+        intent: OrderIntent,
+    ) -> str:
+        if intent.reduce_only or not self.risk_control_heartbeat_enabled:
+            return ""
+
+        if self.last_risk_control_heartbeat_monotonic <= 0.0:
+            return "risk_control_heartbeat_missing"
+        if self.risk_control_heartbeat_status != "healthy":
+            detail = self.risk_control_heartbeat_reason or "unhealthy"
+            return f"risk_control_heartbeat_unhealthy:{detail}"
+
+        age_sec = max(
+            0.0,
+            time.monotonic() - self.last_risk_control_heartbeat_monotonic,
+        )
+        if age_sec > self.risk_control_heartbeat_max_age_sec:
+            return (
+                f"risk_control_heartbeat_stale:{age_sec:.3f}s>"
+                f"{self.risk_control_heartbeat_max_age_sec:.3f}s"
+            )
+        return ""
+
+    def _get_venue_dead_man_switch_rejection_locked(
+        self,
+        intent: OrderIntent,
+    ) -> str:
+        if intent.reduce_only or not self.venue_dead_man_switch_enabled:
+            return ""
+        healthy, reason = self._venue_dead_man_switch_health_locked()
+        if healthy:
+            return ""
+        return f"venue_dead_man_switch:{reason or 'unhealthy'}"
+
+    def _get_margin_health_rejection_locked(self, intent: OrderIntent) -> str:
+        if intent.reduce_only or not self.margin_health_enabled:
+            return ""
+        if not self.account.margin_snapshot_synced:
+            return "margin_health_unavailable" if self.margin_health_require_snapshot else ""
+
+        snapshot_time = float(self.account.margin_snapshot_time or 0.0)
+        age_sec = max(0.0, time.time() - snapshot_time) if snapshot_time else float("inf")
+        if self.margin_snapshot_max_age_sec > 0.0 and age_sec > self.margin_snapshot_max_age_sec:
+            return (
+                f"margin_health_stale:{age_sec:.3f}s>"
+                f"{self.margin_snapshot_max_age_sec:.3f}s"
+            )
+        ratio = float(self.account.maintenance_margin_ratio or 0.0)
+        if math.isnan(ratio) or ratio < 0.0:
+            return f"margin_health_invalid:{ratio!r}"
+        if ratio >= self.margin_reduce_only_ratio:
+            return (
+                f"margin_health_reduce_only:{ratio:.6f}>="
+                f"{self.margin_reduce_only_ratio:.6f}"
+            )
+        return ""
+
+    def _get_strategy_budget_rejection_locked(self, intent: OrderIntent) -> str:
+        if intent.reduce_only or not self.strategy_risk_budgets_enabled:
+            return ""
+        strategy_id = str(intent.strategy_id or "").strip()
+        budget = self.strategy_risk_budgets.get(strategy_id)
+        if budget is None:
+            if self.require_explicit_strategy_budget:
+                return f"strategy_budget_unconfigured:{strategy_id or '<empty>'}"
+            return ""
+        ok, reason = self.exposure.check_strategy_risk(
+            strategy_id,
+            intent.symbol,
+            intent.side,
+            intent.volume,
+            budget["max_gross_notional"],
+            budget["max_symbol_notional"],
+            intent.price,
+        )
+        return "" if ok else f"strategy_budget_limit:{reason}"
+
+    def get_strategy_risk_budget_snapshot(self) -> dict:
+        with self.lock:
+            return {
+                "enabled": self.strategy_risk_budgets_enabled,
+                "require_explicit_strategy": self.require_explicit_strategy_budget,
+                "budgets": {
+                    strategy_id: dict(budget)
+                    for strategy_id, budget in self.strategy_risk_budgets.items()
+                },
+                "ledger": self.exposure.get_strategy_snapshot(),
+            }
+
     def freeze_system(self, reason: str, cancel_active_orders: bool = False):
         if self.state == LifecycleState.HALTED:
             return
@@ -1768,7 +2997,10 @@ class OMS:
         )
         try:
             for symbol in self.config["symbols"]:
-                self.gateway.cancel_all_orders(symbol)
+                self._cancel_all_orders_unchecked(
+                    symbol,
+                    source="system_freeze",
+                )
         except Exception:
             pass
 
@@ -1778,23 +3010,26 @@ class OMS:
             self.manual_rearm_required = True
             self._sync_capability_mode(reason)
             self._audit("halt_reasserted", reason=reason)
-            return
-        self.state = LifecycleState.HALTED
-        self._sync_capability_mode(reason)
-        self.manual_rearm_required = True
-        self.last_halt_reason = reason
-        self.last_freeze_reason = ""
-        logger.critical(f"OMS HALTED: {reason}")
-        self._audit(
-            "lifecycle",
-            state=self.state.value,
-            reason=reason,
-            manual_rearm_required=True,
-        )
-        self.event_engine.put(Event(EVENT_SYSTEM_HEALTH, f"HALT:{reason}"))
+        else:
+            self.state = LifecycleState.HALTED
+            self._sync_capability_mode(reason)
+            self.manual_rearm_required = True
+            self.last_halt_reason = reason
+            self.last_freeze_reason = ""
+            logger.critical(f"OMS HALTED: {reason}")
+            self._audit(
+                "lifecycle",
+                state=self.state.value,
+                reason=reason,
+                manual_rearm_required=True,
+            )
+            self.event_engine.put(Event(EVENT_SYSTEM_HEALTH, f"HALT:{reason}"))
         try:
             for symbol in self.config["symbols"]:
-                self.gateway.cancel_all_orders(symbol)
+                self._cancel_all_orders_unchecked(
+                    symbol,
+                    source="system_halt",
+                )
         except Exception:
             pass
 
@@ -1827,16 +3062,24 @@ class OMS:
         return False
 
     def stop(self):
-        self._audit(
-            "oms_stopped",
-            state=self.state.value,
-            manual_rearm_required=self.manual_rearm_required,
-            symbol_guard_count=len(self.symbol_guards),
-            venue_guard_count=len(self.venue_guards),
-            strategy_guard_count=len(self.strategy_guards),
-            strategy_symbol_guard_count=len(self.strategy_symbol_guards),
-        )
-        self.order_monitor.stop()
+        try:
+            self._audit(
+                "oms_stopped",
+                state=self.state.value,
+                manual_rearm_required=self.manual_rearm_required,
+                symbol_guard_count=len(self.symbol_guards),
+                venue_guard_count=len(self.venue_guards),
+                strategy_guard_count=len(self.strategy_guards),
+                strategy_symbol_guard_count=len(self.strategy_symbol_guards),
+            )
+        finally:
+            with self.lock:
+                self._stopped = True
+            try:
+                self.order_monitor.stop()
+            finally:
+                if self.single_writer_fence is not None:
+                    self.single_writer_fence.release()
 
     def trigger_reconcile(self, reason: str, suspicious_oid: str = None):
         if self.state in [LifecycleState.RECONCILING, LifecycleState.HALTED]:
@@ -2118,9 +3361,17 @@ class OMS:
         logger.info("[OMS] Performing full state reset...")
         self._audit("full_reset_started", symbols=self.config.get("symbols", []))
         try:
+            if not self._ensure_venue_dead_man_switch_armed("full_reset"):
+                return
             command_fence_started = time.monotonic()
             for symbol in self.config["symbols"]:
-                self.gateway.cancel_all_orders(symbol)
+                if not self._cancel_all_orders_unchecked(
+                    symbol,
+                    source="full_reset_initial",
+                ):
+                    raise RuntimeError(
+                        f"initial mass cancel not admitted for {symbol}"
+                    )
 
             initial_snapshot = self._capture_stable_exchange_snapshot(
                 require_no_open_orders=True,
@@ -2135,6 +3386,11 @@ class OMS:
                 initial_snapshot["end_time_ms"],
             ):
                 raise RuntimeError("trade history baseline failed during bootstrap")
+            if self.external_cash_flow_truth_enabled and not self.backfill_external_cash_flow_history(
+                end_time_ms=initial_snapshot["end_time_ms"],
+                source="bootstrap_income_history",
+            ):
+                raise RuntimeError("external cash-flow history failed during bootstrap")
             if not self._backfill_trade_history(
                 end_time_ms=initial_snapshot["end_time_ms"],
             ):
@@ -2156,11 +3412,22 @@ class OMS:
             # cannot arrive after its signed recvWindow expires. Cancel again
             # beyond that fence, then establish the committed snapshot.
             for symbol in self.config["symbols"]:
-                self.gateway.cancel_all_orders(symbol)
+                if not self._cancel_all_orders_unchecked(
+                    symbol,
+                    source="full_reset_fenced",
+                ):
+                    raise RuntimeError(
+                        f"fenced mass cancel not admitted for {symbol}"
+                    )
 
             snapshot = self._capture_stable_exchange_snapshot(
                 require_no_open_orders=True,
             )
+            if self.external_cash_flow_truth_enabled and not self.backfill_external_cash_flow_history(
+                end_time_ms=snapshot["end_time_ms"],
+                source="reset_income_history",
+            ):
+                raise RuntimeError("external cash-flow history failed during reset")
             if not self._backfill_trade_history(end_time_ms=snapshot["end_time_ms"]):
                 raise RuntimeError("final trade history backfill failed during reset")
 
@@ -2184,6 +3451,7 @@ class OMS:
                 self.exposure.avg_prices.clear()
                 self.exposure.open_buy_qty.clear()
                 self.exposure.open_sell_qty.clear()
+                self.exposure.update_open_orders(self.orders)
 
                 for pos in positions:
                     amount = float(pos["positionAmt"])
@@ -2199,6 +3467,11 @@ class OMS:
                     if pos.get("symbol")
                 )
                 for symbol in snapshot_symbols:
+                    self.exposure.reconcile_strategy_position(
+                        symbol,
+                        self.exposure.net_positions[symbol],
+                        self.exposure.avg_prices[symbol],
+                    )
                     self._position_state_event_time[symbol] = max(
                         float(self._position_state_event_time.get(symbol, 0.0) or 0.0),
                         positions_snapshot_floor,
@@ -2213,6 +3486,9 @@ class OMS:
                     float(account["totalWalletBalance"]),
                     float(account["totalInitialMargin"]),
                     float(available_balance) if available_balance is not None else None,
+                    maintenance_margin=account.get("totalMaintMargin"),
+                    margin_balance=account.get("totalMarginBalance"),
+                    margin_snapshot_time=time.time(),
                 )
                 self._account_state_event_time = max(
                     float(self._account_state_event_time or 0.0),
@@ -2250,89 +3526,121 @@ class OMS:
     def submit_order(self, intent: OrderIntent) -> OrderSubmitResult:
         client_oid = str(uuid.uuid4())
         original_intent = intent
-
-        block_reason = self._get_order_block_reason(intent.strategy_id, intent.symbol)
-        if block_reason:
-            return self._reject_intent_locally(
-                intent,
-                client_oid,
-                block_reason,
-            )
-
-        intent, mode_reject_reason = self.adapt_intent_for_trading_mode(intent)
-        if mode_reject_reason:
-            return self._reject_intent_locally(original_intent, client_oid, mode_reject_reason)
-
-        valid, validation_reason = self.validator.validate_params(intent)
-        if not valid:
-            return self._reject_intent_locally(intent, client_oid, validation_reason)
-
-        with self.lock:
-            submission_safety_reason = self._get_submission_safety_reason_locked(intent)
-        if submission_safety_reason:
-            return self._reject_intent_locally(
-                intent,
-                client_oid,
-                submission_safety_reason,
-            )
-
-        notional = intent.price * intent.volume
-        if not self.account.check_margin(notional):
-            return self._reject_intent_locally(
-                intent,
-                client_oid,
-                "insufficient_margin",
-                notional=notional,
-                available=self.account.available,
-            )
-
-        ok, risk_reason = self.exposure.check_risk(
-            intent.symbol,
-            intent.side,
-            intent.volume,
-            self.max_pos_notional,
-            self.max_account_gross_notional,
-            intent.price,
-        )
-        if not ok:
-            logger.warning(f"[OMS] Risk rejected: {risk_reason}")
-            return self._reject_intent_locally(
-                intent,
-                client_oid,
-                f"exposure_limit:{risk_reason}",
-            )
-
-        request = OrderRequest(
-            symbol=intent.symbol,
-            price=intent.price,
-            volume=intent.volume,
-            side=intent.side.value,
-            order_type=intent.order_type,
-            time_in_force=intent.time_in_force,
-            post_only=intent.is_post_only,
-            reduce_only=intent.reduce_only,
-        )
-        order = Order(client_oid, intent)
+        order = None
+        request = None
+        rejection_reason = ""
+        rejection_extra = {}
+        rejection_intent = intent
         command_id = f"SUBMIT:{client_oid}"
 
-        # The order snapshot and command intent must be durable before the first
-        # byte is sent to the venue. A restart can then query by client_oid
-        # without ever blindly resending an ambiguous command.
+        # Risk evaluation and exposure reservation are one critical section.
+        # Every concurrent submit sees earlier accepted-but-not-yet-ACKed orders.
         try:
             with self.lock:
-                self.orders[client_oid] = order
-                order.mark_submitting()
-                self.exposure.update_open_orders(self.orders)
-                self.account.calculate()
-                self._record_order_snapshot(order, "accepted")
+                rejection_reason = self._get_order_block_reason(
+                    intent.strategy_id,
+                    intent.symbol,
+                    reduce_only=intent.reduce_only,
+                )
+                if not rejection_reason:
+                    intent, rejection_reason = self.adapt_intent_for_trading_mode(intent)
+                    rejection_intent = original_intent if rejection_reason else intent
+
+                if not rejection_reason:
+                    valid, rejection_reason = self.validator.validate_params(intent)
+                    rejection_intent = intent
+                    if valid:
+                        rejection_reason = ""
+
+                if not rejection_reason:
+                    rejection_reason = self._get_submission_safety_reason_locked(intent)
+
+                notional = intent.price * intent.volume if not rejection_reason else 0.0
+                if not rejection_reason and intent.reduce_only:
+                    ok, risk_reason = self.exposure.check_reduce_only(
+                        intent.symbol,
+                        intent.side,
+                        intent.volume,
+                    )
+                    if not ok:
+                        rejection_reason = risk_reason
+                elif not rejection_reason:
+                    if not self.account.check_margin(notional):
+                        rejection_reason = "insufficient_margin"
+                        rejection_extra = {
+                            "notional": notional,
+                            "available": self.account.available,
+                        }
+                    else:
+                        ok, risk_reason = self.exposure.check_risk(
+                            intent.symbol,
+                            intent.side,
+                            intent.volume,
+                            self.max_pos_notional,
+                            self.max_account_gross_notional,
+                            intent.price,
+                        )
+                        if not ok:
+                            logger.warning(f"[OMS] Risk rejected: {risk_reason}")
+                            rejection_reason = f"exposure_limit:{risk_reason}"
+
+                if not rejection_reason:
+                    rejection_reason = (
+                        self._get_strategy_budget_rejection_locked(intent)
+                    )
+
+                if not rejection_reason:
+                    message_kind = (
+                        self.OUTBOUND_REDUCE_ORDER
+                        if intent.reduce_only
+                        else self.OUTBOUND_NEW_ORDER
+                    )
+                    rejection_reason = self._reserve_outbound_message_locked(
+                        message_kind
+                    )
+
+                if not rejection_reason:
+                    request = OrderRequest(
+                        symbol=intent.symbol,
+                        price=intent.price,
+                        volume=intent.volume,
+                        side=intent.side.value,
+                        order_type=intent.order_type,
+                        time_in_force=intent.time_in_force,
+                        post_only=intent.is_post_only,
+                        reduce_only=intent.reduce_only,
+                        self_trade_prevention_mode=(
+                            self.exchange_self_trade_prevention_mode
+                        ),
+                    )
+                    order = Order(client_oid, intent)
+                    self.orders[client_oid] = order
+                    order.mark_submitting()
+                    self.exposure.update_open_orders(self.orders)
+                    self.account.calculate()
+                    self._record_order_snapshot(order, "accepted")
+
+            if rejection_reason:
+                return self._reject_intent_locally(
+                    rejection_intent,
+                    client_oid,
+                    rejection_reason,
+                    **rejection_extra,
+                )
+
+            # The durable command intent is committed before the first byte is
+            # sent to the venue. Recovery queries by client_oid and never
+            # blindly resends an ambiguous command.
             self._record_command_prepared(command_id, "SUBMIT", order, request)
         except JournalError as exc:
             with self.lock:
-                order.mark_rejected_locally("durable_journal_unavailable")
+                if order is not None and order.status == OrderStatus.SUBMITTING:
+                    order.mark_rejected_locally("durable_journal_unavailable")
                 self.orders.pop(client_oid, None)
                 self.exposure.update_open_orders(self.orders)
                 self.account.calculate()
-                self._emit_order_update(order)
+                if order is not None:
+                    self._emit_order_update(order)
             self._fail_closed_on_journal_error(exc, "prepare_submit", intent.symbol)
             return OrderSubmitResult(
                 accepted=False,
@@ -2527,6 +3835,20 @@ class OMS:
                 order = self.orders.get(client_oid)
                 if not order or not order.is_active():
                     return False
+                budget_rejection = self._reserve_outbound_message_locked(
+                    self.OUTBOUND_CANCEL
+                )
+                if budget_rejection:
+                    scheduled = self._schedule_cancel_order_retry(client_oid)
+                    deferred = scheduled or client_oid in self._deferred_cancel_oids
+                    self._audit(
+                        "cancel_message_budget_deferred",
+                        client_oid=client_oid,
+                        symbol=order.intent.symbol,
+                        reason=budget_rejection,
+                        scheduled=scheduled,
+                    )
+                    return deferred
                 target_id = order.exchange_oid if order.exchange_oid else client_oid
                 try:
                     order.mark_cancelling()
@@ -2658,6 +3980,44 @@ class OMS:
         self._on_order_truth_check("Order cancel outcome unknown", suspicious_oid=client_oid)
         return True
 
+    def _cancel_all_orders_unchecked(
+        self,
+        symbol: str,
+        source: str,
+        audit: bool = True,
+    ) -> bool:
+        with self.lock:
+            budget_rejection = self._reserve_outbound_message_locked(
+                self.OUTBOUND_CANCEL
+            )
+        if budget_rejection:
+            logger.error(
+                f"[OMS] Mass cancel blocked for {symbol}: {budget_rejection}"
+            )
+            scheduled = self._schedule_cancel_all_retry(symbol, source)
+            with self.lock:
+                deferred = (
+                    scheduled or symbol.upper() in self._deferred_cancel_all_symbols
+                )
+            if audit:
+                self._audit(
+                    "cancel_all_message_budget_deferred",
+                    symbol=symbol,
+                    source=source,
+                    reason=budget_rejection,
+                    scheduled=scheduled,
+                )
+            return deferred
+
+        if audit:
+            self._audit("cancel_all_submitted", symbol=symbol, source=source)
+        try:
+            self.gateway.cancel_all_orders(symbol)
+        except Exception as exc:
+            logger.error(f"[OMS] Mass cancel failed for {symbol}: {exc}")
+            return False
+        return True
+
     def cancel_all_orders(self, symbol: str):
         if not self.can_cancel_orders():
             self._audit(
@@ -2666,9 +4026,10 @@ class OMS:
                 reason=self._get_capability_block_reason("cancel"),
             )
             return False
-        self._audit("cancel_all_submitted", symbol=symbol)
-        self.gateway.cancel_all_orders(symbol)
-        return True
+        return self._cancel_all_orders_unchecked(
+            symbol,
+            source="public_cancel_all",
+        )
 
     def on_exchange_update(self, event):
         try:
@@ -2679,6 +4040,10 @@ class OMS:
 
     def on_exchange_account_update(self, event):
         update: ExchangeAccountUpdate = event.data
+        if str(update.reason or "").upper() in self.CASH_FLOW_DIRTY_REASONS:
+            self.mark_external_cash_flow_truth_unavailable(
+                f"account_update:{str(update.reason).upper()}"
+            )
         tracked_symbols = set(self.config.get("symbols", []))
         tracked_positions = {
             symbol: payload
@@ -2717,6 +4082,11 @@ class OMS:
                     }
                     corrected_with_active_order[symbol] = self._has_active_orders_locked({symbol})
                     self.exposure.force_sync(symbol, remote_volume, remote_entry_price)
+                    self.exposure.reconcile_strategy_position(
+                        symbol,
+                        remote_volume,
+                        remote_entry_price,
+                    )
 
                 if event_time:
                     self._position_state_event_time[symbol] = max(state_time, event_time)
@@ -2962,6 +4332,14 @@ class OMS:
                             exchange_status=update.status,
                         )
                         symbol = order.intent.symbol
+                        if had_fill:
+                            self.exposure.on_strategy_fill(
+                                order.intent.strategy_id,
+                                symbol,
+                                order.intent.side,
+                                delta,
+                                update.filled_price,
+                            )
                         exchange_position_time = float(
                             self._exchange_position_event_time.get(symbol, 0.0) or 0.0
                         )
@@ -2990,6 +4368,11 @@ class OMS:
                                     float(self._position_state_event_time.get(symbol, 0.0) or 0.0),
                                     update.update_time,
                                 )
+                        self.exposure.reconcile_strategy_position(
+                            symbol,
+                            self.exposure.net_positions[symbol],
+                            self.exposure.avg_prices[symbol],
+                        )
                         realized_pnl = (
                             update.realized_pnl
                             if update.realized_pnl is not None
@@ -3194,16 +4577,21 @@ class OMS:
                 "strategy_symbol_guards": {},
                 "mode_override": "",
                 "mode_override_reason": "",
+                "mode_constraints": {},
                 "clean_shutdown": True,
                 "dirty_shutdown": False,
                 "trade_cursors": {},
                 "trade_scan_end_ms": {},
+                "external_cash_flow_total": 0.0,
+                "external_cash_flow_ids": [],
+                "external_cash_flow_scan_end_ms": 0,
             }
 
         latest_order_records = {}
         latest_order_record_indexes = {}
         commands = {}
         executions_by_client_oid = {}
+        execution_records = []
         last_lifecycle = None
         last_freeze_reason = ""
         last_halt_reason = ""
@@ -3214,8 +4602,12 @@ class OMS:
         strategy_symbol_guards = {}
         mode_override = ""
         mode_override_reason = ""
+        mode_constraints = {}
         trade_cursors = {}
         trade_scan_end_ms = {}
+        external_cash_flow_total = 0.0
+        external_cash_flow_ids = set()
+        external_cash_flow_scan_end_ms = 0
         clean_shutdown = records[-1].get("kind") == "oms_stopped"
         for record_index, record in enumerate(records):
             payload = record.get("payload", {})
@@ -3235,6 +4627,9 @@ class OMS:
                     }
             elif kind == "execution_record":
                 client_oid = str(payload.get("client_oid", "") or "")
+                execution_records.append(
+                    {"index": record_index, "payload": payload}
+                )
                 if client_oid:
                     executions_by_client_oid.setdefault(client_oid, []).append(
                         {"index": record_index, "payload": payload}
@@ -3316,9 +4711,42 @@ class OMS:
             elif kind == "trading_mode_override_set":
                 mode_override = str(payload.get("mode", "") or "")
                 mode_override_reason = str(payload.get("reason", "") or "")
+                constraint_key = str(
+                    payload.get("constraint_key", "")
+                    or self._mode_constraint_key(mode_override_reason)
+                )
+                if mode_override and mode_override_reason:
+                    mode_constraints[constraint_key] = {
+                        "mode": mode_override,
+                        "reason": mode_override_reason,
+                    }
             elif kind == "trading_mode_override_cleared":
-                mode_override = ""
-                mode_override_reason = ""
+                cleared_keys = payload.get("cleared_constraint_keys", []) or []
+                if cleared_keys:
+                    for constraint_key in cleared_keys:
+                        mode_constraints.pop(str(constraint_key), None)
+                else:
+                    previous_reason = str(payload.get("previous_reason", "") or "")
+                    if previous_reason:
+                        mode_constraints.pop(
+                            self._mode_constraint_key(previous_reason),
+                            None,
+                        )
+                    else:
+                        mode_constraints.clear()
+                if mode_constraints:
+                    _selected_key, selected = max(
+                        mode_constraints.items(),
+                        key=lambda item: (
+                            self._mode_rank(OMSCapabilityMode(item[1]["mode"])),
+                            item[0],
+                        ),
+                    )
+                    mode_override = selected["mode"]
+                    mode_override_reason = selected["reason"]
+                else:
+                    mode_override = ""
+                    mode_override_reason = ""
             elif kind == "oms_stopped":
                 state = payload.get("state")
                 if state:
@@ -3338,6 +4766,17 @@ class OMS:
                         trade_scan_end_ms.get(symbol, 0),
                         end_time_ms,
                     )
+            elif kind == "external_cash_flow_record":
+                income_id = str(payload.get("income_id", "") or "")
+                if income_id in external_cash_flow_ids:
+                    continue
+                external_cash_flow_ids.add(income_id)
+                external_cash_flow_total += float(payload.get("amount", 0.0) or 0.0)
+            elif kind == "cash_flow_scan_completed":
+                external_cash_flow_scan_end_ms = max(
+                    external_cash_flow_scan_end_ms,
+                    int(payload.get("end_time_ms", 0) or 0),
+                )
 
         latest_command_results = {}
         pending_commands = 0
@@ -3378,6 +4817,63 @@ class OMS:
             self.execution_ids.clear()
             self.terminated_oids.clear()
             self.terminated_oid_queue.clear()
+            self.exposure.strategy_net_positions.clear()
+            self.exposure.strategy_avg_prices.clear()
+            self.exposure.strategy_open_buy_qty.clear()
+            self.exposure.strategy_open_sell_qty.clear()
+            replayed_strategy_executions = set()
+            for execution in execution_records:
+                payload = execution["payload"]
+                execution_id = str(payload.get("execution_id", "") or "")
+                if not execution_id:
+                    raise JournalCorruptionError(
+                        "Execution record without execution_id during strategy replay"
+                    )
+                if execution_id in replayed_strategy_executions:
+                    continue
+                client_oid = str(payload.get("client_oid", "") or "")
+                order_payload = latest_order_records.get(client_oid, {})
+                intent_payload = order_payload.get("intent", {})
+                strategy_id = str(
+                    payload.get("strategy_id", "")
+                    or intent_payload.get("strategy_id", "")
+                    or "exchange_recovery"
+                )
+                symbol = str(
+                    payload.get("symbol", "")
+                    or intent_payload.get("symbol", "")
+                ).upper()
+                side_value = str(
+                    payload.get("side", "")
+                    or intent_payload.get("side", "")
+                )
+                try:
+                    side = Side(side_value)
+                    fill_qty = float(payload.get("fill_qty", 0.0) or 0.0)
+                    fill_price = float(payload.get("fill_price", 0.0) or 0.0)
+                except (TypeError, ValueError) as exc:
+                    raise JournalCorruptionError(
+                        f"Malformed strategy execution {execution_id}: {exc}"
+                    ) from exc
+                if (
+                    not symbol
+                    or fill_qty <= 0.0
+                    or fill_price <= 0.0
+                    or not math.isfinite(fill_qty)
+                    or not math.isfinite(fill_price)
+                ):
+                    raise JournalCorruptionError(
+                        f"Invalid strategy execution values for {execution_id}"
+                    )
+                self.exposure.on_strategy_fill(
+                    strategy_id,
+                    symbol,
+                    side,
+                    fill_qty,
+                    fill_price,
+                )
+                replayed_strategy_executions.add(execution_id)
+                self.execution_ids.add(execution_id)
             recovered_terminal_ids = 0
             recovered_active_orders = 0
             for client_oid, payload in latest_order_records.items():
@@ -3448,10 +4944,14 @@ class OMS:
             "strategy_symbol_guards": strategy_symbol_guards,
             "mode_override": mode_override,
             "mode_override_reason": mode_override_reason,
+            "mode_constraints": mode_constraints,
             "clean_shutdown": clean_shutdown,
             "dirty_shutdown": not clean_shutdown,
             "trade_cursors": trade_cursors,
             "trade_scan_end_ms": trade_scan_end_ms,
+            "external_cash_flow_total": external_cash_flow_total,
+            "external_cash_flow_ids": sorted(external_cash_flow_ids),
+            "external_cash_flow_scan_end_ms": external_cash_flow_scan_end_ms,
         }
         if recovered_terminal_ids:
             logger.info(
@@ -3544,10 +5044,19 @@ class OMS:
         return False
 
     def _extract_quote_asset(self, symbol: str) -> str:
+        symbol = str(symbol or "").upper()
         for suffix in ("USDT", "USDC", "BUSD", "FDUSD", "BTC", "ETH", "BNB"):
             if symbol.endswith(suffix):
                 return suffix
         return ""
+
+    def _tracked_quote_assets(self, symbols) -> set[str]:
+        assets = {
+            self._extract_quote_asset(symbol)
+            for symbol in symbols or []
+        }
+        assets.discard("")
+        return assets or {"USDT", "USDC", "BUSD", "FDUSD"}
 
     def _get_fill_commission(self, update: ExchangeOrderUpdate, order: Order, fill_notional: float) -> float:
         if update.commission is None:

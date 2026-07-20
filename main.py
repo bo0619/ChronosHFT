@@ -1,4 +1,5 @@
 import argparse
+import multiprocessing
 import os
 import sys
 import time
@@ -25,7 +26,11 @@ from event.type import (
 )
 from gateway.binance.gateway import BinanceGateway
 from gateway.binance.truth_provider import BinanceTruthSnapshotProvider
-from infrastructure.admin_control import AdminControlServer, submit_admin_command
+from infrastructure.admin_control import (
+    AdminControlServer,
+    coordinated_rearm,
+    submit_admin_command,
+)
 from infrastructure.config_scaling import load_root_config
 from infrastructure.logger import logger
 from infrastructure.system_health import handle_system_health_event
@@ -38,6 +43,7 @@ from infrastructure.watchdog import (
     emit_strategy_runtime_backlog_if_needed,
 )
 from oms.engine import OMS
+from risk.independent_supervisor import IndependentRiskSupervisor
 from risk.manager import RiskManager
 from strategy.ml_sniper.ml_sniper import MLSniperStrategy
 from strategy.runtime import StrategyRuntime
@@ -89,7 +95,13 @@ def load_config(path="config.json"):
     return None
 
 
-def bootstrap_or_rearm(oms_system, auto_rearm=False, rearm_reason="cli"):
+def bootstrap_or_rearm(
+    oms_system,
+    auto_rearm=False,
+    rearm_reason="cli",
+    risk_manager=None,
+    risk_supervisor=None,
+):
     bootstrapped = oms_system.bootstrap()
     if bootstrapped:
         return True
@@ -99,14 +111,46 @@ def bootstrap_or_rearm(oms_system, auto_rearm=False, rearm_reason="cli"):
         logger.warning(f"[OMS] Manual rearm required. Command: {hint}")
         if auto_rearm:
             logger.warning(f"[OMS] Auto rearm requested via CLI: {rearm_reason}")
-            return bool(oms_system.rearm_system(rearm_reason))
+            result = coordinated_rearm(
+                oms_system,
+                rearm_reason,
+                risk_manager=risk_manager,
+                risk_supervisor=risk_supervisor,
+            )
+            return bool(result.get("accepted", False))
     return False
 
 
+def run_live_risk_checks(risk_controller, independent_supervisor=None):
+    supervisor_healthy = True
+    if independent_supervisor is not None:
+        supervisor_healthy = bool(independent_supervisor.tick())
+    risk_healthy = bool(risk_controller.check_market_data_freshness())
+    return supervisor_healthy and risk_healthy
+
+
+# P0 TODO: Replace the host-local OMS file lock with replicated leader election
+# and a monotonic fencing token before supporting multi-host active/passive OMS.
 def main(argv=None):
     args = parse_cli_args(argv)
     config = load_config(args.config)
     if not config:
+        return
+
+    missing_credentials = [
+        field
+        for field in ("api_key", "api_secret")
+        if not str(config.get(field, "") or "").strip()
+    ]
+    if missing_credentials and not args.admin_command:
+        env_names = [
+            str(config.get(f"{field}_env", "") or "")
+            for field in missing_credentials
+        ]
+        print(
+            "Error: missing Binance credentials. Set environment variables: "
+            + ", ".join(name for name in env_names if name)
+        )
         return
 
     if args.admin_command:
@@ -154,6 +198,11 @@ def main(argv=None):
     )
     oms_system = OMS(engine, gateway, config)
     risk_controller = RiskManager(engine, config, oms=oms_system, gateway=gateway)
+    risk_supervisor = IndependentRiskSupervisor(
+        oms_system,
+        config,
+        risk_manager=risk_controller,
+    )
     alpha_process_config = (
         config.get("system", {})
         .get("strategy_runtime", {})
@@ -170,7 +219,12 @@ def main(argv=None):
     recorder = DataRecorder(engine, config["symbols"]) if config.get("record_data", False) else None
     truth_monitor = TruthMonitor(oms_system, truth_provider, config, start_thread=False)
     venue_supervisor = VenueSupervisor(oms_system, gateway, config, start_thread=False)
-    admin_control = AdminControlServer(oms_system, config)
+    admin_control = AdminControlServer(
+        oms_system,
+        config,
+        risk_manager=risk_controller,
+        risk_supervisor=risk_supervisor,
+    )
 
     def on_time_service_health(severity, reason, details):
         if severity == "freeze":
@@ -239,14 +293,24 @@ def main(argv=None):
 
     engine.start()
     strategy_runtime.start()
+    risk_supervisor.start()
     gateway.connect(config["symbols"])
 
-    time.sleep(3)
+    warmup_deadline = time.monotonic() + 3.0
+    while time.monotonic() < warmup_deadline:
+        run_live_risk_checks(risk_controller, risk_supervisor)
+        time.sleep(0.1)
+    if not risk_supervisor.wait_until_healthy(timeout_sec=2.0):
+        oms_system.halt_system("independent_risk_supervisor_unavailable")
+    risk_controller.resume_kill_switch_supervision()
     bootstrap_or_rearm(
         oms_system,
         auto_rearm=bool(args.rearm),
         rearm_reason=str(args.rearm_reason or "cli"),
+        risk_manager=risk_controller,
+        risk_supervisor=risk_supervisor,
     )
+    run_live_risk_checks(risk_controller, risk_supervisor)
     truth_monitor.start()
     venue_supervisor.start()
 
@@ -257,6 +321,7 @@ def main(argv=None):
             while True:
                 live.update(dashboard.render())
                 time.sleep(0.1)
+                run_live_risk_checks(risk_controller, risk_supervisor)
                 main.stale_watchdog_triggered = emit_market_data_stale_if_needed(
                     engine,
                     main.last_tick_time,
@@ -292,6 +357,7 @@ def main(argv=None):
         strategy_runtime.stop()
         truth_provider.close()
         time_service.stop()
+        risk_supervisor.stop(cancel_orders=True)
         oms_system.stop()
         engine.stop()
         gateway.close()
@@ -300,4 +366,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()

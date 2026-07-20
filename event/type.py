@@ -81,6 +81,7 @@ class OMSCapabilityMode(Enum):
     LIVE = "LIVE"
     DEGRADED = "DEGRADED"
     PASSIVE_ONLY = "PASSIVE_ONLY"
+    REDUCE_ONLY = "REDUCE_ONLY"
     CANCEL_ONLY = "CANCEL_ONLY"
     READ_ONLY = "READ_ONLY"
     LOCKDOWN = "LOCKDOWN"
@@ -146,6 +147,7 @@ class OrderRequest:
     time_in_force: str = TIF_GTC
     post_only: bool = False
     reduce_only: bool = False
+    self_trade_prevention_mode: str = ""
 
 
 @dataclass
@@ -335,6 +337,14 @@ class AccountData:
     budget_balance: float = 0.0
     budget_available: float = 0.0
     trading_budget_by_asset: Dict[str, float] = field(default_factory=dict)
+    maintenance_margin: float = 0.0
+    margin_balance: float = 0.0
+    maintenance_margin_ratio: float = 0.0
+    margin_snapshot_time: float = 0.0
+    margin_snapshot_synced: bool = False
+    external_cash_flow_total: float = 0.0
+    cash_flow_snapshot_time: float = 0.0
+    cash_flow_snapshot_synced: bool = False
 
 
 @dataclass

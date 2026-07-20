@@ -14,9 +14,16 @@ if "requests" not in sys.modules:
             self.headers = headers or {}
 
     requests_module.Request = Request
+    requests_module.Session = lambda: None
     sys.modules["requests"] = requests_module
 
-from gateway.binance.constants import EP_POSITION_RISK
+from event.type import OrderRequest
+from gateway.binance.constants import (
+    EP_COUNTDOWN_CANCEL_ALL,
+    EP_INCOME,
+    EP_ORDER,
+    EP_POSITION_RISK,
+)
 from gateway.binance.rest_api import BinanceRestApi
 
 
@@ -63,6 +70,81 @@ class RestApiThrottleTests(unittest.TestCase):
         api.retry_backoff_sec = 0.01
         api.request("GET", EP_POSITION_RISK, signed=True)
         self.assertGreater(api.endpoint_cooldown_until.get(EP_POSITION_RISK, 0.0), 0.0)
+
+    def test_income_history_maps_public_arguments_to_exchange_parameters(self):
+        api = BinanceRestApi("key", "secret", DummySession(), testnet=True)
+
+        with patch.object(api, "request", return_value=DummyResponse(200, [])) as request:
+            response = api.get_income_history(
+                symbol="BTCUSDT",
+                income_type="TRANSFER",
+                start_time=1000,
+                end_time=2000,
+                page=2,
+                limit=1000,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        request.assert_called_once_with(
+            "GET",
+            EP_INCOME,
+            {
+                "symbol": "BTCUSDT",
+                "incomeType": "TRANSFER",
+                "startTime": 1000,
+                "endTime": 2000,
+                "page": 2,
+                "limit": 1000,
+            },
+            signed=True,
+        )
+
+    def test_new_order_sends_explicit_exchange_stp_mode(self):
+        api = BinanceRestApi("key", "secret", DummySession(), testnet=True)
+        order = OrderRequest(
+            symbol="BTCUSDT",
+            price=100.0,
+            volume=0.1,
+            side="BUY",
+            self_trade_prevention_mode="EXPIRE_MAKER",
+        )
+
+        with patch.object(api, "request", return_value=DummyResponse(200, {})) as request:
+            response = api.new_order(order, "client-1")
+
+        self.assertEqual(response.status_code, 200)
+        request.assert_called_once_with(
+            "POST",
+            EP_ORDER,
+            {
+                "symbol": "BTCUSDT",
+                "side": "BUY",
+                "type": "LIMIT",
+                "quantity": 0.1,
+                "newClientOrderId": "client-1",
+                "price": 100.0,
+                "timeInForce": "GTC",
+                "selfTradePreventionMode": "EXPIRE_MAKER",
+            },
+            signed=True,
+        )
+
+    def test_countdown_cancel_all_maps_dead_man_switch_parameters(self):
+        api = BinanceRestApi("key", "secret", DummySession(), testnet=True)
+
+        with patch.object(api, "request", return_value=DummyResponse(200, {})) as request:
+            response = api.set_countdown_cancel_all("btcusdt", 120_000)
+
+        self.assertEqual(response.status_code, 200)
+        request.assert_called_once_with(
+            "POST",
+            EP_COUNTDOWN_CANCEL_ALL,
+            {
+                "symbol": "BTCUSDT",
+                "countdownTime": 120_000,
+            },
+            signed=True,
+        )
 
     @patch("gateway.binance.rest_api.requests.Request", DummyRequest)
     @patch("gateway.binance.rest_api.time_service._sync", return_value=True)

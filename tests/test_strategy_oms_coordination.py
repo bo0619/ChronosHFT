@@ -233,6 +233,7 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         strategy = DummyStrategy(engine, oms)
         oms.state = LifecycleState.LIVE
         oms._sync_capability_mode("test_live")
+        oms.exposure.force_sync("BTCUSDT", -1.0, 100.0)
         try:
             oid = strategy.exit_short("BTCUSDT", 100.0, 1.0)
 

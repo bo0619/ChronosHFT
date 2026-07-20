@@ -110,6 +110,9 @@ class DummyRestApi:
     def get_open_orders(self):
         return DummyResponse([{"symbol": "BTCUSDT", "orderId": 1}])
 
+    def get_income_history(self, **kwargs):
+        return DummyResponse([{"incomeType": "TRANSFER", "query": kwargs}])
+
 
 class DummyOms:
     def __init__(self, venue_reason=""):
@@ -144,6 +147,15 @@ class TruthProviderTests(unittest.TestCase):
             self.assertEqual(provider.get_account_info(), {"account": True})
             self.assertEqual(provider.get_all_positions(), [{"symbol": "BTCUSDT"}])
             self.assertEqual(provider.get_open_orders(), [{"symbol": "BTCUSDT", "orderId": 1}])
+            self.assertEqual(
+                provider.get_income_history(start_time=1000, limit=1000),
+                [
+                    {
+                        "incomeType": "TRANSFER",
+                        "query": {"start_time": 1000, "limit": 1000},
+                    }
+                ],
+            )
             self.assertIs(provider.rest.session, provider.session)
             self.assertIsNotNone(session_factory.return_value.mount_calls)
         finally:

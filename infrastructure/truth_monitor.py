@@ -34,6 +34,14 @@ class TruthMonitor:
         )
         self.clean_polls_to_clear = max(1, int(cfg.get("clean_polls_to_clear", 2)))
 
+        cash_flow_cfg = config.get("risk", {}).get("cash_flow_truth", {})
+        self.cash_flow_truth_enabled = bool(cash_flow_cfg.get("enabled", False))
+        self.cash_flow_poll_interval_sec = max(
+            1.0,
+            float(cash_flow_cfg.get("poll_interval_sec", 30.0) or 30.0),
+        )
+        self.last_cash_flow_poll_at = 0.0
+
         self.consecutive_api_failures = 0
         self.consecutive_balance_drifts = 0
         self.clean_polls = 0
@@ -77,11 +85,52 @@ class TruthMonitor:
             return self._handle_api_failure()
 
         self._handle_api_recovery()
-        return self._compare_truth(account, positions, open_orders)
+        sync_margin_health = getattr(self.oms, "sync_account_margin_health", None)
+        if callable(sync_margin_health):
+            sync_margin_health(account, snapshot_time=time.time())
+        cash_flow_truth_ok = self._poll_cash_flow_truth()
+        exchange_truth_ok = self._compare_truth(account, positions, open_orders)
+        return cash_flow_truth_ok and exchange_truth_ok
+
+    def _poll_cash_flow_truth(self, now: float = None) -> bool:
+        if not self.cash_flow_truth_enabled:
+            return True
+
+        now = float(now or time.time())
+        if now - self.last_cash_flow_poll_at < self.cash_flow_poll_interval_sec:
+            return True
+        self.last_cash_flow_poll_at = now
+
+        query = getattr(self.snapshot_provider, "get_income_history", None)
+        backfill = getattr(self.oms, "backfill_external_cash_flow_history", None)
+        if not callable(query) or not callable(backfill):
+            mark_unavailable = getattr(
+                self.oms,
+                "mark_external_cash_flow_truth_unavailable",
+                None,
+            )
+            if callable(mark_unavailable):
+                mark_unavailable("truth_plane_income_query_unavailable")
+            return False
+
+        return bool(
+            backfill(
+                query=query,
+                end_time_ms=int(now * 1000),
+            )
+        )
 
     def _handle_api_failure(self):
         self.consecutive_api_failures += 1
         self.clean_polls = 0
+        if self.cash_flow_truth_enabled:
+            mark_unavailable = getattr(
+                self.oms,
+                "mark_external_cash_flow_truth_unavailable",
+                None,
+            )
+            if callable(mark_unavailable):
+                mark_unavailable("truth_plane_snapshot_unavailable")
         venue = self._venue_name()
         logger.error(
             f"[TruthMonitor] Snapshot unavailable "

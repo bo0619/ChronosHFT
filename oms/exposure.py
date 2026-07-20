@@ -19,6 +19,12 @@ class ExposureManager:
         # ?????Symbol -> float?????
         self.open_buy_qty = defaultdict(float)
         self.open_sell_qty = defaultdict(float)
+        self.reduce_only_buy_qty = defaultdict(float)
+        self.reduce_only_sell_qty = defaultdict(float)
+        self.strategy_net_positions = defaultdict(float)
+        self.strategy_avg_prices = defaultdict(float)
+        self.strategy_open_buy_qty = defaultdict(float)
+        self.strategy_open_sell_qty = defaultdict(float)
 
     # ----------------------------------------------------------
     # ??????????
@@ -26,8 +32,26 @@ class ExposureManager:
 
     def on_fill(self, symbol: str, side: Side, qty: float, price: float) -> float:
         """??????? Net Position ???????????? PnL"""
-        current_pos = self.net_positions[symbol]
-        avg_price = self.avg_prices[symbol]
+        return self._apply_fill_to_ledger(
+            self.net_positions,
+            self.avg_prices,
+            symbol,
+            side,
+            qty,
+            price,
+        )
+
+    @staticmethod
+    def _apply_fill_to_ledger(
+        positions,
+        average_prices,
+        key,
+        side: Side,
+        qty: float,
+        price: float,
+    ) -> float:
+        current_pos = positions[key]
+        avg_price = average_prices[key]
         signed_qty = qty if side == Side.BUY else -qty
         next_pos = current_pos + signed_qty
         realized_pnl = 0.0
@@ -43,7 +67,7 @@ class ExposureManager:
             total_val = abs(current_pos) * avg_price + qty * price
             new_total = abs(current_pos) + qty
             if new_total > 0:
-                self.avg_prices[symbol] = total_val / new_total
+                average_prices[key] = total_val / new_total
         else:
             closing_qty = min(abs(current_pos), qty)
             if current_pos > 0:
@@ -51,16 +75,56 @@ class ExposureManager:
             else:
                 realized_pnl = (avg_price - price) * closing_qty
 
-        self.net_positions[symbol] = next_pos
+        positions[key] = next_pos
 
         # ?? / ????
-        if abs(self.net_positions[symbol]) < 1e-9:
-            self.net_positions[symbol] = 0.0
-            self.avg_prices[symbol] = 0.0
-        elif current_pos > 0 > self.net_positions[symbol] or current_pos < 0 < self.net_positions[symbol]:
-            self.avg_prices[symbol] = price
+        if abs(positions[key]) < 1e-9:
+            positions[key] = 0.0
+            average_prices[key] = 0.0
+        elif current_pos > 0 > positions[key] or current_pos < 0 < positions[key]:
+            average_prices[key] = price
 
         return realized_pnl
+
+    def on_strategy_fill(
+        self,
+        strategy_id: str,
+        symbol: str,
+        side: Side,
+        qty: float,
+        price: float,
+    ) -> float:
+        key = (str(strategy_id or "exchange_recovery"), str(symbol or "").upper())
+        return self._apply_fill_to_ledger(
+            self.strategy_net_positions,
+            self.strategy_avg_prices,
+            key,
+            side,
+            qty,
+            price,
+        )
+
+    def reconcile_strategy_position(
+        self,
+        symbol: str,
+        account_position: float,
+        price: float,
+    ) -> float:
+        symbol = str(symbol or "").upper()
+        recovery_key = ("exchange_recovery", symbol)
+        attributed = sum(
+            position
+            for (strategy_id, tracked_symbol), position in self.strategy_net_positions.items()
+            if tracked_symbol == symbol and strategy_id != "exchange_recovery"
+        )
+        recovery_position = float(account_position) - attributed
+        self.strategy_net_positions[recovery_key] = (
+            0.0 if abs(recovery_position) < 1e-9 else recovery_position
+        )
+        self.strategy_avg_prices[recovery_key] = (
+            abs(float(price or 0.0)) if abs(recovery_position) >= 1e-9 else 0.0
+        )
+        return self.strategy_net_positions[recovery_key]
 
     # ----------------------------------------------------------
     # ????
@@ -70,6 +134,10 @@ class ExposureManager:
         """?????????????????????"""
         self.open_buy_qty.clear()
         self.open_sell_qty.clear()
+        self.reduce_only_buy_qty.clear()
+        self.reduce_only_sell_qty.clear()
+        self.strategy_open_buy_qty.clear()
+        self.strategy_open_sell_qty.clear()
 
         for order in active_orders.values():
             if not order.is_active():
@@ -77,10 +145,197 @@ class ExposureManager:
             rem_vol = order.intent.volume - order.filled_volume
             if rem_vol <= 0:
                 continue
-            if order.intent.side == Side.BUY:
+            if order.intent.reduce_only and order.intent.side == Side.BUY:
+                self.reduce_only_buy_qty[order.intent.symbol] += rem_vol
+            elif order.intent.reduce_only:
+                self.reduce_only_sell_qty[order.intent.symbol] += rem_vol
+            elif order.intent.side == Side.BUY:
                 self.open_buy_qty[order.intent.symbol] += rem_vol
+                strategy_key = (
+                    str(order.intent.strategy_id or "unattributed"),
+                    order.intent.symbol,
+                )
+                self.strategy_open_buy_qty[strategy_key] += rem_vol
             else:
                 self.open_sell_qty[order.intent.symbol] += rem_vol
+                strategy_key = (
+                    str(order.intent.strategy_id or "unattributed"),
+                    order.intent.symbol,
+                )
+                self.strategy_open_sell_qty[strategy_key] += rem_vol
+
+    def check_reduce_only(self, symbol: str, side: Side, volume: float) -> tuple:
+        """Validate and reserve closes without allowing a position flip."""
+        current_pos = float(self.net_positions[symbol] or 0.0)
+        if abs(current_pos) <= 1e-9:
+            return False, f"reduce_only_without_position:{symbol}"
+
+        if current_pos > 0:
+            if side != Side.SELL:
+                return False, f"reduce_only_wrong_side:{symbol}:long_requires_sell"
+            already_reserved = self.reduce_only_sell_qty[symbol]
+            available = max(0.0, current_pos - already_reserved)
+        else:
+            if side != Side.BUY:
+                return False, f"reduce_only_wrong_side:{symbol}:short_requires_buy"
+            already_reserved = self.reduce_only_buy_qty[symbol]
+            available = max(0.0, abs(current_pos) - already_reserved)
+
+        if volume > available + 1e-9:
+            return False, (
+                f"reduce_only_exceeds_position:{symbol}:"
+                f"requested={volume:.12g}>available={available:.12g}"
+            )
+        return True, ""
+
+    def check_strategy_risk(
+        self,
+        strategy_id: str,
+        symbol: str,
+        side: Side,
+        volume: float,
+        max_strategy_gross_notional: float,
+        max_strategy_symbol_notional: float,
+        order_price: float = 0.0,
+    ) -> tuple:
+        strategy_id = str(strategy_id or "unattributed")
+        symbol = str(symbol or "").upper()
+        add_buy = volume if side == Side.BUY else 0.0
+        add_sell = volume if side == Side.SELL else 0.0
+        symbol_exposure = self._strategy_symbol_worst_case_abs_qty(
+            strategy_id,
+            symbol,
+            add_buy,
+            add_sell,
+        )
+        mark_price = self._get_price_for_risk(symbol, order_price)
+        if mark_price <= 0.0:
+            return False, f"Strategy Exposure price unavailable for {symbol}"
+        symbol_notional = symbol_exposure * mark_price
+        if symbol_notional > max_strategy_symbol_notional:
+            return False, (
+                f"Strategy Symbol Exposure: strategy={strategy_id} "
+                f"symbol={symbol} projected={symbol_notional:.2f} "
+                f"> {max_strategy_symbol_notional}"
+            )
+
+        gross_notional = self.estimate_strategy_gross_notional(
+            strategy_id,
+            symbol=symbol,
+            side=side,
+            volume=volume,
+            order_price=order_price,
+        )
+        if gross_notional is None:
+            return False, f"Strategy Gross Exposure unavailable for {strategy_id}"
+        if gross_notional > max_strategy_gross_notional:
+            return False, (
+                f"Strategy Gross Exposure: strategy={strategy_id} "
+                f"projected={gross_notional:.2f} > {max_strategy_gross_notional}"
+            )
+        return True, ""
+
+    def estimate_strategy_gross_notional(
+        self,
+        strategy_id: str,
+        symbol: str = "",
+        side: Side = None,
+        volume: float = 0.0,
+        order_price: float = 0.0,
+    ):
+        strategy_id = str(strategy_id or "unattributed")
+        target_symbol = str(symbol or "").upper()
+        tracked_symbols = {
+            tracked_symbol
+            for tracked_strategy, tracked_symbol in self.strategy_net_positions
+            if tracked_strategy == strategy_id
+        }
+        tracked_symbols.update(
+            tracked_symbol
+            for tracked_strategy, tracked_symbol in self.strategy_open_buy_qty
+            if tracked_strategy == strategy_id
+        )
+        tracked_symbols.update(
+            tracked_symbol
+            for tracked_strategy, tracked_symbol in self.strategy_open_sell_qty
+            if tracked_strategy == strategy_id
+        )
+        if target_symbol:
+            tracked_symbols.add(target_symbol)
+
+        gross_notional = 0.0
+        for tracked_symbol in tracked_symbols:
+            add_buy = (
+                volume
+                if tracked_symbol == target_symbol and side == Side.BUY
+                else 0.0
+            )
+            add_sell = (
+                volume
+                if tracked_symbol == target_symbol and side == Side.SELL
+                else 0.0
+            )
+            exposure = self._strategy_symbol_worst_case_abs_qty(
+                strategy_id,
+                tracked_symbol,
+                add_buy,
+                add_sell,
+            )
+            if exposure <= 1e-9:
+                continue
+            fallback_price = order_price if tracked_symbol == target_symbol else 0.0
+            mark_price = self._get_price_for_risk(tracked_symbol, fallback_price)
+            if mark_price <= 0.0:
+                return None
+            gross_notional += exposure * mark_price
+        return gross_notional
+
+    def _strategy_symbol_worst_case_abs_qty(
+        self,
+        strategy_id: str,
+        symbol: str,
+        add_buy_qty: float = 0.0,
+        add_sell_qty: float = 0.0,
+    ) -> float:
+        key = (strategy_id, symbol)
+        current_pos = self.strategy_net_positions[key]
+        worst_long = current_pos + self.strategy_open_buy_qty[key] + add_buy_qty
+        worst_short = current_pos - self.strategy_open_sell_qty[key] - add_sell_qty
+        return max(abs(worst_long), abs(worst_short))
+
+    def get_strategy_snapshot(self) -> dict:
+        strategies = set()
+        strategies.update(strategy for strategy, _symbol in self.strategy_net_positions)
+        strategies.update(strategy for strategy, _symbol in self.strategy_open_buy_qty)
+        strategies.update(strategy for strategy, _symbol in self.strategy_open_sell_qty)
+        snapshot = {}
+        for strategy_id in sorted(strategies):
+            symbols = set()
+            symbols.update(
+                symbol
+                for strategy, symbol in self.strategy_net_positions
+                if strategy == strategy_id
+            )
+            symbols.update(
+                symbol
+                for strategy, symbol in self.strategy_open_buy_qty
+                if strategy == strategy_id
+            )
+            symbols.update(
+                symbol
+                for strategy, symbol in self.strategy_open_sell_qty
+                if strategy == strategy_id
+            )
+            snapshot[strategy_id] = {
+                symbol: {
+                    "position": self.strategy_net_positions[(strategy_id, symbol)],
+                    "avg_price": self.strategy_avg_prices[(strategy_id, symbol)],
+                    "open_buy_qty": self.strategy_open_buy_qty[(strategy_id, symbol)],
+                    "open_sell_qty": self.strategy_open_sell_qty[(strategy_id, symbol)],
+                }
+                for symbol in sorted(symbols)
+            }
+        return snapshot
 
     # ----------------------------------------------------------
     # ??????? worst-case?

@@ -9,7 +9,25 @@ import requests
 from infrastructure.logger import logger
 from infrastructure.time_service import time_service
 from event.type import CancelRequest, OrderRequest, TIF_GTX
-from .constants import *
+from .constants import (
+    EP_ACCOUNT,
+    EP_ALL_OPEN_ORDERS,
+    EP_ALL_ORDERS,
+    EP_COUNTDOWN_CANCEL_ALL,
+    EP_DEPTH_SNAPSHOT,
+    EP_INCOME,
+    EP_LEVERAGE,
+    EP_LISTEN_KEY,
+    EP_MARGIN_TYPE,
+    EP_OPEN_ORDERS,
+    EP_ORDER,
+    EP_POSITION_MODE,
+    EP_POSITION_RISK,
+    EP_TIME,
+    EP_USER_TRADES,
+    REST_URL_MAIN,
+    REST_URL_TEST,
+)
 
 
 class BinanceRestApi:
@@ -31,6 +49,8 @@ class BinanceRestApi:
             EP_OPEN_ORDERS: 1.00,
             EP_ALL_ORDERS: 1.00,
             EP_USER_TRADES: 0.50,
+            EP_INCOME: 2.00,
+            EP_COUNTDOWN_CANCEL_ALL: 1.00,
             EP_ORDER: 0.10,
             EP_ALL_OPEN_ORDERS: 0.30,
             EP_LEVERAGE: 0.30,
@@ -180,6 +200,11 @@ class BinanceRestApi:
         if req.reduce_only:
             params["reduceOnly"] = "true"
 
+        if req.self_trade_prevention_mode:
+            params["selfTradePreventionMode"] = (
+                req.self_trade_prevention_mode
+            )
+
         if client_oid:
             params["newClientOrderId"] = client_oid
 
@@ -199,6 +224,18 @@ class BinanceRestApi:
 
     def cancel_all_orders(self, symbol):
         return self.request("DELETE", EP_ALL_OPEN_ORDERS, {"symbol": symbol}, signed=True)
+
+    def set_countdown_cancel_all(self, symbol, countdown_time_ms):
+        params = {
+            "symbol": str(symbol or "").upper(),
+            "countdownTime": max(0, int(countdown_time_ms)),
+        }
+        return self.request(
+            "POST",
+            EP_COUNTDOWN_CANCEL_ALL,
+            params,
+            signed=True,
+        )
 
     def create_listen_key(self):
         resp = self.request("POST", EP_LISTEN_KEY, signed=True)
@@ -235,6 +272,9 @@ class BinanceRestApi:
 
     def get_account(self):
         return self.request("GET", EP_ACCOUNT, signed=True)
+
+    def get_server_time(self):
+        return self.request("GET", EP_TIME, signed=False)
 
     def get_positions(self):
         return self.request("GET", EP_POSITION_RISK, signed=True)
@@ -284,3 +324,17 @@ class BinanceRestApi:
             if end_time is not None:
                 params["endTime"] = int(end_time)
         return self.request("GET", EP_USER_TRADES, params, signed=True)
+
+    def get_income_history(self, **kwargs):
+        params = dict(kwargs or {})
+        if "start_time" in params:
+            params["startTime"] = int(params.pop("start_time"))
+        if "end_time" in params:
+            params["endTime"] = int(params.pop("end_time"))
+        if "income_type" in params:
+            params["incomeType"] = str(params.pop("income_type"))
+        if "limit" in params:
+            params["limit"] = int(params["limit"])
+        if "page" in params:
+            params["page"] = int(params["page"])
+        return self.request("GET", EP_INCOME, params, signed=True)
