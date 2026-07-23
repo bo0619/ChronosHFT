@@ -28,8 +28,9 @@ class VenueSupervisor:
 
         self.active = False
         self.thread = None
-        self.attempts_by_venue = {}
-        self.last_attempt_ts_by_venue = {}
+        self.attempts_by_recovery = {}
+        self.last_attempt_ts_by_recovery = {}
+        self._stop_event = threading.Event()
 
         if start_thread and self.poll_interval_sec > 0:
             self.start()
@@ -38,15 +39,27 @@ class VenueSupervisor:
         if self.active or self.poll_interval_sec <= 0:
             return
         self.active = True
+        self._stop_event.clear()
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
     def stop(self):
         self.active = False
+        self._stop_event.set()
+        thread = self.thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=max(1.0, self.poll_interval_sec + 0.5))
+        stopped = not thread or not thread.is_alive()
+        if not stopped:
+            logger.critical(
+                "[VenueSupervisor] Recovery worker did not stop before timeout"
+            )
+        return stopped
 
     def _loop(self):
         while self.active:
-            time.sleep(self.poll_interval_sec)
+            if self._stop_event.wait(self.poll_interval_sec):
+                break
             try:
                 self.poll_once()
             except Exception as exc:
@@ -54,25 +67,86 @@ class VenueSupervisor:
 
     def poll_once(self):
         venue = getattr(self.gateway, "gateway_name", "UNKNOWN")
-        reason = self.oms.get_venue_freeze_reason(venue)
-        if not reason or not reason.startswith(self.recoverable_prefixes):
-            self.attempts_by_venue.pop(venue, None)
-            self.last_attempt_ts_by_venue.pop(venue, None)
-            return False
+        get_owners = getattr(self.oms, "get_venue_freeze_owners", None)
+        owners = get_owners(venue) if callable(get_owners) else {}
+        candidates = [
+            (
+                str(owner or ""),
+                int((record or {}).get("epoch", 0) or 0),
+                str((record or {}).get("reason", "") or ""),
+            )
+            for owner, record in (owners or {}).items()
+            if str((record or {}).get("reason", "") or "").startswith(
+                self.recoverable_prefixes
+            )
+        ]
+        context = None
+        if candidates:
+            owner, epoch, reason = max(
+                candidates,
+                key=lambda item: (item[1], item[0]),
+            )
+            context = {
+                "venue": str(venue or "").upper(),
+                "owner": owner,
+                "epoch": epoch,
+                "reason": reason,
+            }
+            recovery_key = (context["venue"], owner, epoch)
+        else:
+            # Compatibility for simple adapters without owner-aware guards.
+            reason = self.oms.get_venue_freeze_reason(venue)
+            if not reason or not reason.startswith(self.recoverable_prefixes):
+                stale_keys = [
+                    key
+                    for key in self.attempts_by_recovery
+                    if key[0] == str(venue or "").upper()
+                ]
+                for key in stale_keys:
+                    self.attempts_by_recovery.pop(key, None)
+                    self.last_attempt_ts_by_recovery.pop(key, None)
+                return False
+            recovery_key = (
+                str(venue or "").upper(),
+                "legacy",
+                str(reason),
+            )
 
-        attempts = self.attempts_by_venue.get(venue, 0)
-        last_attempt_ts = self.last_attempt_ts_by_venue.get(venue, 0.0)
-        now = time.monotonic()
+        stale_keys = [
+            key
+            for key in self.attempts_by_recovery
+            if key[0] == str(venue or "").upper() and key != recovery_key
+        ]
+        for key in stale_keys:
+            self.attempts_by_recovery.pop(key, None)
+            self.last_attempt_ts_by_recovery.pop(key, None)
+
+        attempts = self.attempts_by_recovery.get(recovery_key, 0)
+        last_attempt_ts = self.last_attempt_ts_by_recovery.get(
+            recovery_key,
+            0.0,
+        )
+        now = time.perf_counter()
         if attempts >= self.max_attempts:
-            logger.error(f"[VenueSupervisor] Recovery budget exhausted for {venue}: {reason}")
+            logger.error(
+                f"[VenueSupervisor] Recovery budget exhausted for {venue}: "
+                f"{reason}"
+            )
             return False
         if now - last_attempt_ts < self.recovery_delay_sec:
             return False
 
-        self.attempts_by_venue[venue] = attempts + 1
-        self.last_attempt_ts_by_venue[venue] = now
+        self.attempts_by_recovery[recovery_key] = attempts + 1
+        self.last_attempt_ts_by_recovery[recovery_key] = now
         logger.warning(
             f"[VenueSupervisor] Recovering {venue} "
-            f"({self.attempts_by_venue[venue]}/{self.max_attempts}) because {reason}"
+            f"({self.attempts_by_recovery[recovery_key]}/{self.max_attempts}) "
+            f"because {reason}"
         )
-        return bool(self.gateway.recover_connectivity())
+        if context is None:
+            return bool(self.gateway.recover_connectivity())
+        return bool(
+            self.gateway.recover_connectivity(
+                recovery_context=context,
+            )
+        )

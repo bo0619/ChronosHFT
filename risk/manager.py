@@ -17,6 +17,7 @@ from event.type import (
     EVENT_ORDER_UPDATE,
 )
 from infrastructure.logger import logger
+from infrastructure.time_service import time_service
 from oms.journal import JournalError
 
 
@@ -163,12 +164,18 @@ class RiskManager:
         self.kill_state = "ARMED"
         self.latency_breach_count = 0
         self.processing_lag_breach_count = 0
+        self.last_market_latency_ms = 0.0
+        self.last_processing_lag_ms = 0.0
+        self.last_gateway_dispatch_lag_ms = 0.0
         self.latency_breach_by_symbol = defaultdict(int)
         self.latency_recovery_by_symbol = defaultdict(int)
         self.divergence_breach_by_symbol = defaultdict(int)
         self.divergence_recovery_by_symbol = defaultdict(int)
         self.frozen_symbols = {}
+        self.symbol_freeze_epochs = {}
+        self.symbol_freeze_owners = {}
         self.frozen_venues = {}
+        self.venue_freeze_epochs = {}
         self.venue_recovery_by_venue = defaultdict(int)
         self.processing_mode_recovery_by_venue = defaultdict(int)
         self.symbol_freeze_recovery_updates = max(
@@ -287,13 +294,50 @@ class RiskManager:
                 else None
             ),
             "frozen_symbols": dict(self.frozen_symbols),
+            "frozen_symbol_epochs": dict(self.symbol_freeze_epochs),
+            "frozen_symbol_owners": {
+                symbol: {
+                    owner: dict(record)
+                    for owner, record in owners.items()
+                }
+                for symbol, owners in self.symbol_freeze_owners.items()
+            },
             "frozen_venues": dict(self.frozen_venues),
+            "frozen_venue_epochs": dict(self.venue_freeze_epochs),
+            "market_latency_ms": self.last_market_latency_ms,
+            "processing_lag_ms": self.last_processing_lag_ms,
+            "gateway_dispatch_lag_ms": self.last_gateway_dispatch_lag_ms,
+            "exchange_clock_offset_ms": float(
+                getattr(time_service, "offset", 0.0) or 0.0
+            ),
         }
 
     def _renew_venue_dead_man_switch(self) -> bool:
         if self.oms is None:
             return True
-        renew = getattr(self.oms, "renew_venue_dead_man_switch", None)
+        oms_state = str(
+            getattr(getattr(self.oms, "state", None), "value", "") or ""
+        ).upper()
+        has_guards = any(
+            bool(getattr(self.oms, name, {}))
+            for name in (
+                "symbol_guards",
+                "venue_guards",
+                "strategy_guards",
+                "strategy_symbol_guards",
+            )
+        )
+        if oms_state in {"BOOTSTRAP", "FROZEN", "RECONCILING", "HALTED"} or has_guards:
+            # Do not extend exchange-side order lifetimes while local execution
+            # is guarded. The DMS countdown is the fallback if mass cancel fails.
+            return True
+        renew = getattr(
+            self.oms,
+            "request_venue_dead_man_switch_renewal",
+            None,
+        )
+        if not callable(renew):
+            renew = getattr(self.oms, "renew_venue_dead_man_switch", None)
         if not callable(renew):
             return True
         return bool(renew())
@@ -504,10 +548,34 @@ class RiskManager:
         symbol = getattr(orderbook, "symbol", "").upper()
         venue = self._current_venue()
         now = time.time()
+        now_monotonic = time.perf_counter()
         exchange_ts = float(getattr(orderbook, "exchange_timestamp", 0.0) or 0.0)
         received_ts = float(getattr(orderbook, "received_timestamp", 0.0) or 0.0)
-        processing_lag_ms = max(0.0, (now - received_ts) * 1000.0) if received_ts else 0.0
-        if processing_lag_ms > self.max_processing_lag_ms:
+        corrected_received_ts = float(
+            getattr(orderbook, "corrected_received_timestamp", 0.0) or 0.0
+        )
+        received_monotonic = float(
+            getattr(orderbook, "received_monotonic", 0.0) or 0.0
+        )
+        dispatch_monotonic = float(
+            getattr(orderbook, "dispatch_monotonic", 0.0) or 0.0
+        )
+        if received_monotonic:
+            processing_lag_ms = (now_monotonic - received_monotonic) * 1000.0
+        elif received_ts:
+            # Backward compatibility for synthetic and persisted events that
+            # predate the monotonic ingress timestamp.
+            processing_lag_ms = (now - received_ts) * 1000.0
+        else:
+            processing_lag_ms = 0.0
+        self.last_processing_lag_ms = processing_lag_ms
+        self.last_gateway_dispatch_lag_ms = (
+            (dispatch_monotonic - received_monotonic) * 1000.0
+            if dispatch_monotonic and received_monotonic
+            else 0.0
+        )
+        processing_lag_for_limit = abs(processing_lag_ms)
+        if processing_lag_for_limit > self.max_processing_lag_ms:
             self.processing_lag_breach_count += 1
             self.venue_recovery_by_venue[venue] = 0
             self.processing_mode_recovery_by_venue[venue] = 0
@@ -542,15 +610,34 @@ class RiskManager:
             self.processing_mode_recovery_by_venue[venue] = 0
         self._recover_venue_if_stable(venue, prefix="processing_lag:")
 
-        if exchange_ts and received_ts:
-            latency_ms = max(0.0, (received_ts - exchange_ts) * 1000.0)
-        elif exchange_ts:
-            latency_ms = max(0.0, (now - exchange_ts) * 1000.0)
-        elif received_ts:
-            latency_ms = max(0.0, (now - received_ts) * 1000.0)
+        event_clock_offset_ms = getattr(orderbook, "clock_offset_ms", None)
+        if event_clock_offset_ms is None:
+            clock_offset_sec = (
+                float(getattr(time_service, "offset", 0.0) or 0.0)
+                / 1000.0
+            )
+            # Legacy and synthetic events do not carry an offset snapshot;
+            # their default corrected timestamp is therefore not authoritative.
+            corrected_received_ts = 0.0
         else:
-            latency_ms = max(0.0, (now - orderbook.datetime.timestamp()) * 1000.0)
-        if latency_ms > self.max_latency_ms:
+            clock_offset_sec = float(event_clock_offset_ms) / 1000.0
+        if exchange_ts and received_ts:
+            corrected_received_ts = corrected_received_ts or (
+                received_ts + clock_offset_sec
+            )
+            latency_ms = (corrected_received_ts - exchange_ts) * 1000.0
+        elif exchange_ts:
+            latency_ms = (now + clock_offset_sec - exchange_ts) * 1000.0
+        elif received_ts:
+            latency_ms = (now - received_ts) * 1000.0
+        else:
+            latency_ms = (now - orderbook.datetime.timestamp()) * 1000.0
+        self.last_market_latency_ms = latency_ms
+        # Negative exchange latency is a clock-domain anomaly, not zero
+        # latency. Preserve its sign for telemetry and use its magnitude for
+        # the circuit-breaker threshold so clock skew cannot be hidden.
+        latency_for_limit = abs(latency_ms)
+        if latency_for_limit > self.max_latency_ms:
             self.latency_breach_count += 1
             if symbol:
                 self.latency_breach_by_symbol[symbol] += 1
@@ -756,7 +843,7 @@ class RiskManager:
         if not self.market_freshness_enabled:
             self._publish_risk_control_heartbeat("risk_live_loop")
             return True
-        now = time.time() if now is None else float(now)
+        now = time.perf_counter() if now is None else float(now)
         if now - self._last_freshness_poll_at < self.freshness_poll_interval_sec:
             self._publish_risk_control_heartbeat("risk_live_loop")
             return True
@@ -778,19 +865,21 @@ class RiskManager:
                 continue
 
             self.freshness_breach_by_symbol[symbol] = 0
-            frozen_reason = self.frozen_symbols.get(symbol, "")
+            frozen_reason = self._owned_symbol_reason(
+                symbol,
+                prefix="stale_market_data:",
+            )
             if not frozen_reason.startswith("stale_market_data:"):
                 continue
             self.freshness_recovery_by_symbol[symbol] += 1
             if self.freshness_recovery_by_symbol[symbol] < self.freshness_recovery_checks:
                 continue
-            self.frozen_symbols.pop(symbol, None)
-            self.freshness_recovery_by_symbol[symbol] = 0
-            if self.oms and hasattr(self.oms, "clear_symbol_freeze"):
-                self.oms.clear_symbol_freeze(
-                    symbol,
-                    reason="market data freshness recovered",
-                )
+            if self._clear_owned_symbol_freeze(
+                symbol,
+                frozen_reason,
+                "market data freshness recovered",
+            ):
+                self.freshness_recovery_by_symbol[symbol] = 0
         self._publish_risk_control_heartbeat("risk_live_loop")
         return True
 
@@ -813,6 +902,11 @@ class RiskManager:
         book_age_ms = snapshot.get("book_age_ms")
         if self.require_book and (bid <= 0 or ask <= 0):
             return "stale_market_data:book_unavailable"
+        if bid > 0 and ask > 0 and bid >= ask:
+            return (
+                "stale_market_data:book_crossed="
+                f"bid={bid:.12g},ask={ask:.12g}"
+            )
         if (bid > 0 or ask > 0) and book_age_ms is None:
             return "stale_market_data:book_timestamp_missing"
         if (
@@ -884,10 +978,10 @@ class RiskManager:
             self._kill_supervisor_thread.start()
 
     def _supervise_kill_switch(self):
-        deadline = time.monotonic() + self.kill_verify_timeout_sec
-        next_flatten_at = time.monotonic() + self.kill_flatten_retry_sec
-        while self.kill_switch_triggered and time.monotonic() < deadline:
-            now = time.monotonic()
+        deadline = time.perf_counter() + self.kill_verify_timeout_sec
+        next_flatten_at = time.perf_counter() + self.kill_flatten_retry_sec
+        while self.kill_switch_triggered and time.perf_counter() < deadline:
+            now = time.perf_counter()
             allow_flatten = now >= next_flatten_at
             if self._verify_kill_state_once(allow_flatten=allow_flatten):
                 return
@@ -973,13 +1067,40 @@ class RiskManager:
             except Exception as exc:
                 logger.error(f"[KillSwitch] cancel retry failed for {symbol}: {exc}")
 
+    @staticmethod
+    def _risk_symbol_guard_owner(reason: str) -> str:
+        return str(reason or "").split(":", 1)[0]
+
+    def _refresh_local_symbol_guard(self, symbol: str) -> None:
+        owners = self.symbol_freeze_owners.get(symbol, {})
+        if not owners:
+            self.symbol_freeze_owners.pop(symbol, None)
+            self.frozen_symbols.pop(symbol, None)
+            self.symbol_freeze_epochs.pop(symbol, None)
+            return
+        newest = max(
+            owners.values(),
+            key=lambda record: int(record.get("epoch", 0) or 0),
+        )
+        self.frozen_symbols[symbol] = str(newest.get("reason", "") or "")
+        self.symbol_freeze_epochs[symbol] = int(newest.get("epoch", 0) or 0)
+
+    def _owned_symbol_reason(self, symbol: str, prefix: str) -> str:
+        symbol = str(symbol or "").upper()
+        owner = self._risk_symbol_guard_owner(prefix)
+        record = self.symbol_freeze_owners.get(symbol, {}).get(owner, {})
+        return str(record.get("reason", "") or "")
+
     def _freeze_symbol(self, symbol: str, reason: str):
         if not symbol:
             return
 
         symbol = symbol.upper()
-        existing_reason = self.frozen_symbols.get(symbol, "")
-        self.frozen_symbols[symbol] = reason
+        owner = self._risk_symbol_guard_owner(reason)
+        owners = self.symbol_freeze_owners.setdefault(symbol, {})
+        existing_reason = str(
+            (owners.get(owner) or {}).get("reason", "") or ""
+        )
         if existing_reason == reason:
             return
 
@@ -987,13 +1108,148 @@ class RiskManager:
         self._log_warn(f"Symbol frozen {symbol}: {reason}")
         if self.oms and hasattr(self.oms, "freeze_symbol"):
             try:
-                self.oms.freeze_symbol(symbol, reason, cancel_active_orders=True)
+                epoch = self.oms.freeze_symbol(
+                    symbol,
+                    reason,
+                    cancel_active_orders=True,
+                )
+                if epoch is None:
+                    get_owners = getattr(
+                        self.oms,
+                        "get_symbol_freeze_owners",
+                        None,
+                    )
+                    if callable(get_owners):
+                        remote_owner = (get_owners(symbol) or {}).get(owner, {})
+                        if remote_owner.get("reason") == reason:
+                            epoch = remote_owner.get("epoch")
+                if epoch is None:
+                    get_epoch = getattr(self.oms, "get_symbol_freeze_epoch", None)
+                    get_reason = getattr(self.oms, "get_symbol_freeze_reason", None)
+                    if callable(get_epoch) and (
+                        not callable(get_reason) or get_reason(symbol) == reason
+                    ):
+                        epoch = get_epoch(symbol)
             except Exception as exc:
                 logger.error(f"[Risk] oms.freeze_symbol({symbol}) failed: {exc}")
+                epoch = None
+        else:
+            epoch = max(
+                (int(record.get("epoch", 0) or 0) for record in owners.values()),
+                default=0,
+            ) + 1
+        owners[owner] = {
+            "reason": reason,
+            "epoch": int(epoch or 0),
+        }
+        self._refresh_local_symbol_guard(symbol)
         self._maybe_escalate_symbol_freeze(reason)
 
+    def _clear_owned_symbol_freeze(
+        self,
+        symbol: str,
+        expected_reason: str,
+        recovery_reason: str,
+    ) -> bool:
+        symbol = str(symbol or "").upper()
+        if not symbol:
+            return False
+        owner = self._risk_symbol_guard_owner(expected_reason)
+        owners = self.symbol_freeze_owners.setdefault(symbol, {})
+        owner_record = owners.get(owner)
+        if owner_record is None:
+            legacy_reason = self.frozen_symbols.get(symbol, "")
+            if legacy_reason == expected_reason:
+                owner_record = {
+                    "reason": expected_reason,
+                    "epoch": int(self.symbol_freeze_epochs.get(symbol, 0) or 0),
+                }
+                owners[owner] = owner_record
+        if not self.oms or not hasattr(self.oms, "clear_symbol_freeze"):
+            owners.pop(owner, None)
+            self._refresh_local_symbol_guard(symbol)
+            return True
+
+        expected_epoch = (
+            int(owner_record.get("epoch", 0) or 0)
+            if owner_record is not None
+            else None
+        )
+        get_reason = getattr(self.oms, "get_symbol_freeze_reason", None)
+        get_epoch = getattr(self.oms, "get_symbol_freeze_epoch", None)
+        get_owners = getattr(self.oms, "get_symbol_freeze_owners", None)
+        current_reason = get_reason(symbol) if callable(get_reason) else expected_reason
+        if (expected_epoch is None or expected_epoch <= 0) and callable(get_owners):
+            remote_record = (get_owners(symbol) or {}).get(owner, {})
+            if remote_record.get("reason") == expected_reason:
+                expected_epoch = int(remote_record.get("epoch", 0) or 0)
+                owners[owner] = {
+                    "reason": expected_reason,
+                    "epoch": expected_epoch,
+                }
+        if (
+            (expected_epoch is None or expected_epoch <= 0)
+            and current_reason == expected_reason
+            and callable(get_epoch)
+        ):
+            expected_epoch = int(get_epoch(symbol))
+            owners[owner] = {
+                "reason": expected_reason,
+                "epoch": expected_epoch,
+            }
+        if expected_epoch is None or expected_epoch <= 0:
+            logger.error(
+                "[Risk] Refusing unguarded symbol recovery: "
+                f"symbol={symbol} reason={expected_reason} epoch unavailable"
+            )
+            return False
+
+        try:
+            cleared = bool(
+                self.oms.clear_symbol_freeze(
+                    symbol,
+                    reason=recovery_reason,
+                    expected_epoch=int(expected_epoch),
+                    expected_reason=expected_reason,
+                )
+            )
+        except Exception as exc:
+            logger.error(f"[Risk] oms.clear_symbol_freeze({symbol}) failed: {exc}")
+            return False
+
+        if not cleared:
+            if callable(get_owners):
+                remote_record = (get_owners(symbol) or {}).get(owner)
+                if (
+                    not remote_record
+                    or remote_record.get("reason") != expected_reason
+                    or int(remote_record.get("epoch", 0) or 0)
+                    != int(expected_epoch)
+                ):
+                    owners.pop(owner, None)
+                    self._refresh_local_symbol_guard(symbol)
+                    return True
+            current_reason = get_reason(symbol) if callable(get_reason) else expected_reason
+            if current_reason and current_reason != expected_reason:
+                logger.warning(
+                    "[Risk] Symbol recovery ownership superseded; stale clear ignored: "
+                    f"symbol={symbol} expected={expected_reason} current={current_reason}"
+                )
+                owners.pop(owner, None)
+                self._refresh_local_symbol_guard(symbol)
+                return True
+            if not current_reason:
+                owners.pop(owner, None)
+                self._refresh_local_symbol_guard(symbol)
+                return True
+            return False
+
+        owners.pop(owner, None)
+        self._refresh_local_symbol_guard(symbol)
+        return True
+
     def _recover_symbol_if_stable(self, symbol: str, prefix: str):
-        frozen_reason = self.frozen_symbols.get(symbol, "")
+        frozen_reason = self._owned_symbol_reason(symbol, prefix)
         if not frozen_reason.startswith(prefix):
             return
 
@@ -1007,17 +1263,18 @@ class RiskManager:
         if stable_updates < self.symbol_freeze_recovery_updates:
             return
 
-        self.frozen_symbols.pop(symbol, None)
+        recovery_reason = (
+            f"{prefix.rstrip(':')} recovered after "
+            f"{stable_updates} healthy updates"
+        )
+        if not self._clear_owned_symbol_freeze(
+            symbol,
+            frozen_reason,
+            recovery_reason,
+        ):
+            return
         logger.info(f"[Risk] Symbol circuit breaker cleared {symbol}: {prefix}recovered")
         self._log_warn(f"Symbol restored {symbol}: {prefix}recovered")
-        if self.oms and hasattr(self.oms, "clear_symbol_freeze"):
-            try:
-                self.oms.clear_symbol_freeze(
-                    symbol,
-                    reason=f"{prefix.rstrip(':')} recovered after {stable_updates} healthy updates",
-                )
-            except Exception as exc:
-                logger.error(f"[Risk] oms.clear_symbol_freeze({symbol}) failed: {exc}")
 
         self.latency_recovery_by_symbol[symbol] = 0
         self.divergence_recovery_by_symbol[symbol] = 0
@@ -1045,8 +1302,34 @@ class RiskManager:
         self._log_warn(f"Venue frozen {venue}: {reason}")
         if self.oms and hasattr(self.oms, "freeze_venue"):
             try:
-                self.oms.freeze_venue(venue, reason, cancel_active_orders=False)
+                freeze_epoch = self.oms.freeze_venue(
+                    venue,
+                    reason,
+                    cancel_active_orders=False,
+                )
+                if freeze_epoch is None:
+                    current_reason = getattr(
+                        self.oms,
+                        "get_venue_freeze_reason",
+                        lambda *_args, **_kwargs: "",
+                    )(venue)
+                    get_epoch = getattr(
+                        self.oms,
+                        "get_venue_freeze_epoch",
+                        None,
+                    )
+                    if current_reason == reason and callable(get_epoch):
+                        freeze_epoch = get_epoch(venue)
+                if freeze_epoch is not None:
+                    self.venue_freeze_epochs[venue] = int(freeze_epoch)
+                else:
+                    self.venue_freeze_epochs.pop(venue, None)
+                    logger.error(
+                        f"[Risk] Venue freeze epoch unavailable for {venue}; "
+                        "recovery will remain fail-closed"
+                    )
             except Exception as exc:
+                self.venue_freeze_epochs.pop(venue, None)
                 logger.error(f"[Risk] oms.freeze_venue({venue}) failed: {exc}")
 
     def _recover_venue_if_stable(self, venue: str, prefix: str):
@@ -1060,18 +1343,44 @@ class RiskManager:
         if stable_updates < self.venue_freeze_recovery_updates:
             return
 
+        expected_epoch = self.venue_freeze_epochs.pop(venue, None)
         self.frozen_venues.pop(venue, None)
         self.venue_recovery_by_venue[venue] = 0
-        logger.info(f"[Risk] Venue circuit breaker cleared {venue}: {prefix}recovered")
-        self._log_warn(f"Venue restored {venue}: {prefix}recovered")
+        cleared = False
         if self.oms and hasattr(self.oms, "clear_venue_freeze"):
-            try:
-                self.oms.clear_venue_freeze(
-                    venue,
-                    reason=f"{prefix.rstrip(':')} recovered after {stable_updates} healthy updates",
+            if expected_epoch is None:
+                logger.error(
+                    f"[Risk] Refusing unguarded venue recovery for {venue}: "
+                    "freeze epoch unavailable"
                 )
-            except Exception as exc:
-                logger.error(f"[Risk] oms.clear_venue_freeze({venue}) failed: {exc}")
+            else:
+                try:
+                    cleared = bool(
+                        self.oms.clear_venue_freeze(
+                            venue,
+                            reason=(
+                                f"{prefix.rstrip(':')} recovered after "
+                                f"{stable_updates} healthy updates"
+                            ),
+                            expected_epoch=expected_epoch,
+                            expected_reason=frozen_reason,
+                        )
+                    )
+                except Exception as exc:
+                    logger.error(
+                        f"[Risk] oms.clear_venue_freeze({venue}) failed: {exc}"
+                    )
+
+        if cleared:
+            logger.info(
+                f"[Risk] Venue circuit breaker cleared {venue}: {prefix}recovered"
+            )
+            self._log_warn(f"Venue restored {venue}: {prefix}recovered")
+        else:
+            logger.warning(
+                f"[Risk] Local venue breaker recovered for {venue}, but the "
+                "OMS guard was retained or already replaced"
+            )
 
     def _set_trading_mode(self, mode: OMSCapabilityMode, reason: str):
         if self.oms and hasattr(self.oms, "set_trading_mode"):

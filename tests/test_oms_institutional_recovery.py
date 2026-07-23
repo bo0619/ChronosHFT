@@ -197,6 +197,7 @@ class InstitutionalRecoveryTests(unittest.TestCase):
             order.mark_submitting()
             order.mark_submit_unknown()
             order.updated_at = time.time() - 2.0
+            order.updated_monotonic = time.perf_counter() - 2.0
             oms.orders[order.client_oid] = order
             oms.freeze_symbol(
                 "BTCUSDT",
@@ -263,6 +264,253 @@ class InstitutionalRecoveryTests(unittest.TestCase):
         finally:
             oms.stop()
 
+    def test_cumulative_fill_gap_waits_for_exact_rest_trades(self):
+        oms, gateway = self.make_live_oms()
+        try:
+            order = self.add_active_order(oms)
+            oms.account.force_sync(1000.0, 0.0)
+            oms._schedule_trade_tail_verification = (
+                lambda *_args, **_kwargs: True
+            )
+            reconcile_requests = []
+            oms.trigger_reconcile = (
+                lambda *args, **kwargs: reconcile_requests.append(
+                    (args, kwargs)
+                )
+                or True
+            )
+            oms._advance_trade_cursor(
+                "BTCUSDT",
+                9,
+                1.0,
+                source="rest_backfill",
+            )
+            gateway.trades = [
+                {
+                    "symbol": "BTCUSDT",
+                    "id": 11,
+                    "orderId": "ex-1",
+                    "side": "BUY",
+                    "price": "101",
+                    "qty": "0.6",
+                    "realizedPnl": "0",
+                    "commission": "0.2",
+                    "commissionAsset": "USDT",
+                    "time": 2000,
+                    "maker": False,
+                },
+                {
+                    "symbol": "BTCUSDT",
+                    "id": 10,
+                    "orderId": "ex-1",
+                    "side": "BUY",
+                    "price": "100",
+                    "qty": "0.4",
+                    "realizedPnl": "0",
+                    "commission": "0.1",
+                    "commissionAsset": "USDT",
+                    "time": 3000,
+                    "maker": True,
+                },
+            ]
+
+            oms._append_and_process(
+                Event(
+                    EVENT_EXCHANGE_ORDER_UPDATE,
+                    ExchangeOrderUpdate(
+                        client_oid=order.client_oid,
+                        exchange_oid=order.exchange_oid,
+                        symbol="BTCUSDT",
+                        status="FILLED",
+                        filled_qty=0.6,
+                        filled_price=101.0,
+                        cum_filled_qty=1.0,
+                        update_time=2.0,
+                        trade_id=11,
+                        commission=0.2,
+                        commission_asset="USDT",
+                    ),
+                )
+            )
+
+            self.assertEqual(order.filled_volume, 0.0)
+            self.assertAlmostEqual(oms.account.balance, 1000.0)
+            self.assertEqual(oms.trade_cursors["BTCUSDT"], 9)
+            self.assertEqual(oms.state, LifecycleState.FROZEN)
+
+            self.assertTrue(oms._backfill_trade_history(end_time_ms=4000))
+            self.assertEqual(order.status, OrderStatus.FILLED)
+            self.assertAlmostEqual(order.avg_price, 100.6)
+            self.assertAlmostEqual(oms.exposure.net_positions["BTCUSDT"], 1.0)
+            self.assertAlmostEqual(oms.account.balance, 999.7)
+            self.assertEqual(oms.trade_cursors["BTCUSDT"], 11)
+        finally:
+            oms.stop()
+
+    def test_fill_without_trade_id_is_not_double_booked(self):
+        oms, gateway = self.make_live_oms()
+        try:
+            order = self.add_active_order(oms)
+            oms.account.force_sync(1000.0, 0.0)
+            oms._schedule_trade_tail_verification = (
+                lambda *_args, **_kwargs: True
+            )
+            oms.trigger_reconcile = lambda *_args, **_kwargs: True
+            gateway.trades = [
+                {
+                    "symbol": "BTCUSDT",
+                    "id": 10,
+                    "orderId": "ex-1",
+                    "side": "BUY",
+                    "price": "100",
+                    "qty": "0.4",
+                    "realizedPnl": "0",
+                    "commission": "0.2",
+                    "commissionAsset": "USDT",
+                    "time": 2000,
+                    "maker": True,
+                }
+            ]
+
+            oms._append_and_process(
+                Event(
+                    EVENT_EXCHANGE_ORDER_UPDATE,
+                    ExchangeOrderUpdate(
+                        client_oid=order.client_oid,
+                        exchange_oid=order.exchange_oid,
+                        symbol="BTCUSDT",
+                        status="PARTIALLY_FILLED",
+                        filled_qty=0.4,
+                        filled_price=100.0,
+                        cum_filled_qty=0.4,
+                        update_time=2.0,
+                        trade_id=-1,
+                        commission=0.2,
+                        commission_asset="USDT",
+                    ),
+                )
+            )
+            self.assertEqual(order.filled_volume, 0.0)
+            self.assertAlmostEqual(oms.account.balance, 1000.0)
+
+            self.assertTrue(oms._backfill_trade_history(end_time_ms=3000))
+            self.assertAlmostEqual(order.filled_volume, 0.4)
+            self.assertAlmostEqual(oms.exposure.net_positions["BTCUSDT"], 0.4)
+            self.assertAlmostEqual(oms.account.balance, 999.8)
+            self.assertEqual(oms.trade_cursors["BTCUSDT"], 10)
+        finally:
+            oms.stop()
+
+    def test_rest_duplicate_confirms_cursor_without_reapplying_execution(self):
+        oms, gateway = self.make_live_oms()
+        try:
+            order = self.add_active_order(oms)
+            oms._schedule_trade_tail_verification = (
+                lambda *_args, **_kwargs: True
+            )
+            update = ExchangeOrderUpdate(
+                client_oid=order.client_oid,
+                exchange_oid=order.exchange_oid,
+                symbol="BTCUSDT",
+                status="PARTIALLY_FILLED",
+                filled_qty=0.4,
+                filled_price=100.0,
+                cum_filled_qty=0.4,
+                update_time=2.0,
+                trade_id=42,
+            )
+            self.assertTrue(
+                oms._record_execution(
+                    order,
+                    update,
+                    fill_qty=0.4,
+                    fee=0.0,
+                )
+            )
+            order.add_fill(
+                0.4,
+                100.0,
+                update_time=2.0,
+                exchange_status="PARTIALLY_FILLED",
+            )
+            gateway.trades = [
+                {
+                    "symbol": "BTCUSDT",
+                    "id": 42,
+                    "orderId": "ex-1",
+                    "side": "BUY",
+                    "price": "100",
+                    "qty": "0.4",
+                    "realizedPnl": "0",
+                    "commission": "0",
+                    "commissionAsset": "USDT",
+                    "time": 2000,
+                    "maker": True,
+                }
+            ]
+
+            self.assertTrue(oms._backfill_trade_history(end_time_ms=3000))
+            self.assertAlmostEqual(order.filled_volume, 0.4)
+            self.assertEqual(oms.trade_cursors["BTCUSDT"], 42)
+        finally:
+            oms.stop()
+
+    def test_user_stream_fill_cursor_advances_only_after_rest_confirmation(self):
+        oms, gateway = self.make_live_oms()
+        try:
+            order = self.add_active_order(oms)
+            oms.account.force_sync(1000.0, 0.0)
+            oms.trade_tail_verification_delay_sec = 0.0
+            oms.trade_tail_verification_retry_sec = 0.01
+            oms.trade_tail_verification_attempts = 2
+            gateway.trades = [
+                {
+                    "symbol": "BTCUSDT",
+                    "id": 10,
+                    "orderId": "ex-1",
+                    "side": "BUY",
+                    "price": "100",
+                    "qty": "0.4",
+                    "realizedPnl": "0",
+                    "commission": "0.2",
+                    "commissionAsset": "USDT",
+                    "time": 2000,
+                    "maker": True,
+                }
+            ]
+
+            oms._append_and_process(
+                Event(
+                    EVENT_EXCHANGE_ORDER_UPDATE,
+                    ExchangeOrderUpdate(
+                        client_oid=order.client_oid,
+                        exchange_oid=order.exchange_oid,
+                        symbol="BTCUSDT",
+                        status="PARTIALLY_FILLED",
+                        filled_qty=0.4,
+                        filled_price=100.0,
+                        cum_filled_qty=0.4,
+                        update_time=2.0,
+                        trade_id=10,
+                        commission=0.2,
+                        commission_asset="USDT",
+                    ),
+                )
+            )
+            deadline = time.perf_counter() + 1.0
+            while (
+                oms.trade_cursors.get("BTCUSDT", -1) < 10
+                and time.perf_counter() < deadline
+            ):
+                time.sleep(0.005)
+
+            self.assertAlmostEqual(order.filled_volume, 0.4)
+            self.assertAlmostEqual(oms.exposure.net_positions["BTCUSDT"], 0.4)
+            self.assertAlmostEqual(oms.account.balance, 999.8)
+            self.assertEqual(oms.trade_cursors["BTCUSDT"], 10)
+        finally:
+            oms.stop()
+
     def test_cancel_timeout_remains_unknown_until_query_confirms_terminal(self):
         oms, gateway = self.make_live_oms()
         try:
@@ -295,7 +543,7 @@ class InstitutionalRecoveryTests(unittest.TestCase):
         finally:
             oms.stop()
 
-    def test_terminal_snapshot_recovers_fill_even_if_trade_endpoint_lags(self):
+    def test_terminal_snapshot_waits_for_exact_trade_history(self):
         oms, gateway = self.make_live_oms()
         try:
             order = self.add_active_order(oms)
@@ -315,15 +563,16 @@ class InstitutionalRecoveryTests(unittest.TestCase):
                 "updateTime": 3000,
             }
 
-            self.assertTrue(
+            self.assertFalse(
                 oms._apply_exchange_order_snapshot(
                     gateway.order_snapshot,
                     source="test_trade_lag",
                 )
             )
-            self.assertEqual(order.status, OrderStatus.CANCELLED)
-            self.assertAlmostEqual(order.filled_volume, 0.4)
-            self.assertAlmostEqual(oms.exposure.net_positions["BTCUSDT"], 0.4)
+            self.assertEqual(order.status, OrderStatus.NEW)
+            self.assertAlmostEqual(order.filled_volume, 0.0)
+            self.assertAlmostEqual(oms.exposure.net_positions["BTCUSDT"], 0.0)
+            self.assertEqual(oms.state, LifecycleState.FROZEN)
         finally:
             oms.stop()
 

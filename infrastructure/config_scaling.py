@@ -2,10 +2,35 @@ import json
 import os
 from copy import deepcopy
 
+from infrastructure.live_config_guard import validate_live_runtime_config
 from infrastructure.paper_trade import apply_paper_trade_mode, is_paper_trade
 
 
 QUOTE_ASSET_SUFFIXES = ("USDT", "USDC", "BUSD", "FDUSD")
+TIME_SYNC_DEFAULTS = {
+    "startup_required": True,
+    "require_healthy_for_trading": True,
+    "sample_count": 7,
+    "min_successful_samples": 4,
+    "low_rtt_sample_count": 3,
+    "sample_spacing_ms": 10.0,
+    "request_timeout_sec": 1.0,
+    "max_initial_offset_ms": 5000.0,
+    "max_phase_error_ms": 25.0,
+    "halt_phase_error_ms": 100.0,
+    "max_rtt_ms": 200.0,
+    "max_uncertainty_ms": 50.0,
+    "max_offset_dispersion_ms": 10.0,
+    "max_sync_age_sec": 30.0,
+    "max_wall_clock_step_ms": 20.0,
+    "health_poll_interval_sec": 0.1,
+    "freeze_breach_threshold": 1,
+    "halt_breach_threshold": 2,
+    "recovery_success_threshold": 2,
+    "sync_interval_sec": 10.0,
+    "unhealthy_retry_sec": 1.0,
+    "max_consecutive_failures": 2,
+}
 MARKET_DATA_FRESHNESS_DEFAULTS = {
     "enabled": True,
     "require_mark_price": True,
@@ -59,10 +84,18 @@ INDEPENDENT_RISK_SUPERVISOR_DEFAULTS = {
     "cash_flow_assets": ["USDT", "USDC", "BUSD", "FDUSD"],
     "cash_flow_max_pages": 5,
     "clock_sync_enabled": True,
-    "clock_sync_interval_sec": 30.0,
-    "clock_reduce_only_offset_ms": 250.0,
-    "clock_kill_offset_ms": 1000.0,
-    "clock_max_rtt_ms": 1500.0,
+    "clock_sync_interval_sec": 10.0,
+    "clock_sample_count": 5,
+    "clock_min_successful_samples": 3,
+    "clock_low_rtt_sample_count": 3,
+    "clock_sample_spacing_ms": 10.0,
+    "clock_max_initial_offset_ms": 5000.0,
+    "clock_reduce_only_phase_error_ms": 25.0,
+    "clock_kill_phase_error_ms": 100.0,
+    "clock_max_rtt_ms": 200.0,
+    "clock_max_uncertainty_ms": 50.0,
+    "clock_max_offset_dispersion_ms": 10.0,
+    "clock_max_wall_step_ms": 20.0,
     "liquidation_proximity_enabled": True,
     "require_liquidation_price": True,
     "liquidation_reduce_only_distance_pct": 0.05,
@@ -261,7 +294,6 @@ def apply_capital_scaling(config: dict) -> dict:
         1.0,
         _to_float(scaling.get("notional_buffer", 1.1), 1.1),
     )
-    leverage = max(1.0, _to_float(account.get("leverage", 1.0), 1.0))
     quote_assets = _tracked_quote_assets(symbols)
     budget_weights = scaling.get("budget_asset_weights")
     if not isinstance(budget_weights, dict):
@@ -277,7 +309,7 @@ def apply_capital_scaling(config: dict) -> dict:
     derived_daily_loss = target_daily_loss * capital_multiplier
     derived_max_order_qty = max_order_qty * max(1.0, capital_multiplier)
     derived_lot_multiplier = derived_order_notional / (
-        reference_min_notional * notional_buffer * leverage
+        reference_min_notional * notional_buffer
     )
     derived_budget_by_asset = _derive_budget_by_asset(
         derived_capital,
@@ -294,6 +326,9 @@ def apply_capital_scaling(config: dict) -> dict:
         if value > 0.0
     }
     backtest["initial_capital"] = round(derived_capital, 8)
+    if is_paper_trade(scaled):
+        paper_trade = scaled.setdefault("paper_trade", {})
+        paper_trade["initial_balance_usdt"] = round(derived_capital, 8)
     limits["max_order_notional"] = round(
         derived_order_notional * order_notional_limit_factor,
         8,
@@ -302,7 +337,9 @@ def apply_capital_scaling(config: dict) -> dict:
     limits["max_account_gross_notional"] = round(derived_total_risk_notional, 8)
     limits["max_daily_loss"] = round(derived_daily_loss, 8)
     limits["max_order_qty"] = round(derived_max_order_qty, 8)
+    limits["max_concurrent_symbols"] = active_symbol_slots
     strategy["lot_multiplier"] = round(max(0.01, derived_lot_multiplier), 8)
+    strategy["target_order_notional"] = round(derived_order_notional, 8)
     strategy["max_pos_usdt"] = round(derived_symbol_cap, 8)
 
     return scaled
@@ -313,6 +350,21 @@ def apply_production_safety_defaults(config: dict) -> dict:
         return {}
 
     configured = deepcopy(config)
+    system = configured.get("system")
+    if not isinstance(system, dict):
+        system = {}
+        configured["system"] = system
+    time_sync = system.get("time_sync")
+    if not isinstance(time_sync, dict):
+        time_sync = {}
+        system["time_sync"] = time_sync
+    if "max_phase_error_ms" not in time_sync and "max_offset_ms" in time_sync:
+        time_sync["max_phase_error_ms"] = time_sync["max_offset_ms"]
+    if "halt_phase_error_ms" not in time_sync and "halt_offset_ms" in time_sync:
+        time_sync["halt_phase_error_ms"] = time_sync["halt_offset_ms"]
+    for key, value in TIME_SYNC_DEFAULTS.items():
+        time_sync.setdefault(key, value)
+
     oms = configured.get("oms")
     if not isinstance(oms, dict):
         oms = {}
@@ -392,6 +444,21 @@ def apply_production_safety_defaults(config: dict) -> dict:
     if not isinstance(independent_supervisor, dict):
         independent_supervisor = {}
         risk["independent_supervisor"] = independent_supervisor
+
+    if (
+        "clock_reduce_only_phase_error_ms" not in independent_supervisor
+        and "clock_reduce_only_offset_ms" in independent_supervisor
+    ):
+        independent_supervisor["clock_reduce_only_phase_error_ms"] = (
+            independent_supervisor["clock_reduce_only_offset_ms"]
+        )
+    if (
+        "clock_kill_phase_error_ms" not in independent_supervisor
+        and "clock_kill_offset_ms" in independent_supervisor
+    ):
+        independent_supervisor["clock_kill_phase_error_ms"] = (
+            independent_supervisor["clock_kill_offset_ms"]
+        )
 
     for key, value in INDEPENDENT_RISK_SUPERVISOR_DEFAULTS.items():
         independent_supervisor.setdefault(key, value)
@@ -474,7 +541,7 @@ def normalize_strategy_registration(config: dict) -> dict:
 
     primary_value = strategy.get("primary_model")
     if primary_value is None:
-        primary_value = strategy.get("name", "ml_sniper")
+        primary_value = strategy.get("name", "glft")
     primary_model = canonical_model_key(primary_value)
     strategy["primary_model"] = primary_model
 
@@ -555,4 +622,4 @@ def load_root_config(path: str = "config.json") -> dict:
     configured = resolve_runtime_secrets(configured)
     if is_paper_trade(configured):
         configured = apply_paper_trade_mode(configured)
-    return configured
+    return validate_live_runtime_config(configured)

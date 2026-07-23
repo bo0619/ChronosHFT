@@ -20,6 +20,11 @@ from data.ref_data import ref_data_manager
 from data.cache import data_cache
 from infrastructure.config_scaling import load_root_config
 
+
+def _negative_infinity():
+    return -math.inf
+
+
 class GLFTStrategy(StrategyTemplate):
     def __init__(self, engine, oms, strategy_config=None):
         super().__init__(engine, oms, "GLFT_MultiScale")
@@ -45,7 +50,7 @@ class GLFTStrategy(StrategyTemplate):
 
         # 基础参数
         self.gamma_base = self.strat_conf.get("gamma", 0.1)
-        self.lot_multiplier = self.strat_conf.get("lot_multiplier", 1.0)
+        self.configure_quote_sizing(self.strat_conf)
         self.cycle_interval = self.strat_conf.get("cycle_interval", 1.0)
         self.min_spread_bps = self.strat_conf.get("execution", {}).get("min_spread_bps", 5.0)
 
@@ -56,14 +61,16 @@ class GLFTStrategy(StrategyTemplate):
         # ========= 成交强度与防御 =========
         self.trade_timestamps = defaultdict(deque)
         
-        # [修复] 初始化 last_fill_time
-        self.last_fill_time = defaultdict(float) 
+        # Durations use a monotonic clock.  Negative infinity keeps the
+        # post-fill defense inactive until a real fill has been observed.
+        self.last_fill_time = defaultdict(_negative_infinity)
 
         # ========= 执行状态 =========
         self.quote_state = defaultdict(lambda: {
             "bid_oid": None, "ask_oid": None,
             "bid_price": None, "ask_price": None,
-            "last_update": 0.0
+            "bid_volume": None, "ask_volume": None,
+            "last_update": float("-inf")
         })
         self.cooldown_ms = 200
 
@@ -72,7 +79,7 @@ class GLFTStrategy(StrategyTemplate):
         self.calibrators = {}
         self.models = {}
         self.gates = {}
-        self.last_run_times = defaultdict(float)
+        self.last_run_times = defaultdict(_negative_infinity)
         
         # 信号权重配置
         self.alpha_weights = {
@@ -93,14 +100,22 @@ class GLFTStrategy(StrategyTemplate):
             self.gates[symbol] = AlphaGate(max_bps=10.0, decay_factor=0.9, inventory_dampening=0.05)
         return self.calibrators[symbol], self.models[symbol], self.gates[symbol]
 
-    def _calculate_safe_vol(self, symbol, price):
-        info = ref_data_manager.get_info(symbol)
-        if not info:
-            return 0.0
-        min_vol_by_val = (info.min_notional * 1.1) / price
-        base_vol = max(info.min_qty, min_vol_by_val)
-        target_vol = base_vol * self.lot_multiplier
-        return ref_data_manager.round_qty(symbol, target_vol)
+    def _calculate_safe_vol(
+        self,
+        symbol,
+        price,
+        *,
+        side=None,
+        current_position=0.0,
+        reference_price=None,
+    ):
+        return self.calculate_quote_volume(
+            symbol,
+            price,
+            side=side,
+            current_position=current_position,
+            reference_price=reference_price,
+        )
 
     # ============================================================
     # 核心 Tick 逻辑
@@ -115,7 +130,7 @@ class GLFTStrategy(StrategyTemplate):
         self.feature_engine.on_orderbook(ob)
 
         # 2. 频率控制
-        now = time.time()
+        now = time.perf_counter()
         if now - self.last_run_times[symbol] < self.cycle_interval:
             return
         self.last_run_times[symbol] = now
@@ -138,7 +153,13 @@ class GLFTStrategy(StrategyTemplate):
         mid_signal_strength = abs(alphas["mid"])
         
         target_pos_usdt = alphas["long"] * self.alpha_weights["long_pos_weight"]
-        target_pos_usdt = max(-2000, min(2000, target_pos_usdt))
+        target_position_limit = (
+            self.max_pos_usdt if self.max_pos_usdt > 0.0 else 2000.0
+        )
+        target_pos_usdt = max(
+            -target_position_limit,
+            min(target_position_limit, target_pos_usdt),
+        )
 
         # 6. GLFT 参数准备
         acc = self.oms.account
@@ -218,6 +239,21 @@ class GLFTStrategy(StrategyTemplate):
             target_bid = mid - tick
             target_ask = mid + tick
 
+        bid_order_vol = self._calculate_safe_vol(
+            symbol,
+            target_bid,
+            side=Side.BUY,
+            current_position=current_pos,
+            reference_price=mid,
+        )
+        ask_order_vol = self._calculate_safe_vol(
+            symbol,
+            target_ask,
+            side=Side.SELL,
+            current_position=current_pos,
+            reference_price=mid,
+        )
+
         # 10. 执行更新 (增量改单)
         self._update_quotes(
             symbol,
@@ -225,6 +261,8 @@ class GLFTStrategy(StrategyTemplate):
             target_ask,
             order_vol,
             time_in_force=passive_tif,
+            bid_volume=bid_order_vol,
+            ask_volume=ask_order_vol,
         )
 
         # 11. 状态广播
@@ -257,7 +295,11 @@ class GLFTStrategy(StrategyTemplate):
             "target_bid": target_bid,
             "target_ask": target_ask,
             "quote_spread_bps": quote_spread_bps,
-            "quote_qty": order_vol,
+            "quote_qty": max(bid_order_vol, ask_order_vol),
+            "bid_quote_qty": bid_order_vol,
+            "ask_quote_qty": ask_order_vol,
+            "target_order_notional": self.target_order_notional,
+            "max_position_notional": self.max_pos_usdt,
             "bid_order_id": quote_state["bid_oid"] or "",
             "ask_order_id": quote_state["ask_oid"] or "",
             "gamma_base": float(self.gamma_base),
@@ -293,7 +335,7 @@ class GLFTStrategy(StrategyTemplate):
             "Mode": passive_tif,
             "Spread": f"{quote_spread_bps:.1f}",
             "Sigma": f"{sigma:.1f}",
-            "Size": f"{order_vol:.8g}",
+            "Size": f"{max(bid_order_vol, ask_order_vol):.8g}",
         }
         strat_data = StrategyData(
             symbol=symbol,
@@ -311,23 +353,48 @@ class GLFTStrategy(StrategyTemplate):
         ask,
         volume,
         time_in_force=None,
+        bid_volume=None,
+        ask_volume=None,
     ):
         state = self.quote_state[symbol]
         info = ref_data_manager.get_info(symbol)
         tick = info.tick_size
-        now = time.time()
+        now = time.perf_counter()
         time_in_force = time_in_force or self.resolve_passive_time_in_force(
             symbol,
             use_rpi=self.use_rpi,
             fallback_to_gtx=self.rpi_fallback_to_gtx,
             route="glft_quote",
         )
+        bid_volume = max(
+            0.0,
+            float(volume if bid_volume is None else bid_volume),
+        )
+        ask_volume = max(
+            0.0,
+            float(volume if ask_volume is None else ask_volume),
+        )
+        qty_step = max(float(info.step_size or 0.0), 1e-12)
         
         if (now - state["last_update"]) * 1000 < self.cooldown_ms:
             return
 
         # Buy Side
-        if state["bid_price"] is None or abs(bid - state["bid_price"]) >= tick:
+        bid_price_changed = (
+            state["bid_price"] is None
+            or abs(bid - state["bid_price"]) >= tick
+        )
+        bid_volume_changed = (
+            state.get("bid_volume") is None
+            or abs(bid_volume - state["bid_volume"]) >= qty_step
+        )
+        if bid_volume <= 0.0:
+            if state["bid_oid"]:
+                self.cancel_order(state["bid_oid"])
+            else:
+                state["bid_price"] = None
+                state["bid_volume"] = None
+        elif bid_price_changed or bid_volume_changed:
             if state["bid_oid"]:
                 self.cancel_order(state["bid_oid"])
             else:
@@ -337,7 +404,7 @@ class GLFTStrategy(StrategyTemplate):
                         symbol,
                         Side.BUY,
                         bid,
-                        volume,
+                        bid_volume,
                         time_in_force=time_in_force,
                         is_post_only=True,
                     )
@@ -345,9 +412,24 @@ class GLFTStrategy(StrategyTemplate):
                 if oid:
                     state["bid_oid"] = oid
                     state["bid_price"] = bid
+                    state["bid_volume"] = bid_volume
         
         # Sell Side
-        if state["ask_price"] is None or abs(ask - state["ask_price"]) >= tick:
+        ask_price_changed = (
+            state["ask_price"] is None
+            or abs(ask - state["ask_price"]) >= tick
+        )
+        ask_volume_changed = (
+            state.get("ask_volume") is None
+            or abs(ask_volume - state["ask_volume"]) >= qty_step
+        )
+        if ask_volume <= 0.0:
+            if state["ask_oid"]:
+                self.cancel_order(state["ask_oid"])
+            else:
+                state["ask_price"] = None
+                state["ask_volume"] = None
+        elif ask_price_changed or ask_volume_changed:
             if state["ask_oid"]:
                 self.cancel_order(state["ask_oid"])
             else:
@@ -357,7 +439,7 @@ class GLFTStrategy(StrategyTemplate):
                         symbol,
                         Side.SELL,
                         ask,
-                        volume,
+                        ask_volume,
                         time_in_force=time_in_force,
                         is_post_only=True,
                     )
@@ -365,12 +447,13 @@ class GLFTStrategy(StrategyTemplate):
                 if oid:
                     state["ask_oid"] = oid
                     state["ask_price"] = ask
+                    state["ask_volume"] = ask_volume
                 
         state["last_update"] = now
 
     def on_market_trade(self, trade: AggTradeData):
         self.feature_engine.on_trade(trade)
-        now = time.time()
+        now = time.perf_counter()
         self.trade_timestamps[trade.symbol].append(now)
         
         sign = -1 if trade.maker_is_buyer else 1
@@ -397,10 +480,12 @@ class GLFTStrategy(StrategyTemplate):
             if state["bid_oid"] == snapshot.client_oid:
                 state["bid_oid"] = None
                 state["bid_price"] = None
+                state["bid_volume"] = None
             if state["ask_oid"] == snapshot.client_oid:
                 state["ask_oid"] = None
                 state["ask_price"] = None
+                state["ask_volume"] = None
 
     def on_trade(self, trade: TradeData):
         # [修复] 记录成交时间
-        self.last_fill_time[trade.symbol] = time.time()
+        self.last_fill_time[trade.symbol] = time.perf_counter()

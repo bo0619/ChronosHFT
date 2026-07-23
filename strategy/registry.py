@@ -21,11 +21,6 @@ class StrategyRegistration:
 
 _REGISTRATIONS = (
     StrategyRegistration(
-        model_key="ml_sniper",
-        strategy_id="ML_Sniper",
-        aliases=("ML_Sniper",),
-    ),
-    StrategyRegistration(
         model_key="glft",
         strategy_id="GLFT_MultiScale",
         aliases=("GLFT", "GLFT_MultiScale"),
@@ -165,8 +160,6 @@ def _merged_model_config(
         merged["glft"] = deepcopy(model_config)
     elif model_key == "avellaneda_stoikov":
         merged["as_parameters"] = deepcopy(model_config)
-    elif model_key == "ml_sniper":
-        merged["ml_sniper"] = deepcopy(model_config)
     return merged
 
 
@@ -191,23 +184,10 @@ def _primary_model_key(
     return primary_model
 
 
-def _runtime_alpha_process_config(config: Mapping[str, Any]) -> dict[str, Any]:
-    system_config = config.get("system", {}) if isinstance(config, Mapping) else {}
-    if not isinstance(system_config, Mapping):
-        return {}
-    runtime_config = system_config.get("strategy_runtime", {})
-    if not isinstance(runtime_config, Mapping):
-        return {}
-    alpha_config = runtime_config.get("alpha_process", {})
-    return deepcopy(dict(alpha_config)) if isinstance(alpha_config, Mapping) else {}
-
-
 def create_primary_strategy(
     engine: Any,
     oms: Any,
     config: Mapping[str, Any],
-    *,
-    alpha_process_config: Mapping[str, Any] | None = None,
 ) -> Any:
     """Validate registrations and construct the sole primary strategy."""
     strategy_config = _strategy_config(config)
@@ -224,22 +204,7 @@ def create_primary_strategy(
     primary_model = _primary_model_key(strategy_config, registered_models)
     merged_config = _merged_model_config(strategy_config, primary_model)
 
-    if primary_model == "ml_sniper":
-        from strategy.ml_sniper.ml_sniper import MLSniperStrategy
-
-        if alpha_process_config is None:
-            configured_alpha = merged_config.get("alpha_process_config")
-            if isinstance(configured_alpha, Mapping):
-                alpha_process_config = configured_alpha
-            else:
-                alpha_process_config = _runtime_alpha_process_config(config)
-        strategy = MLSniperStrategy(
-            engine,
-            oms,
-            alpha_process_config=dict(alpha_process_config or {}),
-            strategy_config=merged_config,
-        )
-    elif primary_model == "glft":
+    if primary_model == "glft":
         from strategy.glft import GLFTStrategy
 
         strategy = GLFTStrategy(engine, oms, strategy_config=merged_config)

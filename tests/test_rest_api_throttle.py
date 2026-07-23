@@ -259,7 +259,10 @@ class RestApiThrottleTests(unittest.TestCase):
         )
 
     @patch("gateway.binance.rest_api.requests.Request", DummyRequest)
-    @patch("gateway.binance.rest_api.time_service._sync", return_value=True)
+    @patch(
+        "gateway.binance.rest_api.time_service.synchronize_now",
+        return_value=True,
+    )
     def test_timestamp_error_resyncs_and_retries(self, sync_mock):
         session = SequenceSession(
             [
@@ -274,6 +277,50 @@ class RestApiThrottleTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(sync_mock.call_count, 1)
+
+    @patch("gateway.binance.rest_api.requests.Request", DummyRequest)
+    def test_order_clock_guard_runs_after_throttle_before_send(self):
+        session = SequenceSession([DummyResponse(200, {"orderId": 1})])
+        api = BinanceRestApi("key", "secret", session, testnet=True)
+        api.order_clock_guard = lambda: (
+            False,
+            "CLOCK_UNHEALTHY",
+            "calibration stale",
+        )
+        order = OrderRequest(
+            symbol="BTCUSDT",
+            price=100.0,
+            volume=0.1,
+            side="BUY",
+        )
+
+        response = api.new_order(order, "clock-final-gate")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["code"], "CLOCK_UNHEALTHY")
+        self.assertEqual(len(session.responses), 1)
+
+    @patch("gateway.binance.rest_api.requests.Request", DummyRequest)
+    def test_order_clock_guard_allows_reduce_only(self):
+        session = SequenceSession([DummyResponse(200, {"orderId": 1})])
+        api = BinanceRestApi("key", "secret", session, testnet=True)
+        api.order_clock_guard = lambda: (
+            False,
+            "CLOCK_UNHEALTHY",
+            "calibration stale",
+        )
+        order = OrderRequest(
+            symbol="BTCUSDT",
+            price=100.0,
+            volume=0.1,
+            side="SELL",
+            reduce_only=True,
+        )
+
+        response = api.new_order(order, "clock-reduce-only")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(session.responses), 0)
 
 
 class RPICoreIntegrationTests(unittest.TestCase):

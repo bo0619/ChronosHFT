@@ -204,6 +204,7 @@ class OrderSubmitted:
     order_id: str
     timestamp: float
     status: OrderStatus = OrderStatus.PENDING_ACK
+    monotonic_timestamp: float = 0.0
 
 
 @dataclass
@@ -239,6 +240,11 @@ class OrderBook:
     best_ask_price: float = 0.0
     best_ask_volume: float = 0.0
     depth_levels: int = 0
+    received_monotonic: float = 0.0
+    dispatch_timestamp: float = 0.0
+    dispatch_monotonic: float = 0.0
+    clock_offset_ms: Optional[float] = None
+    corrected_received_timestamp: float = 0.0
 
     def get_best_bid(self):
         if self.best_bid_price > 0.0:
@@ -281,6 +287,13 @@ class MarkPriceData:
     funding_rate: float
     next_funding_time: datetime
     datetime: datetime
+    exchange_timestamp: float = 0.0
+    received_timestamp: float = 0.0
+    received_monotonic: float = 0.0
+    dispatch_timestamp: float = 0.0
+    dispatch_monotonic: float = 0.0
+    clock_offset_ms: Optional[float] = None
+    corrected_received_timestamp: float = 0.0
 
 
 @dataclass(slots=True)
@@ -291,6 +304,13 @@ class AggTradeData:
     quantity: float
     maker_is_buyer: bool
     datetime: datetime
+    exchange_timestamp: float = 0.0
+    received_timestamp: float = 0.0
+    received_monotonic: float = 0.0
+    dispatch_timestamp: float = 0.0
+    dispatch_monotonic: float = 0.0
+    clock_offset_ms: Optional[float] = None
+    corrected_received_timestamp: float = 0.0
 
 
 @dataclass(slots=True)

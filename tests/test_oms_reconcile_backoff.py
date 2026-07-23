@@ -41,7 +41,7 @@ class DummyGateway:
         return None
 
     def cancel_all_orders(self, symbol):
-        return None
+        return types.SimpleNamespace(status_code=200, json=lambda: {})
 
     def get_account_info(self):
         return self.account

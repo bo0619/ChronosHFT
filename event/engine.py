@@ -133,10 +133,10 @@ class EventEngine:
         producers before invoking it.
         """
         timeout_sec = max(0.0, float(timeout_sec))
-        deadline = time.monotonic() + timeout_sec
+        deadline = time.perf_counter() + timeout_sec
         with self._idle_condition:
             while self._pending_work:
-                remaining = deadline - time.monotonic()
+                remaining = deadline - time.perf_counter()
                 if remaining <= 0.0:
                     return False
                 self._idle_condition.wait(timeout=remaining)
@@ -424,7 +424,7 @@ class EventEngine:
         )
 
     def _should_emit_alert(self, registry: dict, key) -> bool:
-        now = time.monotonic()
+        now = time.perf_counter()
         interval_sec = self.profile_config["alert_interval_sec"]
         with self._alert_lock:
             last_at = registry.get(key, 0.0)

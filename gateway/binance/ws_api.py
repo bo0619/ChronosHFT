@@ -6,7 +6,7 @@ import time
 import websocket
 
 from infrastructure.logger import logger
-from .constants import *
+from .constants import WS_URL_MAIN, WS_URL_TEST
 
 
 class BinanceWsApi:
@@ -19,6 +19,10 @@ class BinanceWsApi:
         self.lock = threading.RLock()
         self.stream_apps = {}
         self.close_requested = False
+        self.connected_events = {
+            "MarketWS": threading.Event(),
+            "UserWS": threading.Event(),
+        }
 
     def start_market_stream(self, symbols):
         streams = []
@@ -37,7 +41,28 @@ class BinanceWsApi:
         with self.lock:
             self.active = True
             self.close_requested = False
+            self.connected_events.setdefault(name, threading.Event()).clear()
         threading.Thread(target=self._run, args=(url, name), daemon=True).start()
+
+    def wait_until_connected(self, names=("MarketWS", "UserWS"), timeout_sec=10.0):
+        deadline = time.perf_counter() + max(0.0, float(timeout_sec))
+        for name in names:
+            with self.lock:
+                connected = self.connected_events.setdefault(
+                    name,
+                    threading.Event(),
+                )
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0.0 or not connected.wait(remaining):
+                return False
+        with self.lock:
+            return bool(
+                self.active
+                and all(
+                    self.connected_events[name].is_set()
+                    for name in names
+                )
+            )
 
     def _run(self, url, name):
         logger.info(f"[{name}] Connecting...")
@@ -64,6 +89,10 @@ class BinanceWsApi:
                         self.stream_apps.pop(name, None)
                     if self.ws is ws_app:
                         self.ws = None
+                    self.connected_events.setdefault(
+                        name,
+                        threading.Event(),
+                    ).clear()
 
             if self._is_active():
                 logger.info(f"[{name}] Reconnecting in 5s...")
@@ -76,6 +105,8 @@ class BinanceWsApi:
             stream_apps = list(self.stream_apps.values())
             self.stream_apps = {}
             self.ws = None
+            for connected in self.connected_events.values():
+                connected.clear()
 
         for ws_app in stream_apps:
             try:
@@ -91,6 +122,7 @@ class BinanceWsApi:
         with self.lock:
             self.stream_apps[name] = ws
             self.ws = ws
+            self.connected_events.setdefault(name, threading.Event()).set()
         logger.info(f"[{name}] Connected.")
 
     def _handle_transport_fault(self, name, err, fault_reported):
@@ -113,6 +145,7 @@ class BinanceWsApi:
         with self.lock:
             if self.stream_apps.get(name) is ws:
                 self.stream_apps.pop(name, None)
+            self.connected_events.setdefault(name, threading.Event()).clear()
             if self.ws is ws:
                 self.ws = None
             should_report = self.active and not self.close_requested and not fault_reported["value"]

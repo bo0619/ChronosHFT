@@ -20,6 +20,10 @@ class OrderValidator:
         self.max_deviation_pct = sanity.get("max_deviation_pct", 0.05)
         self.max_spread_pct = sanity.get("max_spread_pct", 0.015)
         self.max_orders_per_sec = tech.get("max_order_count_per_sec", 20)
+        self.max_reduce_orders_per_sec = tech.get(
+            "max_reduce_order_count_per_sec",
+            self.max_orders_per_sec,
+        )
         self.freshness_enabled = bool(freshness.get("enabled", False))
         self.require_mark_price = bool(freshness.get("require_mark_price", True))
         self.require_book = bool(freshness.get("require_book", True))
@@ -33,6 +37,7 @@ class OrderValidator:
         )
 
         self._order_timestamps: deque = deque()
+        self._reduce_order_timestamps: deque = deque()
         self._rate_lock = threading.Lock()
 
     def validate_params(self, intent: OrderIntent) -> tuple[bool, str]:
@@ -104,7 +109,9 @@ class OrderValidator:
                         f"spread_too_wide:{spread_pct*100:.3f}%>{self.max_spread_pct*100:.3f}%",
                     )
 
-        reject, reason = self._check_rate_limit()
+        reject, reason = self._check_rate_limit(
+            reduce_only=intent.reduce_only,
+        )
         if reject:
             return False, reason
 
@@ -145,17 +152,35 @@ class OrderValidator:
             )
         return ""
 
-    def _check_rate_limit(self) -> tuple[bool, str]:
+    def _check_rate_limit(
+        self,
+        *,
+        reduce_only: bool = False,
+    ) -> tuple[bool, str]:
         with self._rate_lock:
-            now = time.monotonic()
+            now = time.perf_counter()
             cutoff = now - 1.0
+            timestamps = (
+                self._reduce_order_timestamps
+                if reduce_only
+                else self._order_timestamps
+            )
+            limit = (
+                self.max_reduce_orders_per_sec
+                if reduce_only
+                else self.max_orders_per_sec
+            )
 
-            while self._order_timestamps and self._order_timestamps[0] < cutoff:
-                self._order_timestamps.popleft()
+            while timestamps and timestamps[0] < cutoff:
+                timestamps.popleft()
 
-            current_count = len(self._order_timestamps)
-            if current_count >= self.max_orders_per_sec:
-                return True, f"rate_limit:{current_count}>={self.max_orders_per_sec}/s"
+            current_count = len(timestamps)
+            if current_count >= limit:
+                channel = "reduce_only" if reduce_only else "risk"
+                return (
+                    True,
+                    f"rate_limit:{channel}:{current_count}>={limit}/s",
+                )
 
-            self._order_timestamps.append(now)
+            timestamps.append(now)
             return False, ""

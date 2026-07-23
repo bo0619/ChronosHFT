@@ -166,7 +166,7 @@ class StrategyRuntime:
         total_depth = len(self._control_queue) + len(self._market_queue)
         if total_depth < self.queue_warn_depth:
             return
-        now = time.monotonic()
+        now = time.perf_counter()
         if now - self._last_alert_at < self.alert_interval_sec:
             return
         self._last_alert_at = now
@@ -234,7 +234,7 @@ class StrategyRuntime:
             self._stats["max_handler_ms"] = max(self._stats["max_handler_ms"], elapsed_ms)
             if elapsed_ms >= self.slow_handler_ms:
                 self._stats["slow_handler_count"] += 1
-                now = time.monotonic()
+                now = time.perf_counter()
                 if now - self._last_alert_at >= self.alert_interval_sec:
                     self._last_alert_at = now
                     logger.warning(

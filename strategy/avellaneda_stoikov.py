@@ -18,6 +18,11 @@ from event.type import (
 from data.ref_data import ref_data_manager
 from infrastructure.config_scaling import load_root_config
 
+
+def _negative_infinity():
+    return -math.inf
+
+
 class AvellanedaStoikovStrategy(StrategyTemplate):
     """
     经典的 Avellaneda-Stoikov 做市策略
@@ -53,11 +58,14 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
         self.interval = self.config.get("cycle_interval", 1.0)
         self.min_spread_ratio = self.as_conf.get("min_spread_ratio", 0.0002)
         
-        self.lot_multiplier = self.config.get("lot_multiplier", 1.0)
+        self.configure_quote_sizing(self.config)
         
         # --- 运行时状态 ---
         self.mid_prices = defaultdict(lambda: deque(maxlen=self.vol_window))
-        self.last_recalc_time = defaultdict(float)
+        # Interval scheduling must not depend on the adjustable wall clock.
+        # Negative infinity also lets the first tick run when process uptime is
+        # shorter than the configured cycle interval.
+        self.last_recalc_time = defaultdict(_negative_infinity)
         self.current_sigma_sq = defaultdict(float)
         
         print(f"[{self.name}] A-S 模型已启动 (OMS驱动): Gamma={self.gamma}, K={self.k}, Cycle={self.interval}s")
@@ -78,15 +86,23 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
         # 方差
         return float(np.var(log_returns))
 
-    def _calculate_safe_vol(self, symbol, price):
+    def _calculate_safe_vol(
+        self,
+        symbol,
+        price,
+        *,
+        side=None,
+        current_position=0.0,
+        reference_price=None,
+    ):
         """计算符合交易所限制的下单量"""
-        info = ref_data_manager.get_info(symbol)
-        if not info:
-            return 0.0
-        safe_min = max(5.0, info.min_notional) * 1.1
-        qty_val = safe_min / price
-        target = max(info.min_qty, qty_val) * self.lot_multiplier
-        return ref_data_manager.round_qty(symbol, target)
+        return self.calculate_quote_volume(
+            symbol,
+            price,
+            side=side,
+            current_position=current_position,
+            reference_price=reference_price,
+        )
 
     def on_orderbook(self, ob: OrderBook):
         bid_1, _ = ob.get_best_bid()
@@ -98,7 +114,7 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
         self.mid_prices[ob.symbol].append(mid_price)
         
         # --- 1. 周期控制 ---
-        now = time.time()
+        now = time.perf_counter()
         if now - self.last_recalc_time[ob.symbol] < self.interval:
             return
         
@@ -133,6 +149,7 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
         position = strategy_positions.get((self.name, ob.symbol))
         if position is None:
             position = self.oms.exposure.net_positions.get(ob.symbol, self.pos)
+        risk_position = self.oms.exposure.net_positions.get(ob.symbol, position)
         inventory_risk_adjustment = (
             position * self.gamma * self.current_sigma_sq[ob.symbol]
         )
@@ -181,34 +198,51 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
         target_ask = ref_data_manager.round_price(ob.symbol, target_ask)
         
         # 6. 执行新挂单
-        order_vol = self._calculate_safe_vol(ob.symbol, mid_price)
-        if order_vol <= 0:
+        bid_order_vol = self._calculate_safe_vol(
+            ob.symbol,
+            target_bid,
+            side=Side.BUY,
+            current_position=risk_position,
+            reference_price=mid_price,
+        )
+        ask_order_vol = self._calculate_safe_vol(
+            ob.symbol,
+            target_ask,
+            side=Side.SELL,
+            current_position=risk_position,
+            reference_price=mid_price,
+        )
+        if bid_order_vol <= 0.0 and ask_order_vol <= 0.0:
             return
         
         # 挂买单 (Bid)
         # 使用 PostOnly 确保我们是 Maker
-        intent_buy = OrderIntent(
-            strategy_id=self.name,
-            symbol=ob.symbol,
-            side=Side.BUY,
-            price=target_bid,
-            volume=order_vol,
-            time_in_force=passive_tif,
-            is_post_only=True,
-        )
-        bid_oid = self.send_intent(intent_buy)
+        bid_oid = None
+        if bid_order_vol > 0.0:
+            intent_buy = OrderIntent(
+                strategy_id=self.name,
+                symbol=ob.symbol,
+                side=Side.BUY,
+                price=target_bid,
+                volume=bid_order_vol,
+                time_in_force=passive_tif,
+                is_post_only=True,
+            )
+            bid_oid = self.send_intent(intent_buy)
         
         # 挂卖单 (Ask)
-        intent_sell = OrderIntent(
-            strategy_id=self.name,
-            symbol=ob.symbol,
-            side=Side.SELL,
-            price=target_ask,
-            volume=order_vol,
-            time_in_force=passive_tif,
-            is_post_only=True,
-        )
-        ask_oid = self.send_intent(intent_sell)
+        ask_oid = None
+        if ask_order_vol > 0.0:
+            intent_sell = OrderIntent(
+                strategy_id=self.name,
+                symbol=ob.symbol,
+                side=Side.SELL,
+                price=target_ask,
+                volume=ask_order_vol,
+                time_in_force=passive_tif,
+                is_post_only=True,
+            )
+            ask_oid = self.send_intent(intent_sell)
 
         quoted_spread = max(0.0, target_ask - target_bid)
         quoted_spread_bps = (
@@ -246,7 +280,11 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
             "target_bid": target_bid,
             "target_ask": target_ask,
             "quote_spread_bps": quoted_spread_bps,
-            "quote_qty": order_vol,
+            "quote_qty": max(bid_order_vol, ask_order_vol),
+            "bid_quote_qty": bid_order_vol,
+            "ask_quote_qty": ask_order_vol,
+            "target_order_notional": self.target_order_notional,
+            "max_position_notional": self.max_pos_usdt,
             "bid_order_id": bid_oid or "",
             "ask_order_id": ask_oid or "",
             "gamma": float(self.gamma),
@@ -271,7 +309,7 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
             "Mode": passive_tif,
             "Spread": f"{quoted_spread_bps:.1f}",
             "Sigma": f"{sigma_bps:.1f}",
-            "Size": f"{order_vol:.8g}",
+            "Size": f"{max(bid_order_vol, ask_order_vol):.8g}",
         }
         self.engine.put(
             Event(

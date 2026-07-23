@@ -32,6 +32,15 @@ from .constants import (
 )
 
 
+class _LocalGuardResponse:
+    def __init__(self, code: str, message: str):
+        self.status_code = 409
+        self._payload = {"code": str(code), "msg": str(message)}
+
+    def json(self):
+        return dict(self._payload)
+
+
 class BinanceRestApi:
     def __init__(self, api_key, api_secret, session, testnet=False):
         self.api_key = api_key
@@ -68,6 +77,8 @@ class BinanceRestApi:
         self.max_endpoint_cooldown_sec = 10.0
         self.timeout_sec = 3.0
         self.recv_window_ms = 5000
+        self.order_clock_guard = None
+        self.clock_resync_callback = None
 
     def _sign(self, params: dict):
         query = urlencode(params)
@@ -80,7 +91,7 @@ class BinanceRestApi:
         endpoint_interval = max(min_interval, self.endpoint_intervals.get(endpoint, min_interval))
 
         with self.request_lock:
-            now = time.monotonic()
+            now = time.perf_counter()
             global_wait = max(0.0, min_interval - (now - self.last_request_ts))
             endpoint_wait = max(
                 0.0,
@@ -90,7 +101,7 @@ class BinanceRestApi:
             wait_time = max(global_wait, endpoint_wait, cooldown_wait)
             if wait_time > 0:
                 time.sleep(wait_time)
-            stamp = time.monotonic()
+            stamp = time.perf_counter()
             self.last_request_ts = stamp
             self.endpoint_last_request_ts[endpoint] = stamp
 
@@ -100,7 +111,7 @@ class BinanceRestApi:
             self.max_endpoint_cooldown_sec,
             max(self.retry_backoff_sec * attempt, endpoint_interval * self.failure_backoff_multiplier),
         )
-        self.endpoint_cooldown_until[endpoint] = time.monotonic() + cooldown_sec
+        self.endpoint_cooldown_until[endpoint] = time.perf_counter() + cooldown_sec
         return cooldown_sec
 
     def _extract_error_details(self, response):
@@ -131,7 +142,46 @@ class BinanceRestApi:
         error_code, _message = self._extract_error_details(response)
         return bool(error_code and error_code in accepted_error_codes)
 
-    def request(self, method, endpoint, params=None, signed=True, suppress_error_codes=None):
+    def _run_pre_send_guard(self, guard):
+        if not callable(guard):
+            return None
+        try:
+            result = guard()
+        except Exception as exc:
+            return _LocalGuardResponse(
+                "CLOCK_HEALTH_UNAVAILABLE",
+                f"{type(exc).__name__}:{exc}",
+            )
+        if isinstance(result, tuple):
+            allowed = bool(result[0]) if result else False
+            code = str(result[1]) if len(result) > 1 else "CLOCK_UNHEALTHY"
+            message = str(result[2]) if len(result) > 2 else code
+        else:
+            allowed = bool(result)
+            code = "CLOCK_UNHEALTHY"
+            message = "exchange clock unavailable"
+        if allowed:
+            return None
+        return _LocalGuardResponse(code, message)
+
+    def _resynchronize_exchange_clock(self):
+        callback = self.clock_resync_callback
+        if callable(callback):
+            result = callback()
+            if isinstance(result, tuple):
+                return bool(result[0]) if result else False
+            return bool(result)
+        return bool(time_service.synchronize_now())
+
+    def request(
+        self,
+        method,
+        endpoint,
+        params=None,
+        signed=True,
+        suppress_error_codes=None,
+        pre_send_guard=None,
+    ):
         url = self.base_url + endpoint
         base_params = dict(params or {})
         headers = {"X-MBX-APIKEY": self.api_key} if signed else {}
@@ -149,6 +199,9 @@ class BinanceRestApi:
             try:
                 req = requests.Request(method, url, params=req_params, headers=headers)
                 prepped = self.session.prepare_request(req)
+                guard_rejection = self._run_pre_send_guard(pre_send_guard)
+                if guard_rejection is not None:
+                    return guard_rejection
                 response = self.session.send(prepped, timeout=self.timeout_sec)
                 self.endpoint_cooldown_until[endpoint] = 0.0
                 if response.status_code == 200:
@@ -163,7 +216,7 @@ class BinanceRestApi:
                 )
 
                 if signed and error_code == "-1021":
-                    sync_ok = time_service._sync()
+                    sync_ok = self._resynchronize_exchange_clock()
                     if attempt < self.max_retries and sync_ok:
                         logger.warning(
                             f"REST retry [{endpoint}] attempt {attempt}/{self.max_retries} after timestamp resync"
@@ -248,7 +301,16 @@ class BinanceRestApi:
             params["price"] = req.price
             params["timeInForce"] = req.time_in_force
 
-        return self.request("POST", EP_ORDER, params, signed=True)
+        order_clock_guard = None if req.reduce_only else self.order_clock_guard
+        if order_clock_guard is None:
+            return self.request("POST", EP_ORDER, params, signed=True)
+        return self.request(
+            "POST",
+            EP_ORDER,
+            params,
+            signed=True,
+            pre_send_guard=order_clock_guard,
+        )
 
     def cancel_order(self, req: CancelRequest):
         params = {"symbol": req.symbol}

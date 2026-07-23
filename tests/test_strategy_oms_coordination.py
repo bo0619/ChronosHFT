@@ -1,4 +1,5 @@
 import json
+import math
 import sys
 import threading
 import types
@@ -20,7 +21,6 @@ from event.type import (
     AccountData,
     AlertData,
     ApiLimitData,
-    Event,
     ExchangeOrderUpdate,
     LifecycleState,
     OrderBook,
@@ -31,19 +31,17 @@ from event.type import (
     StrategyData,
     TIF_GTX,
     TIF_RPI,
-    EVENT_ACCOUNT_UPDATE,
+    TradeData,
     EVENT_LOG,
     EVENT_ORDER_UPDATE,
     EVENT_STRATEGY_UPDATE,
-    EVENT_SYSTEM_HEALTH,
 )
 from data.ref_data import ContractInfo, ref_data_manager
+from alpha.factors import GLFTCalibrator
 from oms.engine import OMS
 from strategy.avellaneda_stoikov import AvellanedaStoikovStrategy
 from strategy.base import StrategyTemplate
 from strategy.glft import GLFTStrategy
-from strategy.ml_sniper.ml_sniper import MLSniperStrategy
-from strategy.predictive_glft import PredictiveGLFTStrategy
 from strategy.registry import (
     canonical_model_key,
     create_primary_strategy,
@@ -79,7 +77,7 @@ class DummyGateway:
         return None
 
     def cancel_all_orders(self, symbol):
-        return None
+        return SimpleNamespace(status_code=200, json=lambda: {})
 
     def get_account_info(self):
         return {
@@ -123,6 +121,294 @@ class PassiveQuoteOMS:
 
     def cancel_order(self, client_oid):
         self.cancelled.append(client_oid)
+
+
+class StrategyMonotonicTimingTests(unittest.TestCase):
+    @staticmethod
+    def make_contract(symbol="LTCUSDT"):
+        return ContractInfo(
+            symbol=symbol,
+            tick_size=0.1,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+            price_precision=1,
+            qty_precision=3,
+            status="TRADING",
+            permissions=frozenset(),
+        )
+
+    @staticmethod
+    def make_orderbook(symbol="LTCUSDT", mid=100.0):
+        return OrderBook(
+            symbol=symbol,
+            exchange="BINANCE",
+            datetime=datetime.utcnow(),
+            best_bid_price=mid - 0.1,
+            best_bid_volume=1.0,
+            best_ask_price=mid + 0.1,
+            best_ask_volume=1.0,
+        )
+
+    @staticmethod
+    def make_clocked_book(
+        mid,
+        *,
+        received_monotonic=None,
+        exchange_timestamp=0.0,
+    ):
+        return SimpleNamespace(
+            received_monotonic=received_monotonic,
+            exchange_timestamp=exchange_timestamp,
+            get_best_bid=lambda: (mid - 0.1, 1.0),
+            get_best_ask=lambda: (mid + 0.1, 1.0),
+        )
+
+    def test_avellaneda_cycle_uses_monotonic_time(self):
+        engine = DispatchingEngine()
+        oms = PassiveQuoteOMS()
+        strategy = AvellanedaStoikovStrategy(
+            engine,
+            oms,
+            strategy_config={
+                "cycle_interval": 1.0,
+                "lot_multiplier": 1.0,
+                "as_parameters": {
+                    "gamma": 0.05,
+                    "k": 1.5,
+                    "vol_window": 5,
+                },
+            },
+        )
+        orderbook = self.make_orderbook()
+
+        with (
+            patch.dict(
+                ref_data_manager.contracts,
+                {"LTCUSDT": self.make_contract()},
+                clear=True,
+            ),
+            patch(
+                "strategy.avellaneda_stoikov.time.perf_counter",
+                side_effect=[0.1, 0.5, 1.2],
+            ),
+            patch(
+                "strategy.avellaneda_stoikov.time.time",
+                side_effect=AssertionError("wall clock must not gate the cycle"),
+            ),
+        ):
+            strategy.on_orderbook(orderbook)
+            self.assertEqual(len(oms.submitted), 2)
+
+            strategy.on_orderbook(orderbook)
+            self.assertEqual(oms.cancelled, [])
+
+            strategy.on_orderbook(orderbook)
+            self.assertCountEqual(oms.cancelled, ["passive-1", "passive-2"])
+
+    def test_glft_cooldown_and_fill_defense_use_monotonic_time(self):
+        engine = DispatchingEngine()
+        oms = PassiveQuoteOMS()
+        strategy = GLFTStrategy(
+            engine,
+            oms,
+            strategy_config={
+                "cycle_interval": 0.0,
+                "execution": {"min_spread_bps": 5.0},
+            },
+        )
+        orderbook = self.make_orderbook()
+
+        with (
+            patch.dict(
+                ref_data_manager.contracts,
+                {"LTCUSDT": self.make_contract()},
+                clear=True,
+            ),
+            patch(
+                "strategy.glft.time.perf_counter",
+                side_effect=[0.1, 0.2, 0.31],
+            ),
+            patch(
+                "strategy.glft.time.time",
+                side_effect=AssertionError("wall clock must not gate quote cooldown"),
+            ),
+        ):
+            strategy._update_quotes("LTCUSDT", 99.0, 101.0, 0.1)
+            self.assertEqual(len(oms.submitted), 2)
+
+            strategy._update_quotes("LTCUSDT", 98.5, 101.5, 0.1)
+            self.assertEqual(oms.cancelled, [])
+
+            strategy._update_quotes("LTCUSDT", 98.5, 101.5, 0.1)
+            self.assertCountEqual(oms.cancelled, ["passive-1", "passive-2"])
+
+        calibrator = SimpleNamespace(
+            on_orderbook=lambda _ob: None,
+            sigma_bps=2.5,
+            A=1.2,
+            k=1.1,
+        )
+        observed_model_times = []
+        model = SimpleNamespace(
+            update_and_predict=lambda _features, _mid, now: (
+                observed_model_times.append(now)
+                or {"short": 0.0, "mid": 0.0, "long": 0.0}
+            )
+        )
+        gate = SimpleNamespace(process=lambda value, _position: value)
+        strategy._get_components = lambda _symbol: (calibrator, model, gate)
+        strategy.feature_engine = SimpleNamespace(
+            on_orderbook=lambda _ob: None,
+            get_features=lambda _symbol: [0.0] * 9,
+            reset_interval=lambda _symbol: None,
+        )
+        strategy._update_quotes = lambda *_args, **_kwargs: None
+        engine.events.clear()
+
+        with (
+            patch.dict(
+                ref_data_manager.contracts,
+                {"LTCUSDT": self.make_contract()},
+                clear=True,
+            ),
+            patch(
+                "strategy.glft.time.perf_counter",
+                side_effect=[0.1, 0.2, 1.0, 2.3],
+            ),
+            patch(
+                "strategy.glft.time.time",
+                side_effect=AssertionError("wall clock must not gate fill defense"),
+            ),
+        ):
+            strategy.on_orderbook(orderbook)
+            strategy.on_trade(
+                TradeData(
+                    symbol="LTCUSDT",
+                    order_id="order-1",
+                    trade_id="trade-1",
+                    side="BUY",
+                    price=100.0,
+                    volume=0.1,
+                    datetime=datetime.utcnow(),
+                )
+            )
+            strategy.on_orderbook(orderbook)
+            strategy.on_orderbook(orderbook)
+
+        telemetry = [
+            event.data.params
+            for event in engine.events
+            if event.type == EVENT_STRATEGY_UPDATE
+        ]
+        self.assertEqual(observed_model_times, [0.1, 1.0, 2.3])
+        self.assertFalse(telemetry[0]["recent_fill_defense"])
+        self.assertTrue(telemetry[1]["recent_fill_defense"])
+        self.assertFalse(telemetry[2]["recent_fill_defense"])
+
+    def test_glft_calibrator_prefers_event_clocks_then_monotonic(self):
+        cases = (
+            (
+                "received_monotonic",
+                self.make_clocked_book(
+                    100.0,
+                    received_monotonic=50.0,
+                    exchange_timestamp=1000.0,
+                ),
+                self.make_clocked_book(
+                    101.0,
+                    received_monotonic=50.25,
+                    exchange_timestamp=1100.0,
+                ),
+                [10.0, 999.0],
+                0.25,
+            ),
+            (
+                "exchange_timestamp",
+                self.make_clocked_book(100.0, exchange_timestamp=2000.0),
+                self.make_clocked_book(101.0, exchange_timestamp=2000.5),
+                [20.0, 900.0],
+                0.5,
+            ),
+            (
+                "monotonic",
+                self.make_clocked_book(100.0),
+                self.make_clocked_book(101.0),
+                [30.0, 30.25],
+                0.25,
+            ),
+        )
+
+        with patch(
+            "alpha.factors.time.time",
+            side_effect=AssertionError("calibrator must not read wall time"),
+        ):
+            for expected_source, first_book, second_book, local_times, dt in cases:
+                with self.subTest(source=expected_source):
+                    calibrator = GLFTCalibrator(window=20)
+                    with patch(
+                        "alpha.factors.time.perf_counter",
+                        side_effect=local_times,
+                    ):
+                        calibrator.on_orderbook(first_book)
+                        calibrator.on_orderbook(second_book)
+
+                    expected_return = (
+                        (101.0 / 100.0 - 1.0) * 10000.0 / math.sqrt(dt)
+                    )
+                    self.assertEqual(calibrator.last_tick_source, expected_source)
+                    self.assertEqual(len(calibrator.norm_returns), 1)
+                    self.assertAlmostEqual(
+                        calibrator.norm_returns[-1],
+                        expected_return,
+                    )
+
+    def test_glft_calibrator_rejects_nonpositive_dt_and_rebases_large_gap(self):
+        calibrator = GLFTCalibrator(
+            window=20,
+            config={
+                "strategy": {
+                    "calibrator": {
+                        "max_tick_gap_sec": 1.0,
+                    }
+                }
+            },
+        )
+        books = (
+            self.make_clocked_book(100.0, exchange_timestamp=100.0),
+            self.make_clocked_book(90.0, exchange_timestamp=99.0),
+            self.make_clocked_book(102.0, exchange_timestamp=103.0),
+            self.make_clocked_book(103.0, exchange_timestamp=103.25),
+        )
+
+        with (
+            patch(
+                "alpha.factors.time.perf_counter",
+                side_effect=[1.0, 1.1, 1.2, 1.3],
+            ),
+            patch(
+                "alpha.factors.time.time",
+                side_effect=AssertionError("calibrator must not read wall time"),
+            ),
+        ):
+            calibrator.on_orderbook(books[0])
+            calibrator.on_orderbook(books[1])
+            self.assertEqual(calibrator.last_mid, 100.0)
+            self.assertEqual(calibrator.last_tick_time, 100.0)
+            self.assertEqual(len(calibrator.norm_returns), 0)
+
+            calibrator.on_orderbook(books[2])
+            self.assertEqual(calibrator.last_mid, 102.0)
+            self.assertEqual(calibrator.last_tick_time, 103.0)
+            self.assertEqual(len(calibrator.norm_returns), 0)
+
+            calibrator.on_orderbook(books[3])
+
+        expected_return = (
+            (103.0 / 102.0 - 1.0) * 10000.0 / math.sqrt(0.25)
+        )
+        self.assertEqual(len(calibrator.norm_returns), 1)
+        self.assertAlmostEqual(calibrator.norm_returns[-1], expected_return)
 
 
 class StrategyOmsCoordinationTests(unittest.TestCase):
@@ -227,6 +513,212 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             4.0,
         )
 
+    def test_paper_quote_fee_uses_the_same_config_as_paper_execution(self):
+        oms = PassiveQuoteOMS()
+        oms.config = {
+            "execution": {"mode": "paper"},
+            "paper_trade": {
+                "enabled": True,
+                "maker_fee": 0.0003,
+                "rpi_commission_rate": 0.0002,
+            },
+            "backtest": {
+                "maker_fee": 0.0,
+                "rpi_commission_rate": 0.0,
+            },
+        }
+        strategy = DummyStrategy(DispatchingEngine(), oms)
+
+        self.assertAlmostEqual(
+            strategy.passive_round_trip_fee_bps("LTCUSDT", TIF_GTX),
+            6.0,
+        )
+        self.assertAlmostEqual(
+            strategy.passive_round_trip_fee_bps("LTCUSDT", TIF_RPI),
+            10.0,
+        )
+
+    def test_market_makers_enforce_order_and_inventory_notionals(self):
+        sizing_config = {
+            "target_order_notional": 8.0,
+            "max_pos_usdt": 18.0,
+            "cycle_interval": 0.0,
+        }
+        strategies = (
+            GLFTStrategy(
+                DispatchingEngine(),
+                PassiveQuoteOMS(),
+                strategy_config=sizing_config,
+            ),
+            AvellanedaStoikovStrategy(
+                DispatchingEngine(),
+                PassiveQuoteOMS(),
+                strategy_config=sizing_config,
+            ),
+        )
+
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"LTCUSDT": self.make_contract("LTCUSDT", supports_rpi=False)},
+            clear=True,
+        ):
+            for strategy in strategies:
+                with self.subTest(strategy=strategy.name):
+                    self.assertEqual(
+                        strategy._calculate_safe_vol("LTCUSDT", 100.0),
+                        0.08,
+                    )
+                    self.assertEqual(
+                        strategy._calculate_safe_vol(
+                            "LTCUSDT",
+                            100.0,
+                            side=Side.BUY,
+                            current_position=0.12,
+                            reference_price=100.0,
+                        ),
+                        0.06,
+                    )
+                    self.assertEqual(
+                        strategy._calculate_safe_vol(
+                            "LTCUSDT",
+                            100.0,
+                            side=Side.SELL,
+                            current_position=0.12,
+                            reference_price=100.0,
+                        ),
+                        0.08,
+                    )
+                    self.assertEqual(
+                        strategy._calculate_safe_vol(
+                            "LTCUSDT",
+                            100.0,
+                            side=Side.BUY,
+                            current_position=0.15,
+                            reference_price=100.0,
+                        ),
+                        0.0,
+                    )
+                    self.assertEqual(
+                        strategy._calculate_safe_vol(
+                            "LTCUSDT",
+                            100.0,
+                            side=Side.BUY,
+                            current_position=0.18,
+                            reference_price=100.0,
+                        ),
+                        0.0,
+                    )
+                    self.assertEqual(
+                        strategy._calculate_safe_vol(
+                            "LTCUSDT",
+                            100.0,
+                            side=Side.SELL,
+                            current_position=-0.18,
+                            reference_price=100.0,
+                        ),
+                        0.0,
+                    )
+                    self.assertEqual(
+                        strategy._calculate_safe_vol(
+                            "LTCUSDT",
+                            100.0,
+                            side=Side.SELL,
+                            current_position=0.20,
+                            reference_price=100.0,
+                        ),
+                        0.08,
+                    )
+
+    def test_market_maker_sizing_keeps_legacy_lot_multiplier_fallback(self):
+        strategies = (
+            GLFTStrategy(
+                DispatchingEngine(),
+                PassiveQuoteOMS(),
+                strategy_config={"lot_multiplier": 1.0},
+            ),
+            AvellanedaStoikovStrategy(
+                DispatchingEngine(),
+                PassiveQuoteOMS(),
+                strategy_config={"lot_multiplier": 1.0},
+            ),
+        )
+
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"LTCUSDT": self.make_contract("LTCUSDT", supports_rpi=False)},
+            clear=True,
+        ):
+            for strategy in strategies:
+                with self.subTest(strategy=strategy.name):
+                    self.assertEqual(
+                        strategy._calculate_safe_vol("LTCUSDT", 100.0),
+                        0.055,
+                    )
+
+    def test_market_maker_sizing_accepts_nested_capital_scaling_config(self):
+        strategy = GLFTStrategy(
+            DispatchingEngine(),
+            PassiveQuoteOMS(),
+            strategy_config={
+                "capital_multiplier": 2.0,
+                "capital_scaling": {"target_order_notional": 8.0},
+            },
+        )
+
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"LTCUSDT": self.make_contract("LTCUSDT", supports_rpi=False)},
+            clear=True,
+        ):
+            self.assertEqual(
+                strategy._calculate_safe_vol("LTCUSDT", 100.0),
+                0.16,
+            )
+
+    @patch("oms.validator.ref_data_manager.get_info", return_value=None)
+    @patch("oms.validator.data_cache.get_best_quote", return_value=(99.9, 100.1))
+    @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
+    def test_clock_health_gate_fails_closed_but_allows_reduce_only(self, *_mocks):
+        config = self.make_config()
+        config["system"] = {
+            "time_sync": {"require_healthy_for_trading": True}
+        }
+        engine = DispatchingEngine()
+        gateway = DummyGateway()
+        oms = OMS(engine, gateway, config)
+        oms.state = LifecycleState.LIVE
+        try:
+            with patch(
+                "oms.engine.time_service.health_snapshot",
+                return_value={
+                    "ready": False,
+                    "state": "halt",
+                    "reason": "exchange clock is stale",
+                },
+            ):
+                rejected = oms.submit_order(
+                    OrderIntent("clocked", "BTCUSDT", Side.BUY, 100.0, 0.1)
+                )
+                self.assertFalse(rejected.accepted)
+                self.assertIn("clock_health:halt", rejected.reason)
+                self.assertEqual(gateway.sent_requests, [])
+
+                oms.exposure.net_positions["BTCUSDT"] = 0.1
+                reduce_result = oms.submit_order(
+                    OrderIntent(
+                        "clocked",
+                        "BTCUSDT",
+                        Side.SELL,
+                        100.0,
+                        0.1,
+                        reduce_only=True,
+                    )
+                )
+                self.assertTrue(reduce_result.accepted)
+                self.assertEqual(len(gateway.sent_requests), 1)
+        finally:
+            oms.stop()
+
     def test_avellaneda_stoikov_quotes_rpi_and_waits_for_cancel_ack(self):
         engine = DispatchingEngine()
         oms = PassiveQuoteOMS()
@@ -239,6 +731,8 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
                 "rpi_fallback_to_gtx": True,
                 "cycle_interval": 0.0,
                 "lot_multiplier": 1.0,
+                "target_order_notional": 8.0,
+                "max_pos_usdt": 18.0,
                 "as_parameters": {
                     "gamma": 0.05,
                     "k": 1.5,
@@ -277,6 +771,11 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             self.assertEqual(telemetry.params["time_in_force"], TIF_RPI)
             self.assertEqual(telemetry.params["bid_order_id"], "passive-1")
             self.assertEqual(telemetry.params["ask_order_id"], "passive-2")
+            self.assertEqual(telemetry.params["target_order_notional"], 8.0)
+            self.assertEqual(telemetry.params["max_position_notional"], 18.0)
+            self.assertTrue(
+                all(order.price * order.volume <= 8.0 for order in oms.submitted)
+            )
             self.assertIn("reservation_price", telemetry.params)
             self.assertIn("inventory_risk_adjustment", telemetry.params)
             self.assertIn("optimal_spread", telemetry.params)
@@ -344,6 +843,40 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             self.assertEqual(len(oms.submitted), 4)
             self.assertTrue(all(order.time_in_force == TIF_RPI for order in oms.submitted))
 
+    def test_glft_cancels_a_same_price_side_when_inventory_disables_it(self):
+        oms = PassiveQuoteOMS()
+        strategy = GLFTStrategy(
+            DispatchingEngine(),
+            oms,
+            strategy_config={"execution": {"min_spread_bps": 5.0}},
+        )
+        strategy.cooldown_ms = 0
+
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"LTCUSDT": self.make_contract("LTCUSDT", supports_rpi=False)},
+            clear=True,
+        ):
+            strategy._update_quotes(
+                "LTCUSDT",
+                99.0,
+                101.0,
+                0.1,
+                bid_volume=0.1,
+                ask_volume=0.1,
+            )
+            strategy._update_quotes(
+                "LTCUSDT",
+                99.0,
+                101.0,
+                0.1,
+                bid_volume=0.0,
+                ask_volume=0.1,
+            )
+
+        self.assertEqual(len(oms.submitted), 2)
+        self.assertEqual(oms.cancelled, ["passive-1"])
+
     def test_glft_on_orderbook_publishes_complete_params_telemetry(self):
         engine = DispatchingEngine()
         oms = PassiveQuoteOMS()
@@ -354,6 +887,8 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
                 "use_rpi": True,
                 "use_rpi_for_glft": True,
                 "cycle_interval": 0.0,
+                "target_order_notional": 8.0,
+                "max_pos_usdt": 18.0,
                 "execution": {"min_spread_bps": 5.0},
             },
         )
@@ -404,6 +939,11 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         self.assertEqual(params["schema"], "market_making.v1")
         self.assertEqual(params["time_in_force"], TIF_RPI)
         self.assertEqual(params["signals"], {"short": 2.0, "mid": 1.0, "long": 0.25})
+        self.assertEqual(params["target_position_notional"], 18.0)
+        self.assertEqual(params["target_order_notional"], 8.0)
+        self.assertEqual(params["max_position_notional"], 18.0)
+        self.assertLessEqual(params["bid_quote_qty"] * params["target_bid"], 8.0)
+        self.assertLessEqual(params["ask_quote_qty"] * params["target_ask"], 8.0)
         self.assertEqual(params["bid_order_id"], "passive-1")
         self.assertEqual(params["ask_order_id"], "passive-2")
         for field in (
@@ -417,84 +957,6 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             "base_half_spread_bps",
             "inventory_skew_bps",
             "effective_min_spread_bps",
-        ):
-            self.assertIn(field, params)
-        json.dumps(params)
-
-    def test_predictive_glft_uses_params_and_publishes_model_telemetry(self):
-        engine = DispatchingEngine()
-        oms = PassiveQuoteOMS()
-        with patch.object(
-            PredictiveGLFTStrategy,
-            "_load_strategy_config",
-            return_value={
-                "strategy": {
-                    "gamma": 0.1,
-                    "lot_multiplier": 1.0,
-                }
-            },
-        ):
-            strategy = PredictiveGLFTStrategy(engine, oms)
-        strategy.cycle_interval = 0.0
-        strategy.cooldown_ms = 0
-        calibrator = SimpleNamespace(
-            on_orderbook=lambda _ob: None,
-            sigma_bps=2.0,
-            A=1.3,
-            k=1.2,
-        )
-        model = SimpleNamespace(
-            update_and_predict=lambda _features, _mid: 8.0,
-        )
-        strategy._get_components = lambda _symbol: (calibrator, model)
-        strategy.feature_engine = SimpleNamespace(
-            on_orderbook=lambda _ob: None,
-            get_features=lambda _symbol: [0.0] * 9,
-            reset_interval=lambda _symbol: None,
-        )
-        ob = OrderBook(
-            symbol="LTCUSDT",
-            exchange="BINANCE",
-            datetime=datetime.utcnow(),
-            best_bid_price=99.9,
-            best_bid_volume=1.0,
-            best_ask_price=100.1,
-            best_ask_volume=1.0,
-        )
-
-        with patch.dict(
-            ref_data_manager.contracts,
-            {"LTCUSDT": self.make_contract("LTCUSDT", supports_rpi=True)},
-            clear=True,
-        ):
-            strategy.on_orderbook(ob)
-
-        telemetry = [
-            event.data
-            for event in engine.events
-            if event.type == EVENT_STRATEGY_UPDATE
-        ][-1]
-        params = telemetry.params
-        self.assertEqual(params["schema"], "market_making.v1")
-        self.assertEqual(params["time_in_force"], TIF_GTX)
-        self.assertEqual(params["raw_prediction_bps"], 8.0)
-        self.assertEqual(params["filtered_prediction_bps"], 8.0)
-        self.assertEqual(params["bid_order_id"], "passive-1")
-        self.assertEqual(params["ask_order_id"], "passive-2")
-        for field in (
-            "adjusted_prediction_bps",
-            "prediction_confidence",
-            "fee_threshold_bps",
-            "inventory_ratio",
-            "gamma_multiplier",
-            "gamma",
-            "margin_usage",
-            "k",
-            "A",
-            "sigma_bps",
-            "q_norm",
-            "half_spread_bps",
-            "inventory_skew_bps",
         ):
             self.assertIn(field, params)
         json.dumps(params)
@@ -543,50 +1005,6 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         finally:
             oms.stop()
 
-    def test_ml_sniper_publishes_account_health_and_reject_context(self):
-        engine = DispatchingEngine()
-        oms = SimpleNamespace(
-            state=LifecycleState.LIVE,
-            config={"backtest": {"maker_fee": 0.0, "taker_fee": 0.0}},
-            exposure=SimpleNamespace(net_positions={}),
-        )
-        strategy = MLSniperStrategy(engine, oms)
-
-        engine.register(EVENT_ACCOUNT_UPDATE, lambda event: strategy.on_account_update(event.data))
-        engine.register(EVENT_SYSTEM_HEALTH, lambda event: strategy.on_system_health(event.data))
-
-        engine.put(
-            Event(
-                EVENT_ACCOUNT_UPDATE,
-                AccountData(
-                    balance=1000.0,
-                    equity=995.0,
-                    available=900.0,
-                    used_margin=95.0,
-                    datetime=datetime.utcnow(),
-                ),
-            )
-        )
-        engine.put(Event(EVENT_SYSTEM_HEALTH, "HALT:test_gateway"))
-        strategy.last_submit_reject_by_symbol["BTCUSDT"] = "insufficient_margin"
-
-        predictor = strategy._get_predictor("BTCUSDT")
-        strategy._publish_state(
-            "BTCUSDT",
-            mid=100.0,
-            bid_1=99.9,
-            ask_1=100.1,
-            signal=2.0,
-            velocity=0.0,
-            preds={"1s": 1.0, "10s": 2.0, "30s": 1.5},
-            predictor=predictor,
-        )
-
-        update = [event.data for event in engine.events if event.type == EVENT_STRATEGY_UPDATE][-1]
-        self.assertEqual(update.params["Avail"], "900.0")
-        self.assertEqual(update.params["Health"], "HALT:test_gateway")
-        self.assertEqual(update.params["Reject"], "insufficient_margin")
-
     @patch("oms.validator.ref_data_manager.get_info", return_value=None)
     @patch("oms.validator.data_cache.get_best_quote", return_value=(99.9, 100.1))
     @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
@@ -611,6 +1029,45 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             self.assertEqual(len(order_updates), 1)
             self.assertEqual(order_updates[0].status, OrderStatus.REJECTED_LOCALLY)
             self.assertIn("Account Gross Exposure", order_updates[0].error_msg)
+        finally:
+            oms.stop()
+
+    @patch("oms.validator.ref_data_manager.get_info", return_value=None)
+    @patch("oms.validator.data_cache.get_best_quote", return_value=(99.9, 100.1))
+    @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
+    @patch("oms.exposure.data_cache.get_best_quote", return_value=(99.9, 100.1))
+    @patch("oms.exposure.data_cache.get_mark_price", return_value=100.0)
+    def test_concurrent_symbol_limit_rejects_a_new_risk_symbol(self, *_mocks):
+        engine = DispatchingEngine()
+        gateway = DummyGateway(send_order_result="ex-order")
+        config = self.make_config()
+        config["symbols"] = ["BTCUSDT", "ETHUSDT"]
+        config["risk"]["limits"]["max_concurrent_symbols"] = 1
+        oms = OMS(engine, gateway, config)
+        strategy = DummyStrategy(engine, oms)
+        engine.register(
+            EVENT_ORDER_UPDATE,
+            lambda event: strategy.on_order(event.data),
+        )
+        oms.state = LifecycleState.LIVE
+        oms.exposure.net_positions["ETHUSDT"] = 0.5
+        try:
+            oid = strategy.send_intent(
+                OrderIntent(
+                    "dummy",
+                    "BTCUSDT",
+                    Side.BUY,
+                    100.0,
+                    0.1,
+                )
+            )
+
+            self.assertIsNone(oid)
+            self.assertIn(
+                "Concurrent Symbol Limit",
+                strategy.last_submit_reject_reason,
+            )
+            self.assertEqual(gateway.sent_requests, [])
         finally:
             oms.stop()
 
@@ -706,7 +1163,6 @@ class LocalWebDashboardTests(unittest.TestCase):
                 "registered_models": [
                     "glft",
                     "avellaneda_stoikov",
-                    "ml_sniper",
                 ],
                 "execution_policy": "single_primary",
                 "use_rpi": True,
@@ -805,7 +1261,7 @@ class LocalWebDashboardTests(unittest.TestCase):
         self.assertEqual(snapshot["meta"]["primary_strategy_model"], "glft")
         self.assertEqual(
             snapshot["meta"]["registered_strategy_models"],
-            ["glft", "avellaneda_stoikov", "ml_sniper"],
+            ["glft", "avellaneda_stoikov"],
         )
         self.assertEqual(
             snapshot["meta"]["strategy_execution_policy"],
@@ -835,6 +1291,64 @@ class LocalWebDashboardTests(unittest.TestCase):
             with self.assertRaises(HTTPError) as rejected:
                 urlopen(request, timeout=2.0)
             self.assertEqual(rejected.exception.code, 400)
+        finally:
+            dashboard.stop()
+
+    def test_startup_blocked_dashboard_separates_liveness_from_readiness(self):
+        class UnhealthyClock:
+            active = True
+
+            def __init__(self):
+                self.notify_listener_args = []
+
+            def health_snapshot(self, *, notify_listeners=True):
+                self.notify_listener_args.append(notify_listeners)
+                return {
+                    "state": "unsynchronized",
+                    "ready": False,
+                    "reason": "exchange clock quorum failed",
+                    "last_error": "connect timeout",
+                }
+
+        clock = UnhealthyClock()
+        dashboard = LocalWebDashboard(
+            config=self.make_config(),
+            time_service=clock,
+        )
+        dashboard.set_startup_status(
+            state="STARTUP_BLOCKED",
+            operating_mode="OBSERVE_ONLY",
+            startup_blocked=True,
+            execution_enabled=False,
+            restart_required=True,
+            reason="exchange clock quorum failed",
+        )
+        dashboard.publish_snapshot(force=True)
+
+        snapshot = dashboard.get_snapshot()
+        self.assertTrue(snapshot["startup"]["startup_blocked"])
+        self.assertFalse(snapshot["startup"]["execution_enabled"])
+        self.assertTrue(snapshot["startup"]["restart_required"])
+        self.assertEqual(snapshot["system"]["startup"], snapshot["startup"])
+        self.assertEqual(snapshot["system"]["time_service"]["health"], "unsynchronized")
+        self.assertTrue(clock.notify_listener_args)
+        self.assertTrue(all(value is False for value in clock.notify_listener_args))
+
+        try:
+            base_url = dashboard.start()
+            with urlopen(f"{base_url}healthz", timeout=2.0) as response:
+                health = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(health["status"], "ok")
+            self.assertEqual(health["engine_status"], "STARTUP_BLOCKED")
+            self.assertTrue(health["startup_blocked"])
+
+            with self.assertRaises(HTTPError) as rejected:
+                urlopen(f"{base_url}readyz", timeout=2.0)
+            self.assertEqual(rejected.exception.code, 503)
+            readiness = json.loads(rejected.exception.read().decode("utf-8"))
+            self.assertEqual(readiness["status"], "not_ready")
+            self.assertFalse(readiness["execution_enabled"])
+            self.assertTrue(readiness["restart_required"])
         finally:
             dashboard.stop()
 
@@ -917,17 +1431,8 @@ class StrategyRegistryTests(unittest.TestCase):
     @staticmethod
     def make_root_config(primary_model):
         return {
-            "system": {
-                "strategy_runtime": {
-                    "alpha_process": {
-                        "enabled": False,
-                        "processes": 7,
-                    }
-                }
-            },
             "strategy": {
                 "registered_models": [
-                    "ML_Sniper",
                     "GLFT_MultiScale",
                     "as",
                 ],
@@ -942,10 +1447,6 @@ class StrategyRegistryTests(unittest.TestCase):
                     },
                 },
                 "models": {
-                    "ml_sniper": {
-                        "entry": {"maker_entry_threshold_bps": 4.25},
-                        "execution": {"tick_interval_sec": 0.2},
-                    },
                     "GLFT": {
                         "gamma": 0.42,
                         "execution": {"min_spread_bps": 7.5},
@@ -961,7 +1462,6 @@ class StrategyRegistryTests(unittest.TestCase):
 
     def test_aliases_resolve_to_canonical_models_and_stable_strategy_ids(self):
         aliases = {
-            "ML_Sniper": ("ml_sniper", "ML_Sniper"),
             "GLFT_MultiScale": ("glft", "GLFT_MultiScale"),
             "as": ("avellaneda_stoikov", "AvellanedaStoikov"),
             "AvellanedaStoikov": (
@@ -977,7 +1477,6 @@ class StrategyRegistryTests(unittest.TestCase):
 
     def test_registry_constructs_each_primary_but_only_one_execution_instance(self):
         cases = (
-            ("ML_Sniper", MLSniperStrategy, "ml_sniper", "ML_Sniper"),
             ("GLFT_MultiScale", GLFTStrategy, "glft", "GLFT_MultiScale"),
             (
                 "as",
@@ -1001,12 +1500,9 @@ class StrategyRegistryTests(unittest.TestCase):
                 self.assertEqual(strategy.model_key, model_key)
                 self.assertEqual(
                     strategy.registered_models,
-                    ("ml_sniper", "glft", "avellaneda_stoikov"),
+                    ("glft", "avellaneda_stoikov"),
                 )
                 self.assertEqual(strategy.execution_role, "primary")
-                if model_key == "ml_sniper":
-                    self.assertFalse(strategy.alpha_process.enabled)
-                    self.assertEqual(strategy.alpha_process.worker_count, 7)
 
     def test_registry_deep_merges_shared_and_model_parameters(self):
         glft = create_primary_strategy(
@@ -1030,22 +1526,9 @@ class StrategyRegistryTests(unittest.TestCase):
         self.assertEqual(avellaneda_stoikov.k, 2.75)
         self.assertEqual(avellaneda_stoikov.vol_window, 17)
 
-        ml_sniper = create_primary_strategy(
-            DispatchingEngine(),
-            PassiveQuoteOMS(),
-            self.make_root_config("ml_sniper"),
-            alpha_process_config={"enabled": False, "processes": 3},
-        )
-        self.assertEqual(ml_sniper.lot_multiplier, 2.5)
-        self.assertEqual(ml_sniper.base_maker_entry_threshold, 4.25)
-        self.assertEqual(ml_sniper.tick_interval, 0.2)
-        self.assertEqual(ml_sniper.cycle_interval, 2.0)
-        self.assertFalse(ml_sniper.alpha_process.enabled)
-        self.assertEqual(ml_sniper.alpha_process.worker_count, 3)
-
     def test_registry_fails_fast_for_unknown_or_unregistered_primary(self):
-        unknown = self.make_root_config("ML_Sniper")
-        unknown["strategy"]["registered_models"] = ["ML_Sniper", "not-a-model"]
+        unknown = self.make_root_config("GLFT")
+        unknown["strategy"]["registered_models"] = ["GLFT", "not-a-model"]
         with self.assertRaisesRegex(ValueError, "Unknown strategy model"):
             create_primary_strategy(
                 DispatchingEngine(),
@@ -1054,7 +1537,7 @@ class StrategyRegistryTests(unittest.TestCase):
             )
 
         unregistered = self.make_root_config("as")
-        unregistered["strategy"]["registered_models"] = ["ml_sniper", "glft"]
+        unregistered["strategy"]["registered_models"] = ["glft"]
         with self.assertRaisesRegex(ValueError, "not present"):
             create_primary_strategy(
                 DispatchingEngine(),

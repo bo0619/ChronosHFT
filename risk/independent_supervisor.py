@@ -5,11 +5,20 @@ import multiprocessing
 import os
 import queue
 import secrets
+import statistics
 import time
 from datetime import datetime, timezone
 
 
 SUPERVISOR_SOURCE = "independent_supervisor"
+_HARD_CLOCK_FAILURE_PREFIXES = (
+    "clock_phase_error_kill:",
+    "clock_initial_offset_exceeded:",
+    "clock_anchor_non_finite",
+    "clock_monotonic_regressed",
+    "clock_phase_error_non_finite",
+    "clock_phase_threshold_invalid",
+)
 
 
 def _finite_float(value, label: str) -> float:
@@ -26,6 +35,11 @@ def _is_truthy(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y"}
     return bool(value)
+
+
+def _clock_failure_requires_kill(reason: str) -> bool:
+    normalized = str(reason or "").strip().lower()
+    return normalized.startswith(_HARD_CLOCK_FAILURE_PREFIXES)
 
 
 class BinanceRiskSidecarExchange:
@@ -50,6 +64,7 @@ class BinanceRiskSidecarExchange:
             self.session,
             testnet=testnet,
         )
+        self.rest.clock_resync_callback = self.sync_exchange_clock
         settings = settings or {}
         self.daily_loss_enabled = bool(
             settings.get("daily_loss_enabled", False)
@@ -84,41 +99,355 @@ class BinanceRiskSidecarExchange:
                 "clock_sync_interval_sec",
             ),
         )
+        self.clock_sample_count = max(
+            1,
+            int(settings.get("clock_sample_count", 5) or 5),
+        )
+        self.clock_min_successful_samples = max(
+            1,
+            min(
+                self.clock_sample_count,
+                int(settings.get("clock_min_successful_samples", 3) or 3),
+            ),
+        )
+        self.clock_low_rtt_sample_count = max(
+            1,
+            min(
+                self.clock_sample_count,
+                int(settings.get("clock_low_rtt_sample_count", 3) or 3),
+            ),
+        )
+        self.clock_sample_spacing_ms = max(
+            0.0,
+            _finite_float(
+                settings.get("clock_sample_spacing_ms", 10.0) or 0.0,
+                "clock_sample_spacing_ms",
+            ),
+        )
+        self.clock_max_rtt_ms = max(
+            0.0,
+            _finite_float(
+                settings.get("clock_max_rtt_ms", 200.0) or 0.0,
+                "clock_max_rtt_ms",
+            ),
+        )
+        self.clock_max_uncertainty_ms = max(
+            0.0,
+            _finite_float(
+                settings.get("clock_max_uncertainty_ms", 50.0) or 0.0,
+                "clock_max_uncertainty_ms",
+            ),
+        )
+        self.clock_max_offset_dispersion_ms = max(
+            0.0,
+            _finite_float(
+                settings.get("clock_max_offset_dispersion_ms", 10.0) or 0.0,
+                "clock_max_offset_dispersion_ms",
+            ),
+        )
+        self.clock_max_wall_step_ms = max(
+            0.0,
+            _finite_float(
+                settings.get("clock_max_wall_step_ms", 20.0) or 0.0,
+                "clock_max_wall_step_ms",
+            ),
+        )
+        self.clock_max_initial_offset_ms = max(
+            0.0,
+            _finite_float(
+                settings.get("clock_max_initial_offset_ms", 5000.0) or 0.0,
+                "clock_max_initial_offset_ms",
+            ),
+        )
+        reduce_only_phase_setting = settings.get(
+            "clock_reduce_only_phase_error_ms"
+        )
+        reduce_only_phase_key = "clock_reduce_only_phase_error_ms"
+        if reduce_only_phase_setting is None:
+            reduce_only_phase_setting = settings.get(
+                "clock_reduce_only_offset_ms",
+                25.0,
+            )
+            reduce_only_phase_key = "clock_reduce_only_offset_ms"
+        self.clock_reduce_only_phase_error_ms = max(
+            0.0,
+            _finite_float(
+                reduce_only_phase_setting or 0.0,
+                reduce_only_phase_key,
+            ),
+        )
+        kill_phase_setting = settings.get("clock_kill_phase_error_ms")
+        kill_phase_key = "clock_kill_phase_error_ms"
+        if kill_phase_setting is None:
+            kill_phase_setting = settings.get(
+                "clock_kill_offset_ms",
+                100.0,
+            )
+            kill_phase_key = "clock_kill_offset_ms"
+        self.clock_kill_phase_error_ms = max(
+            self.clock_reduce_only_phase_error_ms,
+            _finite_float(
+                kill_phase_setting or 0.0,
+                kill_phase_key,
+            ),
+        )
         self.last_clock_sync_monotonic = 0.0
         self.clock_offset_ms = 0.0
+        self.clock_phase_error_ms = 0.0
         self.clock_rtt_ms = 0.0
+        self.clock_uncertainty_ms = 0.0
+        self.clock_offset_dispersion_ms = 0.0
+        self._clock_anchor_epoch_ms = 0.0
+        self._clock_anchor_monotonic = 0.0
         self.clock_reason = "clock_sync_missing"
+
+    def _collect_clock_samples(self):
+        sample_count = max(1, int(getattr(self, "clock_sample_count", 1)))
+        min_samples = max(
+            1,
+            min(
+                sample_count,
+                int(getattr(self, "clock_min_successful_samples", 1)),
+            ),
+        )
+        low_rtt_count = max(
+            1,
+            min(
+                sample_count,
+                int(getattr(self, "clock_low_rtt_sample_count", 1)),
+            ),
+        )
+        spacing_ms = max(
+            0.0,
+            float(getattr(self, "clock_sample_spacing_ms", 0.0) or 0.0),
+        )
+        max_wall_step_ms = max(
+            0.0,
+            float(getattr(self, "clock_max_wall_step_ms", 20.0) or 0.0),
+        )
+        samples = []
+        errors = []
+        for index in range(sample_count):
+            started_monotonic = time.perf_counter()
+            started_ms = time.time() * 1000.0
+            ok, payload, reason = self._response_payload(
+                self.rest.get_server_time(),
+                dict,
+                "server_time",
+            )
+            finished_ms = time.time() * 1000.0
+            finished_monotonic = time.perf_counter()
+            if not ok:
+                errors.append(reason)
+            else:
+                try:
+                    server_time_ms = float(payload["serverTime"])
+                except (KeyError, TypeError, ValueError):
+                    errors.append("server_time_payload_invalid")
+                else:
+                    if not math.isfinite(server_time_ms):
+                        errors.append("server_time_non_finite")
+                    elif server_time_ms <= 0.0:
+                        errors.append("server_time_non_positive")
+                    else:
+                        rtt_ms = max(
+                            0.0,
+                            (finished_monotonic - started_monotonic) * 1000.0,
+                        )
+                        wall_step_ms = (
+                            finished_ms - started_ms - rtt_ms
+                        )
+                        if (
+                            max_wall_step_ms > 0.0
+                            and abs(wall_step_ms) >= max_wall_step_ms
+                        ):
+                            errors.append(
+                                f"clock_wall_step:{wall_step_ms:.3f}ms"
+                            )
+                        else:
+                            samples.append(
+                                {
+                                    "offset_ms": server_time_ms
+                                    - (started_ms + rtt_ms / 2.0),
+                                    "rtt_ms": rtt_ms,
+                                }
+                            )
+            if index + 1 < sample_count and spacing_ms > 0.0:
+                time.sleep(spacing_ms / 1000.0)
+        if len(samples) < min_samples:
+            reason = errors[-1] if errors else "clock_sample_quorum_failed"
+            return None, reason
+        selected = sorted(samples, key=lambda item: item["rtt_ms"])[
+            : min(len(samples), low_rtt_count)
+        ]
+        offsets = [sample["offset_ms"] for sample in selected]
+        offset_ms = float(statistics.median(offsets))
+        rtt_ms = float(
+            statistics.median(sample["rtt_ms"] for sample in selected)
+        )
+        dispersion_ms = float(
+            statistics.median(abs(offset - offset_ms) for offset in offsets)
+        )
+        return {
+            "offset_ms": offset_ms,
+            "rtt_ms": rtt_ms,
+            "dispersion_ms": dispersion_ms,
+            "uncertainty_ms": rtt_ms / 2.0 + dispersion_ms,
+        }, ""
 
     def sync_exchange_clock(self):
         from infrastructure.time_service import time_service
 
-        started_ms = time.time() * 1000.0
-        ok, payload, reason = self._response_payload(
-            self.rest.get_server_time(),
-            dict,
-            "server_time",
-        )
-        finished_ms = time.time() * 1000.0
-        if not ok:
+        sample, reason = self._collect_clock_samples()
+        if sample is None:
             self.clock_reason = reason
             return False, reason
-        try:
-            server_time_ms = float(payload["serverTime"])
-        except (KeyError, TypeError, ValueError):
-            self.clock_reason = "server_time_payload_invalid"
-            return False, self.clock_reason
-        if not math.isfinite(server_time_ms):
-            self.clock_reason = "server_time_non_finite"
-            return False, self.clock_reason
-        self.clock_rtt_ms = max(0.0, finished_ms - started_ms)
-        self.clock_offset_ms = server_time_ms - (
-            (started_ms + finished_ms) / 2.0
+        max_rtt_ms = max(
+            0.0,
+            float(getattr(self, "clock_max_rtt_ms", 200.0) or 0.0),
         )
+        max_uncertainty_ms = max(
+            0.0,
+            float(getattr(self, "clock_max_uncertainty_ms", 50.0) or 0.0),
+        )
+        max_dispersion_ms = max(
+            0.0,
+            float(
+                getattr(self, "clock_max_offset_dispersion_ms", 10.0)
+                or 0.0
+            ),
+        )
+        if max_rtt_ms > 0.0 and sample["rtt_ms"] >= max_rtt_ms:
+            reason = f"clock_rtt_exceeded:{sample['rtt_ms']:.3f}ms"
+            self.clock_reason = reason
+            return False, reason
+        if (
+            max_uncertainty_ms > 0.0
+            and sample["uncertainty_ms"] >= max_uncertainty_ms
+        ):
+            reason = (
+                f"clock_uncertainty_exceeded:"
+                f"{sample['uncertainty_ms']:.3f}ms"
+            )
+            self.clock_reason = reason
+            return False, reason
+        if (
+            max_dispersion_ms > 0.0
+            and sample["dispersion_ms"] >= max_dispersion_ms
+        ):
+            reason = (
+                f"clock_dispersion_exceeded:"
+                f"{sample['dispersion_ms']:.3f}ms"
+            )
+            self.clock_reason = reason
+            return False, reason
+
+        offset_ms = float(sample["offset_ms"])
+        anchor_monotonic = time.perf_counter()
+        anchor_wall_ms = time.time() * 1000.0
+        anchor_epoch_ms = anchor_wall_ms + offset_ms
+        if not all(
+            math.isfinite(value)
+            for value in (offset_ms, anchor_monotonic, anchor_epoch_ms)
+        ):
+            reason = "clock_anchor_non_finite"
+            self.clock_reason = reason
+            return False, reason
+
+        previous_anchor_epoch_ms = float(
+            getattr(self, "_clock_anchor_epoch_ms", 0.0) or 0.0
+        )
+        previous_anchor_monotonic = float(
+            getattr(self, "_clock_anchor_monotonic", 0.0) or 0.0
+        )
+        if previous_anchor_epoch_ms > 0.0 and previous_anchor_monotonic > 0.0:
+            monotonic_elapsed_ms = (
+                anchor_monotonic - previous_anchor_monotonic
+            ) * 1000.0
+            if not math.isfinite(monotonic_elapsed_ms) or monotonic_elapsed_ms < 0.0:
+                reason = "clock_monotonic_regressed"
+                self.clock_reason = reason
+                return False, reason
+            expected_epoch_ms = previous_anchor_epoch_ms + monotonic_elapsed_ms
+            phase_error_ms = anchor_epoch_ms - expected_epoch_ms
+            if not math.isfinite(phase_error_ms):
+                reason = "clock_phase_error_non_finite"
+                self.clock_reason = reason
+                return False, reason
+        else:
+            max_initial_offset_ms = max(
+                0.0,
+                float(
+                    getattr(self, "clock_max_initial_offset_ms", 5000.0)
+                    or 0.0
+                ),
+            )
+            if max_initial_offset_ms > 0.0 and abs(offset_ms) >= max_initial_offset_ms:
+                reason = f"clock_initial_offset_exceeded:{offset_ms:.3f}ms"
+                self.clock_reason = reason
+                return False, reason
+            phase_error_ms = 0.0
+
+        try:
+            reduce_only_phase_error_ms = max(
+                0.0,
+                _finite_float(
+                    getattr(
+                        self,
+                        "clock_reduce_only_phase_error_ms",
+                        25.0,
+                    )
+                    or 0.0,
+                    "clock_reduce_only_phase_error_ms",
+                ),
+            )
+            kill_phase_error_ms = max(
+                reduce_only_phase_error_ms,
+                _finite_float(
+                    getattr(
+                        self,
+                        "clock_kill_phase_error_ms",
+                        100.0,
+                    )
+                    or 0.0,
+                    "clock_kill_phase_error_ms",
+                ),
+            )
+        except ValueError:
+            reason = "clock_phase_threshold_invalid"
+            self.clock_reason = reason
+            return False, reason
+
+        # Preserve candidate quality/phase telemetry, but never replace the
+        # last-known-good exchange anchor with a candidate that already
+        # requires an independent risk action.
+        self.clock_phase_error_ms = phase_error_ms
+        self.clock_rtt_ms = float(sample["rtt_ms"])
+        self.clock_uncertainty_ms = float(sample["uncertainty_ms"])
+        self.clock_offset_dispersion_ms = float(sample["dispersion_ms"])
+        if (
+            kill_phase_error_ms > 0.0
+            and abs(phase_error_ms) >= kill_phase_error_ms
+        ):
+            reason = f"clock_phase_error_kill:{phase_error_ms:.3f}ms"
+            self.clock_reason = reason
+            return False, reason
+        if (
+            reduce_only_phase_error_ms > 0.0
+            and abs(phase_error_ms) >= reduce_only_phase_error_ms
+        ):
+            reason = f"clock_phase_error_reduce_only:{phase_error_ms:.3f}ms"
+            self.clock_reason = reason
+            return False, reason
+
+        self.clock_offset_ms = offset_ms
+        self._clock_anchor_epoch_ms = anchor_epoch_ms
+        self._clock_anchor_monotonic = anchor_monotonic
         time_service.offset = self.clock_offset_ms
-        time_service.last_sync_time = time.time()
+        time_service.last_sync_time = anchor_wall_ms / 1000.0
         time_service.last_rtt_ms = self.clock_rtt_ms
         time_service.last_error = ""
-        self.last_clock_sync_monotonic = time.monotonic()
+        self.last_clock_sync_monotonic = anchor_monotonic
         self.clock_reason = ""
         return True, ""
 
@@ -127,13 +456,14 @@ class BinanceRiskSidecarExchange:
             return True, ""
         age = max(
             0.0,
-            time.monotonic()
+            time.perf_counter()
             - float(getattr(self, "last_clock_sync_monotonic", 0.0) or 0.0),
         )
         if (
             not force
             and self.last_clock_sync_monotonic > 0.0
             and age <= self.clock_sync_interval_sec
+            and not str(getattr(self, "clock_reason", "") or "")
         ):
             return True, ""
         return self.sync_exchange_clock()
@@ -209,8 +539,22 @@ class BinanceRiskSidecarExchange:
                     "clock_offset_ms": float(
                         getattr(self, "clock_offset_ms", 0.0) or 0.0
                     ),
+                    "clock_phase_error_ms": float(
+                        getattr(self, "clock_phase_error_ms", 0.0) or 0.0
+                    ),
                     "clock_rtt_ms": float(
                         getattr(self, "clock_rtt_ms", 0.0) or 0.0
+                    ),
+                    "clock_uncertainty_ms": float(
+                        getattr(self, "clock_uncertainty_ms", 0.0) or 0.0
+                    ),
+                    "clock_offset_dispersion_ms": float(
+                        getattr(
+                            self,
+                            "clock_offset_dispersion_ms",
+                            0.0,
+                        )
+                        or 0.0
                     ),
                     "captured_at": time_service.now() / 1000.0,
                 },
@@ -409,7 +753,7 @@ class RiskSidecarCore:
     """Deterministic sidecar state machine, separated for fault-injection tests."""
 
     def __init__(self, exchange, settings: dict, now: float = None):
-        now = time.monotonic() if now is None else float(now)
+        now = time.perf_counter() if now is None else float(now)
         self.exchange = exchange
         self.symbols = tuple(
             sorted(
@@ -507,25 +851,63 @@ class RiskSidecarCore:
         self.clock_sync_enabled = bool(
             settings.get("clock_sync_enabled", False)
         )
-        self.clock_reduce_only_offset_ms = max(
+        reduce_only_phase_setting = settings.get(
+            "clock_reduce_only_phase_error_ms"
+        )
+        reduce_only_phase_key = "clock_reduce_only_phase_error_ms"
+        if reduce_only_phase_setting is None:
+            reduce_only_phase_setting = settings.get(
+                "clock_reduce_only_offset_ms",
+                25.0,
+            )
+            reduce_only_phase_key = "clock_reduce_only_offset_ms"
+        self.clock_reduce_only_phase_error_ms = max(
             0.0,
             _finite_float(
-                settings.get("clock_reduce_only_offset_ms", 250.0) or 0.0,
-                "clock_reduce_only_offset_ms",
+                reduce_only_phase_setting or 0.0,
+                reduce_only_phase_key,
             ),
         )
-        self.clock_kill_offset_ms = max(
-            self.clock_reduce_only_offset_ms,
-            _finite_float(
-                settings.get("clock_kill_offset_ms", 1000.0) or 0.0,
+        kill_phase_setting = settings.get("clock_kill_phase_error_ms")
+        kill_phase_key = "clock_kill_phase_error_ms"
+        if kill_phase_setting is None:
+            kill_phase_setting = settings.get(
                 "clock_kill_offset_ms",
+                100.0,
+            )
+            kill_phase_key = "clock_kill_offset_ms"
+        self.clock_kill_phase_error_ms = max(
+            self.clock_reduce_only_phase_error_ms,
+            _finite_float(
+                kill_phase_setting or 0.0,
+                kill_phase_key,
             ),
         )
+        # Compatibility attributes for code which still inspects the old
+        # names.  Their values are phase-error thresholds, never raw offsets.
+        self.clock_reduce_only_offset_ms = (
+            self.clock_reduce_only_phase_error_ms
+        )
+        self.clock_kill_offset_ms = self.clock_kill_phase_error_ms
         self.clock_max_rtt_ms = max(
             0.0,
             _finite_float(
-                settings.get("clock_max_rtt_ms", 1500.0) or 0.0,
+                settings.get("clock_max_rtt_ms", 200.0) or 0.0,
                 "clock_max_rtt_ms",
+            ),
+        )
+        self.clock_max_uncertainty_ms = max(
+            0.0,
+            _finite_float(
+                settings.get("clock_max_uncertainty_ms", 50.0) or 0.0,
+                "clock_max_uncertainty_ms",
+            ),
+        )
+        self.clock_max_offset_dispersion_ms = max(
+            0.0,
+            _finite_float(
+                settings.get("clock_max_offset_dispersion_ms", 10.0) or 0.0,
+                "clock_max_offset_dispersion_ms",
             ),
         )
         self.liquidation_proximity_enabled = bool(
@@ -605,7 +987,10 @@ class RiskSidecarCore:
             "peak_drawdown_pct": 0.0,
             "external_cash_flow_total": 0.0,
             "clock_offset_ms": 0.0,
+            "clock_phase_error_ms": 0.0,
             "clock_rtt_ms": 0.0,
+            "clock_uncertainty_ms": 0.0,
+            "clock_offset_dispersion_ms": 0.0,
             "minimum_liquidation_distance_pct": None,
             "minimum_liquidation_distance_symbol": "",
         }
@@ -833,7 +1218,7 @@ class RiskSidecarCore:
             return False
 
     def receive_parent_heartbeat(self, sequence: int, now: float = None):
-        now = time.monotonic() if now is None else float(now)
+        now = time.perf_counter() if now is None else float(now)
         sequence = int(sequence or 0)
         if sequence <= self.last_parent_sequence:
             return False
@@ -881,7 +1266,7 @@ class RiskSidecarCore:
         return True, ""
 
     def prepare_rearm(self, request_id: str, reason: str, now: float = None):
-        now = time.monotonic() if now is None else float(now)
+        now = time.perf_counter() if now is None else float(now)
         request_id = str(request_id or "")
         if not request_id:
             self._set_rearm_result(
@@ -922,7 +1307,7 @@ class RiskSidecarCore:
         token: str,
         now: float = None,
     ):
-        now = time.monotonic() if now is None else float(now)
+        now = time.perf_counter() if now is None else float(now)
         request_id = str(request_id or "")
         token = str(token or "")
         prepared = self.prepared_rearm or {}
@@ -1252,31 +1637,54 @@ class RiskSidecarCore:
         if self.clock_sync_enabled:
             try:
                 clock_offset_ms = float(snapshot["clock_offset_ms"])
+                clock_phase_error_ms = float(
+                    snapshot["clock_phase_error_ms"]
+                )
                 clock_rtt_ms = float(snapshot["clock_rtt_ms"])
+                clock_uncertainty_ms = float(
+                    snapshot["clock_uncertainty_ms"]
+                )
+                clock_offset_dispersion_ms = float(
+                    snapshot["clock_offset_dispersion_ms"]
+                )
             except (KeyError, TypeError, ValueError):
                 return "REDUCE_ONLY", "clock_snapshot_invalid", metrics
             if (
                 not math.isfinite(clock_offset_ms)
+                or not math.isfinite(clock_phase_error_ms)
                 or not math.isfinite(clock_rtt_ms)
+                or not math.isfinite(clock_uncertainty_ms)
+                or not math.isfinite(clock_offset_dispersion_ms)
                 or clock_rtt_ms < 0.0
+                or clock_uncertainty_ms < 0.0
+                or clock_offset_dispersion_ms < 0.0
             ):
                 return "REDUCE_ONLY", "clock_snapshot_invalid", metrics
             metrics["clock_offset_ms"] = clock_offset_ms
+            metrics["clock_phase_error_ms"] = clock_phase_error_ms
             metrics["clock_rtt_ms"] = clock_rtt_ms
+            metrics["clock_uncertainty_ms"] = clock_uncertainty_ms
+            metrics["clock_offset_dispersion_ms"] = (
+                clock_offset_dispersion_ms
+            )
             if (
-                self.clock_kill_offset_ms > 0.0
-                and abs(clock_offset_ms) >= self.clock_kill_offset_ms
+                self.clock_kill_phase_error_ms > 0.0
+                and abs(clock_phase_error_ms)
+                >= self.clock_kill_phase_error_ms
             ):
                 clock_action = "KILL"
-                clock_reason = f"clock_offset_kill:{clock_offset_ms:.3f}ms"
+                clock_reason = (
+                    f"clock_phase_error_kill:{clock_phase_error_ms:.3f}ms"
+                )
             elif (
-                self.clock_reduce_only_offset_ms > 0.0
-                and abs(clock_offset_ms)
-                >= self.clock_reduce_only_offset_ms
+                self.clock_reduce_only_phase_error_ms > 0.0
+                and abs(clock_phase_error_ms)
+                >= self.clock_reduce_only_phase_error_ms
             ):
                 clock_action = "REDUCE_ONLY"
                 clock_reason = (
-                    f"clock_offset_reduce_only:{clock_offset_ms:.3f}ms"
+                    "clock_phase_error_reduce_only:"
+                    f"{clock_phase_error_ms:.3f}ms"
                 )
             elif (
                 self.clock_max_rtt_ms > 0.0
@@ -1284,6 +1692,25 @@ class RiskSidecarCore:
             ):
                 clock_action = "REDUCE_ONLY"
                 clock_reason = f"clock_rtt_reduce_only:{clock_rtt_ms:.3f}ms"
+            elif (
+                self.clock_max_uncertainty_ms > 0.0
+                and clock_uncertainty_ms >= self.clock_max_uncertainty_ms
+            ):
+                clock_action = "REDUCE_ONLY"
+                clock_reason = (
+                    "clock_uncertainty_reduce_only:"
+                    f"{clock_uncertainty_ms:.3f}ms"
+                )
+            elif (
+                self.clock_max_offset_dispersion_ms > 0.0
+                and clock_offset_dispersion_ms
+                >= self.clock_max_offset_dispersion_ms
+            ):
+                clock_action = "REDUCE_ONLY"
+                clock_reason = (
+                    "clock_dispersion_reduce_only:"
+                    f"{clock_offset_dispersion_ms:.3f}ms"
+                )
 
         if maintenance_margin_ratio >= self.margin_kill_ratio:
             return (
@@ -1383,7 +1810,10 @@ class RiskSidecarCore:
             "peak_drawdown_pct": 0.0,
             "external_cash_flow_total": 0.0,
             "clock_offset_ms": 0.0,
+            "clock_phase_error_ms": 0.0,
             "clock_rtt_ms": 0.0,
+            "clock_uncertainty_ms": 0.0,
+            "clock_offset_dispersion_ms": 0.0,
             "minimum_liquidation_distance_pct": None,
             "minimum_liquidation_distance_symbol": "",
         }
@@ -1400,7 +1830,11 @@ class RiskSidecarCore:
             self.exchange_healthy = bool(healthy)
             self.exchange_reason = str(reason or "")
             if not self.exchange_healthy:
-                self.risk_action = "REDUCE_ONLY"
+                self.risk_action = (
+                    "KILL"
+                    if _clock_failure_requires_kill(self.exchange_reason)
+                    else "REDUCE_ONLY"
+                )
                 self.risk_reason = self.exchange_reason or "exchange_snapshot_failed"
                 return
             self.last_exchange_success_at = now
@@ -1459,7 +1893,7 @@ class RiskSidecarCore:
         self.last_flatten_reason = str(reason or "")
 
     def step(self, now: float = None):
-        now = time.monotonic() if now is None else float(now)
+        now = time.perf_counter() if now is None else float(now)
         if self.stop_requested:
             if self.cancel_on_stop:
                 self._emergency_cancel(now)
@@ -1495,10 +1929,16 @@ class RiskSidecarCore:
         elif self.parent_stale_since <= 0.0:
             self.parent_stale_since = now
 
-        action = self.risk_action if exchange_valid else "REDUCE_ONLY"
+        action = (
+            self.risk_action
+            if exchange_valid or self.risk_action == "KILL"
+            else "REDUCE_ONLY"
+        )
         if not parent_healthy:
             parent_stale_age = max(0.0, now - self.parent_stale_since)
-            if (
+            if action == "KILL":
+                reason = self.risk_reason or "independent_hard_risk_breach"
+            elif (
                 self.flatten_enabled
                 and parent_stale_age >= self.parent_loss_flatten_delay_sec
             ):
@@ -1508,7 +1948,11 @@ class RiskSidecarCore:
                 action = "REDUCE_ONLY"
                 reason = "parent_heartbeat_stale"
         elif not exchange_valid:
-            reason = self.exchange_reason or "exchange_health_stale"
+            reason = (
+                self.risk_reason
+                if action == "KILL"
+                else self.exchange_reason
+            ) or "exchange_health_stale"
         elif action != "NONE":
             reason = self.risk_reason or "independent_risk_breach"
         else:
@@ -1716,7 +2160,7 @@ def run_sidecar_loop(
                 elif command_type == "ABORT_REARM":
                     core.abort_rearm(command.get("token", ""))
 
-            now = time.monotonic()
+            now = time.perf_counter()
             status, keep_running = core.step(now)
             signature = (
                 status["healthy"],
@@ -1959,8 +2403,19 @@ class IndependentRiskSupervisor:
             daemon=False,
         )
         self.process.start()
-        self.started_at = time.monotonic()
+        self.started_at = time.perf_counter()
+        self._send_heartbeat(self.started_at)
         self._apply_oms_health(False, "supervisor_starting")
+        return True
+
+    def pulse_parent_heartbeat(self) -> bool:
+        """Emit only the liveness pulse, without applying parent-side risk state."""
+        if not self.enabled:
+            return True
+        process = self.process
+        if process is None or not process.is_alive():
+            return False
+        self._send_heartbeat(time.perf_counter())
         return True
 
     def _send_heartbeat(self, now: float):
@@ -2068,7 +2523,7 @@ class IndependentRiskSupervisor:
     def tick(self) -> bool:
         if not self.enabled:
             return True
-        now = time.monotonic()
+        now = time.perf_counter()
         if self.process is None or not self.process.is_alive():
             self._apply_oms_health(False, "supervisor_process_down")
             return False
@@ -2088,8 +2543,8 @@ class IndependentRiskSupervisor:
     def wait_until_healthy(self, timeout_sec: float = 10.0) -> bool:
         if not self.enabled:
             return True
-        deadline = time.monotonic() + max(0.0, float(timeout_sec or 0.0))
-        while time.monotonic() <= deadline:
+        deadline = time.perf_counter() + max(0.0, float(timeout_sec or 0.0))
+        while time.perf_counter() <= deadline:
             if self.tick():
                 return True
             time.sleep(0.05)
@@ -2128,15 +2583,15 @@ class IndependentRiskSupervisor:
             if timeout_sec is None
             else max(0.0, float(timeout_sec or 0.0))
         )
-        deadline = time.monotonic() + timeout
-        while time.monotonic() <= deadline:
+        deadline = time.perf_counter() + timeout
+        while time.perf_counter() <= deadline:
             if not self.process.is_alive():
                 return {
                     "accepted": False,
                     "reason": "supervisor_process_down",
                     "token": "",
                 }
-            now = time.monotonic()
+            now = time.perf_counter()
             self._send_heartbeat(now)
             self._drain_status(now)
             if str(
@@ -2190,7 +2645,7 @@ class IndependentRiskSupervisor:
         return True
 
     def get_status_snapshot(self) -> dict:
-        now = time.monotonic()
+        now = time.perf_counter()
         process_alive = bool(self.process is not None and self.process.is_alive())
         status_age = (
             max(0.0, now - self.last_status_received_at)

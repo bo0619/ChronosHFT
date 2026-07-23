@@ -1,3 +1,5 @@
+import math
+
 from event.type import (
     AccountData,
     Event,
@@ -35,6 +37,109 @@ class StrategyTemplate:
         self.last_submit_reject_oid = ""
         self.last_submit_reject_by_symbol = {}
         self._rpi_fallback_warned_routes = set()
+        self.lot_multiplier = 1.0
+        self.target_order_notional = 0.0
+        self.max_pos_usdt = 0.0
+
+    @staticmethod
+    def _positive_finite(value, default: float = 0.0) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if not math.isfinite(parsed) or parsed <= 0.0:
+            return float(default)
+        return parsed
+
+    def configure_quote_sizing(self, strategy_config: dict | None):
+        """Load quote sizing while keeping legacy lot_multiplier configs valid."""
+        config = strategy_config if isinstance(strategy_config, dict) else {}
+        self.lot_multiplier = self._positive_finite(
+            config.get("lot_multiplier", 1.0),
+            1.0,
+        )
+        scaling = config.get("capital_scaling", {})
+        if not isinstance(scaling, dict):
+            scaling = {}
+        scaled_notional_fallback = (
+            self._positive_finite(scaling.get("target_order_notional", 0.0))
+            * self._positive_finite(config.get("capital_multiplier", 1.0), 1.0)
+        )
+        self.target_order_notional = self._positive_finite(
+            config.get(
+                "target_order_notional",
+                config.get(
+                    "order_notional_usdt",
+                    config.get("order_notional", scaled_notional_fallback),
+                ),
+            )
+        )
+        self.max_pos_usdt = self._positive_finite(
+            config.get("max_pos_usdt", 0.0)
+        )
+
+    def calculate_quote_volume(
+        self,
+        symbol: str,
+        price: float,
+        *,
+        side: Side | None = None,
+        current_position: float = 0.0,
+        reference_price: float | None = None,
+    ) -> float:
+        """Return a step-rounded quote size within order and inventory notionals."""
+        info = ref_data_manager.get_info(symbol)
+        if info is None:
+            return 0.0
+
+        try:
+            price = float(price)
+            reference_price = float(
+                price if reference_price is None else reference_price
+            )
+            current_position = float(current_position)
+        except (TypeError, ValueError):
+            return 0.0
+        if (
+            not math.isfinite(price)
+            or not math.isfinite(reference_price)
+            or not math.isfinite(current_position)
+            or price <= 0.0
+            or reference_price <= 0.0
+        ):
+            return 0.0
+
+        min_notional = max(5.0, float(info.min_notional or 0.0))
+        explicit_notional = self.target_order_notional > 0.0
+        if explicit_notional:
+            target_notional = self.target_order_notional
+        else:
+            target_notional = min_notional * 1.1 * self.lot_multiplier
+        if self.max_pos_usdt > 0.0:
+            target_notional = min(target_notional, self.max_pos_usdt)
+
+        target_qty = target_notional / price
+        min_qty = max(0.0, float(info.min_qty or 0.0))
+        if min_qty > target_qty:
+            if explicit_notional or self.max_pos_usdt > 0.0:
+                return 0.0
+            target_qty = min_qty
+
+        if self.max_pos_usdt > 0.0 and side in {Side.BUY, Side.SELL}:
+            current_notional = current_position * reference_price
+            if side == Side.BUY:
+                remaining_notional = self.max_pos_usdt - current_notional
+            else:
+                remaining_notional = self.max_pos_usdt + current_notional
+            capacity_qty = max(0.0, remaining_notional) / reference_price
+            target_qty = min(target_qty, capacity_qty)
+
+        rounded_qty = ref_data_manager.round_qty(symbol, target_qty)
+        if rounded_qty < min_qty or rounded_qty <= 0.0:
+            return 0.0
+        if rounded_qty * price + 1e-9 < min_notional:
+            return 0.0
+        return rounded_qty
 
     def on_orderbook(self, orderbook: OrderBook):
         raise NotImplementedError
@@ -113,7 +218,19 @@ class StrategyTemplate:
 
     def passive_fee_rate(self, symbol: str, time_in_force: str) -> float:
         """Return maker fee plus the account's symbol-specific RPI surcharge."""
-        fee_config = getattr(self.oms, "config", {}).get("backtest", {})
+        config = getattr(self.oms, "config", {}) or {}
+        fee_config = dict(config.get("backtest", {}) or {})
+        execution = config.get("execution", {}) or {}
+        paper_config = config.get("paper_trade", {}) or {}
+        system = config.get("system", {}) or {}
+        execution_mode = str(execution.get("mode", "") or "").strip().lower()
+        paper_enabled = bool(paper_config.get("enabled", False)) or bool(
+            system.get("dry_run", False)
+        )
+        if execution_mode in {"paper", "paper_trade", "simulation", "sim"}:
+            paper_enabled = True
+        if paper_enabled:
+            fee_config.update(paper_config)
         fee_rate = float(fee_config.get("maker_fee", 0.0))
         if str(time_in_force or "").upper() != TIF_RPI:
             return fee_rate

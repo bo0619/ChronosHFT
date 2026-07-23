@@ -66,6 +66,7 @@ from infrastructure.config_scaling import (
     STRATEGY_RISK_BUDGET_DEFAULTS,
     VENUE_DEAD_MAN_SWITCH_DEFAULTS,
     apply_capital_scaling,
+    apply_production_safety_defaults,
     finalize_strategy_risk_budgets,
     load_root_config,
     normalize_strategy_registration,
@@ -73,8 +74,6 @@ from infrastructure.config_scaling import (
 from infrastructure.paper_trade import apply_paper_trade_mode, is_paper_trade
 from main import run_live_risk_checks
 from oms.engine import OMS
-from strategy.ml_sniper.config_loader import load_sniper_config
-from strategy.ml_sniper.ml_sniper import MLSniperStrategy
 
 
 class DummyEngine:
@@ -187,7 +186,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             CASH_FLOW_TRUTH_DEFAULTS,
         )
 
-    def test_root_config_preserves_explicit_cash_flow_truth_overrides(self):
+    def test_safety_defaults_preserve_explicit_cash_flow_truth_overrides(self):
         payload = {
             "risk": {
                 "cash_flow_truth": {
@@ -198,8 +197,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             }
         }
 
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+        loaded = apply_production_safety_defaults(payload)
 
         cash_flow = loaded["risk"]["cash_flow_truth"]
         self.assertFalse(cash_flow["enabled"])
@@ -222,7 +220,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             RISK_CONTROL_HEARTBEAT_DEFAULTS,
         )
 
-    def test_root_config_preserves_explicit_risk_heartbeat_overrides(self):
+    def test_safety_defaults_preserve_explicit_risk_heartbeat_overrides(self):
         payload = {
             "risk": {
                 "risk_control_heartbeat": {
@@ -232,8 +230,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             }
         }
 
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+        loaded = apply_production_safety_defaults(payload)
 
         heartbeat = loaded["risk"]["risk_control_heartbeat"]
         self.assertFalse(heartbeat["enabled"])
@@ -254,15 +251,14 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             "independent_supervisor",
         )
 
-    def test_disabling_independent_supervisor_restores_local_heartbeat_source(self):
+    def test_safety_defaults_use_local_heartbeat_when_supervisor_disabled(self):
         payload = {
             "risk": {
                 "independent_supervisor": {"enabled": False},
             }
         }
 
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+        loaded = apply_production_safety_defaults(payload)
 
         self.assertEqual(
             loaded["risk"]["risk_control_heartbeat"]["required_source"],
@@ -406,7 +402,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             "symbols": ["BTCUSDT"],
             "strategy": {
                 "name": "GLFT_MultiScale",
-                "registered_models": ["GLFT", "as", "ML_Sniper"],
+                "registered_models": ["GLFT", "as"],
             },
             "risk": {
                 "limits": {
@@ -433,7 +429,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
         self.assertEqual(loaded["strategy"]["primary_model"], "glft")
         self.assertEqual(
             loaded["strategy"]["registered_models"],
-            ["glft", "avellaneda_stoikov", "ml_sniper"],
+            ["glft", "avellaneda_stoikov"],
         )
         self.assertEqual(
             {
@@ -493,23 +489,6 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             },
         )
 
-    def test_load_sniper_config_inherits_top_level_strategy_fields(self):
-        payload = {
-            "strategy": {
-                "name": "ML_Sniper",
-                "lot_multiplier": 10.0,
-                "ml_sniper": {
-                    "weights": {"1s": 0.1, "10s": 0.5, "30s": 0.4}
-                },
-            }
-        }
-
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            config = load_sniper_config()
-
-        self.assertEqual(config["lot_multiplier"], 10.0)
-        self.assertIn("weights", config)
-
     def test_capital_scaling_derives_runtime_limits_from_single_multiplier(self):
         payload = {
             "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"],
@@ -552,45 +531,39 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
         self.assertEqual(scaled["risk"]["limits"]["max_account_gross_notional"], 90.0)
         self.assertEqual(scaled["risk"]["limits"]["max_daily_loss"], 10.0)
         self.assertEqual(scaled["risk"]["limits"]["max_order_qty"], 20000.0)
-        self.assertAlmostEqual(scaled["strategy"]["lot_multiplier"], 16.0 / 27.5, places=8)
+        self.assertEqual(scaled["risk"]["limits"]["max_concurrent_symbols"], 3)
+        self.assertAlmostEqual(scaled["strategy"]["lot_multiplier"], 16.0 / 5.5, places=8)
+        self.assertEqual(scaled["strategy"]["target_order_notional"], 16.0)
         self.assertEqual(scaled["strategy"]["max_pos_usdt"], 32.0)
 
-    def test_load_sniper_config_applies_capital_scaling_before_merge(self):
+    def test_capital_scaling_keeps_paper_venue_balance_in_sync(self):
         payload = {
-            "account": {"leverage": 5, "initial_balance_usdt": 100.0},
-            "backtest": {"initial_capital": 100.0},
-            "risk": {
-                "limits": {
-                    "max_order_qty": 10000.0,
-                    "max_order_notional": 8.0,
-                    "max_pos_notional": 16.0,
-                    "max_account_gross_notional": 45.0,
-                    "max_daily_loss": 5.0,
-                }
+            "execution": {"mode": "paper"},
+            "paper_trade": {
+                "enabled": True,
+                "initial_balance_usdt": 100.0,
             },
+            "symbols": ["BTCUSDT"],
+            "account": {"leverage": 8, "initial_balance_usdt": 100.0},
+            "backtest": {"initial_capital": 100.0},
+            "risk": {"limits": {"max_order_notional": 8.0}},
             "strategy": {
-                "capital_multiplier": 2.0,
+                "capital_multiplier": 20.0,
                 "capital_scaling": {
                     "enabled": True,
                     "reference_capital_usdt": 100.0,
                     "target_order_notional": 8.0,
-                    "target_total_risk_notional": 45.0,
-                    "target_concurrent_symbols": 3,
-                    "position_buffer_orders": 2.0,
-                    "reference_min_notional": 5.0,
-                    "notional_buffer": 1.1,
-                },
-                "ml_sniper": {
-                    "weights": {"1s": 0.1, "10s": 0.5, "30s": 0.4}
+                    "target_total_risk_notional": 36.0,
+                    "target_concurrent_symbols": 1,
                 },
             },
         }
 
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            config = load_sniper_config()
+        scaled = apply_capital_scaling(payload)
 
-        self.assertAlmostEqual(config["lot_multiplier"], 16.0 / 27.5, places=8)
-        self.assertIn("weights", config)
+        self.assertEqual(scaled["account"]["initial_balance_usdt"], 2000.0)
+        self.assertEqual(scaled["backtest"]["initial_capital"], 2000.0)
+        self.assertEqual(scaled["paper_trade"]["initial_balance_usdt"], 2000.0)
 
     def test_capital_scaling_splits_budget_across_usdt_and_usdc_symbols(self):
         payload = {
@@ -671,19 +644,8 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
         scaled = apply_capital_scaling(payload)
 
         self.assertEqual(scaled["risk"]["limits"]["max_order_notional"], 12.0)
-        self.assertAlmostEqual(scaled["strategy"]["lot_multiplier"], 8.0 / 44.0, places=8)
-
-    @patch("strategy.ml_sniper.ml_sniper.load_sniper_config", return_value={"lot_multiplier": 10.0})
-    @patch("strategy.ml_sniper.ml_sniper.ref_data_manager.round_qty", side_effect=lambda symbol, qty: round(qty, 2))
-    @patch("strategy.ml_sniper.ml_sniper.ref_data_manager.get_info", return_value=SimpleNamespace(min_qty=0.01, min_notional=5.0))
-    def test_calc_vol_uses_lot_multiplier_and_leverage_with_risk_cap(self, _get_info, _round_qty, _load_cfg):
-        strategy = MLSniperStrategy(DummyEngine(), DummyOMS(leverage=5, max_order_notional=200.0))
-
-        qty = strategy._calc_vol("BTCUSDT", 100.0)
-
-        self.assertEqual(strategy.lot_multiplier, 10.0)
-        self.assertEqual(strategy.account_leverage, 5.0)
-        self.assertEqual(qty, 1.9)
+        self.assertAlmostEqual(scaled["strategy"]["lot_multiplier"], 8.0 / 5.5, places=8)
+        self.assertEqual(scaled["strategy"]["target_order_notional"], 8.0)
 
     def test_oms_sets_gateway_target_leverage_from_account_config(self):
         config = {

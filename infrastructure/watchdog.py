@@ -14,7 +14,7 @@ def emit_market_data_stale_if_needed(
     if triggered or last_tick_time <= 0:
         return triggered
 
-    now = time.time() if now is None else now
+    now = time.perf_counter() if now is None else now
     silence_sec = now - last_tick_time
     if silence_sec <= threshold_sec:
         return triggered
@@ -52,9 +52,24 @@ def emit_event_engine_backlog_if_needed(
             reason_prefix = ("event_engine_backlog:",)
             if hasattr(oms, "clear_trading_mode"):
                 oms.clear_trading_mode(reason="event engine backlog recovered", prefixes=reason_prefix)
-            venue_reason = getattr(oms, "get_venue_freeze_reason", lambda *_args, **_kwargs: "")(venue)
-            if venue_reason.startswith("event_engine_backlog:") and hasattr(oms, "clear_venue_freeze"):
-                oms.clear_venue_freeze(venue, reason="event engine backlog recovered")
+            freeze_epoch = state.get("venue_freeze_epoch")
+            freeze_reason = state.get("venue_freeze_reason", "")
+            if (
+                freeze_epoch is not None
+                and freeze_reason.startswith("event_engine_backlog:")
+                and hasattr(oms, "clear_venue_freeze")
+            ):
+                oms.clear_venue_freeze(
+                    venue,
+                    reason="event engine backlog recovered",
+                    expected_epoch=int(freeze_epoch),
+                    expected_reason=freeze_reason,
+                )
+            elif freeze_reason.startswith("event_engine_backlog:"):
+                logger.error(
+                    "[Watchdog] Refusing unguarded event-engine venue recovery: "
+                    f"venue={venue} epoch unavailable"
+                )
             logger.info("[Watchdog] Event engine backlog recovered")
             return {
                 "severity": 0,
@@ -82,7 +97,22 @@ def emit_event_engine_backlog_if_needed(
 
     if severity >= 3:
         logger.error(f"[Watchdog] Event engine backlog freeze: {reason}")
-        oms.freeze_venue(venue, reason, cancel_active_orders=True)
+        freeze_epoch = oms.freeze_venue(
+            venue,
+            reason,
+            cancel_active_orders=True,
+        )
+        if freeze_epoch is None:
+            current_reason = getattr(
+                oms,
+                "get_venue_freeze_reason",
+                lambda *_args, **_kwargs: "",
+            )(venue)
+            get_epoch = getattr(oms, "get_venue_freeze_epoch", None)
+            if current_reason == reason and callable(get_epoch):
+                freeze_epoch = get_epoch(venue)
+        state["venue_freeze_epoch"] = freeze_epoch
+        state["venue_freeze_reason"] = reason
         return state
 
     if severity == 2:
@@ -191,13 +221,13 @@ def _strategy_runtime_severity(metrics: dict, config: dict):
 
     if (
         _metric_trip(total_depth, backlog_ms, config, "freeze_queue_depth", "freeze_backlog_ms", 80, 1500.0)
-        or deferred_depth >= int(config.get("alpha_process_freeze_deferred", 32))
+        or deferred_depth >= int(config.get("async_worker_freeze_deferred", 32))
         or (async_worker and not async_worker.get("alive", True))
     ):
         return 2, reason
     if (
         _metric_trip(total_depth, backlog_ms, config, "warn_queue_depth", "warn_backlog_ms", 20, 400.0)
-        or deferred_depth >= int(config.get("alpha_process_warn_deferred", 8))
+        or deferred_depth >= int(config.get("async_worker_warn_deferred", 8))
     ):
         return 1, reason
     return 0, reason

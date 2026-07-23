@@ -40,23 +40,54 @@ Copy-Item config.example.json config.json
 
 The read-only monitoring page starts with the engine at
 `http://127.0.0.1:8765/`. It covers account, PnL, positions, market data,
-orders, fills, A-S/GLFT/ML strategy telemetry, risk limits, kill/freeze
+orders, fills, A-S/GLFT strategy telemetry, risk limits, kill/freeze
 states, runtime queues, RPI eligibility/routing/fees, alerts, and logs.
 The service binds to loopback only and exposes no trading action endpoint.
+The browser opens automatically after `127.0.0.1:8765` binds. If Binance clock
+calibration cannot complete, the same page remains available in
+`STARTUP_BLOCKED / OBSERVE_ONLY` mode: no OMS, strategy, Gateway, or execution
+worker starts, and a process restart is required even if clock telemetry later
+recovers.
 Before trusting the run, verify the top banner says `PAPER · LIVE DATA`,
 `本地模拟资金与撮合`, and `私有 API 已禁用`. If it says
 `LIVE · REAL MONEY`, stop the process and inspect `execution.mode`.
 
+## HFT time system
+
+ChronosHFT uses one high-resolution monotonic domain (`perf_counter` /
+QueryPerformanceCounter on Windows) for scheduling, freshness, cooldowns,
+processing latency, OMS fences, and strategy timing. Exchange epoch time is
+calibrated from multiple Binance server-time samples, selecting the lowest-RTT
+subset and validating initial offset, subsequent phase error, RTT, MAD
+dispersion, and estimated uncertainty before a candidate can replace the
+last-known-good anchor. A stable OS wall-clock offset is corrected rather than
+treated as drift; only a broad startup bound and movement against the existing
+exchange-time/monotonic anchor are safety signals.
+
+Each market event carries exchange time, local ingress wall time, ingress
+monotonic time, corrected exchange-epoch ingress time, clock-offset snapshot,
+and gateway dispatch timestamps. Startup and the final live/paper order-send
+boundary fail closed when clock health is unavailable. Risk-reducing orders and
+cancels remain available. Stale calibration, wall-clock steps, bad sample
+quorums, and excessive uncertainty move the clock to an unhealthy state.
+
+This is a software HFT clock discipline, not hardware timestamping. Sub-
+millisecond production claims still require host PTP/chrony discipline, NIC
+hardware timestamps, kernel bypass or equivalent capture, stable CPU topology,
+and venue-proximate infrastructure. The dashboard exposes the software clock's
+offset, phase error, RTT, uncertainty, dispersion, sync age, source, and health
+state.
+
 ## Strategy model registry
 
-The engine registers `glft`, `avellaneda_stoikov`, and `ml_sniper`, while
-constructing exactly one order-owning strategy. The current Paper configuration
-uses GLFT as the primary; A-S and ML Sniper are registered choices:
+The engine registers `glft` and `avellaneda_stoikov`, while constructing exactly
+one order-owning strategy. The current Paper configuration uses GLFT as the
+primary, with A-S available as a manually selected alternative:
 
 ```json
 "strategy": {
   "primary_model": "glft",
-  "registered_models": ["glft", "avellaneda_stoikov", "ml_sniper"],
+  "registered_models": ["glft", "avellaneda_stoikov"],
   "execution_policy": "single_primary"
 }
 ```
@@ -104,9 +135,8 @@ Useful filters and export formats:
       aversion, volatility estimation, fees/adverse selection, queue and
       latency models, multi-level quoting, regime switching, and empirical
       validation.
-- [ ] Remove the TUI completely: delete the Rich Live dashboard, its event/log
-      fan-out wiring, configuration, and runtime dependency so the local web UI
-      becomes the only operator interface. Redesign that web UI around a
+- [ ] Remove the remaining legacy TUI modules, tests, and Rich dependency. The
+      main runtime and event/log wiring are now web-only. Redesign the web UI around a
       top-tier institutional trading-console hierarchy with fewer simultaneous
       panels, stronger prioritization, progressive disclosure, and materially
       lower visual noise while retaining full telemetry access.

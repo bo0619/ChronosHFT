@@ -12,7 +12,22 @@ def handle_system_health_event(event, risk_controller, oms=None):
 
     if message.startswith("CLEAR_SYMBOL:") and oms is not None:
         _, symbol, reason = message.split(":", 2)
-        oms.clear_symbol_freeze(symbol, reason=f"system_health:{reason}")
+        if reason.startswith("ORDERBOOK_RESYNCED:"):
+            _, recovery_token = reason.rsplit(":", 1)
+            oms.clear_orderbook_freeze(
+                symbol,
+                recovery_token,
+                reason=f"system_health:{reason}",
+            )
+        else:
+            expected_reason = oms.get_symbol_freeze_reason(symbol)
+            expected_epoch = oms.get_symbol_freeze_epoch(symbol)
+            oms.clear_symbol_freeze(
+                symbol,
+                reason=f"system_health:{reason}",
+                expected_epoch=expected_epoch,
+                expected_reason=expected_reason,
+            )
         return
 
     if message.startswith("FREEZE_STRATEGY:") and oms is not None:
@@ -47,7 +62,36 @@ def handle_system_health_event(event, risk_controller, oms=None):
 
     if message.startswith("CLEAR_VENUE:") and oms is not None:
         _, venue, reason = message.split(":", 2)
-        oms.clear_venue_freeze(venue, reason=f"system_health:{reason}")
+        oms.request_venue_recovery_verification(
+            venue,
+            reason=f"legacy_clear_request:{reason}",
+        )
+        return
+
+    if message.startswith("VERIFY_VENUE:") and oms is not None:
+        parts = message.split(":", 3)
+        if len(parts) == 4:
+            _, venue, raw_epoch, owner = parts
+            try:
+                expected_epoch = int(raw_epoch)
+            except ValueError:
+                expected_epoch = None
+            if expected_epoch is not None and owner:
+                owners = oms.get_venue_freeze_owners(venue)
+                record = owners.get(owner, {})
+                oms.request_venue_recovery_verification(
+                    venue,
+                    reason="system_health:TRANSPORT_RECOVERED",
+                    expected_owner=owner,
+                    expected_epoch=expected_epoch,
+                    expected_reason=str(record.get("reason", "") or ""),
+                )
+                return
+        _, venue, reason = message.split(":", 2)
+        oms.request_venue_recovery_verification(
+            venue,
+            reason=f"system_health:{reason}",
+        )
         return
 
     if message.startswith("KILL:"):

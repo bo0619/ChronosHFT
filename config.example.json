@@ -47,7 +47,7 @@
             "enabled": true,
             "host": "127.0.0.1",
             "port": 8765,
-            "open_browser": false,
+            "open_browser": true,
             "refresh_interval_ms": 1000,
             "history_limit": 600,
             "orders_limit": 100,
@@ -55,15 +55,29 @@
             "logs_limit": 200
         },
         "time_sync": {
-            "max_offset_ms": 250.0,
-            "halt_offset_ms": 1000.0,
-            "max_rtt_ms": 1500.0,
-            "freeze_breach_threshold": 2,
+            "_comment": "Software HFT clock: Binance multi-sample calibration anchors exchange epoch to perf_counter_ns. Startup and every risk-increasing order fail closed unless healthy.",
+            "startup_required": true,
+            "require_healthy_for_trading": true,
+            "sample_count": 7,
+            "min_successful_samples": 4,
+            "low_rtt_sample_count": 3,
+            "sample_spacing_ms": 10.0,
+            "request_timeout_sec": 1.0,
+            "max_initial_offset_ms": 5000.0,
+            "max_phase_error_ms": 25.0,
+            "halt_phase_error_ms": 100.0,
+            "max_rtt_ms": 200.0,
+            "max_uncertainty_ms": 50.0,
+            "max_offset_dispersion_ms": 10.0,
+            "max_sync_age_sec": 30.0,
+            "max_wall_clock_step_ms": 20.0,
+            "health_poll_interval_sec": 0.1,
+            "freeze_breach_threshold": 1,
             "halt_breach_threshold": 2,
             "recovery_success_threshold": 2,
-            "sync_interval_sec": 600.0,
-            "unhealthy_retry_sec": 15.0,
-            "max_consecutive_failures": 3
+            "sync_interval_sec": 10.0,
+            "unhealthy_retry_sec": 1.0,
+            "max_consecutive_failures": 2
         },
         "event_engine": {
             "queue_warn_depth": {
@@ -114,7 +128,10 @@
             "testnet": false,
             "public_only": true,
             "publish_depth_levels": 5,
-            "emit_full_orderbook_events": false
+            "emit_full_orderbook_events": false,
+            "max_book_buffer": 50000,
+            "book_resync_max_attempts": 3,
+            "book_resync_retry_sec": 0.25
         },
         "strategy_runtime": {
             "queue_warn_depth": 100,
@@ -122,25 +139,9 @@
             "freeze_queue_depth": 80,
             "warn_backlog_ms": 400,
             "freeze_backlog_ms": 1500,
-            "alpha_process_warn_deferred": 8,
-            "alpha_process_freeze_deferred": 32,
             "recovery_checks": 20,
             "slow_handler_ms": 100,
-            "alert_interval_sec": 5,
-            "alpha_process": {
-                "enabled": true,
-                "queue_size": 256,
-                "processes": 2,
-                "auto_restart": true,
-                "restart_cooldown_sec": 2.0,
-                "max_restart_burst": 3,
-                "restart_window_sec": 30.0,
-                "quarantine_sec": 30.0,
-                "standby_profile": {
-                    "tick_interval_sec": 0.25,
-                    "cycle_interval_sec": 2.0
-                }
-            }
+            "alert_interval_sec": 5
         }
     },
     "alert": {
@@ -173,10 +174,18 @@
         "unknown_order_resolution_timeout_sec": 15.0,
         "trade_recovery_lookback_ms": 86400000,
         "trade_recovery_overlap_ms": 60000,
+        "trade_recovery_id_overlap": 100,
+        "trade_tail_verification_delay_sec": 0.25,
+        "trade_tail_verification_retry_sec": 0.5,
+        "trade_tail_verification_attempts": 4,
         "snapshot_stability_required": 2,
         "snapshot_max_attempts": 6,
         "snapshot_settle_interval_sec": 0.25,
         "command_fence_timeout_sec": 0.0,
+        "outbound_gate_drain_timeout_sec": 10.0,
+        "shutdown_cancel_timeout_sec": 30.0,
+        "shutdown_empty_snapshots_required": 2,
+        "shutdown_cancel_settle_interval_sec": 0.25,
         "outbound_message_budget": {
             "enabled": true,
             "window_sec": 1.0,
@@ -290,10 +299,18 @@
             "cash_flow_assets": ["USDT", "USDC", "BUSD", "FDUSD"],
             "cash_flow_max_pages": 5,
             "clock_sync_enabled": true,
-            "clock_sync_interval_sec": 30.0,
-            "clock_reduce_only_offset_ms": 250.0,
-            "clock_kill_offset_ms": 1000.0,
-            "clock_max_rtt_ms": 1500.0,
+            "clock_sync_interval_sec": 10.0,
+            "clock_sample_count": 5,
+            "clock_min_successful_samples": 3,
+            "clock_low_rtt_sample_count": 3,
+            "clock_sample_spacing_ms": 10.0,
+            "clock_max_initial_offset_ms": 5000.0,
+            "clock_reduce_only_phase_error_ms": 25.0,
+            "clock_kill_phase_error_ms": 100.0,
+            "clock_max_rtt_ms": 200.0,
+            "clock_max_uncertainty_ms": 50.0,
+            "clock_max_offset_dispersion_ms": 10.0,
+            "clock_max_wall_step_ms": 20.0,
             "liquidation_proximity_enabled": true,
             "require_liquidation_price": true,
             "liquidation_reduce_only_distance_pct": 0.05,
@@ -338,8 +355,7 @@
         "primary_model": "glft",
         "registered_models": [
             "glft",
-            "avellaneda_stoikov",
-            "ml_sniper"
+            "avellaneda_stoikov"
         ],
         "execution_policy": "single_primary",
         "_comment_model_policy": "All models are selectable, but exactly one primary owns order submission. Change primary_model and restart to switch; automatic failover is not enabled.",

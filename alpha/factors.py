@@ -3,7 +3,6 @@
 
 import math
 import time
-import json
 import numpy as np
 from collections import deque
 from event.type import OrderBook, TradeData, AggTradeData
@@ -49,10 +48,54 @@ class GLFTCalibrator:
 
         # 运行时状态
         self.last_mid:       float = 0.0
-        self.last_tick_time: float = 0.0   # [FIX-SIGMA] 记录上一 tick 的时间戳
+        # `last_tick_time` remains public for compatibility, but now belongs
+        # to `last_tick_source` instead of the host wall clock.
+        self.last_tick_time: float = 0.0
+        self.last_tick_source: str = ""
+        self.last_tick_monotonic: float = 0.0
+        self._has_tick_reference: bool = False
         self.is_warmed_up:   bool  = False
 
     # ----------------------------------------------------------
+
+    @staticmethod
+    def _valid_clock_value(value) -> float | None:
+        try:
+            clock_value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(clock_value) or clock_value <= 0.0:
+            return None
+        return clock_value
+
+    def _clock_sample(self, ob: OrderBook, now_monotonic: float) -> tuple[str, float]:
+        received_monotonic = self._valid_clock_value(
+            getattr(ob, "received_monotonic", None)
+        )
+        if received_monotonic is not None:
+            return "received_monotonic", received_monotonic
+
+        exchange_timestamp = self._valid_clock_value(
+            getattr(ob, "exchange_timestamp", None)
+        )
+        if exchange_timestamp is not None:
+            return "exchange_timestamp", exchange_timestamp
+
+        return "monotonic", now_monotonic
+
+    def _set_tick_reference(
+        self,
+        *,
+        mid: float,
+        clock_source: str,
+        tick_time: float,
+        now_monotonic: float,
+    ) -> None:
+        self.last_mid = mid
+        self.last_tick_source = clock_source
+        self.last_tick_time = tick_time
+        self.last_tick_monotonic = now_monotonic
+        self._has_tick_reference = True
 
     def on_orderbook(self, ob: OrderBook):
         bid, _ = ob.get_best_bid()
@@ -61,16 +104,32 @@ class GLFTCalibrator:
             return
 
         mid = (bid + ask) / 2.0
-        now = time.time()
+        now_monotonic = time.perf_counter()
+        clock_source, tick_time = self._clock_sample(ob, now_monotonic)
 
-        if self.last_mid > 0 and self.last_tick_time > 0:
-            dt = now - self.last_tick_time  # 实际经过的秒数
+        if self.last_mid > 0 and self._has_tick_reference:
+            if clock_source == self.last_tick_source:
+                dt = tick_time - self.last_tick_time
+            else:
+                # Clock domains cannot be subtracted from one another.  A
+                # source transition therefore uses local monotonic arrival
+                # time for exactly this interval.
+                dt = now_monotonic - self.last_tick_monotonic
 
-            # [FIX-SIGMA] 超过阈值视为断线/暂停，丢弃此 tick 避免污染
+            # Duplicate/out-of-order events must not advance the price or time
+            # reference.  Falling back here would hide invalid event ordering.
+            if not math.isfinite(dt) or dt <= 0.0:
+                return
+
+            # A reconnect/pause gap is not a volatility sample.  Rebase so the
+            # next valid event starts a fresh interval.
             if dt > self.max_tick_gap:
-                # 不更新 sigma，只更新参考点
-                self.last_mid       = mid
-                self.last_tick_time = now
+                self._set_tick_reference(
+                    mid=mid,
+                    clock_source=clock_source,
+                    tick_time=tick_time,
+                    now_monotonic=now_monotonic,
+                )
                 return
 
             # [FIX-SIGMA] 时间归一化回报：ret_normalized 的方差 ≈ sigma²（每秒）
@@ -96,8 +155,12 @@ class GLFTCalibrator:
 
                 self.is_warmed_up = True
 
-        self.last_mid       = mid
-        self.last_tick_time = now
+        self._set_tick_reference(
+            mid=mid,
+            clock_source=clock_source,
+            tick_time=tick_time,
+            now_monotonic=now_monotonic,
+        )
 
     # ----------------------------------------------------------
 

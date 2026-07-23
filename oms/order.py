@@ -116,6 +116,8 @@ class Order:
         now = time.time()
         self.created_at = now
         self.updated_at = now
+        self.created_monotonic = time.perf_counter()
+        self.updated_monotonic = self.created_monotonic
 
         self.error_msg = ""
         self.last_update_seq = 0
@@ -233,6 +235,7 @@ class Order:
         if seq:
             self.last_update_seq = max(self.last_update_seq, seq)
         self.updated_at = update_time if update_time else time.time()
+        self.updated_monotonic = time.perf_counter()
 
     def mark_submitting(self):
         self._transition(OrderStatus.SUBMITTING)

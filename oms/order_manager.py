@@ -32,10 +32,13 @@ class OrderManager:
 
     def on_order_submitted(self, event):
         data: OrderSubmitted = event.data
+        submitted_monotonic = float(
+            getattr(data, "monotonic_timestamp", 0.0) or data.timestamp
+        )
         with self.lock:
             self.monitored_orders[data.order_id] = {
                 "symbol": data.req.symbol,
-                "submit_time": data.timestamp,
+                "submit_time": submitted_monotonic,
                 "last_ack_time": 0.0,
                 "status": data.status,
                 "ack_timeout_reported": False,
@@ -44,11 +47,12 @@ class OrderManager:
 
     def recover_order(self, order):
         """Resume truth auditing for an active order restored from the ledger."""
+        recovered_at = time.perf_counter()
         with self.lock:
             self.monitored_orders[order.client_oid] = {
                 "symbol": order.intent.symbol,
-                "submit_time": order.created_at,
-                "last_ack_time": order.updated_at,
+                "submit_time": recovered_at,
+                "last_ack_time": recovered_at,
                 "status": order.status,
                 "ack_timeout_reported": False,
                 "last_timeout_reported_at": 0.0,
@@ -77,12 +81,12 @@ class OrderManager:
                 OrderStatus.SUBMIT_UNKNOWN,
                 OrderStatus.CANCEL_UNKNOWN,
             }:
-                self.monitored_orders[order_id]["last_ack_time"] = time.time()
+                self.monitored_orders[order_id]["last_ack_time"] = time.perf_counter()
                 self.monitored_orders[order_id]["ack_timeout_reported"] = False
                 self.monitored_orders[order_id]["last_timeout_reported_at"] = 0.0
 
     def _check_once(self, now=None):
-        now = time.time() if now is None else now
+        now = time.perf_counter() if now is None else now
         suspicious_oid = None
 
         with self.lock:

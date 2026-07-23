@@ -23,27 +23,34 @@ class LiveDataCache:
         self.book_update_times = {}
         self.mark_update_times = {}
         self.trade_update_times = {}
+        self.book_update_wall_times = {}
+        self.mark_update_wall_times = {}
+        self.trade_update_wall_times = {}
         self._lock = threading.RLock()
 
     def update_book(self, ob: OrderBook):
-        received_at = float(getattr(ob, "received_timestamp", 0.0) or time.time())
+        received_at = self._received_monotonic(ob)
+        received_wall = self._received_wall(ob)
         with self._lock:
             self.books[ob.symbol] = ob
             self.book_update_times[ob.symbol] = received_at
+            self.book_update_wall_times[ob.symbol] = received_wall
 
     def update_mark_price(self, mp: MarkPriceData):
-        source_time = getattr(mp, "datetime", None)
-        update_time = source_time.timestamp() if source_time is not None else time.time()
+        update_time = self._received_monotonic(mp)
+        received_wall = self._received_wall(mp)
         with self._lock:
             self.mark_prices[mp.symbol] = mp
             self.mark_update_times[mp.symbol] = update_time
+            self.mark_update_wall_times[mp.symbol] = received_wall
 
     def update_trade(self, tr: AggTradeData):
-        source_time = getattr(tr, "datetime", None)
-        update_time = source_time.timestamp() if source_time is not None else time.time()
+        update_time = self._received_monotonic(tr)
+        received_wall = self._received_wall(tr)
         with self._lock:
             self.last_trades[tr.symbol] = tr
             self.trade_update_times[tr.symbol] = update_time
+            self.trade_update_wall_times[tr.symbol] = received_wall
 
     def get_book(self, symbol):
         with self._lock:
@@ -76,8 +83,8 @@ class LiveDataCache:
             return trade.price if trade else 0.0
 
     def get_risk_snapshot(self, symbol: str, now: float = None) -> dict:
-        """Return native prices and the age of each source used by risk."""
-        now = time.time() if now is None else float(now)
+        """Return prices and source ages using the process monotonic clock."""
+        now = time.perf_counter() if now is None else float(now)
         with self._lock:
             mark = self.mark_prices.get(symbol)
             book = self.books.get(symbol)
@@ -85,6 +92,15 @@ class LiveDataCache:
             mark_time = float(self.mark_update_times.get(symbol, 0.0) or 0.0)
             book_time = float(self.book_update_times.get(symbol, 0.0) or 0.0)
             trade_time = float(self.trade_update_times.get(symbol, 0.0) or 0.0)
+            mark_wall_time = float(
+                self.mark_update_wall_times.get(symbol, 0.0) or 0.0
+            )
+            book_wall_time = float(
+                self.book_update_wall_times.get(symbol, 0.0) or 0.0
+            )
+            trade_wall_time = float(
+                self.trade_update_wall_times.get(symbol, 0.0) or 0.0
+            )
 
             bid = ask = 0.0
             if book is not None:
@@ -103,7 +119,27 @@ class LiveDataCache:
                 "mark_update_time": mark_time,
                 "book_update_time": book_time,
                 "trade_update_time": trade_time,
+                "mark_update_wall_time": mark_wall_time,
+                "book_update_wall_time": book_wall_time,
+                "trade_update_wall_time": trade_wall_time,
+                "update_clock": "monotonic",
             }
+
+    @staticmethod
+    def _received_monotonic(data) -> float:
+        return float(
+            getattr(data, "received_monotonic", 0.0)
+            or getattr(data, "dispatch_monotonic", 0.0)
+            or time.perf_counter()
+        )
+
+    @staticmethod
+    def _received_wall(data) -> float:
+        return float(
+            getattr(data, "received_timestamp", 0.0)
+            or getattr(data, "dispatch_timestamp", 0.0)
+            or time.time()
+        )
 
 
 data_cache = LiveDataCache()

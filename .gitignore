@@ -28,3 +28,6 @@ tests/*
 !tests/test_oms_institutional_recovery.py
 !tests/test_oms_durable_ledger.py
 !tests/test_paper_gateway.py
+!tests/test_main_dashboard_startup.py
+!tests/test_live_config_guard.py
+!tests/test_live_config_guard.py

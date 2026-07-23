@@ -98,6 +98,36 @@ class OrderValidatorTests(unittest.TestCase):
         self.assertFalse(second_valid)
         self.assertIn("rate_limit", second_reason)
 
+    @patch("oms.validator.ref_data_manager.get_info", return_value=None)
+    @patch("oms.validator.data_cache.get_best_quote", return_value=(99.95, 100.05))
+    @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
+    def test_reduce_only_has_an_independent_rate_limit_channel(self, *_mocks):
+        validator = self.make_validator()
+        opening = OrderIntent(
+            "test",
+            "BTCUSDT",
+            Side.BUY,
+            100.0,
+            0.5,
+        )
+        reduction = OrderIntent(
+            "test",
+            "BTCUSDT",
+            Side.SELL,
+            100.0,
+            0.5,
+            reduce_only=True,
+        )
+
+        first_opening, _ = validator.validate_params(opening)
+        reduce_valid, reduce_reason = validator.validate_params(reduction)
+        second_opening, second_reason = validator.validate_params(opening)
+
+        self.assertTrue(first_opening)
+        self.assertTrue(reduce_valid, reduce_reason)
+        self.assertFalse(second_opening)
+        self.assertIn("rate_limit:risk", second_reason)
+
 
 class OMSConfigTests(unittest.TestCase):
     def test_oms_uses_max_pos_notional_from_risk_limits(self):

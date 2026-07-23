@@ -9,6 +9,7 @@ import time
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 if "requests" not in sys.modules:
     requests_module = types.ModuleType("requests")
@@ -63,6 +64,7 @@ from event.type import (
     EVENT_SYSTEM_HEALTH,
 )
 from gateway.binance.gateway import BinanceGateway
+from infrastructure.watchdog import emit_event_engine_backlog_if_needed
 from oms.engine import OMS
 from oms.journal import OMSJournal
 from oms.order import Order
@@ -107,7 +109,7 @@ class DummyGateway:
 
     def cancel_all_orders(self, symbol):
         self.cancelled_symbols.append(symbol)
-        return None
+        return DummyResponse({}, status_code=200)
 
     def get_account_info(self):
         return self.account
@@ -126,8 +128,14 @@ class DummyOMS:
         self.halt_reasons = []
         self.frozen_symbols = []
         self.unfrozen_symbols = []
+        self.symbol_clear_attempts = []
+        self._symbol_freeze_reasons = {}
+        self._symbol_freeze_epochs = {}
         self.frozen_venues = []
         self.unfrozen_venues = []
+        self.venue_clear_attempts = []
+        self._venue_freeze_reasons = {}
+        self._venue_freeze_epochs = {}
         self.trading_modes = []
         self.cleared_trading_modes = []
         self.flatten_reasons = []
@@ -140,18 +148,76 @@ class DummyOMS:
         self.halt_reasons.append(reason)
 
     def freeze_symbol(self, symbol, reason, cancel_active_orders=True):
+        symbol = symbol.upper()
+        epoch = self._symbol_freeze_epochs.get(symbol, 0) + 1
+        self._symbol_freeze_epochs[symbol] = epoch
+        self._symbol_freeze_reasons[symbol] = reason
         self.frozen_symbols.append((symbol, reason, cancel_active_orders))
+        return epoch
 
-    def clear_symbol_freeze(self, symbol, reason=""):
+    def clear_symbol_freeze(
+        self,
+        symbol,
+        reason="",
+        expected_epoch=None,
+        expected_reason=None,
+    ):
+        symbol = symbol.upper()
+        current_epoch = self._symbol_freeze_epochs.get(symbol, 0)
+        current_reason = self._symbol_freeze_reasons.get(symbol, "")
+        self.symbol_clear_attempts.append(
+            (symbol, reason, expected_epoch, expected_reason)
+        )
+        if expected_epoch is not None and expected_epoch != current_epoch:
+            return False
+        if expected_reason is not None and expected_reason != current_reason:
+            return False
+        if not self._symbol_freeze_reasons.pop(symbol, ""):
+            return False
         self.unfrozen_symbols.append((symbol, reason))
         return True
 
-    def freeze_venue(self, venue, reason, cancel_active_orders=True):
-        self.frozen_venues.append((venue, reason, cancel_active_orders))
+    def get_symbol_freeze_reason(self, symbol):
+        return self._symbol_freeze_reasons.get(symbol.upper(), "")
 
-    def clear_venue_freeze(self, venue, reason=""):
+    def get_symbol_freeze_epoch(self, symbol):
+        return self._symbol_freeze_epochs.get(symbol.upper(), 0)
+
+    def freeze_venue(self, venue, reason, cancel_active_orders=True):
+        venue = venue.upper()
+        epoch = self._venue_freeze_epochs.get(venue, 0) + 1
+        self._venue_freeze_epochs[venue] = epoch
+        self._venue_freeze_reasons[venue] = reason
+        self.frozen_venues.append((venue, reason, cancel_active_orders))
+        return epoch
+
+    def clear_venue_freeze(
+        self,
+        venue,
+        reason="",
+        expected_epoch=None,
+        expected_reason=None,
+    ):
+        venue = venue.upper()
+        current_epoch = self._venue_freeze_epochs.get(venue, 0)
+        current_reason = self._venue_freeze_reasons.get(venue, "")
+        self.venue_clear_attempts.append(
+            (venue, reason, expected_epoch, expected_reason)
+        )
+        if expected_epoch is not None and expected_epoch != current_epoch:
+            return False
+        if expected_reason is not None and expected_reason != current_reason:
+            return False
+        if not self._venue_freeze_reasons.pop(venue, ""):
+            return False
         self.unfrozen_venues.append((venue, reason))
         return True
+
+    def get_venue_freeze_reason(self, venue):
+        return self._venue_freeze_reasons.get(venue.upper(), "")
+
+    def get_venue_freeze_epoch(self, venue):
+        return self._venue_freeze_epochs.get(venue.upper(), 0)
 
     def set_trading_mode(self, mode, reason):
         self.trading_modes.append((mode, reason))
@@ -373,6 +439,7 @@ class ExchangeTruthTests(unittest.TestCase):
                 commission_asset="USDT",
                 realized_pnl=-8.0,
                 is_maker=False,
+                trade_id=1,
             )
 
             oms._apply_event(Event(EVENT_EXCHANGE_ORDER_UPDATE, update))
@@ -470,6 +537,10 @@ class ExchangeTruthTests(unittest.TestCase):
         gateway.event_engine = engine
         gateway.gateway_name = "BINANCE"
         gateway.state = GatewayState.READY
+        gateway._book_lock = threading.RLock()
+        gateway._book_generation = 0
+        gateway.active = True
+        gateway.ws = None
 
         gateway.on_ws_message("{bad-json")
 
@@ -479,6 +550,12 @@ class ExchangeTruthTests(unittest.TestCase):
     def test_gateway_classifies_missing_submit_response_as_unknown(self):
         gateway = BinanceGateway.__new__(BinanceGateway)
         gateway.gateway_name = "BINANCE"
+        gateway.require_healthy_clock = False
+        gateway._book_lock = threading.RLock()
+        gateway.active = True
+        gateway.state = GatewayState.READY
+        gateway.book_resyncing = set()
+        gateway.ws_buffer = {"BTCUSDT": None}
         gateway.rest = types.SimpleNamespace(new_order=lambda _req, _client_oid: None)
         request = OrderRequest(
             symbol="BTCUSDT",
@@ -491,6 +568,79 @@ class ExchangeTruthTests(unittest.TestCase):
 
         self.assertEqual(result.outcome, CommandOutcome.UNKNOWN)
         self.assertEqual(result.exchange_oid, "")
+
+    def test_gateway_classifies_binance_unknown_execution_as_unknown(self):
+        gateway = BinanceGateway.__new__(BinanceGateway)
+        gateway.gateway_name = "BINANCE"
+        gateway.require_healthy_clock = False
+        gateway._book_lock = threading.RLock()
+        gateway.active = True
+        gateway.state = GatewayState.READY
+        gateway.book_resyncing = set()
+        gateway.ws_buffer = {"BTCUSDT": None}
+        gateway.rest = types.SimpleNamespace(
+            new_order=lambda _req, _client_oid: DummyResponse(
+                {"code": -1006, "msg": "Unexpected response from message bus"},
+                status_code=400,
+            )
+        )
+        request = OrderRequest(
+            symbol="BTCUSDT",
+            price=100.0,
+            volume=1.0,
+            side="BUY",
+        )
+
+        result = gateway.send_order(request, "oid-unknown-execution")
+
+        self.assertEqual(result.outcome, CommandOutcome.UNKNOWN)
+        self.assertEqual(result.error_code, "-1006")
+
+    @patch(
+        "gateway.binance.gateway.time_service.health_snapshot",
+        return_value={
+            "ready": False,
+            "state": "degraded",
+            "reason": "clock uncertainty",
+        },
+    )
+    def test_gateway_clock_gate_is_final_and_allows_reduce_only(
+        self,
+        _clock_health,
+    ):
+        calls = []
+        gateway = BinanceGateway.__new__(BinanceGateway)
+        gateway.gateway_name = "BINANCE"
+        gateway.require_healthy_clock = True
+        gateway._book_lock = threading.RLock()
+        gateway.active = True
+        gateway.state = GatewayState.READY
+        gateway.book_resyncing = set()
+        gateway.ws_buffer = {"BTCUSDT": None}
+        gateway.rest = types.SimpleNamespace(
+            new_order=lambda req, client_oid: calls.append((req, client_oid))
+        )
+        opening = OrderRequest(
+            symbol="BTCUSDT",
+            price=100.0,
+            volume=1.0,
+            side="BUY",
+        )
+        reducing = OrderRequest(
+            symbol="BTCUSDT",
+            price=100.0,
+            volume=1.0,
+            side="SELL",
+            reduce_only=True,
+        )
+
+        rejected = gateway.send_order(opening, "clock-rejected")
+        reduced = gateway.send_order(reducing, "clock-reduce")
+
+        self.assertEqual(rejected.outcome, CommandOutcome.REJECTED)
+        self.assertEqual(rejected.error_code, "CLOCK_UNHEALTHY")
+        self.assertEqual(reduced.outcome, CommandOutcome.UNKNOWN)
+        self.assertEqual(len(calls), 1)
 
     def test_gateway_keeps_position_only_account_update(self):
         engine = DummyEngine()
@@ -749,6 +899,7 @@ class ExchangeTruthTests(unittest.TestCase):
                 commission_asset="USDT",
                 realized_pnl=0.0,
                 is_maker=True,
+                trade_id=1,
             )
             oms._apply_event(Event(EVENT_EXCHANGE_ORDER_UPDATE, fill_update))
 
@@ -783,6 +934,7 @@ class ExchangeTruthTests(unittest.TestCase):
                 seq=2,
                 commission=0.0,
                 realized_pnl=0.0,
+                trade_id=1,
             )
             oms._apply_event(Event(EVENT_EXCHANGE_ORDER_UPDATE, fill_update))
 
@@ -1180,6 +1332,83 @@ class RiskExecutionTests(unittest.TestCase):
         self.assertFalse(risk.kill_switch_triggered)
         self.assertTrue(oms.frozen_symbols)
 
+    def test_venue_latency_applies_exchange_clock_offset_and_preserves_negative_skew(self):
+        from infrastructure.time_service import time_service
+
+        original_offset = time_service.offset
+        received_timestamp = time.time()
+        try:
+            time_service.offset = 250.0
+            corrected_oms = DummyOMS()
+            corrected_risk = RiskManager(
+                DummyEngine(),
+                self.make_risk_config(),
+                oms=corrected_oms,
+                gateway=DummyGateway(),
+            )
+            corrected_book = OrderBook(
+                symbol="BTCUSDT",
+                exchange="BINANCE",
+                datetime=datetime.fromtimestamp(received_timestamp),
+                exchange_timestamp=received_timestamp + 0.25,
+                received_timestamp=received_timestamp,
+                received_monotonic=time.perf_counter(),
+            )
+
+            corrected_risk.on_orderbook(Event("eOrderBook", corrected_book))
+            corrected_risk.on_orderbook(Event("eOrderBook", corrected_book))
+
+            self.assertFalse(corrected_oms.frozen_symbols)
+            self.assertAlmostEqual(corrected_risk.last_market_latency_ms, 0.0, places=3)
+
+            time_service.offset = 0.0
+            skewed_oms = DummyOMS()
+            skewed_risk = RiskManager(
+                DummyEngine(),
+                self.make_risk_config(),
+                oms=skewed_oms,
+                gateway=DummyGateway(),
+            )
+            skewed_risk.on_orderbook(Event("eOrderBook", corrected_book))
+            skewed_risk.on_orderbook(Event("eOrderBook", corrected_book))
+
+            self.assertLess(skewed_risk.last_market_latency_ms, -200.0)
+            self.assertTrue(skewed_oms.frozen_symbols)
+            self.assertIn("latency:-", skewed_oms.frozen_symbols[-1][1])
+        finally:
+            time_service.offset = original_offset
+
+    def test_processing_lag_prefers_monotonic_ingress_over_stale_wall_clock(self):
+        from infrastructure.time_service import time_service
+
+        original_offset = time_service.offset
+        try:
+            time_service.offset = 0.0
+            oms = DummyOMS()
+            risk = RiskManager(
+                DummyEngine(),
+                self.make_risk_config(),
+                oms=oms,
+                gateway=DummyGateway(),
+            )
+            stale_wall = time.time() - 30.0
+            book = OrderBook(
+                symbol="BTCUSDT",
+                exchange="BINANCE",
+                datetime=datetime.fromtimestamp(stale_wall),
+                exchange_timestamp=stale_wall,
+                received_timestamp=stale_wall,
+                received_monotonic=time.perf_counter(),
+            )
+
+            risk.on_orderbook(Event("eOrderBook", book))
+            risk.on_orderbook(Event("eOrderBook", book))
+
+            self.assertFalse(oms.frozen_venues)
+            self.assertLess(risk.last_processing_lag_ms, 100.0)
+        finally:
+            time_service.offset = original_offset
+
     def test_symbol_freeze_escalates_when_multiple_symbols_are_frozen(self):
         engine = DummyEngine()
         gateway = DummyGateway()
@@ -1235,6 +1464,44 @@ class RiskExecutionTests(unittest.TestCase):
 
         self.assertTrue(oms.unfrozen_symbols)
 
+    def test_stale_risk_symbol_recovery_cannot_clear_newer_guard(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        risk = RiskManager(engine, self.make_risk_config(), oms=oms, gateway=gateway)
+        stale_book = OrderBook(
+            symbol="BTCUSDT",
+            exchange="BINANCE",
+            datetime=datetime.now() - timedelta(milliseconds=250),
+        )
+        fresh_book = OrderBook(
+            symbol="BTCUSDT",
+            exchange="BINANCE",
+            datetime=datetime.now(),
+            exchange_timestamp=datetime.now().timestamp(),
+        )
+
+        risk.on_orderbook(Event("eOrderBook", stale_book))
+        risk.on_orderbook(Event("eOrderBook", stale_book))
+        owned_reason = risk.frozen_symbols["BTCUSDT"]
+        owned_epoch = risk.symbol_freeze_epochs["BTCUSDT"]
+        newer_epoch = oms.freeze_symbol(
+            "BTCUSDT",
+            "truth_plane:newer",
+            cancel_active_orders=False,
+        )
+
+        risk.on_orderbook(Event("eOrderBook", fresh_book))
+        risk.on_orderbook(Event("eOrderBook", fresh_book))
+
+        self.assertGreater(newer_epoch, owned_epoch)
+        self.assertEqual(oms.get_symbol_freeze_reason("BTCUSDT"), "truth_plane:newer")
+        self.assertNotIn("BTCUSDT", risk.frozen_symbols)
+        self.assertIn(
+            ("BTCUSDT", "latency recovered after 2 healthy updates", owned_epoch, owned_reason),
+            oms.symbol_clear_attempts,
+        )
+
     def test_processing_lag_freezes_venue_instead_of_symbol(self):
         engine = DummyEngine()
         gateway = DummyGateway()
@@ -1285,6 +1552,84 @@ class RiskExecutionTests(unittest.TestCase):
         risk.on_orderbook(Event("eOrderBook", fresh_book))
 
         self.assertTrue(oms.unfrozen_venues)
+
+    def test_processing_lag_stale_recovery_cannot_clear_new_venue_fault(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        risk = RiskManager(engine, self.make_risk_config(), oms=oms, gateway=gateway)
+
+        risk._freeze_venue("BINANCE", "processing_lag:first")
+        stale_epoch = risk.venue_freeze_epochs["BINANCE"]
+        oms.freeze_venue(
+            "BINANCE",
+            "system_health:new_fault",
+            cancel_active_orders=False,
+        )
+
+        for _ in range(risk.venue_freeze_recovery_updates):
+            risk._recover_venue_if_stable("BINANCE", prefix="processing_lag:")
+
+        self.assertEqual(
+            oms.get_venue_freeze_reason("BINANCE"),
+            "system_health:new_fault",
+        )
+        self.assertFalse(oms.unfrozen_venues)
+        self.assertEqual(oms.venue_clear_attempts[-1][2], stale_epoch)
+        self.assertEqual(
+            oms.venue_clear_attempts[-1][3],
+            "processing_lag:first",
+        )
+
+    def test_watchdog_stale_recovery_cannot_clear_new_venue_fault(self):
+        oms = DummyOMS()
+        snapshot = {
+            "lanes": {
+                "market": {
+                    "depth": 101,
+                    "oldest_queued_ms": 0.0,
+                }
+            }
+        }
+        event_engine = types.SimpleNamespace(
+            get_metrics_snapshot=lambda: snapshot,
+        )
+        config = {"recovery_checks": 2}
+
+        state = emit_event_engine_backlog_if_needed(
+            event_engine,
+            oms,
+            "BINANCE",
+            {},
+            config,
+        )
+        stale_epoch = state["venue_freeze_epoch"]
+        original_reason = state["venue_freeze_reason"]
+        oms.freeze_venue(
+            "BINANCE",
+            "system_health:new_fault",
+            cancel_active_orders=False,
+        )
+        snapshot["lanes"] = {}
+
+        for _ in range(config["recovery_checks"]):
+            state = emit_event_engine_backlog_if_needed(
+                event_engine,
+                oms,
+                "BINANCE",
+                state,
+                config,
+            )
+
+        self.assertEqual(
+            oms.get_venue_freeze_reason("BINANCE"),
+            "system_health:new_fault",
+        )
+        self.assertFalse(oms.unfrozen_venues)
+        self.assertEqual(
+            oms.venue_clear_attempts[-1][2:],
+            (stale_epoch, original_reason),
+        )
 
     def test_processing_lag_degrades_before_venue_freeze(self):
         engine = DummyEngine()
@@ -1839,7 +2184,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         self.assertEqual(status["risk_action"], "REDUCE_ONLY")
         self.assertEqual(status["reason"], "daily_equity_snapshot_invalid")
 
-    def test_sidecar_clock_offset_has_soft_and_hard_risk_stages(self):
+    def test_sidecar_clock_phase_error_has_soft_and_hard_risk_stages(self):
         base_snapshot = {
             "account": {
                 "totalMaintMargin": "0",
@@ -1847,40 +2192,116 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             },
             "positions": [],
             "open_orders": [],
+            "clock_offset_ms": -800.0,
             "clock_rtt_ms": 10.0,
+            "clock_uncertainty_ms": 6.0,
+            "clock_offset_dispersion_ms": 1.0,
         }
         settings = self.make_settings(
             clock_sync_enabled=True,
-            clock_reduce_only_offset_ms=250.0,
-            clock_kill_offset_ms=1000.0,
-            clock_max_rtt_ms=1500.0,
+            # Legacy offset keys remain accepted, but now define phase limits.
+            clock_reduce_only_offset_ms=25.0,
+            clock_kill_offset_ms=100.0,
+            clock_max_rtt_ms=200.0,
+            clock_max_uncertainty_ms=50.0,
+            clock_max_offset_dispersion_ms=10.0,
         )
+        stable_exchange = DummySidecarExchange(
+            risk_snapshot={**base_snapshot, "clock_phase_error_ms": 0.0}
+        )
+        stable = RiskSidecarCore(stable_exchange, settings, now=790.0)
+        stable.receive_parent_heartbeat(1, now=790.1)
+        stable_status, _ = stable.step(now=790.1)
+        self.assertEqual(stable_status["risk_action"], "NONE")
+
         soft_exchange = DummySidecarExchange(
-            risk_snapshot={**base_snapshot, "clock_offset_ms": 300.0}
+            risk_snapshot={**base_snapshot, "clock_phase_error_ms": 30.0}
         )
         soft = RiskSidecarCore(soft_exchange, settings, now=800.0)
         soft.receive_parent_heartbeat(1, now=800.1)
         soft_status, _ = soft.step(now=800.1)
         self.assertEqual(soft_status["risk_action"], "REDUCE_ONLY")
-        self.assertIn("clock_offset_reduce_only", soft_status["reason"])
+        self.assertIn("clock_phase_error_reduce_only", soft_status["reason"])
 
         hard_exchange = DummySidecarExchange(
-            risk_snapshot={**base_snapshot, "clock_offset_ms": -1200.0}
+            risk_snapshot={**base_snapshot, "clock_phase_error_ms": -120.0}
         )
         hard = RiskSidecarCore(hard_exchange, settings, now=810.0)
         hard.receive_parent_heartbeat(1, now=810.1)
         hard_status, _ = hard.step(now=810.1)
         self.assertEqual(hard_status["risk_action"], "KILL")
-        self.assertIn("clock_offset_kill", hard_status["reason"])
+        self.assertIn("clock_phase_error_kill", hard_status["reason"])
 
-    def test_sidecar_clock_rtt_or_missing_snapshot_fails_closed(self):
+    def test_sidecar_hard_clock_failure_kills_without_private_snapshot(self):
+        exchange = DummySidecarExchange(
+            healthy=False,
+            reason="clock_phase_error_kill:120.000ms",
+        )
+        core = RiskSidecarCore(
+            exchange,
+            self.make_settings(clock_sync_enabled=True),
+            now=815.0,
+        )
+        core.receive_parent_heartbeat(1, now=815.1)
+
+        status, _ = core.step(now=815.1)
+
+        self.assertEqual(status["risk_action"], "KILL")
+        self.assertTrue(status["kill_latched"])
+        self.assertIn("clock_phase_error_kill", status["reason"])
+        self.assertEqual(len(exchange.cancel_calls), 1)
+
+    def test_sidecar_clock_quality_or_missing_snapshot_fails_closed(self):
         settings = self.make_settings(
             clock_sync_enabled=True,
-            clock_reduce_only_offset_ms=250.0,
-            clock_kill_offset_ms=1000.0,
-            clock_max_rtt_ms=1500.0,
+            clock_reduce_only_phase_error_ms=25.0,
+            clock_kill_phase_error_ms=100.0,
+            clock_max_rtt_ms=200.0,
+            clock_max_uncertainty_ms=50.0,
+            clock_max_offset_dispersion_ms=10.0,
         )
-        high_rtt_exchange = DummySidecarExchange(
+        base_snapshot = {
+            "account": {
+                "totalMaintMargin": "0",
+                "totalMarginBalance": "1000",
+            },
+            "positions": [],
+            "open_orders": [],
+            "clock_offset_ms": -800.0,
+            "clock_phase_error_ms": 0.0,
+            "clock_rtt_ms": 10.0,
+            "clock_uncertainty_ms": 6.0,
+            "clock_offset_dispersion_ms": 1.0,
+        }
+        cases = (
+            (
+                {"clock_rtt_ms": 250.0},
+                "clock_rtt_reduce_only",
+            ),
+            (
+                {"clock_uncertainty_ms": 60.0},
+                "clock_uncertainty_reduce_only",
+            ),
+            (
+                {"clock_offset_dispersion_ms": 12.0},
+                "clock_dispersion_reduce_only",
+            ),
+        )
+        for index, (override, expected_reason) in enumerate(cases):
+            exchange = DummySidecarExchange(
+                risk_snapshot={**base_snapshot, **override}
+            )
+            core = RiskSidecarCore(
+                exchange,
+                settings,
+                now=820.0 + index,
+            )
+            core.receive_parent_heartbeat(1, now=820.1 + index)
+            status, _ = core.step(now=820.1 + index)
+            self.assertEqual(status["risk_action"], "REDUCE_ONLY")
+            self.assertIn(expected_reason, status["reason"])
+
+        invalid_exchange = DummySidecarExchange(
             risk_snapshot={
                 "account": {
                     "totalMaintMargin": "0",
@@ -1888,19 +2309,22 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                 },
                 "positions": [],
                 "open_orders": [],
-                "clock_offset_ms": 10.0,
-                "clock_rtt_ms": 2000.0,
+                "clock_offset_ms": -800.0,
+                "clock_phase_error_ms": float("nan"),
+                "clock_rtt_ms": 10.0,
+                "clock_uncertainty_ms": 6.0,
+                "clock_offset_dispersion_ms": 1.0,
             }
         )
-        high_rtt = RiskSidecarCore(
-            high_rtt_exchange,
+        invalid = RiskSidecarCore(
+            invalid_exchange,
             settings,
-            now=820.0,
+            now=829.0,
         )
-        high_rtt.receive_parent_heartbeat(1, now=820.1)
-        high_rtt_status, _ = high_rtt.step(now=820.1)
-        self.assertEqual(high_rtt_status["risk_action"], "REDUCE_ONLY")
-        self.assertIn("clock_rtt_reduce_only", high_rtt_status["reason"])
+        invalid.receive_parent_heartbeat(1, now=829.1)
+        invalid_status, _ = invalid.step(now=829.1)
+        self.assertEqual(invalid_status["risk_action"], "REDUCE_ONLY")
+        self.assertEqual(invalid_status["reason"], "clock_snapshot_invalid")
 
         missing_exchange = DummySidecarExchange()
         missing = RiskSidecarCore(missing_exchange, settings, now=830.0)
@@ -2331,6 +2755,265 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(snapshot, {})
         self.assertEqual(reason, "server_time_status=503")
+
+    def test_binance_sidecar_clock_failure_bypasses_success_cache(self):
+        exchange = BinanceRiskSidecarExchange.__new__(
+            BinanceRiskSidecarExchange
+        )
+        exchange.clock_sync_enabled = True
+        exchange.clock_sync_interval_sec = 30.0
+        exchange.last_clock_sync_monotonic = time.perf_counter()
+        exchange.clock_reason = "clock_rtt_exceeded:250ms"
+
+        with patch.object(
+            exchange,
+            "sync_exchange_clock",
+            return_value=(False, exchange.clock_reason),
+        ) as sync_clock:
+            ok, reason = exchange._ensure_exchange_clock()
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "clock_rtt_exceeded:250ms")
+        sync_clock.assert_called_once_with()
+
+    def test_binance_sidecar_clock_uses_low_rtt_median(self):
+        rtts_ms = [100.0, 1.0, 2.0, 3.0, 80.0]
+        offsets_ms = [900.0, 20.0, 21.0, 19.0, -700.0]
+        wall_values = []
+        monotonic_values = []
+        server_values = []
+        for index, (rtt_ms, offset_ms) in enumerate(
+            zip(rtts_ms, offsets_ms, strict=True)
+        ):
+            wall_start = 1_000.0 + index
+            mono_start = 10.0 + index
+            wall_values.extend([wall_start, wall_start + rtt_ms / 1000.0])
+            monotonic_values.extend(
+                [mono_start, mono_start + rtt_ms / 1000.0]
+            )
+            server_values.append(
+                wall_start * 1000.0 + rtt_ms / 2.0 + offset_ms
+            )
+
+        exchange = BinanceRiskSidecarExchange.__new__(
+            BinanceRiskSidecarExchange
+        )
+        exchange.clock_sample_count = 5
+        exchange.clock_min_successful_samples = 3
+        exchange.clock_low_rtt_sample_count = 3
+        exchange.clock_sample_spacing_ms = 0.0
+        exchange.clock_max_wall_step_ms = 20.0
+        server_iter = iter(server_values)
+        exchange.rest = types.SimpleNamespace(
+            get_server_time=lambda: DummyResponse(
+                {"serverTime": next(server_iter)}
+            )
+        )
+
+        with (
+            patch(
+                "risk.independent_supervisor.time.time",
+                side_effect=wall_values,
+            ),
+            patch(
+                "risk.independent_supervisor.time.perf_counter",
+                side_effect=monotonic_values,
+            ),
+        ):
+            sample, reason = exchange._collect_clock_samples()
+
+        self.assertEqual(reason, "")
+        self.assertAlmostEqual(sample["offset_ms"], 20.0, places=6)
+        self.assertAlmostEqual(sample["rtt_ms"], 2.0, places=6)
+        self.assertAlmostEqual(sample["dispersion_ms"], 1.0, places=6)
+        self.assertAlmostEqual(sample["uncertainty_ms"], 2.0, places=6)
+
+    def test_binance_sidecar_tracks_phase_against_previous_anchor(self):
+        from infrastructure.time_service import time_service
+
+        exchange = BinanceRiskSidecarExchange.__new__(
+            BinanceRiskSidecarExchange
+        )
+        exchange.clock_max_rtt_ms = 200.0
+        exchange.clock_max_uncertainty_ms = 50.0
+        exchange.clock_max_offset_dispersion_ms = 10.0
+        exchange.clock_max_initial_offset_ms = 5000.0
+        exchange.clock_reduce_only_phase_error_ms = 25.0
+        exchange.clock_kill_phase_error_ms = 100.0
+        exchange._clock_anchor_epoch_ms = 0.0
+        exchange._clock_anchor_monotonic = 0.0
+        exchange.clock_reason = "clock_sync_missing"
+        stable = {
+            "offset_ms": -800.0,
+            "rtt_ms": 2.0,
+            "dispersion_ms": 1.0,
+            "uncertainty_ms": 2.0,
+        }
+        shifted = {**stable, "offset_ms": -770.0}
+        original_offset = time_service.offset
+        try:
+            with (
+                patch.object(exchange, "_collect_clock_samples", return_value=(stable, "")),
+                patch("risk.independent_supervisor.time.perf_counter", return_value=10.0),
+                patch("risk.independent_supervisor.time.time", return_value=1000.0),
+            ):
+                self.assertEqual(exchange.sync_exchange_clock(), (True, ""))
+            self.assertEqual(exchange.clock_phase_error_ms, 0.0)
+
+            with (
+                patch.object(exchange, "_collect_clock_samples", return_value=(stable, "")),
+                patch("risk.independent_supervisor.time.perf_counter", return_value=20.0),
+                patch("risk.independent_supervisor.time.time", return_value=1010.0),
+            ):
+                self.assertEqual(exchange.sync_exchange_clock(), (True, ""))
+            self.assertAlmostEqual(exchange.clock_phase_error_ms, 0.0)
+            stable_anchor = (
+                exchange._clock_anchor_epoch_ms,
+                exchange._clock_anchor_monotonic,
+            )
+
+            with (
+                patch.object(exchange, "_collect_clock_samples", return_value=(shifted, "")),
+                patch("risk.independent_supervisor.time.perf_counter", return_value=30.0),
+                patch("risk.independent_supervisor.time.time", return_value=1020.0),
+            ):
+                self.assertEqual(
+                    exchange.sync_exchange_clock(),
+                    (False, "clock_phase_error_reduce_only:30.000ms"),
+                )
+            self.assertAlmostEqual(exchange.clock_phase_error_ms, 30.0)
+            self.assertEqual(exchange.clock_offset_ms, -800.0)
+            self.assertEqual(
+                (
+                    exchange._clock_anchor_epoch_ms,
+                    exchange._clock_anchor_monotonic,
+                ),
+                stable_anchor,
+            )
+
+            # The rejected candidate must not become the next baseline.
+            with (
+                patch.object(exchange, "_collect_clock_samples", return_value=(shifted, "")),
+                patch("risk.independent_supervisor.time.perf_counter", return_value=40.0),
+                patch("risk.independent_supervisor.time.time", return_value=1030.0),
+            ):
+                self.assertEqual(
+                    exchange.sync_exchange_clock(),
+                    (False, "clock_phase_error_reduce_only:30.000ms"),
+                )
+            self.assertEqual(
+                (
+                    exchange._clock_anchor_epoch_ms,
+                    exchange._clock_anchor_monotonic,
+                ),
+                stable_anchor,
+            )
+
+            hard_shifted = {**stable, "offset_ms": -680.0}
+            with (
+                patch.object(
+                    exchange,
+                    "_collect_clock_samples",
+                    return_value=(hard_shifted, ""),
+                ),
+                patch("risk.independent_supervisor.time.perf_counter", return_value=50.0),
+                patch("risk.independent_supervisor.time.time", return_value=1040.0),
+            ):
+                self.assertEqual(
+                    exchange.sync_exchange_clock(),
+                    (False, "clock_phase_error_kill:120.000ms"),
+                )
+            self.assertEqual(
+                (
+                    exchange._clock_anchor_epoch_ms,
+                    exchange._clock_anchor_monotonic,
+                ),
+                stable_anchor,
+            )
+        finally:
+            time_service.offset = original_offset
+
+    def test_binance_sidecar_rejects_uncertain_clock_candidate(self):
+        exchange = BinanceRiskSidecarExchange.__new__(
+            BinanceRiskSidecarExchange
+        )
+        exchange.clock_offset_ms = 7.0
+        exchange.clock_max_rtt_ms = 200.0
+        exchange.clock_max_uncertainty_ms = 50.0
+        exchange.clock_max_offset_dispersion_ms = 10.0
+        candidate = {
+            "offset_ms": 25.0,
+            "rtt_ms": 120.0,
+            "dispersion_ms": 1.0,
+            "uncertainty_ms": 61.0,
+        }
+
+        with patch.object(
+            exchange,
+            "_collect_clock_samples",
+            return_value=(candidate, ""),
+        ):
+            ok, reason = exchange.sync_exchange_clock()
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "clock_uncertainty_exceeded:61.000ms")
+        self.assertEqual(exchange.clock_offset_ms, 7.0)
+
+    def test_binance_sidecar_rejects_wall_clock_step_during_sample(self):
+        exchange = BinanceRiskSidecarExchange.__new__(
+            BinanceRiskSidecarExchange
+        )
+        exchange.clock_sample_count = 1
+        exchange.clock_min_successful_samples = 1
+        exchange.clock_low_rtt_sample_count = 1
+        exchange.clock_sample_spacing_ms = 0.0
+        exchange.clock_max_wall_step_ms = 20.0
+        exchange.rest = types.SimpleNamespace(
+            get_server_time=lambda: DummyResponse({"serverTime": 1_000_001.0})
+        )
+
+        with (
+            patch(
+                "risk.independent_supervisor.time.time",
+                side_effect=[1000.0, 1001.0],
+            ),
+            patch(
+                "risk.independent_supervisor.time.perf_counter",
+                side_effect=[10.0, 10.001],
+            ),
+        ):
+            sample, reason = exchange._collect_clock_samples()
+
+        self.assertIsNone(sample)
+        self.assertIn("clock_wall_step", reason)
+
+    def test_binance_sidecar_rejects_non_positive_server_time(self):
+        exchange = BinanceRiskSidecarExchange.__new__(
+            BinanceRiskSidecarExchange
+        )
+        exchange.clock_sample_count = 1
+        exchange.clock_min_successful_samples = 1
+        exchange.clock_low_rtt_sample_count = 1
+        exchange.clock_sample_spacing_ms = 0.0
+        exchange.clock_max_wall_step_ms = 20.0
+        exchange.rest = types.SimpleNamespace(
+            get_server_time=lambda: DummyResponse({"serverTime": 0.0})
+        )
+
+        with (
+            patch(
+                "risk.independent_supervisor.time.time",
+                side_effect=[1000.0, 1000.001],
+            ),
+            patch(
+                "risk.independent_supervisor.time.perf_counter",
+                side_effect=[10.0, 10.001],
+            ),
+        ):
+            sample, reason = exchange._collect_clock_samples()
+
+        self.assertIsNone(sample)
+        self.assertEqual(reason, "server_time_non_positive")
 
     def test_sidecar_loop_consumes_heartbeats_then_cancels_when_they_stop(self):
         exchange = DummySidecarExchange(healthy=True)

@@ -47,6 +47,7 @@ class TruthMonitor:
         self.clean_polls = 0
         self.active = False
         self.thread = None
+        self._stop_event = threading.Event()
 
         if start_thread and self.poll_interval_sec > 0:
             self.start()
@@ -55,15 +56,21 @@ class TruthMonitor:
         if self.active or self.poll_interval_sec <= 0:
             return
         self.active = True
+        self._stop_event.clear()
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
     def stop(self):
         self.active = False
+        self._stop_event.set()
+        thread = self.thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=max(1.0, self.poll_interval_sec + 0.5))
 
     def _loop(self):
         while self.active:
-            time.sleep(self.poll_interval_sec)
+            if self._stop_event.wait(self.poll_interval_sec):
+                break
             try:
                 self.poll_once()
             except Exception as exc:
@@ -150,10 +157,6 @@ class TruthMonitor:
 
     def _handle_api_recovery(self):
         self.consecutive_api_failures = 0
-        venue = self._venue_name()
-        venue_reason = self.oms.get_venue_freeze_reason(venue)
-        if venue_reason.startswith("truth_plane:api_unreachable"):
-            self.oms.clear_venue_freeze(venue, reason="truth plane API recovered")
 
     def _compare_truth(self, account, positions, open_orders):
         tracked_symbols = set(self.oms.config.get("symbols", []))
@@ -177,6 +180,23 @@ class TruthMonitor:
             local_balance, _local_source = self._local_balance_value(tracked_assets)
 
         remote_active_orders = self.oms._normalize_remote_open_orders(open_orders)
+        off_config_symbols = {
+            item["symbol"]
+            for item in remote_active_orders
+            if item.get("symbol") not in tracked_symbols
+        }
+        if off_config_symbols:
+            self.consecutive_balance_drifts = 0
+            self.clean_polls = 0
+            for symbol in sorted(off_config_symbols):
+                self.oms.freeze_symbol(
+                    symbol,
+                    "truth_plane:off_config_open_order",
+                    cancel_active_orders=True,
+                )
+            self.oms.trigger_reconcile("Truth plane off-config open order")
+            return False
+
         if local_active_orders != remote_active_orders:
             self.consecutive_balance_drifts = 0
             impacted_symbols = {

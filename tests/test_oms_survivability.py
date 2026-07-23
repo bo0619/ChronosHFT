@@ -64,6 +64,7 @@ class DummyGateway:
         self.cancel_response = None
         self.dead_man_requests = []
         self.dead_man_status_code = 200
+        self.cancel_all_status_code = 200
 
     def send_order(self, req, client_oid):
         self.sent_orders.append((req, client_oid))
@@ -75,7 +76,10 @@ class DummyGateway:
 
     def cancel_all_orders(self, symbol):
         self.cancelled_symbols.append(symbol)
-        return None
+        return types.SimpleNamespace(
+            status_code=self.cancel_all_status_code,
+            json=lambda: {},
+        )
 
     def set_countdown_cancel_all(self, symbol, countdown_time_ms):
         self.dead_man_requests.append((symbol, countdown_time_ms))
@@ -107,6 +111,8 @@ class DummyScopedOms:
         self.strategy_freezes = []
         self.cleared_symbols = []
         self.cleared_venues = []
+        self.venue_verifications = []
+        self.orderbook_clears = []
 
     def freeze_symbol(self, symbol, reason, cancel_active_orders=True):
         self.symbol_freezes.append((symbol, reason, cancel_active_orders))
@@ -114,11 +120,19 @@ class DummyScopedOms:
     def clear_symbol_freeze(self, symbol, reason=""):
         self.cleared_symbols.append((symbol, reason))
 
+    def clear_orderbook_freeze(self, symbol, recovery_token, reason=""):
+        self.orderbook_clears.append((symbol, recovery_token, reason))
+        return True
+
     def freeze_venue(self, venue, reason, cancel_active_orders=True):
         self.venue_freezes.append((venue, reason, cancel_active_orders))
 
     def clear_venue_freeze(self, venue, reason=""):
         self.cleared_venues.append((venue, reason))
+
+    def request_venue_recovery_verification(self, venue, reason=""):
+        self.venue_verifications.append((venue, reason))
+        return True
 
     def freeze_strategy(self, strategy_id, reason, symbol="", cancel_active_orders=True):
         self.strategy_freezes.append((strategy_id, symbol, reason, cancel_active_orders))
@@ -239,6 +253,7 @@ class OMSSurvivabilityTests(unittest.TestCase):
                 cum_filled_qty=1.0,
                 update_time=2.0,
                 seq=2,
+                trade_id=1,
             )
 
             oms._apply_event(Event(EVENT_EXCHANGE_ORDER_UPDATE, update))
@@ -288,6 +303,88 @@ class OMSSurvivabilityTests(unittest.TestCase):
         finally:
             oms.stop()
 
+    def test_full_reset_imports_but_halts_on_off_config_position(self):
+        gateway = DummyGateway()
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        snapshot = {
+            "open_orders": [],
+            "account": {
+                "totalWalletBalance": "1000",
+                "totalInitialMargin": "10",
+                "availableBalance": "990",
+                "totalMaintMargin": "1",
+                "totalMarginBalance": "1000",
+            },
+            "positions": [
+                {
+                    "symbol": "ETHUSDT",
+                    "positionAmt": "0.5",
+                    "entryPrice": "2000",
+                }
+            ],
+            "account_floor": 1.0,
+            "positions_floor": 1.0,
+            "end_time_ms": 1000,
+        }
+        try:
+            oms._ensure_venue_dead_man_switch_armed = lambda *_args: True
+            oms.query_open_orders = lambda: []
+            oms._cancel_all_orders_unchecked = lambda *_args, **_kwargs: True
+            oms._capture_stable_exchange_snapshot = lambda **_kwargs: snapshot
+            oms._prime_trade_history_baseline = lambda *_args, **_kwargs: True
+            oms._backfill_trade_history = lambda *_args, **_kwargs: True
+
+            oms._perform_full_reset()
+
+            self.assertEqual(oms.state, LifecycleState.HALTED)
+            self.assertTrue(oms.manual_rearm_required)
+            self.assertEqual(oms.exposure.net_positions["ETHUSDT"], 0.5)
+            self.assertIn("Off-config nonzero positions", oms.last_halt_reason)
+        finally:
+            oms.stop()
+
+    def test_full_reset_completion_cannot_overwrite_newer_halt(self):
+        gateway = DummyGateway()
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        snapshot = {
+            "open_orders": [],
+            "account": {
+                "totalWalletBalance": "1000",
+                "totalInitialMargin": "0",
+                "availableBalance": "1000",
+                "totalMaintMargin": "0",
+                "totalMarginBalance": "1000",
+            },
+            "positions": [],
+            "account_floor": 1.0,
+            "positions_floor": 1.0,
+            "end_time_ms": 1000,
+        }
+        try:
+            oms._ensure_venue_dead_man_switch_armed = lambda *_args: True
+            oms.query_open_orders = lambda: []
+            oms._cancel_all_orders_unchecked = lambda *_args, **_kwargs: True
+            oms._capture_stable_exchange_snapshot = lambda **_kwargs: snapshot
+            oms._prime_trade_history_baseline = lambda *_args, **_kwargs: True
+            oms._backfill_trade_history = lambda *_args, **_kwargs: True
+            halt_injected = False
+
+            def halt_before_commit(_symbol):
+                nonlocal halt_injected
+                if not halt_injected:
+                    halt_injected = True
+                    oms.halt_system("newer reset halt")
+
+            oms._emit_position_update = halt_before_commit
+
+            oms._perform_full_reset()
+
+            self.assertEqual(oms.state, LifecycleState.HALTED)
+            self.assertTrue(oms.manual_rearm_required)
+            self.assertEqual(oms.last_halt_reason, "newer reset halt")
+        finally:
+            oms.stop()
+
     def test_manual_rearm_requires_explicit_reset_path(self):
         gateway = DummyGateway()
         oms = OMS(DummyEngine(), gateway, self.make_config())
@@ -325,6 +422,179 @@ class OMSSurvivabilityTests(unittest.TestCase):
             self.assertFalse(result.accepted)
             self.assertIn("symbol_frozen", result.reason)
             self.assertEqual(oms.state, LifecycleState.LIVE)
+        finally:
+            oms.stop()
+
+    def test_stale_symbol_epoch_cannot_clear_newer_guard(self):
+        gateway = DummyGateway()
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            first_epoch = oms.freeze_symbol(
+                "BTCUSDT",
+                "latency:first",
+                cancel_active_orders=False,
+            )
+            second_epoch = oms.freeze_symbol(
+                "BTCUSDT",
+                "truth_plane:newer",
+                cancel_active_orders=False,
+            )
+
+            self.assertTrue(
+                oms.clear_symbol_freeze(
+                    "BTCUSDT",
+                    reason="stale recovery",
+                    expected_epoch=first_epoch,
+                    expected_reason="latency:first",
+                )
+            )
+            self.assertEqual(
+                oms.get_symbol_freeze_reason("BTCUSDT"),
+                "truth_plane:newer",
+            )
+            self.assertTrue(
+                oms.clear_symbol_freeze(
+                    "BTCUSDT",
+                    reason="current recovery",
+                    expected_epoch=second_epoch,
+                    expected_reason="truth_plane:newer",
+                )
+            )
+        finally:
+            oms.stop()
+
+    def test_independent_symbol_guard_owners_must_each_recover(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            book_epoch = oms.freeze_symbol(
+                "BTCUSDT",
+                "system_health:FATAL_GAP:41",
+                cancel_active_orders=False,
+            )
+            latency_epoch = oms.freeze_symbol(
+                "BTCUSDT",
+                "latency:250ms>100ms",
+                cancel_active_orders=False,
+            )
+
+            self.assertTrue(
+                oms.clear_symbol_freeze(
+                    "BTCUSDT",
+                    reason="latency recovered",
+                    expected_epoch=latency_epoch,
+                    expected_reason="latency:250ms>100ms",
+                )
+            )
+            self.assertEqual(
+                oms.get_symbol_freeze_reason("BTCUSDT"),
+                "system_health:FATAL_GAP:41",
+            )
+            self.assertEqual(
+                oms.get_symbol_freeze_epoch("BTCUSDT"),
+                book_epoch,
+            )
+            self.assertTrue(oms.clear_orderbook_freeze("BTCUSDT", "41"))
+            self.assertEqual(oms.get_symbol_freeze_reason("BTCUSDT"), "")
+        finally:
+            oms.stop()
+
+    def test_order_truth_resolver_only_clears_its_own_order(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            oms.freeze_symbol(
+                "BTCUSDT",
+                "order_truth:submit_unknown:order-a",
+                cancel_active_orders=False,
+            )
+            oms.freeze_symbol(
+                "BTCUSDT",
+                "order_truth:cancel_unknown:order-b",
+                cancel_active_orders=False,
+            )
+
+            oms._clear_order_truth_guard("BTCUSDT", "order-a")
+
+            owners = oms.get_symbol_freeze_owners("BTCUSDT")
+            self.assertNotIn("order_truth:order-a", owners)
+            self.assertEqual(
+                owners["order_truth:order-b"]["reason"],
+                "order_truth:cancel_unknown:order-b",
+            )
+        finally:
+            oms.stop()
+
+    def test_transient_cleanup_snapshot_cannot_clear_reasserted_guard(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            oms.freeze_symbol(
+                "BTCUSDT",
+                "truth_plane:position_mismatch:old",
+                cancel_active_orders=False,
+            )
+            with oms.lock:
+                snapshot = oms._capture_guard_cleanup_snapshot_locked(
+                    prefixes=("truth_plane:",)
+                )
+            oms.freeze_symbol(
+                "BTCUSDT",
+                "truth_plane:position_mismatch:new",
+                cancel_active_orders=False,
+            )
+
+            self.assertEqual(
+                oms.clear_transient_guards(
+                    prefixes=("truth_plane:",),
+                    guard_snapshot=snapshot,
+                ),
+                0,
+            )
+            self.assertEqual(
+                oms.get_symbol_freeze_reason("BTCUSDT"),
+                "truth_plane:position_mismatch:new",
+            )
+        finally:
+            oms.stop()
+
+    def test_reconcile_start_cannot_overwrite_concurrent_halt(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            oms.state = LifecycleState.LIVE
+            oms._sync_capability_mode("test_live")
+
+            def halt_during_freeze(*_args, **_kwargs):
+                oms.halt_system("newer halt")
+
+            oms.freeze_system = halt_during_freeze
+
+            self.assertFalse(oms.trigger_reconcile("raced reconcile"))
+            self.assertEqual(oms.state, LifecycleState.HALTED)
+            self.assertTrue(oms.manual_rearm_required)
+            self.assertIsNone(oms._reconcile_thread)
+        finally:
+            oms.stop()
+
+    def test_reconcile_completion_cannot_overwrite_newer_halt(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            oms.account.force_sync(1000.0, 0.0, 1000.0)
+            oms.state = LifecycleState.RECONCILING
+            oms._sync_capability_mode("test_reconcile")
+            oms.query_positions = lambda: []
+            oms.query_open_orders = lambda: []
+            oms.query_account_info = lambda: {"totalWalletBalance": "1000"}
+            oms._backfill_trade_history = lambda *_args, **_kwargs: True
+
+            def halt_then_confirm(_remote_orders):
+                oms.halt_system("newer reconcile halt")
+                return True
+
+            oms._refresh_missing_local_order_terminals = halt_then_confirm
+
+            oms._execute_reconcile(None)
+
+            self.assertEqual(oms.state, LifecycleState.HALTED)
+            self.assertTrue(oms.manual_rearm_required)
+            self.assertEqual(oms.last_halt_reason, "newer reconcile halt")
         finally:
             oms.stop()
 
@@ -939,6 +1209,498 @@ class OMSSurvivabilityTests(unittest.TestCase):
                 data_cache.mark_prices.pop("BTCUSDT", None)
                 data_cache.mark_update_times.pop("BTCUSDT", None)
 
+    def test_dead_man_renewal_request_does_not_block_risk_loop(self):
+        gateway = DummyGateway()
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_renew(symbol, countdown_time_ms):
+            gateway.dead_man_requests.append((symbol, countdown_time_ms))
+            started.set()
+            release.wait(timeout=1.0)
+            return types.SimpleNamespace(status_code=200)
+
+        gateway.set_countdown_cancel_all = slow_renew
+        config = self.make_config()
+        config["oms"]["venue_dead_man_switch"] = {
+            "enabled": True,
+            "countdown_time_ms": 5000,
+            "renewal_interval_sec": 0.05,
+            "max_renewal_age_sec": 0.5,
+        }
+        oms = OMS(DummyEngine(), gateway, config)
+        try:
+            started_at = time.perf_counter()
+            self.assertFalse(oms.request_venue_dead_man_switch_renewal())
+            elapsed = time.perf_counter() - started_at
+
+            self.assertLess(elapsed, 0.05)
+            self.assertTrue(started.wait(timeout=0.5))
+            self.assertTrue(oms.venue_dead_man_renewal_inflight)
+            release.set()
+            oms._venue_dead_man_renewal_thread.join(timeout=1.0)
+            self.assertFalse(oms.venue_dead_man_renewal_inflight)
+            self.assertTrue(oms.get_venue_dead_man_switch_snapshot()["valid"])
+        finally:
+            release.set()
+            oms.stop()
+
+    def test_mass_cancel_http_failure_remains_unknown_and_frozen(self):
+        gateway = DummyGateway()
+        gateway.cancel_all_status_code = 500
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        retries = []
+        truth_checks = []
+        oms._schedule_cancel_all_retry = (
+            lambda symbol, source: retries.append((symbol, source)) or True
+        )
+        oms._on_order_truth_check = (
+            lambda reason, suspicious_oid=None: truth_checks.append(reason)
+        )
+        try:
+            acknowledged = oms._cancel_all_orders_unchecked(
+                "BTCUSDT",
+                source="test_failure",
+            )
+
+            self.assertFalse(acknowledged)
+            self.assertIn("BTCUSDT", oms.symbol_guards)
+            self.assertEqual(retries, [("BTCUSDT", "test_failure")])
+            self.assertEqual(truth_checks, ["Mass cancel outcome unknown"])
+        finally:
+            oms.stop()
+
+    def test_freeze_waits_for_inflight_risk_send_before_mass_cancel(self):
+        gateway = DummyGateway()
+        send_started = threading.Event()
+        release_send = threading.Event()
+        timeline = []
+
+        def blocking_send(request, client_oid):
+            gateway.sent_orders.append((request, client_oid))
+            timeline.append("send_started")
+            send_started.set()
+            release_send.wait(timeout=2.0)
+            timeline.append("send_returned")
+            return "ex-blocked"
+
+        def record_cancel_all(symbol):
+            gateway.cancelled_symbols.append(symbol)
+            timeline.append("cancel_all")
+            return DummyResponse(200, {})
+
+        gateway.send_order = blocking_send
+        gateway.cancel_all_orders = record_cancel_all
+        config = self.make_config()
+        config["oms"]["outbound_gate_drain_timeout_sec"] = 1.0
+        oms = OMS(DummyEngine(), gateway, config)
+        submit_results = []
+        try:
+            oms.state = LifecycleState.LIVE
+            oms._sync_capability_mode("test_live")
+            oms.account.force_sync(1000.0, 0.0, available=1000.0)
+            oms.validator.validate_params = lambda _intent: (True, "")
+            oms.exposure.check_risk = lambda *_args, **_kwargs: (True, "")
+
+            submit_thread = threading.Thread(
+                target=lambda: submit_results.append(
+                    oms.submit_order(
+                        OrderIntent(
+                            "alpha",
+                            "BTCUSDT",
+                            Side.BUY,
+                            100.0,
+                            0.1,
+                        )
+                    )
+                )
+            )
+            submit_thread.start()
+            self.assertTrue(send_started.wait(timeout=1.0))
+
+            freeze_thread = threading.Thread(
+                target=lambda: oms.freeze_system(
+                    "test_inflight_race",
+                    cancel_active_orders=True,
+                )
+            )
+            freeze_thread.start()
+            deadline = time.perf_counter() + 1.0
+            while oms.get_outbound_gate_snapshot()["open"] and time.perf_counter() < deadline:
+                time.sleep(0.005)
+
+            snapshot = oms.get_outbound_gate_snapshot()
+            self.assertFalse(snapshot["open"])
+            self.assertEqual(snapshot["risk_sends_inflight"], 1)
+            self.assertNotIn("cancel_all", timeline)
+
+            blocked = oms.submit_order(
+                OrderIntent("alpha", "BTCUSDT", Side.BUY, 101.0, 0.1)
+            )
+            self.assertFalse(blocked.accepted)
+            self.assertEqual(len(gateway.sent_orders), 1)
+
+            release_send.set()
+            submit_thread.join(timeout=1.0)
+            freeze_thread.join(timeout=1.0)
+
+            self.assertFalse(submit_thread.is_alive())
+            self.assertFalse(freeze_thread.is_alive())
+            self.assertEqual(timeline, ["send_started", "send_returned", "cancel_all"])
+            self.assertTrue(submit_results[0].accepted)
+            self.assertEqual(oms.state, LifecycleState.FROZEN)
+        finally:
+            release_send.set()
+            oms.stop()
+
+    def test_symbol_freeze_cancels_twice_and_waits_only_for_target_symbol(self):
+        gateway = DummyGateway()
+        send_started = {
+            "BTCUSDT": threading.Event(),
+            "ETHUSDT": threading.Event(),
+        }
+        release_send = {
+            "BTCUSDT": threading.Event(),
+            "ETHUSDT": threading.Event(),
+        }
+        timeline = []
+        timeline_lock = threading.Lock()
+
+        def blocking_send(request, client_oid):
+            symbol = request.symbol
+            with timeline_lock:
+                timeline.append(f"send_started:{symbol}")
+            send_started[symbol].set()
+            release_send[symbol].wait(timeout=2.0)
+            with timeline_lock:
+                timeline.append(f"send_returned:{symbol}")
+            return f"ex-{client_oid}"
+
+        def record_cancel_all(symbol):
+            with timeline_lock:
+                timeline.append(f"cancel_all:{symbol}")
+            return DummyResponse(200, {})
+
+        gateway.send_order = blocking_send
+        gateway.cancel_all_orders = record_cancel_all
+        config = self.make_config()
+        config["symbols"] = ["BTCUSDT", "ETHUSDT"]
+        config["oms"]["outbound_gate_drain_timeout_sec"] = 1.0
+        oms = OMS(DummyEngine(), gateway, config)
+        submit_threads = []
+        freeze_thread = None
+        try:
+            oms.state = LifecycleState.LIVE
+            oms._sync_capability_mode("test_live")
+            oms.account.force_sync(1000.0, 0.0, available=1000.0)
+            oms.validator.validate_params = lambda _intent: (True, "")
+            oms.exposure.check_risk = lambda *_args, **_kwargs: (True, "")
+
+            for symbol in ("BTCUSDT", "ETHUSDT"):
+                thread = threading.Thread(
+                    target=lambda target=symbol: oms.submit_order(
+                        OrderIntent(
+                            "alpha",
+                            target,
+                            Side.BUY,
+                            100.0,
+                            0.1,
+                        )
+                    )
+                )
+                submit_threads.append(thread)
+                thread.start()
+            self.assertTrue(send_started["BTCUSDT"].wait(timeout=1.0))
+            self.assertTrue(send_started["ETHUSDT"].wait(timeout=1.0))
+
+            freeze_thread = threading.Thread(
+                target=lambda: oms.freeze_symbol(
+                    "BTCUSDT",
+                    "latency:test",
+                    cancel_active_orders=True,
+                )
+            )
+            freeze_thread.start()
+
+            deadline = time.perf_counter() + 1.0
+            while time.perf_counter() < deadline:
+                with timeline_lock:
+                    if timeline.count("cancel_all:BTCUSDT") >= 1:
+                        break
+                time.sleep(0.005)
+            with timeline_lock:
+                self.assertEqual(timeline.count("cancel_all:BTCUSDT"), 1)
+                self.assertNotIn("cancel_all:ETHUSDT", timeline)
+                self.assertNotIn("send_returned:BTCUSDT", timeline)
+            self.assertTrue(freeze_thread.is_alive())
+
+            release_send["BTCUSDT"].set()
+            freeze_thread.join(timeout=1.0)
+            self.assertFalse(freeze_thread.is_alive())
+            self.assertTrue(submit_threads[1].is_alive())
+            with timeline_lock:
+                self.assertEqual(timeline.count("cancel_all:BTCUSDT"), 2)
+                self.assertNotIn("cancel_all:ETHUSDT", timeline)
+                first_cancel = timeline.index("cancel_all:BTCUSDT")
+                send_returned = timeline.index("send_returned:BTCUSDT")
+                second_cancel = len(timeline) - 1 - timeline[::-1].index(
+                    "cancel_all:BTCUSDT"
+                )
+                self.assertLess(first_cancel, send_returned)
+                self.assertLess(send_returned, second_cancel)
+
+            release_send["ETHUSDT"].set()
+            for thread in submit_threads:
+                thread.join(timeout=1.0)
+                self.assertFalse(thread.is_alive())
+        finally:
+            for event in release_send.values():
+                event.set()
+            if freeze_thread is not None:
+                freeze_thread.join(timeout=1.0)
+            for thread in submit_threads:
+                thread.join(timeout=1.0)
+            oms.stop()
+
+    def test_shutdown_verified_cancel_discovers_off_config_orders(self):
+        gateway = DummyGateway()
+        gateway.open_orders = [
+            {
+                "symbol": "OLDUSDT",
+                "orderId": 77,
+                "clientOrderId": "legacy-order",
+                "side": "BUY",
+            }
+        ]
+
+        def cancel_and_remove(symbol):
+            gateway.cancelled_symbols.append(symbol)
+            gateway.open_orders = [
+                order
+                for order in gateway.open_orders
+                if order.get("symbol") != symbol
+            ]
+            return DummyResponse(200, {})
+
+        gateway.cancel_all_orders = cancel_and_remove
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            oms.state = LifecycleState.LIVE
+            oms._sync_capability_mode("test_live")
+
+            self.assertTrue(oms.begin_shutdown("test_shutdown"))
+            self.assertTrue(
+                oms.cancel_all_account_orders_verified(
+                    gateway,
+                    timeout_sec=1.0,
+                    settle_interval_sec=0.01,
+                )
+            )
+
+            self.assertIn("OLDUSDT", gateway.cancelled_symbols)
+            self.assertTrue(
+                oms.get_outbound_gate_snapshot()["shutdown_cancel_verified"]
+            )
+            self.assertEqual(gateway.open_orders, [])
+        finally:
+            oms.stop(clean_shutdown=True, reason="test_shutdown")
+
+    def test_shutdown_requires_consecutive_empty_account_snapshots(self):
+        gateway = DummyGateway()
+        snapshots = iter([[], None, [], []])
+        query_count = 0
+
+        def get_open_orders():
+            nonlocal query_count
+            query_count += 1
+            return next(snapshots)
+
+        gateway.get_open_orders = get_open_orders
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            oms.state = LifecycleState.LIVE
+            oms._sync_capability_mode("test_live")
+            self.assertTrue(oms.begin_shutdown("test_snapshot_quorum"))
+
+            verified = oms.cancel_all_account_orders_verified(
+                gateway,
+                timeout_sec=1.0,
+                settle_interval_sec=0.01,
+            )
+
+            self.assertTrue(verified)
+            self.assertEqual(query_count, 4)
+        finally:
+            oms.stop(clean_shutdown=True, reason="test_snapshot_quorum")
+
+    def test_stale_venue_recovery_epoch_cannot_clear_new_fault(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            oms.state = LifecycleState.LIVE
+            oms._sync_capability_mode("test_live")
+            oms.freeze_venue(
+                "BINANCE",
+                "system_health:WS_TRANSPORT_DROP:first",
+                cancel_active_orders=False,
+            )
+            stale_epoch = oms.get_venue_freeze_epoch("BINANCE")
+            oms.freeze_venue(
+                "BINANCE",
+                "system_health:WS_TRANSPORT_DROP:second",
+                cancel_active_orders=False,
+            )
+
+            self.assertFalse(
+                oms.clear_venue_freeze(
+                    "BINANCE",
+                    reason="stale_recovery",
+                    expected_epoch=stale_epoch,
+                )
+            )
+            self.assertEqual(
+                oms.get_venue_freeze_reason("BINANCE"),
+                "system_health:WS_TRANSPORT_DROP:second",
+            )
+        finally:
+            oms.stop()
+
+    def test_venue_recovery_reason_must_match_same_epoch_guard(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            oms.state = LifecycleState.LIVE
+            oms._sync_capability_mode("test_live")
+            epoch = oms.freeze_venue(
+                "BINANCE",
+                "event_engine_backlog:market:first",
+                cancel_active_orders=False,
+            )
+
+            self.assertFalse(
+                oms.clear_venue_freeze(
+                    "BINANCE",
+                    reason="wrong owner recovery",
+                    expected_epoch=epoch,
+                    expected_reason="processing_lag:first",
+                )
+            )
+            self.assertEqual(
+                oms.get_venue_freeze_reason("BINANCE"),
+                "event_engine_backlog:market:first",
+            )
+        finally:
+            oms.stop()
+
+    def test_old_recovery_context_cannot_verify_new_transport_epoch(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            first_reason = "system_health:WS_TRANSPORT_DROP:first"
+            first_epoch = oms.freeze_venue(
+                "BINANCE",
+                first_reason,
+                cancel_active_orders=False,
+            )
+            oms.freeze_venue(
+                "BINANCE",
+                "system_health:WS_TRANSPORT_DROP:second",
+                cancel_active_orders=False,
+            )
+            requests = []
+            oms.trigger_reconcile = (
+                lambda *args, **kwargs: requests.append((args, kwargs)) or True
+            )
+
+            self.assertFalse(
+                oms.request_venue_recovery_verification(
+                    "BINANCE",
+                    expected_owner="system_health:transport",
+                    expected_epoch=first_epoch,
+                    expected_reason=first_reason,
+                )
+            )
+            self.assertEqual(requests, [])
+        finally:
+            oms.stop()
+
+    def test_transport_recovery_clears_only_exact_transport_owner(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            lag_reason = "event_engine_backlog:market:first"
+            oms.freeze_venue(
+                "BINANCE",
+                lag_reason,
+                cancel_active_orders=False,
+            )
+            transport_reason = "system_health:WS_TRANSPORT_DROP:first"
+            transport_epoch = oms.freeze_venue(
+                "BINANCE",
+                transport_reason,
+                cancel_active_orders=False,
+            )
+            oms.state = LifecycleState.LIVE
+            oms._sync_capability_mode("truth_verified")
+
+            self.assertTrue(
+                oms._complete_venue_recovery_verification(
+                    "BINANCE",
+                    transport_epoch,
+                    "system_health:transport",
+                    transport_reason,
+                )
+            )
+            self.assertEqual(
+                oms.get_venue_freeze_owners("BINANCE"),
+                {
+                    "event_engine_backlog": {
+                        "reason": lag_reason,
+                        "epoch": 1,
+                    }
+                },
+            )
+        finally:
+            oms.stop()
+
+    def test_orderbook_recovery_token_cannot_clear_unrelated_symbol_guard(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            oms.state = LifecycleState.LIVE
+            oms._sync_capability_mode("test_live")
+            oms.freeze_symbol(
+                "BTCUSDT",
+                "truth_plane:position_mismatch",
+                cancel_active_orders=False,
+            )
+
+            self.assertFalse(
+                oms.clear_orderbook_freeze(
+                    "BTCUSDT",
+                    "17",
+                    reason="system_health:ORDERBOOK_RESYNCED:17",
+                )
+            )
+            self.assertEqual(
+                oms.get_symbol_freeze_reason("BTCUSDT"),
+                "truth_plane:position_mismatch",
+            )
+
+            oms.freeze_symbol(
+                "BTCUSDT",
+                "system_health:FATAL_GAP:18",
+                cancel_active_orders=False,
+            )
+            self.assertTrue(
+                oms.clear_orderbook_freeze(
+                    "BTCUSDT",
+                    "18",
+                    reason="system_health:ORDERBOOK_RESYNCED:18",
+                )
+            )
+            self.assertEqual(
+                oms.get_symbol_freeze_reason("BTCUSDT"),
+                "truth_plane:position_mismatch",
+            )
+        finally:
+            oms.stop()
+
     def test_bootstrap_dead_man_failure_halts_and_retries_mass_cancel(self):
         gateway = DummyGateway()
         gateway.dead_man_status_code = 500
@@ -1540,10 +2302,12 @@ class OMSSurvivabilityTests(unittest.TestCase):
 
             self.assertEqual(submitted, 1)
             sent_req, client_oid = gateway.sent_orders[-1]
-            self.assertTrue(client_oid.startswith("EMERGENCY_"))
+            self.assertTrue(client_oid.startswith("EMG_"))
+            self.assertLessEqual(len(client_oid), 36)
             self.assertEqual(sent_req.order_type, "MARKET")
             self.assertTrue(sent_req.reduce_only)
             self.assertEqual(sent_req.side, "SELL")
+            self.assertTrue(oms.orders[client_oid].intent.reduce_only)
         finally:
             oms.stop()
 
@@ -1675,7 +2439,131 @@ class OMSSurvivabilityTests(unittest.TestCase):
                     "manual:symbol",
                 )
                 self.assertEqual(recovered.state, LifecycleState.FROZEN)
-                self.assertTrue(recovered.rebuild_summary["clean_shutdown"])
+                self.assertFalse(recovered.rebuild_summary["clean_shutdown"])
+            finally:
+                recovered.stop()
+
+    def test_restart_preserves_only_active_venue_guard_owners(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal_path = os.path.join(tmpdir, "oms_journal.jsonl")
+            config = self.make_journaled_config(journal_path)
+
+            oms = OMS(DummyEngine(), DummyGateway(), config)
+            lag_epoch = oms.freeze_venue(
+                "BINANCE",
+                "event_engine_backlog:market:first",
+                cancel_active_orders=False,
+            )
+            transport_epoch = oms.freeze_venue(
+                "BINANCE",
+                "system_health:WS_TRANSPORT_DROP:first",
+                cancel_active_orders=False,
+            )
+            self.assertTrue(
+                oms.clear_venue_freeze(
+                    "BINANCE",
+                    reason="processing recovered",
+                    expected_owner="event_engine_backlog",
+                    expected_epoch=lag_epoch,
+                    expected_reason="event_engine_backlog:market:first",
+                )
+            )
+            self.assertEqual(
+                set(oms.get_venue_freeze_owners("BINANCE")),
+                {"system_health:transport"},
+            )
+            oms.stop()
+
+            recovered = OMS(DummyEngine(), DummyGateway(), config)
+            try:
+                self.assertEqual(
+                    recovered.get_venue_freeze_owners("BINANCE"),
+                    {
+                        "system_health:transport": {
+                            "reason": "system_health:WS_TRANSPORT_DROP:first",
+                            "epoch": transport_epoch,
+                        }
+                    },
+                )
+                self.assertEqual(
+                    recovered.get_venue_freeze_reason("BINANCE"),
+                    "system_health:WS_TRANSPORT_DROP:first",
+                )
+            finally:
+                recovered.stop()
+
+    def test_guard_replay_ignores_stale_freeze_and_clear_epochs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal_path = os.path.join(tmpdir, "oms_journal.jsonl")
+            config = self.make_journaled_config(journal_path)
+
+            oms = OMS(DummyEngine(), DummyGateway(), config)
+            oms._audit(
+                "symbol_frozen",
+                symbol="BTCUSDT",
+                reason="latency:new",
+                owner="latency",
+                epoch=5,
+            )
+            oms._audit(
+                "symbol_frozen",
+                symbol="BTCUSDT",
+                reason="latency:old",
+                owner="latency",
+                epoch=4,
+            )
+            oms._audit(
+                "symbol_unfrozen",
+                symbol="BTCUSDT",
+                previous_reason="latency:old",
+                owner="latency",
+                epoch=4,
+            )
+            oms._audit(
+                "venue_frozen",
+                venue="BINANCE",
+                reason="system_health:WS_TRANSPORT_DROP:new",
+                owner="system_health:transport",
+                epoch=9,
+            )
+            oms._audit(
+                "venue_frozen",
+                venue="BINANCE",
+                reason="system_health:WS_TRANSPORT_DROP:old",
+                owner="system_health:transport",
+                epoch=8,
+            )
+            oms._audit(
+                "venue_unfrozen",
+                venue="BINANCE",
+                previous_reason="system_health:WS_TRANSPORT_DROP:old",
+                owner="system_health:transport",
+                epoch=8,
+            )
+            oms.stop()
+
+            recovered = OMS(DummyEngine(), DummyGateway(), config)
+            try:
+                self.assertEqual(
+                    recovered.get_symbol_freeze_owners("BTCUSDT"),
+                    {
+                        "latency": {
+                            "reason": "latency:new",
+                            "epoch": 5,
+                        }
+                    },
+                )
+                self.assertEqual(
+                    recovered.get_venue_freeze_owners("BINANCE"),
+                    {
+                        "system_health:transport": {
+                            "reason": (
+                                "system_health:WS_TRANSPORT_DROP:new"
+                            ),
+                            "epoch": 9,
+                        }
+                    },
+                )
             finally:
                 recovered.stop()
 
@@ -1719,11 +2607,52 @@ class OMSSurvivabilityTests(unittest.TestCase):
                 self.assertEqual(recovered.get_strategy_freeze_reason("alpha"), "manual:test")
                 self.assertFalse(recovered.can_submit_for_strategy("alpha", "BTCUSDT"))
 
+                recovered.state = LifecycleState.RECONCILING
+                recovered._sync_capability_mode("test_reconcile")
                 recovered._execute_reconcile(None)
 
                 self.assertEqual(recovered.state, LifecycleState.LIVE)
                 self.assertEqual(recovered.get_strategy_freeze_reason("alpha"), "")
                 self.assertTrue(recovered.can_submit_for_strategy("alpha", "BTCUSDT"))
+            finally:
+                recovered.stop()
+
+    def test_symbol_guard_owner_registry_survives_journal_replay(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal_path = os.path.join(tmpdir, "oms_journal.jsonl")
+            config = self.make_journaled_config(journal_path)
+
+            oms = OMS(DummyEngine(), DummyGateway(), config)
+            oms.freeze_symbol(
+                "BTCUSDT",
+                "system_health:FATAL_GAP:77",
+                cancel_active_orders=False,
+            )
+            latency_epoch = oms.freeze_symbol(
+                "BTCUSDT",
+                "latency:300ms>100ms",
+                cancel_active_orders=False,
+            )
+            oms.clear_symbol_freeze(
+                "BTCUSDT",
+                reason="latency recovered",
+                expected_epoch=latency_epoch,
+                expected_reason="latency:300ms>100ms",
+            )
+            oms.stop()
+
+            recovered = OMS(DummyEngine(), DummyGateway(), config)
+            try:
+                owners = recovered.get_symbol_freeze_owners("BTCUSDT")
+                self.assertEqual(
+                    set(owners),
+                    {"system_health:orderbook"},
+                )
+                self.assertEqual(
+                    owners["system_health:orderbook"]["reason"],
+                    "system_health:FATAL_GAP:77",
+                )
+                self.assertEqual(recovered.state, LifecycleState.FROZEN)
             finally:
                 recovered.stop()
 
@@ -1843,6 +2772,37 @@ class TruthMonitorTests(unittest.TestCase):
 
             monitor.poll_once()
             self.assertEqual(oms.state, LifecycleState.HALTED)
+        finally:
+            oms.stop()
+
+    def test_truth_monitor_api_recovery_requires_clean_poll_quorum(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        provider = DummyTruthProvider()
+        monitor = TruthMonitor(oms, provider, self.make_config(), start_thread=False)
+        try:
+            oms.state = LifecycleState.LIVE
+            provider.account = None
+            provider.positions = None
+            provider.open_orders = None
+            monitor.poll_once()
+            monitor.poll_once()
+            self.assertTrue(
+                oms.get_venue_freeze_reason("BINANCE").startswith(
+                    "truth_plane:api_unreachable"
+                )
+            )
+
+            provider.account = {
+                "totalWalletBalance": "1000",
+                "totalInitialMargin": "0",
+            }
+            provider.positions = []
+            provider.open_orders = []
+            monitor.poll_once()
+            self.assertTrue(oms.get_venue_freeze_reason("BINANCE"))
+
+            monitor.poll_once()
+            self.assertEqual(oms.get_venue_freeze_reason("BINANCE"), "")
         finally:
             oms.stop()
 
@@ -2067,6 +3027,29 @@ class SystemHealthHandlerTests(unittest.TestCase):
         self.assertEqual(risk_controller.reasons, [])
         self.assertEqual(oms.symbol_freezes, [("BTCUSDT", "system_health:FATAL_GAP", True)])
 
+    def test_orderbook_clear_event_uses_recovery_token(self):
+        risk_controller = DummyRiskController()
+        oms = DummyScopedOms()
+        handle_system_health_event(
+            Event(
+                "eSystemHealth",
+                "CLEAR_SYMBOL:BTCUSDT:ORDERBOOK_RESYNCED:42",
+            ),
+            risk_controller,
+            oms,
+        )
+        self.assertEqual(oms.cleared_symbols, [])
+        self.assertEqual(
+            oms.orderbook_clears,
+            [
+                (
+                    "BTCUSDT",
+                    "42",
+                    "system_health:ORDERBOOK_RESYNCED:42",
+                )
+            ],
+        )
+
     def test_scoped_venue_health_event_freezes_venue_without_kill(self):
         risk_controller = DummyRiskController()
         oms = DummyScopedOms()
@@ -2077,6 +3060,21 @@ class SystemHealthHandlerTests(unittest.TestCase):
         )
         self.assertEqual(risk_controller.reasons, [])
         self.assertEqual(oms.venue_freezes, [("BINANCE", "system_health:WS_PARSE_ERROR", True)])
+
+    def test_transport_recovery_requests_truth_verification_without_clearing(self):
+        risk_controller = DummyRiskController()
+        oms = DummyScopedOms()
+        handle_system_health_event(
+            Event("eSystemHealth", "VERIFY_VENUE:BINANCE:WS_RECOVERED"),
+            risk_controller,
+            oms,
+        )
+        self.assertEqual(risk_controller.reasons, [])
+        self.assertEqual(oms.cleared_venues, [])
+        self.assertEqual(
+            oms.venue_verifications,
+            [("BINANCE", "system_health:WS_RECOVERED")],
+        )
 
     def test_generic_stale_market_data_freezes_venue_without_kill(self):
         risk_controller = DummyRiskController()

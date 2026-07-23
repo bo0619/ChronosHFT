@@ -137,7 +137,7 @@ class DashboardV2Tests(unittest.TestCase):
                     "TEdge": "-0.6",
                     "ExitEWMA": "+0.0",
                     "Health": "HALT:test_gateway",
-                    "Block": "strategy_frozen:alpha_process_unhealthy",
+                    "Block": "strategy_frozen:strategy_runtime_backlog",
                     "Reject": "insufficient_margin",
                     "Blend": {"1s": 0.1, "10s": 0.5, "30s": 0.4},
                     "Weights": {"Imb": 0.42},
@@ -148,7 +148,7 @@ class DashboardV2Tests(unittest.TestCase):
 
         text = self.render_to_text(dashboard._render_focus())
         self.assertIn("HALT:test_gateway", text)
-        self.assertIn("strategy_frozen:alpha_process_unhealthy", text)
+        self.assertIn("strategy_frozen:strategy_runtime_backlog", text)
         self.assertIn("insufficient_margin", text)
         self.assertIn("Maker 1.2 | Taker 5.6", text)
 

@@ -201,19 +201,19 @@ class MarketDataWatchdogTests(unittest.TestCase):
         state = emit_strategy_runtime_backlog_if_needed(
             runtime,
             oms,
-            "ML_Sniper_USDC",
+            "GLFT_MultiScale",
             {},
             {"freeze_queue_depth": 80, "recovery_checks": 2},
         )
         self.assertEqual(state["severity"], 2)
-        self.assertEqual(oms.strategy_frozen[-1][0], "ML_Sniper_USDC")
+        self.assertEqual(oms.strategy_frozen[-1][0], "GLFT_MultiScale")
         self.assertTrue(oms.strategy_reason.startswith("strategy_runtime_backlog:"))
 
         runtime.metrics.update({"market_depth": 0, "last_kind": ""})
         state = emit_strategy_runtime_backlog_if_needed(
             runtime,
             oms,
-            "ML_Sniper_USDC",
+            "GLFT_MultiScale",
             state,
             {"freeze_queue_depth": 80, "recovery_checks": 2},
         )
@@ -221,12 +221,12 @@ class MarketDataWatchdogTests(unittest.TestCase):
         state = emit_strategy_runtime_backlog_if_needed(
             runtime,
             oms,
-            "ML_Sniper_USDC",
+            "GLFT_MultiScale",
             state,
             {"freeze_queue_depth": 80, "recovery_checks": 2},
         )
         self.assertEqual(state["severity"], 0)
-        self.assertEqual(oms.strategy_unfrozen[-1][0], "ML_Sniper_USDC")
+        self.assertEqual(oms.strategy_unfrozen[-1][0], "GLFT_MultiScale")
 
 
 if __name__ == "__main__":

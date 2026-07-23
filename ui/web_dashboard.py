@@ -364,6 +364,15 @@ class LocalWebDashboard:
         self._risk_sources: dict[str, dict[str, Any]] = {}
         self._runtime_metrics: dict[str, Any] = {}
         self._system_health: Any = None
+        self._startup_status: dict[str, Any] = {
+            "state": "STARTING",
+            "operating_mode": "INITIALIZING",
+            "startup_blocked": False,
+            "execution_enabled": False,
+            "restart_required": False,
+            "reason": "startup_in_progress",
+            "updated_at": time.time(),
+        }
         self._rpi_external: dict[str, Any] = {}
         self._rpi_capabilities: dict[str, bool | None] = {}
 
@@ -454,8 +463,8 @@ class LocalWebDashboard:
             if not isinstance(registered_models, (list, tuple)):
                 registered_models = []
             primary_model = str(
-                strategy.get("primary_model", strategy.get("name", "ML_Sniper"))
-                or "ML_Sniper"
+                strategy.get("primary_model", strategy.get("name", "glft"))
+                or "glft"
             )
             execution_policy = str(
                 strategy.get("execution_policy", "single_primary")
@@ -463,7 +472,7 @@ class LocalWebDashboard:
             )
         else:
             registered_models = []
-            primary_model = "ML_Sniper"
+            primary_model = "glft"
             execution_policy = "single_primary"
 
         return {
@@ -479,9 +488,11 @@ class LocalWebDashboard:
             "private_api_enabled": not is_paper,
             "symbols": [str(symbol).upper() for symbol in config.get("symbols", [])],
             "exchange": "BINANCE",
-            "strategy": str(strategy.get("name", "ML_Sniper") or "ML_Sniper")
+            "strategy": str(
+                strategy.get("name", "GLFT_MultiScale") or "GLFT_MultiScale"
+            )
             if isinstance(strategy, Mapping)
-            else "ML_Sniper",
+            else "GLFT_MultiScale",
             "primary_strategy_model": primary_model,
             "registered_strategy_models": [
                 str(model) for model in registered_models
@@ -540,6 +551,29 @@ class LocalWebDashboard:
         with self._lock:
             return self._running
 
+    def set_startup_status(
+        self,
+        *,
+        state: str,
+        operating_mode: str,
+        startup_blocked: bool,
+        execution_enabled: bool,
+        restart_required: bool,
+        reason: str = "",
+    ) -> None:
+        """Publish the engine startup latch independently from HTTP liveness."""
+        status = {
+            "state": str(state or "UNKNOWN").upper(),
+            "operating_mode": str(operating_mode or "UNKNOWN").upper(),
+            "startup_blocked": bool(startup_blocked),
+            "execution_enabled": bool(execution_enabled),
+            "restart_required": bool(restart_required),
+            "reason": _redact_text(reason, 512),
+            "updated_at": time.time(),
+        }
+        with self._lock:
+            self._startup_status = status
+
     def start(self) -> str:
         """Start the loopback HTTP server and return its URL."""
         with self._lifecycle_lock:
@@ -554,7 +588,7 @@ class LocalWebDashboard:
                 self._running = True
                 self._service_state = "running"
                 self._started_wall = time.time()
-                self._started_monotonic = time.monotonic()
+                self._started_monotonic = time.perf_counter()
             self.publish_snapshot(force=True)
             thread = threading.Thread(
                 target=server.serve_forever,
@@ -1081,7 +1115,7 @@ class LocalWebDashboard:
         force: bool = True,
     ) -> bool:
         """Build and atomically publish a JSON snapshot on the caller's thread."""
-        now_monotonic = time.monotonic()
+        now_monotonic = time.perf_counter()
         if (
             not force
             and self.publish_interval_sec > 0.0
@@ -1136,6 +1170,10 @@ class LocalWebDashboard:
         health = json.dumps(
             {
                 "status": "ok" if self.is_running else self._service_state,
+                "engine_status": snapshot["startup"]["state"],
+                "startup_blocked": snapshot["startup"]["startup_blocked"],
+                "execution_enabled": snapshot["startup"]["execution_enabled"],
+                "restart_required": snapshot["startup"]["restart_required"],
                 "sequence": sequence,
                 "generated_at": snapshot["meta"]["generated_at"],
                 "snapshot_age_sec": 0.0,
@@ -1582,20 +1620,48 @@ class LocalWebDashboard:
         if service is None:
             return _section_unavailable()
         try:
-            last_sync = _finite_float(getattr(service, "last_sync_time", 0.0), 0.0) or 0.0
-            return {
+            health_reader = getattr(service, "health_snapshot", None)
+            if callable(health_reader):
+                try:
+                    health = health_reader(notify_listeners=False)
+                except TypeError:
+                    health = health_reader()
+            else:
+                health = {}
+            if not isinstance(health, Mapping):
+                health = {}
+            last_sync = (
+                _finite_float(
+                    health.get(
+                        "last_sync_time",
+                        getattr(service, "last_sync_time", 0.0),
+                    ),
+                    0.0,
+                )
+                or 0.0
+            )
+            snapshot = {
                 "available": True,
                 "active": bool(getattr(service, "active", False)),
-                "health": str(getattr(service, "_health_state", "unknown") or "unknown"),
-                "offset_ms": _finite_float(getattr(service, "offset", None)),
-                "rtt_ms": _finite_float(getattr(service, "last_rtt_ms", None)),
+                "health": str(
+                    health.get(
+                        "state",
+                        getattr(service, "_health_state", "unknown"),
+                    )
+                    or "unknown"
+                ),
+                **_safe_value(dict(health)),
                 "last_sync_time": last_sync or None,
-                "last_sync_age_sec": max(0.0, time.time() - last_sync) if last_sync else None,
-                "last_error": _redact_text(getattr(service, "last_error", ""), 512),
-                "consecutive_failures": _finite_int(
-                    getattr(service, "consecutive_failures", 0), 0
+                "last_sync_age_sec": _finite_float(
+                    health.get("sync_age_sec"),
                 ),
             }
+            snapshot["last_error"] = _redact_text(
+                snapshot.get("last_error", getattr(service, "last_error", "")),
+                512,
+            )
+            snapshot["reason"] = _redact_text(snapshot.get("reason", ""), 512)
+            return snapshot
         except Exception as exc:
             return _section_unavailable(error=f"{type(exc).__name__}:{_redact_text(exc)}")
 
@@ -1629,6 +1695,28 @@ class LocalWebDashboard:
         if supervisor is None:
             return _section_unavailable()
         try:
+            raw_attempts = dict(
+                getattr(supervisor, "attempts_by_recovery", {}) or {}
+            )
+            attempts_by_recovery = {}
+            attempts_by_venue = {}
+            for raw_key, raw_count in raw_attempts.items():
+                count = _finite_int(raw_count, 0)
+                if isinstance(raw_key, tuple) and raw_key:
+                    venue = str(raw_key[0] or "UNKNOWN")
+                    recovery_key = "|".join(str(part) for part in raw_key)
+                else:
+                    venue = str(raw_key or "UNKNOWN")
+                    recovery_key = venue
+                attempts_by_recovery[recovery_key] = count
+                attempts_by_venue[venue] = max(
+                    attempts_by_venue.get(venue, 0),
+                    count,
+                )
+            if not raw_attempts:
+                attempts_by_venue = dict(
+                    getattr(supervisor, "attempts_by_venue", {}) or {}
+                )
             return {
                 "available": True,
                 "active": bool(getattr(supervisor, "active", False)),
@@ -1636,9 +1724,8 @@ class LocalWebDashboard:
                     getattr(supervisor, "poll_interval_sec", None)
                 ),
                 "max_attempts": _finite_int(getattr(supervisor, "max_attempts", None)),
-                "attempts_by_venue": _safe_value(
-                    dict(getattr(supervisor, "attempts_by_venue", {}) or {})
-                ),
+                "attempts_by_venue": _safe_value(attempts_by_venue),
+                "attempts_by_recovery": _safe_value(attempts_by_recovery),
             }
         except Exception as exc:
             return _section_unavailable(error=f"{type(exc).__name__}:{_redact_text(exc)}")
@@ -1671,12 +1758,13 @@ class LocalWebDashboard:
         performance["execution_venue"] = self._config_view["execution_venue"]
         performance["execution_source"] = execution_source
         uptime = (
-            max(0.0, time.monotonic() - self._started_monotonic)
+            max(0.0, time.perf_counter() - self._started_monotonic)
             if self._started_monotonic
             else 0.0
         )
         system = {
             "available": True,
+            "startup": deepcopy(self._startup_status),
             "gateway": components.get("gateway", _section_unavailable()),
             "oms": components.get("oms", _section_unavailable()),
             "risk_supervisor": components.get(
@@ -1755,6 +1843,7 @@ class LocalWebDashboard:
                 ],
                 "configured_symbols": list(self._config_view["symbols"]),
             },
+            "startup": deepcopy(self._startup_status),
             "environment": environment,
             "system": system,
             "account": account,
@@ -2383,6 +2472,10 @@ class LocalWebDashboard:
                 if path == "/healthz":
                     self._send(owner._get_health_json(), "application/json; charset=utf-8", 200)
                     return
+                if path == "/readyz":
+                    payload, status = owner._get_readiness_json()
+                    self._send(payload, "application/json; charset=utf-8", status)
+                    return
                 self._send(b'{"error":"not_found"}', "application/json; charset=utf-8", 404)
 
             def do_HEAD(self) -> None:  # noqa: N802 - stdlib handler API
@@ -2466,6 +2559,10 @@ class LocalWebDashboard:
             age = max(0.0, time.time() - self._published_at) if self._published_at else None
             payload = {
                 "status": "ok" if self._running else self._service_state,
+                "engine_status": self._startup_status["state"],
+                "startup_blocked": self._startup_status["startup_blocked"],
+                "execution_enabled": self._startup_status["execution_enabled"],
+                "restart_required": self._startup_status["restart_required"],
                 "sequence": self._published_sequence,
                 "snapshot_age_sec": age,
                 "generated_at": _utc_iso(self._published_at) if self._published_at else None,
@@ -2476,6 +2573,33 @@ class LocalWebDashboard:
             allow_nan=False,
             separators=(",", ":"),
         ).encode("utf-8")
+
+    def _get_readiness_json(self) -> tuple[bytes, int]:
+        with self._lock:
+            state = str(self._startup_status.get("state", "UNKNOWN") or "UNKNOWN")
+            execution_enabled = bool(
+                self._startup_status.get("execution_enabled", False)
+            )
+            ready = bool(self._running and state == "RUNNING" and execution_enabled)
+            payload = {
+                "status": "ready" if ready else "not_ready",
+                "engine_status": state,
+                "startup_blocked": bool(
+                    self._startup_status.get("startup_blocked", False)
+                ),
+                "execution_enabled": execution_enabled,
+                "restart_required": bool(
+                    self._startup_status.get("restart_required", False)
+                ),
+                "reason": self._startup_status.get("reason", ""),
+            }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return encoded, 200 if ready else 503
 
     def _load_static_page(self) -> bytes:
         try:

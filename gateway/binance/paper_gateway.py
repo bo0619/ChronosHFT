@@ -53,6 +53,7 @@ from event.type import (
 )
 from gateway.base_gateway import BaseGateway
 from infrastructure.logger import logger
+from infrastructure.time_service import time_service
 
 from .constants import EP_DEPTH_SNAPSHOT, EP_RPI_DEPTH, REST_URL_MAIN
 from .ws_api import BinanceWsApi
@@ -114,12 +115,12 @@ class _PublicBinanceRest:
     ):
         for attempt in range(2):
             with self._lock:
-                now = time.monotonic()
+                now = time.perf_counter()
                 reference = self._last_rpi_request_at if rpi else self._last_request_at
                 wait_for = max(0.0, float(minimum_interval) - (now - reference))
                 if wait_for:
                     time.sleep(wait_for)
-                stamp = time.monotonic()
+                stamp = time.perf_counter()
                 self._last_request_at = stamp
                 if rpi:
                     self._last_rpi_request_at = stamp
@@ -211,6 +212,10 @@ class BinancePaperGateway(BaseGateway):
         self.symbols = [str(value).upper() for value in self.config.get("symbols", [])]
         self.active = False
         self._accepting_orders = False
+        time_sync_config = system.get("time_sync", {}) or {}
+        self.require_healthy_clock = bool(
+            time_sync_config.get("require_healthy_for_trading", False)
+        )
 
         self.publish_depth_levels = max(
             1,
@@ -328,9 +333,15 @@ class BinancePaperGateway(BaseGateway):
         self.orderbooks: dict[str, LocalOrderBook] = {}
         self.ws_buffer: dict[str, list[dict] | None] = {}
         self.book_resyncing: set[str] = set()
+        self.book_recovery_generation: dict[str, int] = {}
+        self.book_recovery_tokens: dict[str, int] = {}
+        self._book_recovery_token = 0
+        self._book_generation = 0
         self._book_lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
         self._fault_lock = threading.Lock()
+        self._fault_epoch = 0
+        self._closing = False
 
         self._commands: queue.Queue[_EngineCommand] = queue.Queue(maxsize=queue_size)
         self._worker: threading.Thread | None = None
@@ -370,8 +381,12 @@ class BinancePaperGateway(BaseGateway):
 
     def connect(self, symbols: list):
         with self._lifecycle_lock:
+            if self._closing:
+                return False
             if self.active and self.state == GatewayState.READY:
                 return True
+            with self._fault_lock:
+                fault_epoch = self._fault_epoch
             self.symbols = [str(symbol).upper() for symbol in (symbols or self.symbols)]
             if not self.symbols:
                 self.set_state(GatewayState.ERROR)
@@ -384,35 +399,58 @@ class BinancePaperGateway(BaseGateway):
             self.active = True
             self._accepting_orders = False
             self._start_worker()
-            self._reset_public_books()
-            self.ws = BinanceWsApi(self.on_ws_message, self.on_ws_error, testnet=False)
-            self.ws.start_market_stream(self.symbols)
+            generation = self._reset_public_books()
+            ws = self._new_public_ws(generation)
+            self.ws = ws
+            ws.start_market_stream(self.symbols)
 
-        all_synced = all(self._resync_book(symbol) for symbol in self.symbols)
+        all_synced = all(
+            self._resync_book(symbol, expected_generation=generation)
+            for symbol in self.symbols
+        )
         if not all_synced:
-            self._fault("WS_HANDLER_FAILURE:PUBLIC_BOOK_INITIALIZATION_FAILED")
+            if self._book_generation_is_current(generation):
+                self._fault("WS_HANDLER_FAILURE:PUBLIC_BOOK_INITIALIZATION_FAILED")
+            ws.close()
             return False
 
-        self._accepting_orders = True
-        self.set_state(GatewayState.READY)
-        self._emit_full_account_update(reason="PAPER_BOOTSTRAP")
+        with self._lifecycle_lock:
+            if not self._emit_full_account_update(reason="PAPER_BOOTSTRAP"):
+                ws.close()
+                return False
+            if not self._commit_ready_if_current(
+                ws,
+                generation,
+                fault_epoch,
+            ):
+                ws.close()
+                return False
         logger.info(
             "[BINANCE_PAPER] Ready on production public data; "
             f"RPI fill model={self.rpi_fill_model}"
         )
         return True
 
+    def begin_shutdown(self):
+        with self._lifecycle_lock:
+            self._closing = True
+            self._accepting_orders = False
+            self.active = False
+            self._invalidate_public_book_lifecycle()
+            ws = self.ws
+            self.ws = None
+            with self._fault_lock:
+                self.set_state(GatewayState.DISCONNECTED)
+        if ws is not None:
+            ws.close()
+        return True
+
     def close(self):
+        self.begin_shutdown()
         with self._lifecycle_lock:
             if self.state == GatewayState.DISCONNECTED and not self._worker_running:
                 self.rest.close()
                 return
-            self._accepting_orders = False
-            self.active = False
-            ws = self.ws
-            self.ws = None
-        if ws is not None:
-            ws.close()
 
         if self._worker_running:
             try:
@@ -429,43 +467,103 @@ class BinancePaperGateway(BaseGateway):
         self.rest.close()
         self.set_state(GatewayState.DISCONNECTED)
 
-    def recover_connectivity(self):
+    def recover_connectivity(self, recovery_context=None):
         with self._lifecycle_lock:
-            if not self.symbols or not self._worker_running:
+            if (
+                self._closing
+                or not self.symbols
+                or not self._worker_running
+            ):
                 return False
+            with self._fault_lock:
+                fault_epoch = self._fault_epoch
             self._accepting_orders = False
+            self.active = True
             self.set_state(GatewayState.CONNECTING)
             if self.ws is not None:
                 self.ws.close()
-            self._reset_public_books()
-            self.ws = BinanceWsApi(self.on_ws_message, self.on_ws_error, testnet=False)
-            self.ws.start_market_stream(self.symbols)
+            generation = self._reset_public_books()
+            ws = self._new_public_ws(generation)
+            self.ws = ws
+            ws.start_market_stream(self.symbols)
 
-        all_synced = all(self._resync_book(symbol) for symbol in self.symbols)
-        if not all_synced:
-            self._fault("WS_HANDLER_FAILURE:PUBLIC_BOOK_RECOVERY_FAILED")
-            return False
-        self.active = True
-        self._accepting_orders = True
-        self.set_state(GatewayState.READY)
-        self.event_engine.put(
-            Event(
-                EVENT_SYSTEM_HEALTH,
-                f"CLEAR_VENUE:{self.gateway_name}:PUBLIC_MARKET_RECOVERED",
-            )
+        all_synced = all(
+            self._resync_book(symbol, expected_generation=generation)
+            for symbol in self.symbols
         )
+        if not all_synced:
+            if self._book_generation_is_current(generation):
+                self._fault("WS_HANDLER_FAILURE:PUBLIC_BOOK_RECOVERY_FAILED")
+            ws.close()
+            return False
+        with self._lifecycle_lock:
+            if not self._commit_ready_if_current(
+                ws,
+                generation,
+                fault_epoch,
+            ):
+                ws.close()
+                return False
+            if recovery_context:
+                owner = str(recovery_context.get("owner", "") or "")
+                epoch = int(recovery_context.get("epoch", 0) or 0)
+                recovery_event = (
+                    f"VERIFY_VENUE:{self.gateway_name}:{epoch}:{owner}"
+                )
+            else:
+                recovery_event = (
+                    f"CLEAR_VENUE:{self.gateway_name}:PUBLIC_MARKET_RECOVERED"
+                )
+            self.event_engine.put(
+                Event(
+                    EVENT_SYSTEM_HEALTH,
+                    recovery_event,
+                )
+            )
         return True
 
-    def on_ws_message(self, raw_message):
+    def _new_public_ws(self, generation: int):
+        return BinanceWsApi(
+            lambda raw_message: self.on_ws_message(
+                raw_message,
+                expected_generation=generation,
+            ),
+            lambda error: self.on_ws_error(
+                error,
+                expected_generation=generation,
+            ),
+            testnet=False,
+        )
+
+    def on_ws_message(self, raw_message, *, expected_generation=None):
+        if not self._book_generation_is_current(expected_generation):
+            return
+        (
+            received_timestamp,
+            received_monotonic,
+            corrected_received_timestamp,
+            clock_offset_ms,
+        ) = time_service.capture_timestamp()
         try:
             message = json.loads(raw_message)
             if not isinstance(message, dict) or "stream" not in message:
                 return
-            self._handle_market_message(message["stream"], message.get("data", {}))
+            self._handle_market_message(
+                message["stream"],
+                message.get("data", {}),
+                received_timestamp=received_timestamp,
+                received_monotonic=received_monotonic,
+                clock_offset_ms=clock_offset_ms,
+                corrected_received_timestamp=corrected_received_timestamp,
+                expected_generation=expected_generation,
+            )
         except Exception as exc:
-            self._fault(f"WS_HANDLER_FAILURE:PUBLIC:{type(exc).__name__}:{exc}")
+            if self._book_generation_is_current(expected_generation):
+                self._fault(f"WS_HANDLER_FAILURE:PUBLIC:{type(exc).__name__}:{exc}")
 
-    def on_ws_error(self, error):
+    def on_ws_error(self, error, *, expected_generation=None):
+        if not self._book_generation_is_current(expected_generation):
+            return
         if isinstance(error, dict):
             stream = str(error.get("stream", "MarketWS") or "MarketWS")
             kind = str(error.get("kind", "error") or "error")
@@ -475,16 +573,45 @@ class BinancePaperGateway(BaseGateway):
             rendered = str(error)
         self._fault(f"WS_TRANSPORT_DROP:PUBLIC:{rendered}")
 
-    def _handle_market_message(self, stream: str, data: dict):
+    def _handle_market_message(
+        self,
+        stream: str,
+        data: dict,
+        *,
+        received_timestamp: float = None,
+        received_monotonic: float = None,
+        clock_offset_ms: float = None,
+        corrected_received_timestamp: float = None,
+        expected_generation=None,
+    ):
+        data = dict(data)
         symbol = str(data.get("s", "") or "").upper()
-        if not symbol or symbol not in self.orderbooks:
-            return
+        with self._book_lock:
+            if not self._book_generation_matches_locked(expected_generation):
+                return
+            if not symbol or symbol not in self.orderbooks:
+                return
+            message_generation = self._book_generation
 
-        event_ms = int(data.get("E", data.get("T", 0)) or 0)
+        received_timestamp = float(received_timestamp or time.time())
+        received_monotonic = float(received_monotonic or time.perf_counter())
+        clock_offset_ms = float(
+            getattr(time_service, "offset", 0.0)
+            if clock_offset_ms is None
+            else clock_offset_ms
+        )
+        corrected_received_timestamp = float(
+            corrected_received_timestamp
+            or (received_timestamp + clock_offset_ms / 1000.0)
+        )
+        event_ms = int(
+            data.get("E", 0)
+            or (0 if "@markPrice" in stream else data.get("T", 0))
+            or 0
+        )
         if event_ms:
-            self.latency_stats["ws_delay"] = max(
-                0.0,
-                time.time() * 1000.0 - event_ms,
+            self.latency_stats["ws_delay"] = (
+                corrected_received_timestamp * 1000.0 - event_ms
             )
 
         if "@aggTrade" in stream:
@@ -495,11 +622,23 @@ class BinancePaperGateway(BaseGateway):
                 quantity=float(data.get("q", 0.0) or 0.0),
                 maker_is_buyer=bool(data.get("m", False)),
                 datetime=datetime.fromtimestamp(
-                    float(data.get("T", event_ms) or int(time.time() * 1000)) / 1000.0
+                    float(data.get("T", event_ms) or int(received_timestamp * 1000))
+                    / 1000.0
                 ),
+                exchange_timestamp=(
+                    float(data.get("T", event_ms) or 0.0) / 1000.0
+                ),
+                received_timestamp=received_timestamp,
+                received_monotonic=received_monotonic,
+                clock_offset_ms=clock_offset_ms,
+                corrected_received_timestamp=corrected_received_timestamp,
             )
-            self._submit_worker("market_trade", trade)
-            self.on_market_data(EVENT_AGG_TRADE, trade)
+            self._publish_public_market_update(
+                message_generation,
+                EVENT_AGG_TRADE,
+                trade,
+                worker_kind="market_trade",
+            )
             return
 
         if "@markPrice" in stream:
@@ -514,18 +653,108 @@ class BinancePaperGateway(BaseGateway):
                     next_funding_ms / 1000.0 if next_funding_ms else time.time()
                 ),
                 datetime=datetime.fromtimestamp(
-                    event_time_ms / 1000.0 if event_time_ms else time.time()
+                    event_time_ms / 1000.0 if event_time_ms else received_timestamp
                 ),
+                exchange_timestamp=(event_time_ms / 1000.0 if event_time_ms else 0.0),
+                received_timestamp=received_timestamp,
+                received_monotonic=received_monotonic,
+                clock_offset_ms=clock_offset_ms,
+                corrected_received_timestamp=corrected_received_timestamp,
             )
-            self._submit_worker("mark", mark)
-            self.on_market_data(EVENT_MARK_PRICE, mark)
+            self._publish_public_market_update(
+                message_generation,
+                EVENT_MARK_PRICE,
+                mark,
+                worker_kind="mark",
+            )
             return
 
         if "@depth" in stream:
-            self._process_book_delta(symbol, data)
+            data["_local_received_timestamp"] = received_timestamp
+            data["_local_received_monotonic"] = received_monotonic
+            data["_local_clock_offset_ms"] = clock_offset_ms
+            data["_local_corrected_received_timestamp"] = (
+                corrected_received_timestamp
+            )
+            self._process_book_delta(
+                symbol,
+                data,
+                expected_generation=message_generation,
+            )
+
+    @staticmethod
+    def _stamp_market_dispatch(data):
+        data.dispatch_timestamp = time.time()
+        data.dispatch_monotonic = time.perf_counter()
+
+    def _publish_public_market_update(
+        self,
+        generation,
+        event_type,
+        data,
+        *,
+        worker_kind: str,
+    ) -> bool:
+        # Serialize the final generation check, matching enqueue, and public
+        # emission against lifecycle reset.  The worker validates the same
+        # generation again when it dequeues the command.
+        with self._book_lock:
+            if self._book_generation != generation:
+                return False
+            self._stamp_market_dispatch(data)
+            if not self._submit_worker(
+                worker_kind,
+                (generation, data),
+            ):
+                return False
+            self.on_market_data(event_type, data)
+            return True
+
+    def _book_generation_matches_locked(self, expected_generation):
+        return bool(
+            expected_generation is None
+            or self._book_generation == expected_generation
+        )
+
+    def _book_generation_is_current(self, expected_generation):
+        with self._book_lock:
+            return self._book_generation_matches_locked(expected_generation)
+
+    def _commit_ready_if_current(
+        self,
+        expected_ws,
+        expected_generation,
+        expected_fault_epoch,
+    ) -> bool:
+        with self._book_lock:
+            if not self._book_generation_matches_locked(expected_generation):
+                return False
+        with self._fault_lock:
+            if (
+                self._closing
+                or self.ws is not expected_ws
+                or not self.active
+                or self.state == GatewayState.ERROR
+                or self._fault_epoch != expected_fault_epoch
+                or self._book_generation != expected_generation
+            ):
+                return False
+            self._accepting_orders = True
+            self.set_state(GatewayState.READY)
+            return True
+
+    def _invalidate_public_book_lifecycle(self):
+        with self._book_lock:
+            self._book_generation += 1
+            self.book_resyncing.clear()
+            self.book_recovery_generation.clear()
+            self.book_recovery_tokens.clear()
+            return self._book_generation
 
     def _reset_public_books(self):
         with self._book_lock:
+            self._book_generation += 1
+            generation = self._book_generation
             self.orderbooks = {
                 symbol: LocalOrderBook(
                     symbol,
@@ -536,13 +765,31 @@ class BinancePaperGateway(BaseGateway):
             }
             self.ws_buffer = {symbol: [] for symbol in self.symbols}
             self.book_resyncing.clear()
+            self.book_recovery_generation.clear()
+            self.book_recovery_tokens.clear()
+            return generation
 
-    def _resync_book(self, symbol: str):
+    def _resync_book(
+        self,
+        symbol: str,
+        *,
+        expected_generation=None,
+        recovery_token=None,
+    ):
         snapshot = self.rest.get_depth_snapshot(symbol)
         if not snapshot:
             return False
         try:
             with self._book_lock:
+                if not self._book_generation_matches_locked(expected_generation):
+                    return False
+                generation = self._book_generation
+                if recovery_token is not None and not self._owns_book_recovery_locked(
+                    symbol,
+                    generation,
+                    recovery_token,
+                ):
+                    return False
                 book = self.orderbooks[symbol]
                 book.init_snapshot(snapshot)
                 buffered = list(self.ws_buffer.get(symbol) or [])
@@ -555,15 +802,31 @@ class BinancePaperGateway(BaseGateway):
             logger.error(f"[BINANCE_PAPER] Book sync failed for {symbol}: {exc}")
             return False
 
-        if matching_book is not None:
-            self._submit_worker("book", matching_book)
-        if event_book is not None:
-            self.on_market_data(EVENT_ORDERBOOK, event_book)
-        return True
+        return self._publish_book_update(
+            generation,
+            symbol=symbol,
+            expected_book=book,
+            expected_recovery_token=recovery_token,
+            event_book=event_book,
+            matching_book=matching_book,
+        )
 
-    def _process_book_delta(self, symbol: str, delta: dict):
-        try:
-            with self._book_lock:
+    def _process_book_delta(
+        self,
+        symbol: str,
+        delta: dict,
+        *,
+        expected_generation=None,
+    ):
+        processing_generation = expected_generation
+        recovery = None
+        gap_failure = None
+        other_failure = None
+        with self._book_lock:
+            try:
+                if not self._book_generation_matches_locked(expected_generation):
+                    return
+                processing_generation = self._book_generation
                 buffered = self.ws_buffer.get(symbol)
                 if buffered is not None:
                     if len(buffered) >= self.max_book_buffer:
@@ -574,28 +837,85 @@ class BinancePaperGateway(BaseGateway):
                 book.process_delta(delta)
                 event_book = book.generate_event_data()
                 matching_book = self._full_matching_book(book)
-        except OrderBookGapError:
-            self.event_engine.put(
-                Event(EVENT_SYSTEM_HEALTH, f"FREEZE_SYMBOL:{symbol}:FATAL_GAP")
-            )
-            self._schedule_book_recovery(symbol)
+            except OrderBookGapError as exc:
+                gap_failure = exc
+                # The new owner is installed under the exact lock that saw
+                # the broken sequence.  The old recovery worker can no longer
+                # win the detection-to-schedule window and emit a stale clear.
+                recovery = self._begin_book_recovery_locked(
+                    symbol,
+                    freeze_reason="FATAL_GAP",
+                    expected_generation=processing_generation,
+                )
+            except Exception as exc:
+                other_failure = exc
+
+        if gap_failure is not None:
+            if recovery is not None:
+                self._launch_book_recovery(recovery)
             return
-        except Exception as exc:
-            self._fault(
-                f"WS_HANDLER_FAILURE:PUBLIC_BOOK:{symbol}:"
-                f"{type(exc).__name__}:{exc}"
-            )
+        if other_failure is not None:
+            if self._book_generation_is_current(processing_generation):
+                self._fault(
+                    f"WS_HANDLER_FAILURE:PUBLIC_BOOK:{symbol}:"
+                    f"{type(other_failure).__name__}:{other_failure}"
+                )
             return
 
-        if matching_book is not None:
-            self._submit_worker("book", matching_book)
-        if event_book is not None:
-            self.on_market_data(EVENT_ORDERBOOK, event_book)
+        self._publish_book_update(
+            processing_generation,
+            symbol=symbol,
+            expected_book=book,
+            event_book=event_book,
+            matching_book=matching_book,
+        )
+
+    def _publish_book_update(
+        self,
+        generation,
+        *,
+        symbol,
+        expected_book,
+        expected_recovery_token=None,
+        event_book,
+        matching_book,
+    ):
+        # Keep the generation check and publication ordered against reset.
+        # The matching worker validates the generation again when dequeuing.
+        with self._book_lock:
+            if self._book_generation != generation:
+                return False
+            if self.orderbooks.get(symbol) is not expected_book:
+                return False
+            if (
+                expected_recovery_token is not None
+                and not self._owns_book_recovery_locked(
+                    symbol,
+                    generation,
+                    expected_recovery_token,
+                )
+            ):
+                return False
+            if matching_book is not None:
+                if not self._submit_worker(
+                    "book",
+                    (generation, matching_book),
+                ):
+                    return False
+            if event_book is not None:
+                self._stamp_market_dispatch(event_book)
+                self.on_market_data(EVENT_ORDERBOOK, event_book)
+            return True
 
     def _full_matching_book(self, book: LocalOrderBook):
         if not book.initialized:
             return None
         received_at = float(book.last_received_ts or time.time())
+        received_monotonic = float(
+            book.last_received_monotonic or time.perf_counter()
+        )
+        dispatch_timestamp = time.time()
+        dispatch_monotonic = time.perf_counter()
         return OrderBook(
             symbol=book.symbol,
             exchange="BINANCE",
@@ -606,6 +926,13 @@ class BinancePaperGateway(BaseGateway):
             top_asks=tuple(book.top_asks),
             exchange_timestamp=float(book.last_exchange_ts or 0.0),
             received_timestamp=received_at,
+            received_monotonic=received_monotonic,
+            dispatch_timestamp=dispatch_timestamp,
+            dispatch_monotonic=dispatch_monotonic,
+            clock_offset_ms=book.last_clock_offset_ms,
+            corrected_received_timestamp=float(
+                book.last_corrected_received_ts or 0.0
+            ),
             best_bid_price=float(book.best_bid_price or 0.0),
             best_bid_volume=float(book.best_bid_volume or 0.0),
             best_ask_price=float(book.best_ask_price or 0.0),
@@ -613,45 +940,152 @@ class BinancePaperGateway(BaseGateway):
             depth_levels=max(len(book.bids), len(book.asks)),
         )
 
-    def _schedule_book_recovery(self, symbol: str):
-        with self._book_lock:
-            if symbol in self.book_resyncing:
-                return
-            self.book_resyncing.add(symbol)
-            self.orderbooks[symbol] = LocalOrderBook(
-                symbol,
-                publish_depth_levels=self.publish_depth_levels,
-                emit_full_book=self.emit_full_orderbook_events,
-            )
-            self.ws_buffer[symbol] = []
+    def _owns_book_recovery_locked(self, symbol, generation, recovery_token):
+        return bool(
+            self._book_generation == generation
+            and symbol in self.book_resyncing
+            and self.book_recovery_generation.get(symbol) == generation
+            and self.book_recovery_tokens.get(symbol) == recovery_token
+        )
 
-        def recover():
-            try:
-                ok = self._resync_book(symbol)
-                if ok:
-                    self.event_engine.put(
-                        Event(
-                            EVENT_SYSTEM_HEALTH,
-                            f"CLEAR_SYMBOL:{symbol}:ORDERBOOK_RESYNCED",
-                        )
+    def _release_book_recovery_locked(self, symbol, generation, recovery_token):
+        if not self._owns_book_recovery_locked(
+            symbol,
+            generation,
+            recovery_token,
+        ):
+            return False
+        self.book_recovery_generation.pop(symbol, None)
+        self.book_recovery_tokens.pop(symbol, None)
+        self.book_resyncing.discard(symbol)
+        return True
+
+    def _schedule_book_recovery(
+        self,
+        symbol: str,
+        freeze_reason: str = "",
+        *,
+        expected_generation=None,
+    ):
+        with self._book_lock:
+            recovery = self._begin_book_recovery_locked(
+                symbol,
+                freeze_reason,
+                expected_generation=expected_generation,
+            )
+        if recovery is None:
+            return False
+        self._launch_book_recovery(recovery)
+        return True
+
+    def _begin_book_recovery_locked(
+        self,
+        symbol: str,
+        freeze_reason: str = "",
+        *,
+        expected_generation=None,
+    ):
+        if not self._book_generation_matches_locked(expected_generation):
+            return None
+        if symbol in self.book_resyncing and not freeze_reason:
+            return None
+        generation = self._book_generation
+        self._book_recovery_token += 1
+        recovery_token = self._book_recovery_token
+        self.book_resyncing.add(symbol)
+        self.book_recovery_generation[symbol] = generation
+        self.book_recovery_tokens[symbol] = recovery_token
+        self.orderbooks[symbol] = LocalOrderBook(
+            symbol,
+            publish_depth_levels=self.publish_depth_levels,
+            emit_full_book=self.emit_full_orderbook_events,
+        )
+        self.ws_buffer[symbol] = []
+        return symbol, generation, recovery_token, freeze_reason
+
+    def _launch_book_recovery(self, recovery):
+        symbol, generation, recovery_token, freeze_reason = recovery
+        with self._book_lock:
+            if not self._owns_book_recovery_locked(
+                symbol,
+                generation,
+                recovery_token,
+            ):
+                return False
+            if freeze_reason:
+                self.event_engine.put(
+                    Event(
+                        EVENT_SYSTEM_HEALTH,
+                        f"FREEZE_SYMBOL:{symbol}:{freeze_reason}:{recovery_token}",
                     )
-                else:
-                    self._fault(
-                        f"WS_HANDLER_FAILURE:PUBLIC_BOOK_RESYNC_FAILED:{symbol}"
-                    )
-            finally:
-                with self._book_lock:
-                    self.book_resyncing.discard(symbol)
+                )
 
         threading.Thread(
-            target=recover,
+            target=self._recover_orderbook,
+            args=(symbol, generation, recovery_token),
             daemon=True,
             name=f"PaperBookRecovery-{symbol}",
         ).start()
+        return True
+
+    def _recover_orderbook(self, symbol, generation, recovery_token):
+        try:
+            ok = self._resync_book(
+                symbol,
+                expected_generation=generation,
+                recovery_token=recovery_token,
+            )
+            if ok:
+                with self._book_lock:
+                    completed = self._release_book_recovery_locked(
+                        symbol,
+                        generation,
+                        recovery_token,
+                    )
+                    if completed:
+                        self.event_engine.put(
+                            Event(
+                                EVENT_SYSTEM_HEALTH,
+                                f"CLEAR_SYMBOL:{symbol}:ORDERBOOK_RESYNCED:{recovery_token}",
+                            )
+                        )
+                return
+            with self._book_lock:
+                if self._owns_book_recovery_locked(
+                    symbol,
+                    generation,
+                    recovery_token,
+                ):
+                    self._fault(
+                        f"WS_HANDLER_FAILURE:PUBLIC_BOOK_RESYNC_FAILED:{symbol}"
+                    )
+        finally:
+            with self._book_lock:
+                self._release_book_recovery_locked(
+                    symbol,
+                    generation,
+                    recovery_token,
+                )
 
     # ------------------------------------------------------------------
     # OMS command/query surface
     # ------------------------------------------------------------------
+
+    def _clock_health_rejection(self, req: OrderRequest):
+        if req.reduce_only or not self.require_healthy_clock:
+            return "", ""
+        try:
+            clock_health = time_service.health_snapshot(
+                notify_listeners=False
+            )
+        except Exception as exc:
+            return "CLOCK_HEALTH_UNAVAILABLE", f"{type(exc).__name__}:{exc}"
+        if not bool(clock_health.get("ready", False)):
+            return (
+                "CLOCK_UNHEALTHY",
+                str(clock_health.get("reason", "exchange clock unavailable")),
+            )
+        return "", ""
 
     def send_order(
         self,
@@ -663,6 +1097,27 @@ class BinancePaperGateway(BaseGateway):
                 CommandOutcome.REJECTED,
                 error_code="PAPER_NOT_READY",
                 error_message="paper gateway is not ready for new orders",
+            )
+        if not req.reduce_only:
+            symbol = str(req.symbol or "").upper()
+            with self._book_lock:
+                if (
+                    symbol in self.book_resyncing
+                    or self.ws_buffer.get(symbol) is not None
+                ):
+                    return GatewayCommandResult(
+                        CommandOutcome.REJECTED,
+                        error_code="PAPER_ORDERBOOK_NOT_READY",
+                        error_message=(
+                            f"{symbol} paper order book is resynchronizing"
+                        ),
+                    )
+        clock_error, clock_message = self._clock_health_rejection(req)
+        if clock_error:
+            return GatewayCommandResult(
+                CommandOutcome.REJECTED,
+                error_code=clock_error,
+                error_message=clock_message,
             )
         if not client_oid:
             client_oid = f"PAPER_CLIENT_{time.time_ns()}"
@@ -699,7 +1154,11 @@ class BinancePaperGateway(BaseGateway):
 
     def cancel_order(self, req: CancelRequest):
         try:
-            payload = self._call_worker("cancel_order", copy.deepcopy(req))
+            payload = self._call_worker(
+                "cancel_order",
+                copy.deepcopy(req),
+                allow_closing=True,
+            )
         except TimeoutError as exc:
             return _PaperResponse(
                 504,
@@ -896,12 +1355,24 @@ class BinancePaperGateway(BaseGateway):
             symbol, countdown_ms = payload
             return self._set_dms_internal(symbol, countdown_ms)
         if kind == "book":
-            return self._on_book(payload)
+            generation, book = payload
+            with self._book_lock:
+                if generation != self._book_generation:
+                    return False
+                return self._on_book(book)
         if kind == "market_trade":
-            return self._on_market_trade(payload)
+            generation, trade = payload
+            with self._book_lock:
+                if generation != self._book_generation:
+                    return False
+                return self._on_market_trade(trade)
         if kind == "mark":
-            self._marks[payload.symbol] = float(payload.mark_price or 0.0)
-            return True
+            generation, mark = payload
+            with self._book_lock:
+                if generation != self._book_generation:
+                    return False
+                self._marks[mark.symbol] = float(mark.mark_price or 0.0)
+                return True
         if kind == "query":
             query_name, args = payload
             return self._query_internal(query_name, args)
@@ -1043,6 +1514,15 @@ class BinancePaperGateway(BaseGateway):
         ):
             reason = order.pending_cancel_reason or "PAPER_CANCEL_ALL_BARRIER"
             return self._cancel_staged_order(order, reason)
+
+        clock_error, clock_message = self._clock_health_rejection(
+            order.request
+        )
+        if clock_error:
+            return self._reject_staged_order(
+                order,
+                f"{clock_error}:{clock_message}",
+            )
 
         # Admission and commit are separated by the OMS durability barrier.
         # Revalidate against the latest book/position state so a GTX/RPI order
@@ -1502,7 +1982,7 @@ class BinancePaperGateway(BaseGateway):
         if countdown_ms == 0:
             self._dms_deadlines.pop(symbol, None)
         else:
-            self._dms_deadlines[symbol] = time.monotonic() + countdown_ms / 1000.0
+            self._dms_deadlines[symbol] = time.perf_counter() + countdown_ms / 1000.0
         return {
             "symbol": symbol,
             "countdownTime": countdown_ms,
@@ -1512,7 +1992,7 @@ class BinancePaperGateway(BaseGateway):
     def _check_dms_deadlines(self):
         if not self._dms_deadlines:
             return
-        now = time.monotonic()
+        now = time.perf_counter()
         expired = [
             symbol
             for symbol, deadline in self._dms_deadlines.items()
@@ -1947,8 +2427,8 @@ class BinancePaperGateway(BaseGateway):
 
     def _emit_full_account_update(self, reason: str):
         if not self._worker_running:
-            return
-        self._submit_worker("emit_full_account", reason)
+            return False
+        return self._submit_worker("emit_full_account", reason)
 
     def _emit_full_account_update_internal(self, reason: str):
         metrics = self._account_metrics()
@@ -2065,8 +2545,16 @@ class BinancePaperGateway(BaseGateway):
         reason = str(reason or "PAPER_GATEWAY_FAILURE")
         with self._fault_lock:
             self._accepting_orders = False
-            if self.state != GatewayState.ERROR:
-                self.set_state(GatewayState.ERROR)
+            self.active = False
+            if self._closing:
+                return
+            self._fault_epoch += 1
+            with self._book_lock:
+                self._book_generation += 1
+                self.book_resyncing.clear()
+                self.book_recovery_generation.clear()
+                self.book_recovery_tokens.clear()
+            self.set_state(GatewayState.ERROR)
             self.event_engine.put(
                 Event(
                     EVENT_SYSTEM_HEALTH,

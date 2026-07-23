@@ -349,6 +349,7 @@ class ExposureManager:
         max_pos_notional: float,
         max_account_gross_notional: float = 0.0,
         order_price: float = 0.0,
+        max_concurrent_symbols: int = 0,
     ) -> tuple:
         """
         [FIX-RISK] ?? worst-case ????
@@ -371,6 +372,28 @@ class ExposureManager:
 
         new_buy_qty = volume if side == Side.BUY else 0.0
         new_sell_qty = volume if side == Side.SELL else 0.0
+
+        if max_concurrent_symbols > 0:
+            active_symbols = self.get_active_risk_symbols()
+            target_is_active = symbol in active_symbols
+            target_would_be_active = (
+                self._symbol_worst_case_abs_qty(
+                    symbol,
+                    new_buy_qty,
+                    new_sell_qty,
+                )
+                > 1e-9
+            )
+            if (
+                target_would_be_active
+                and not target_is_active
+                and len(active_symbols) >= max_concurrent_symbols
+            ):
+                return False, (
+                    "Concurrent Symbol Limit: "
+                    f"active={len(active_symbols)}>="
+                    f"{max_concurrent_symbols} target={symbol}"
+                )
 
         worst_long = self._symbol_worst_long_qty(symbol, new_buy_qty)
         worst_short = self._symbol_worst_short_qty(symbol, new_sell_qty)
@@ -431,6 +454,16 @@ class ExposureManager:
             gross_notional += max_exposure * mark_price
 
         return gross_notional
+
+    def get_active_risk_symbols(self) -> set[str]:
+        tracked_symbols = set(self.net_positions)
+        tracked_symbols.update(self.open_buy_qty)
+        tracked_symbols.update(self.open_sell_qty)
+        return {
+            symbol
+            for symbol in tracked_symbols
+            if self._symbol_worst_case_abs_qty(symbol) > 1e-9
+        }
 
     def _symbol_worst_case_abs_qty(
         self,

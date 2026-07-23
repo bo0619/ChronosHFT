@@ -28,7 +28,7 @@
     html { scroll-behavior: smooth; }
     body {
       margin: 0;
-      min-width: 1180px;
+      min-width: 0;
       background: var(--bg);
       color: var(--text);
       font-family: var(--sans);
@@ -88,6 +88,17 @@
     .dot.live { background: var(--green); box-shadow: 0 0 10px rgba(66, 211, 146, .65); }
     .dot.warn { background: var(--amber); box-shadow: 0 0 10px rgba(244, 190, 85, .55); }
     .dot.bad { background: var(--red); box-shadow: 0 0 10px rgba(255, 107, 120, .6); }
+
+    .startup-banner {
+      display: none; min-height: 48px; align-items: center; justify-content: center;
+      flex-wrap: wrap;
+      gap: 16px; padding: 10px 24px; color: #ffd9dd; background: #2b1116;
+      border-bottom: 1px solid #8f3541; font: 700 11px var(--mono);
+    }
+    .startup-banner strong { color: var(--red); font-size: 12px; }
+    .startup-banner .reason { color: #f1bcc3; overflow-wrap: anywhere; }
+    .startup-banner .latch { color: #d9939c; white-space: nowrap; }
+    body.startup-blocked .startup-banner { display: flex; }
 
     .paper-banner {
       display: none; position: sticky; top: 68px; z-index: 20; min-height: 38px;
@@ -217,6 +228,67 @@
       .chart-grid { grid-template-columns: 1fr 1fr; }
       .chart-grid > :last-child { grid-column: 1 / -1; }
     }
+
+    @media (max-width: 1399px) {
+      .topbar {
+        position: static; height: auto; min-height: 68px; display: grid;
+        grid-template-columns: minmax(0, 1fr) auto; gap: 12px; padding: 11px 16px;
+      }
+      .brand { min-width: 0; }
+      .top-status {
+        grid-column: 1 / -1; display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px;
+      }
+      .state-box, .state-box:first-child { min-width: 0; }
+      .state-box strong { overflow: hidden; text-overflow: ellipsis; }
+      .top-actions { justify-content: end; }
+      .startup-banner, .paper-banner { position: static; }
+      .subnav, body.paper-mode .subnav { top: 0; overflow-x: auto; }
+      .subnav a { flex: 0 0 auto; }
+      #asOf { display: none; }
+      main { padding-right: 16px; padding-left: 16px; }
+      section, body.paper-mode section { scroll-margin-top: 44px; }
+      .split { grid-template-columns: 1fr; }
+      .quad { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 700px) {
+      body { font-size: 13px; }
+      .topbar { grid-template-columns: 1fr; padding: 10px 12px; }
+      .brand { min-width: 0; }
+      .brand p { font-size: 9px; }
+      .top-actions {
+        grid-column: 1; justify-content: start; overflow-x: auto;
+        padding-bottom: 2px;
+      }
+      .top-status {
+        grid-column: 1; grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .state-box { padding: 7px 8px; }
+      .state-box strong { font-size: 10px; }
+      .startup-banner, .paper-banner {
+        justify-content: flex-start; gap: 8px; padding: 9px 12px;
+      }
+      .startup-banner .latch { white-space: normal; }
+      .paper-banner { flex-wrap: wrap; }
+      .paper-banner i { display: none; }
+      .subnav { padding: 0 10px; }
+      main { padding: 12px 10px 28px; }
+      .section-head { display: block; }
+      .section-head p { margin-top: 5px; line-height: 1.5; }
+      .status-grid, .account-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .chart-grid, .triple, .quad { grid-template-columns: 1fr; }
+      .chart-grid > :last-child { grid-column: auto; }
+      .strategy-list { grid-template-columns: 1fr; }
+      .strategy-tabs { border-right: 0; border-bottom: 1px solid var(--line-soft); }
+      .metric { min-width: 0; }
+      .metric-label, .metric-value, .metric-note { white-space: normal; overflow-wrap: anywhere; }
+      .kv-grid { grid-template-columns: 1fr; }
+      .log-line { grid-template-columns: 64px 54px minmax(0, 1fr); gap: 6px; }
+      .log-line > :last-child { overflow-wrap: anywhere; }
+      .footer { display: block; line-height: 1.7; }
+      .fatal-card { width: calc(100vw - 24px); padding: 18px; }
+    }
   </style>
 </head>
 <body>
@@ -239,6 +311,12 @@
       <button id="pauseButton" class="control" type="button">暂停刷新</button>
     </div>
   </header>
+
+  <div id="startupBanner" class="startup-banner" role="alert" aria-live="assertive">
+    <strong>STARTUP BLOCKED · OBSERVE ONLY</strong>
+    <span id="startupReason" class="reason">HFT 时钟启动闸门未通过</span>
+    <span class="latch">execution_enabled=false · 恢复后仍须重启</span>
+  </div>
 
   <div id="paperBanner" class="paper-banner" role="status" aria-live="polite">
     <strong>PAPER · LIVE DATA</strong><i></i>
@@ -303,7 +381,7 @@
     </section>
 
     <section id="strategy">
-      <div class="section-head"><h2>策略全量遥测</h2><p>A-S / GLFT / ML Sniper 参数动态展开；未识别字段也不会丢失</p></div>
+      <div class="section-head"><h2>策略全量遥测</h2><p>A-S / GLFT 参数动态展开；未识别字段也不会丢失</p></div>
       <article class="panel strategy-list"><div id="strategyTabs" class="strategy-tabs"></div><div id="strategyDetail" class="strategy-detail"><p class="muted">等待策略数据</p></div></article>
     </section>
 
@@ -400,7 +478,7 @@
     const statusClass = (s) => {
       const x = String(s || "").toUpperCase();
       if (["LIVE","READY","HEALTHY","CLEAN","FILLED","NEW","RUNNING"].includes(x)) return "positive";
-      if (/HALT|ERROR|REJECT|LOCKDOWN|KILL|DISCONNECT|UNHEALTHY/.test(x)) return "negative";
+      if (/HALT|ERROR|REJECT|LOCKDOWN|KILL|DISCONNECT|UNHEALTHY|BLOCKED/.test(x)) return "negative";
       if (/FROZEN|DEGRADED|PASSIVE|CANCEL|RECONCIL|WARN|BOOTSTRAP/.test(x)) return "warning";
       return "muted";
     };
@@ -441,8 +519,14 @@
     function setTop(data) {
       const meta = obj(data.meta), system = obj(data.system);
       const gateway = obj(system.gateway), oms = obj(system.oms), supervisor = obj(system.risk_supervisor || system.independent_risk_supervisor);
+      const startup = obj(first(data.startup, system.startup, path(data, "runtime.startup"), {}));
+      const startupBlocked = startup.startup_blocked === true || String(startup.state || "").toUpperCase() === "STARTUP_BLOCKED";
       const context=executionContext(data);
       document.body.classList.toggle("paper-mode",context.isPaper);
+      document.body.classList.toggle("startup-blocked",startupBlocked);
+      if (startupBlocked) {
+        $("startupReason").textContent = first(startup.reason, "HFT 时钟启动闸门未通过");
+      }
       $("envState").textContent = context.label;
       $("envState").className = context.isPaper || context.isTestnet ? "warning" : "negative";
       $("overviewModeText").textContent = context.isPaper
@@ -451,11 +535,11 @@
       $("executionModeText").textContent = context.isPaper
         ? "所有订单、成交、费用与 PnL 均为本地模拟结果"
         : "所有 TIF、RPI 路由、状态、成交率、拒单与延迟";
-      const omsState = first(oms.state, path(data, "risk.status.kill_state"), "—");
+      const omsState = startupBlocked ? startup.state : first(oms.state, path(data, "risk.status.kill_state"), "—");
       $("omsState").textContent = omsState; $("omsState").className = statusClass(omsState);
-      const cap = first(oms.capability_mode, oms.mode, path(oms, "capability.mode"), "—");
+      const cap = startupBlocked ? startup.operating_mode : first(oms.capability_mode, oms.mode, path(oms, "capability.mode"), "—");
       $("capabilityState").textContent = cap; $("capabilityState").className = statusClass(cap);
-      const gw = first(gateway.state, gateway.status, gateway.active === true ? "READY" : null, "—");
+      const gw = startupBlocked ? "NOT STARTED" : first(gateway.state, gateway.status, gateway.active === true ? "READY" : null, "—");
       $("gatewayState").textContent = gw; $("gatewayState").className = statusClass(gw);
       const sup = supervisor.enabled === false ? "DISABLED" : supervisor.healthy === true ? "HEALTHY" : supervisor.healthy === false ? "UNHEALTHY" : "—";
       $("supervisorState").textContent = sup; $("supervisorState").className = statusClass(sup);
