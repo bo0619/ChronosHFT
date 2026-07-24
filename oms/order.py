@@ -118,6 +118,7 @@ class Order:
         self.updated_at = now
         self.created_monotonic = time.perf_counter()
         self.updated_monotonic = self.created_monotonic
+        self.recovered_from_journal = False
 
         self.error_msg = ""
         self.last_update_seq = 0
@@ -153,6 +154,10 @@ class Order:
             time_in_force=self.intent.time_in_force,
             is_post_only=self.intent.is_post_only,
             is_rpi=self.intent.is_rpi,
+            side=self.intent.side,
+            created_monotonic=self.created_monotonic,
+            updated_monotonic=self.updated_monotonic,
+            recovered_from_journal=self.recovered_from_journal,
         )
 
     def to_record(self) -> dict:
@@ -165,6 +170,9 @@ class Order:
             "cumulative_cost": self.cumulative_cost,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "created_monotonic": self.created_monotonic,
+            "updated_monotonic": self.updated_monotonic,
+            "recovered_from_journal": self.recovered_from_journal,
             "error_msg": self.error_msg,
             "last_update_seq": self.last_update_seq,
             "last_exchange_status": self.last_exchange_status,
@@ -181,6 +189,11 @@ class Order:
                 "reduce_only": self.intent.reduce_only,
                 "policy": self.intent.policy.value,
                 "tag": self.intent.tag,
+                "calibration_permit_id": self.intent.calibration_permit_id,
+                "calibration_depth_bps": self.intent.calibration_depth_bps,
+                "calibration_reference_mid": (
+                    self.intent.calibration_reference_mid
+                ),
             },
         }
 
@@ -201,6 +214,16 @@ class Order:
                 intent_payload.get("policy", ExecutionPolicy.PASSIVE.value)
             ),
             tag=intent_payload.get("tag", ""),
+            calibration_permit_id=intent_payload.get(
+                "calibration_permit_id",
+                "",
+            ),
+            calibration_depth_bps=intent_payload.get(
+                "calibration_depth_bps"
+            ),
+            calibration_reference_mid=intent_payload.get(
+                "calibration_reference_mid"
+            ),
         )
         order = cls(payload.get("client_oid", ""), intent)
         order.exchange_oid = payload.get("exchange_oid", "")
@@ -214,6 +237,7 @@ class Order:
         order.last_update_seq = int(payload.get("last_update_seq", 0))
         order.last_exchange_status = payload.get("last_exchange_status", "")
         order.last_exchange_update_time = float(payload.get("last_exchange_update_time", 0.0))
+        order.recovered_from_journal = True
         return order
 
     def note_exchange_update(

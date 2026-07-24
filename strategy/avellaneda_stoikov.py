@@ -1,10 +1,14 @@
-# file: strategy/avellaneda_stoikov.py
+"""Avellaneda-Stoikov quoting with explicit log-bps and time units."""
 
-import time
+from __future__ import annotations
+
 import math
-import numpy as np
+import time
 from collections import defaultdict, deque
-from .base import StrategyTemplate
+
+import numpy as np
+
+from data.ref_data import ref_data_manager
 from event.type import (
     EVENT_STRATEGY_UPDATE,
     Event,
@@ -15,29 +19,38 @@ from event.type import (
     StrategyData,
     TradeData,
 )
-from data.ref_data import ref_data_manager
 from infrastructure.config_scaling import load_root_config
+from strategy.base import StrategyTemplate
+from strategy.model_readiness import (
+    evaluate_symbol_readiness,
+    readiness_requirements,
+)
+from strategy.quote_math import (
+    AS_FORMULA_VERSION,
+    UNITS_VERSION,
+    as_quote_offsets,
+    depths_bps_to_prices,
+)
 
 
-def _negative_infinity():
+def _negative_infinity() -> float:
     return -math.inf
 
 
 class AvellanedaStoikovStrategy(StrategyTemplate):
-    """
-    经典的 Avellaneda-Stoikov 做市策略
-    适配 OMS 核心架构 (Step 11)
-    """
+    """Finite-horizon A-S strategy using fixed-notional inventory lots."""
+
     def __init__(self, engine, oms, strategy_config=None):
-        # [修改] 适配新的基类构造函数
         super().__init__(engine, oms, "AvellanedaStoikov")
-        
+
         self.config = (
             dict(strategy_config)
             if strategy_config is not None
             else self._load_strategy_config()
         )
-        self.as_conf = self.config.get("as_parameters", {})
+        raw_as_config = self.config.get("as_parameters", {})
+        self.as_conf = dict(raw_as_config) if isinstance(raw_as_config, dict) else {}
+
         self.use_rpi = bool(self.config.get("use_rpi", False)) and bool(
             self.as_conf.get(
                 "use_rpi",
@@ -50,41 +63,160 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
                 self.config.get("rpi_fallback_to_gtx", True),
             )
         )
-        
-        # --- A-S 模型参数 ---
-        self.gamma = self.as_conf.get("gamma", 0.05)
-        self.k = self.as_conf.get("k", 1.5)
-        self.vol_window = self.as_conf.get("vol_window", 60)
-        self.interval = self.config.get("cycle_interval", 1.0)
-        self.min_spread_ratio = self.as_conf.get("min_spread_ratio", 0.0002)
-        
+
+        self.gamma = float(self.as_conf.get("gamma", 0.05))
+        self.k = float(self.as_conf.get("k", 1.5))
+        self.horizon_s = self._positive_finite(
+            self.as_conf.get("horizon_s", 1.0),
+            1.0,
+        )
+        self.min_sigma_bps = self._positive_finite(
+            self.as_conf.get("min_sigma_bps", 0.1),
+            0.1,
+        )
+        self.max_tick_gap_sec = self._positive_finite(
+            self.as_conf.get("max_tick_gap_sec", 2.0),
+            2.0,
+        )
+        self.vol_window = max(2, int(self.as_conf.get("vol_window", 60) or 60))
+        self.interval = self._positive_finite(
+            self.config.get(
+                "cycle_interval",
+                self.as_conf.get("cycle_interval", 1.0),
+            ),
+            1.0,
+        )
+        self.min_spread_ratio = self._positive_finite(
+            self.as_conf.get("min_spread_ratio", 0.0002),
+            0.0002,
+        )
+        self.readiness_requirements = readiness_requirements(
+            self.config,
+            "avellaneda_stoikov",
+        )
+        required_window = max(
+            self.readiness_requirements.min_model_samples,
+            self.readiness_requirements.min_volatility_samples,
+        )
+        if (
+            self.readiness_requirements.enabled
+            and self.vol_window < required_window
+        ):
+            raise ValueError(
+                "avellaneda_stoikov.vol_window must retain at least "
+                f"{required_window} normalized-return samples"
+            )
+
         self.configure_quote_sizing(self.config)
-        
-        # --- 运行时状态 ---
-        self.mid_prices = defaultdict(lambda: deque(maxlen=self.vol_window))
-        # Interval scheduling must not depend on the adjustable wall clock.
-        # Negative infinity also lets the first tick run when process uptime is
-        # shorter than the configured cycle interval.
+        self.inventory_lot_notional_usdt = self._positive_finite(
+            self.as_conf.get(
+                "inventory_lot_notional_usdt",
+                self.target_order_notional,
+            )
+        )
+
+        self.normalized_returns = defaultdict(
+            lambda: deque(maxlen=self.vol_window)
+        )
+        self.last_mid = defaultdict(float)
+        self.last_tick_time = defaultdict(float)
+        self.last_tick_source = defaultdict(str)
+        self.last_tick_monotonic = defaultdict(float)
         self.last_recalc_time = defaultdict(_negative_infinity)
-        self.current_sigma_sq = defaultdict(float)
-        
-        print(f"[{self.name}] A-S 模型已启动 (OMS驱动): Gamma={self.gamma}, K={self.k}, Cycle={self.interval}s")
+        self.current_sigma_bps = defaultdict(float)
+
+        print(
+            f"[{self.name}] A-S initialized: gamma={self.gamma}, "
+            f"k={self.k}, cycle={self.interval}s"
+        )
 
     def _load_strategy_config(self):
         full_config = load_root_config("config.json")
         return full_config.get("strategy", {}) if full_config else {}
 
-    def _calculate_volatility_sq(self, symbol):
-        """计算短期回报率的方差 (sigma^2)"""
-        prices_for_symbol = self.mid_prices[symbol]
-        if len(prices_for_symbol) < 5: # 需要足够样本
+    @staticmethod
+    def _valid_clock_value(value) -> float | None:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) and parsed > 0.0 else None
+
+    def _clock_sample(
+        self,
+        ob: OrderBook,
+        now_monotonic: float,
+    ) -> tuple[str, float]:
+        received_monotonic = self._valid_clock_value(ob.received_monotonic)
+        if received_monotonic is not None:
+            return "received_monotonic", received_monotonic
+        exchange_timestamp = self._valid_clock_value(ob.exchange_timestamp)
+        if exchange_timestamp is not None:
+            return "exchange_timestamp", exchange_timestamp
+        return "monotonic", now_monotonic
+
+    def _set_volatility_reference(
+        self,
+        symbol: str,
+        *,
+        mid: float,
+        clock_source: str,
+        tick_time: float,
+        now_monotonic: float,
+    ) -> None:
+        self.last_mid[symbol] = mid
+        self.last_tick_source[symbol] = clock_source
+        self.last_tick_time[symbol] = tick_time
+        self.last_tick_monotonic[symbol] = now_monotonic
+
+    def _update_volatility(
+        self,
+        symbol: str,
+        mid: float,
+        ob: OrderBook,
+        now_monotonic: float,
+    ) -> None:
+        clock_source, tick_time = self._clock_sample(ob, now_monotonic)
+        previous_mid = self.last_mid[symbol]
+        if previous_mid > 0.0:
+            if clock_source == self.last_tick_source[symbol]:
+                dt = tick_time - self.last_tick_time[symbol]
+            else:
+                dt = now_monotonic - self.last_tick_monotonic[symbol]
+
+            if not math.isfinite(dt) or dt <= 0.0:
+                return
+            if dt > self.max_tick_gap_sec:
+                self._set_volatility_reference(
+                    symbol,
+                    mid=mid,
+                    clock_source=clock_source,
+                    tick_time=tick_time,
+                    now_monotonic=now_monotonic,
+                )
+                return
+            if dt > 1e-4:
+                log_return_bps = math.log(mid / previous_mid) * 10_000.0
+                normalized = log_return_bps / math.sqrt(dt)
+                if math.isfinite(normalized):
+                    self.normalized_returns[symbol].append(normalized)
+
+        self._set_volatility_reference(
+            symbol,
+            mid=mid,
+            clock_source=clock_source,
+            tick_time=tick_time,
+            now_monotonic=now_monotonic,
+        )
+
+    def _calculate_sigma_bps(self, symbol: str) -> float:
+        samples = self.normalized_returns[symbol]
+        if len(samples) < 2:
+            return self.min_sigma_bps
+        sigma = float(np.std(np.asarray(samples, dtype=float)))
+        if not math.isfinite(sigma):
             return 0.0
-        
-        prices = np.array(prices_for_symbol)
-        log_returns = np.log(prices[1:] / prices[:-1])
-        
-        # 方差
-        return float(np.var(log_returns))
+        return max(self.min_sigma_bps, sigma)
 
     def _calculate_safe_vol(
         self,
@@ -95,7 +227,6 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
         current_position=0.0,
         reference_price=None,
     ):
-        """计算符合交易所限制的下单量"""
         return self.calculate_quote_volume(
             symbol,
             price,
@@ -107,22 +238,34 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
     def on_orderbook(self, ob: OrderBook):
         bid_1, _ = ob.get_best_bid()
         ask_1, _ = ob.get_best_ask()
-        if bid_1 == 0:
+        if bid_1 <= 0.0 or ask_1 <= bid_1:
             return
-        
+
         mid_price = (bid_1 + ask_1) / 2.0
-        self.mid_prices[ob.symbol].append(mid_price)
-        
-        # --- 1. 周期控制 ---
         now = time.perf_counter()
+        self._update_volatility(ob.symbol, mid_price, ob, now)
         if now - self.last_recalc_time[ob.symbol] < self.interval:
             return
-        
         self.last_recalc_time[ob.symbol] = now
 
-        # --- 2. 只撤本策略在该标的上的旧报价，并等待终态 ACK ---
-        # 不能使用 symbol-wide mass cancel，否则会误撤同标的上的其他策略订单；
-        # 也不能在撤单确认前立刻重挂，否则可能产生重叠报价。
+        self.current_sigma_bps[ob.symbol] = self._calculate_sigma_bps(ob.symbol)
+        volatility_samples = len(self.normalized_returns[ob.symbol])
+        readiness = evaluate_symbol_readiness(
+            "avellaneda_stoikov",
+            self.readiness_requirements,
+            volatility_samples=volatility_samples,
+            model_samples=volatility_samples,
+        )
+        if not readiness.ready:
+            self._publish_warming_up(
+                ob.symbol,
+                mid_price,
+                bid_1,
+                ask_1,
+                readiness,
+            )
+            return
+
         active_symbol_orders = [
             oid
             for oid, intent in self.active_orders.items()
@@ -133,71 +276,102 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
                 self.cancel_order(oid)
             return
 
-        # --- 3. A-S 核心计算 ---
-        
-        # A. 更新波动率
-        self.current_sigma_sq[ob.symbol] = self._calculate_volatility_sq(ob.symbol)
-        
-        # B. 计算保留价格 (Reservation Price)
-        # r = s - q * gamma * sigma^2 * T (T=1)
-        # 这里的 q 是 self.pos (净持仓)
         strategy_positions = getattr(
             self.oms.exposure,
             "strategy_net_positions",
             {},
         )
-        position = strategy_positions.get((self.name, ob.symbol))
-        if position is None:
-            position = self.oms.exposure.net_positions.get(ob.symbol, self.pos)
-        risk_position = self.oms.exposure.net_positions.get(ob.symbol, position)
-        inventory_risk_adjustment = (
-            position * self.gamma * self.current_sigma_sq[ob.symbol]
+        strategy_position = strategy_positions.get((self.name, ob.symbol))
+        if strategy_position is None:
+            strategy_position = self.oms.exposure.net_positions.get(
+                ob.symbol,
+                self.pos,
+            )
+        risk_position = self.oms.exposure.net_positions.get(
+            ob.symbol,
+            strategy_position,
         )
-        reservation_price = mid_price - inventory_risk_adjustment
-        
-        # C. 计算最优价差 (Optimal Spread)
-        # δ_a + δ_b = (2/gamma) * ln(1 + gamma/k)
-        if self.k > 0:
-            optimal_spread = (2.0 / self.gamma) * math.log(1.0 + self.gamma / self.k)
-        else:
-            optimal_spread = mid_price * 0.001 # Fallback
-            
-        # D. 结合波动率调整价差 (工程实践)
-        # 波动越大，价差应该越宽，以保护自己
-        # Spread = OptimalSpread + VolatilityAdjustment
-        # 这里的 sigma 是收益率标准差，本身就是比例
-        volatility_adjustment = (
-            self.current_sigma_sq[ob.symbol] * self.gamma * mid_price
+
+        reference_order_volume = self._calculate_safe_vol(
+            ob.symbol,
+            mid_price,
+            current_position=risk_position,
+            reference_price=mid_price,
         )
-        
-        # 总价差
-        total_spread = optimal_spread + volatility_adjustment
-        
-        # E. 应用最小价差保护
-        min_spread_val = mid_price * self.min_spread_ratio
+        if reference_order_volume <= 0.0:
+            return
+        inventory_lot_notional = (
+            self.inventory_lot_notional_usdt
+            or reference_order_volume * mid_price
+        )
+        if inventory_lot_notional <= 0.0:
+            return
+        inventory_lots = risk_position * mid_price / inventory_lot_notional
+        sigma_bps = self.current_sigma_bps[ob.symbol]
+
+        try:
+            formula_quote = as_quote_offsets(
+                mid_price=mid_price,
+                inventory_lots=inventory_lots,
+                sigma_bps_sqrt_s=sigma_bps,
+                gamma_per_bps=self.gamma,
+                k_per_bps=self.k,
+                horizon_s=self.horizon_s,
+            )
+        except ValueError as exc:
+            self._publish_warming_up(
+                ob.symbol,
+                mid_price,
+                bid_1,
+                ask_1,
+                readiness,
+                formula_error=str(exc),
+            )
+            return
+
         passive_tif = self.resolve_passive_time_in_force(
             ob.symbol,
             use_rpi=self.use_rpi,
             fallback_to_gtx=self.rpi_fallback_to_gtx,
             route="avellaneda_stoikov_quote",
         )
-        fee_spread_val = (
-            mid_price
-            * self.passive_round_trip_fee_bps(ob.symbol, passive_tif)
-            / 10000.0
+        configured_min_spread_bps = self.min_spread_ratio * 10_000.0
+        passive_fee_bps = self.passive_round_trip_fee_bps(
+            ob.symbol,
+            passive_tif,
         )
-        final_spread = max(total_spread, min_spread_val, fee_spread_val)
+        effective_min_spread_bps = max(
+            configured_min_spread_bps,
+            passive_fee_bps,
+        )
+        effective_half_spread_bps = max(
+            formula_quote.half_spread_bps,
+            effective_min_spread_bps / 2.0,
+        )
+        target_bid, target_ask = depths_bps_to_prices(
+            mid_price,
+            effective_half_spread_bps - formula_quote.center_offset_bps,
+            effective_half_spread_bps + formula_quote.center_offset_bps,
+        )
+        reservation_price = mid_price * math.exp(
+            formula_quote.center_offset_bps / 10_000.0
+        )
 
-        # 4. 计算目标挂单价
-        target_bid = reservation_price - final_spread / 2.0
-        target_ask = reservation_price + final_spread / 2.0
-        
-        # 5. 规整化与安全检查
-        # 策略层负责规整，OMS层负责最终校验
+        info = ref_data_manager.get_info(ob.symbol)
+        if info is None:
+            return
+        tick = float(info.tick_size or 0.0)
+        if tick <= 0.0:
+            return
         target_bid = ref_data_manager.round_price(ob.symbol, target_bid)
         target_ask = ref_data_manager.round_price(ob.symbol, target_ask)
-        
-        # 6. 执行新挂单
+        if target_bid >= ask_1:
+            target_bid = ask_1 - tick
+        if target_ask <= bid_1:
+            target_ask = bid_1 + tick
+        if target_bid <= 0.0 or target_bid >= target_ask:
+            return
+
         bid_order_vol = self._calculate_safe_vol(
             ob.symbol,
             target_bid,
@@ -214,69 +388,55 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
         )
         if bid_order_vol <= 0.0 and ask_order_vol <= 0.0:
             return
-        
-        # 挂买单 (Bid)
-        # 使用 PostOnly 确保我们是 Maker
+
         bid_oid = None
         if bid_order_vol > 0.0:
-            intent_buy = OrderIntent(
-                strategy_id=self.name,
-                symbol=ob.symbol,
-                side=Side.BUY,
-                price=target_bid,
-                volume=bid_order_vol,
-                time_in_force=passive_tif,
-                is_post_only=True,
+            bid_oid = self.send_intent(
+                OrderIntent(
+                    strategy_id=self.name,
+                    symbol=ob.symbol,
+                    side=Side.BUY,
+                    price=target_bid,
+                    volume=bid_order_vol,
+                    time_in_force=passive_tif,
+                    is_post_only=True,
+                )
             )
-            bid_oid = self.send_intent(intent_buy)
-        
-        # 挂卖单 (Ask)
+
         ask_oid = None
         if ask_order_vol > 0.0:
-            intent_sell = OrderIntent(
-                strategy_id=self.name,
-                symbol=ob.symbol,
-                side=Side.SELL,
-                price=target_ask,
-                volume=ask_order_vol,
-                time_in_force=passive_tif,
-                is_post_only=True,
+            ask_oid = self.send_intent(
+                OrderIntent(
+                    strategy_id=self.name,
+                    symbol=ob.symbol,
+                    side=Side.SELL,
+                    price=target_ask,
+                    volume=ask_order_vol,
+                    time_in_force=passive_tif,
+                    is_post_only=True,
+                )
             )
-            ask_oid = self.send_intent(intent_sell)
 
         quoted_spread = max(0.0, target_ask - target_bid)
-        quoted_spread_bps = (
-            quoted_spread / mid_price * 10000.0
-            if mid_price > 0.0
-            else 0.0
-        )
-        sigma_sq = float(self.current_sigma_sq[ob.symbol])
-        sigma_bps = math.sqrt(max(0.0, sigma_sq)) * 10000.0
-        alpha_bps = (
-            (reservation_price - mid_price) / mid_price * 10000.0
-            if mid_price > 0.0
-            else 0.0
-        )
+        quoted_spread_bps = quoted_spread / mid_price * 10_000.0
+        inventory_risk_adjustment = mid_price - reservation_price
         params = {
             "schema": "market_making.v1",
             "strategy": self.name,
             "state": "QUOTING",
             "mode": passive_tif,
             "time_in_force": passive_tif,
-            "use_rpi": bool(self.use_rpi),
+            "use_rpi": self.use_rpi,
             "rpi_supported": ref_data_manager.supports_rpi(ob.symbol),
             "mid_price": mid_price,
             "best_bid": bid_1,
             "best_ask": ask_1,
-            "market_spread_bps": (
-                (ask_1 - bid_1) / mid_price * 10000.0
-                if mid_price > 0.0
-                else 0.0
-            ),
+            "market_spread_bps": (ask_1 - bid_1) / mid_price * 10_000.0,
             "fair_value": reservation_price,
-            "alpha_bps": alpha_bps,
-            "position_qty": float(position),
-            "position_notional": float(position) * mid_price,
+            "alpha_bps": 0.0,
+            "position_qty": float(strategy_position),
+            "position_notional": float(strategy_position) * mid_price,
+            "risk_position_qty": float(risk_position),
             "target_bid": target_bid,
             "target_ask": target_ask,
             "quote_spread_bps": quoted_spread_bps,
@@ -287,24 +447,28 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
             "max_position_notional": self.max_pos_usdt,
             "bid_order_id": bid_oid or "",
             "ask_order_id": ask_oid or "",
-            "gamma": float(self.gamma),
-            "k": float(self.k),
-            "sigma_sq": sigma_sq,
+            "gamma_per_bps": self.gamma,
+            "k_per_bps": self.k,
+            "horizon_s": self.horizon_s,
             "sigma_bps": sigma_bps,
+            "sigma_sq": sigma_bps * sigma_bps,
+            "sigma_units": "bps/sqrt(second)",
+            "inventory_lots": inventory_lots,
+            "inventory_lot_notional_usdt": inventory_lot_notional,
             "inventory_risk_adjustment": inventory_risk_adjustment,
+            "inventory_center_offset_bps": formula_quote.center_offset_bps,
             "reservation_price": reservation_price,
-            "optimal_spread": optimal_spread,
-            "volatility_adjustment": volatility_adjustment,
-            "raw_spread": total_spread,
-            "min_spread": min_spread_val,
-            "fee_spread": fee_spread_val,
-            "final_spread": final_spread,
-            "final_spread_bps": (
-                final_spread / mid_price * 10000.0
-                if mid_price > 0.0
-                else 0.0
-            ),
-            # Compatibility fields consumed by the existing TUI.
+            "formula_half_spread_bps": formula_quote.half_spread_bps,
+            "formula_bid_depth_bps": formula_quote.bid_depth_bps,
+            "formula_ask_depth_bps": formula_quote.ask_depth_bps,
+            "configured_min_spread_bps": configured_min_spread_bps,
+            "passive_fee_bps": passive_fee_bps,
+            "effective_min_spread_bps": effective_min_spread_bps,
+            "units_version": UNITS_VERSION,
+            "formula_version": AS_FORMULA_VERSION,
+            "readiness": readiness.as_params(),
+            "final_spread": quoted_spread,
+            "final_spread_bps": quoted_spread_bps,
             "State": "QUOTING",
             "Mode": passive_tif,
             "Spread": f"{quoted_spread_bps:.1f}",
@@ -317,21 +481,67 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
                 StrategyData(
                     symbol=ob.symbol,
                     fair_value=reservation_price,
-                    alpha_bps=alpha_bps,
+                    alpha_bps=0.0,
                     params=params,
                 ),
             )
         )
-        
-        # 打印日志
-        # self.log(f"Quoting Bid={target_bid} Ask={target_ask} | r={reservation_price:.2f} s={final_spread:.2f}")
+
+    def _publish_warming_up(
+        self,
+        symbol,
+        mid_price,
+        best_bid,
+        best_ask,
+        readiness,
+        *,
+        formula_error="",
+    ):
+        for client_oid, intent in tuple(self.active_orders.items()):
+            if intent.symbol == symbol:
+                self.cancel_order(client_oid)
+        readiness_params = readiness.as_params()
+        state = "WARMING_UP"
+        if formula_error:
+            state = "FORMULA_INVALID"
+            readiness_params["ready"] = False
+            readiness_params["state"] = state
+            readiness_params["formula_error"] = formula_error
+        sigma_bps = float(self.current_sigma_bps[symbol])
+        params = {
+            "schema": "market_making.v1",
+            "strategy": self.name,
+            "state": state,
+            "mode": "OBSERVE_ONLY",
+            "time_in_force": "",
+            "use_rpi": self.use_rpi,
+            "rpi_supported": ref_data_manager.supports_rpi(symbol),
+            "mid_price": mid_price,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "fair_value": mid_price,
+            "alpha_bps": 0.0,
+            "sigma_sq": sigma_bps * sigma_bps,
+            "sigma_bps": sigma_bps,
+            "sigma_units": "bps/sqrt(second)",
+            "units_version": UNITS_VERSION,
+            "formula_version": AS_FORMULA_VERSION,
+            "readiness": readiness_params,
+        }
+        self.engine.put(
+            Event(
+                EVENT_STRATEGY_UPDATE,
+                StrategyData(
+                    symbol=symbol,
+                    fair_value=mid_price,
+                    alpha_bps=0.0,
+                    params=params,
+                ),
+            )
+        )
 
     def on_trade(self, trade: TradeData):
-        # A-S 模型不依赖 Trade 流，但可以打印日志
-        # self.log(f"成交: {trade.side} @ {trade.price} Vol={trade.volume}")
-        pass
+        del trade
 
     def on_order(self, snapshot: OrderStateSnapshot):
-        # 调用基类处理 active_orders
         super().on_order(snapshot)
-        # 可选：如果订单被 Reject，可以在这里加入重试或调整逻辑

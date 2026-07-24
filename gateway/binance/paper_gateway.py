@@ -52,6 +52,7 @@ from event.type import (
     TIF_RPI,
 )
 from gateway.base_gateway import BaseGateway
+from infrastructure.commission_truth import resolve_passive_fee_rate
 from infrastructure.logger import logger
 from infrastructure.time_service import time_service
 
@@ -450,8 +451,9 @@ class BinancePaperGateway(BaseGateway):
         with self._lifecycle_lock:
             if self.state == GatewayState.DISCONNECTED and not self._worker_running:
                 self.rest.close()
-                return
+                return True
 
+        worker_stopped = True
         if self._worker_running:
             try:
                 self._call_worker("shutdown", None, allow_closing=True)
@@ -462,10 +464,12 @@ class BinancePaperGateway(BaseGateway):
             if worker is not None and worker.is_alive():
                 worker.join(timeout=max(2.0, self.command_timeout_sec * 2.0))
                 if worker.is_alive():
+                    worker_stopped = False
                     logger.critical("[BINANCE_PAPER] Matching thread did not stop cleanly")
 
         self.rest.close()
         self.set_state(GatewayState.DISCONNECTED)
+        return worker_stopped
 
     def recover_connectivity(self, recovery_context=None):
         with self._lifecycle_lock:
@@ -644,13 +648,16 @@ class BinancePaperGateway(BaseGateway):
         if "@markPrice" in stream:
             next_funding_ms = int(data.get("T", 0) or 0)
             event_time_ms = int(data.get("E", 0) or 0)
+            next_funding_timestamp = (
+                next_funding_ms / 1000.0 if next_funding_ms else 0.0
+            )
             mark = MarkPriceData(
                 symbol=symbol,
                 mark_price=float(data.get("p", 0.0) or 0.0),
                 index_price=float(data.get("i", 0.0) or 0.0),
                 funding_rate=float(data.get("r", 0.0) or 0.0),
                 next_funding_time=datetime.fromtimestamp(
-                    next_funding_ms / 1000.0 if next_funding_ms else time.time()
+                    next_funding_timestamp or time.time()
                 ),
                 datetime=datetime.fromtimestamp(
                     event_time_ms / 1000.0 if event_time_ms else received_timestamp
@@ -660,6 +667,7 @@ class BinancePaperGateway(BaseGateway):
                 received_monotonic=received_monotonic,
                 clock_offset_ms=clock_offset_ms,
                 corrected_received_timestamp=corrected_received_timestamp,
+                next_funding_timestamp=next_funding_timestamp,
             )
             self._publish_public_market_update(
                 message_generation,
@@ -1268,7 +1276,7 @@ class BinancePaperGateway(BaseGateway):
             "symbol": symbol,
             "makerCommissionRate": f"{self.maker_fee:.12g}",
             "takerCommissionRate": f"{self.taker_fee:.12g}",
-            "rpiCommissionRate": f"{self._rpi_surcharge(symbol):.12g}",
+            "rpiCommissionRate": f"{self._rpi_fee_rate(symbol):.12g}",
             "_simulated": True,
         }
 
@@ -2161,19 +2169,19 @@ class BinancePaperGateway(BaseGateway):
         return 0.0
 
     def _fee_rate(self, order: _PaperOrder, is_maker: bool):
-        rate = self.maker_fee if is_maker else self.taker_fee
         if order.request.time_in_force == TIF_RPI:
-            rate += self._rpi_surcharge(order.request.symbol)
-        return max(0.0, rate)
+            return self._rpi_fee_rate(order.request.symbol)
+        return max(0.0, self.maker_fee if is_maker else self.taker_fee)
 
-    def _rpi_surcharge(self, symbol: str):
+    def _rpi_fee_rate(self, symbol: str):
         return max(
             0.0,
-            float(
-                self.rpi_commission_rates.get(
-                    str(symbol or "").upper(),
-                    self.rpi_commission_rate,
-                )
+            resolve_passive_fee_rate(
+                maker_rate=self.maker_fee,
+                symbol=symbol,
+                is_rpi=True,
+                rpi_commission_rates=self.rpi_commission_rates,
+                default_rpi_commission_rate=self.rpi_commission_rate,
             ),
         )
 
@@ -2644,5 +2652,8 @@ class PaperTruthSnapshotProvider:
     def get_income_history(self, **kwargs):
         return self.gateway.get_income_history(**kwargs)
 
+    def get_commission_rate(self, symbol: str):
+        return self.gateway.get_commission_rate(symbol)
+
     def close(self):
-        return None
+        return True

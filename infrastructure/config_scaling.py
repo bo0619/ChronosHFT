@@ -2,8 +2,20 @@ import json
 import os
 from copy import deepcopy
 
-from infrastructure.live_config_guard import validate_live_runtime_config
+from infrastructure.live_config_guard import (
+    CANARY_STAGE,
+    RPI_CALIBRATION_CANARY_STAGE,
+    live_launch_stage,
+    validate_live_runtime_config,
+)
 from infrastructure.paper_trade import apply_paper_trade_mode, is_paper_trade
+from infrastructure.rpi_calibration_permit import (
+    load_and_validate_rpi_calibration_permit,
+)
+from strategy.model_readiness import (
+    apply_model_readiness_defaults,
+    validate_live_calibration_approval,
+)
 
 
 QUOTE_ASSET_SUFFIXES = ("USDT", "USDC", "BUSD", "FDUSD")
@@ -129,6 +141,18 @@ VENUE_DEAD_MAN_SWITCH_DEFAULTS = {
     "renewal_interval_sec": 30.0,
     "max_renewal_age_sec": 45.0,
     "recovery_checks": 2,
+}
+LIVE_EVIDENCE_RECORDER_DEFAULTS = {
+    "enabled": False,
+    "path": "",
+    "queue_capacity": 8192,
+    "max_batch_records": 256,
+    "fsync_interval_sec": 1.0,
+    "close_timeout_sec": 15.0,
+    "single_writer_fence": {
+        "enabled": True,
+        "path": "",
+    },
 }
 
 
@@ -350,6 +374,12 @@ def apply_production_safety_defaults(config: dict) -> dict:
         return {}
 
     configured = deepcopy(config)
+    strategy = configured.get("strategy")
+    if not isinstance(strategy, dict):
+        strategy = {}
+        configured["strategy"] = strategy
+    apply_model_readiness_defaults(strategy)
+
     system = configured.get("system")
     if not isinstance(system, dict):
         system = {}
@@ -364,6 +394,13 @@ def apply_production_safety_defaults(config: dict) -> dict:
         time_sync["halt_phase_error_ms"] = time_sync["halt_offset_ms"]
     for key, value in TIME_SYNC_DEFAULTS.items():
         time_sync.setdefault(key, value)
+
+    evidence_recorder = system.get("evidence_recorder")
+    if not isinstance(evidence_recorder, dict):
+        evidence_recorder = {}
+        system["evidence_recorder"] = evidence_recorder
+    for key, value in LIVE_EVIDENCE_RECORDER_DEFAULTS.items():
+        evidence_recorder.setdefault(key, deepcopy(value))
 
     oms = configured.get("oms")
     if not isinstance(oms, dict):
@@ -607,19 +644,79 @@ def finalize_strategy_risk_budgets(config: dict) -> dict:
     return configured
 
 
+_UNTRUSTED_RUNTIME_VALIDATION_KEYS = frozenset(
+    {
+        "_validated_calibration",
+        "_validated_rpi_calibration_permit",
+    }
+)
+
+
+def _strip_untrusted_runtime_validation_products(value):
+    if isinstance(value, dict):
+        return {
+            key: _strip_untrusted_runtime_validation_products(item)
+            for key, item in value.items()
+            if key not in _UNTRUSTED_RUNTIME_VALIDATION_KEYS
+        }
+    if isinstance(value, list):
+        return [
+            _strip_untrusted_runtime_validation_products(item)
+            for item in value
+        ]
+    return deepcopy(value)
+
+
+def normalize_root_config_preapproval(raw: dict) -> dict:
+    """Normalize config while discarding all caller-supplied trust products."""
+    if not isinstance(raw, dict):
+        return {}
+    sanitized = _strip_untrusted_runtime_validation_products(raw)
+
+    configured = apply_production_safety_defaults(sanitized)
+    if is_paper_trade(configured):
+        configured = apply_paper_trade_mode(configured)
+    configured = apply_capital_scaling(configured)
+    configured = normalize_strategy_registration(configured)
+    return finalize_strategy_risk_budgets(configured)
+
+
 def load_root_config(path: str = "config.json") -> dict:
     try:
         with open(path, "r", encoding="utf-8") as handle:
             raw = json.load(handle)
     except Exception:
         return {}
-    configured = apply_production_safety_defaults(raw)
-    if is_paper_trade(configured):
-        configured = apply_paper_trade_mode(configured)
-    configured = apply_capital_scaling(configured)
-    configured = normalize_strategy_registration(configured)
-    configured = finalize_strategy_risk_budgets(configured)
+    configured = normalize_root_config_preapproval(raw)
+    if not is_paper_trade(configured):
+        stage = live_launch_stage(configured)
+        if stage == RPI_CALIBRATION_CANARY_STAGE:
+            configured["_validated_rpi_calibration_permit"] = (
+                load_and_validate_rpi_calibration_permit(
+                    configured,
+                    config_path=path,
+                )
+            )
+        elif stage == CANARY_STAGE:
+            approval = validate_live_calibration_approval(
+                configured,
+                config_path=path,
+            )
+            runtime_calibration = approval.get("_runtime_calibration")
+            if runtime_calibration is not None:
+                configured["strategy"]["_validated_calibration"] = (
+                    runtime_calibration
+                )
+        else:
+            raise ValueError(
+                "live_launch.stage must be 'canary' or "
+                f"{RPI_CALIBRATION_CANARY_STAGE!r}"
+            )
     configured = resolve_runtime_secrets(configured)
     if is_paper_trade(configured):
         configured = apply_paper_trade_mode(configured)
-    return validate_live_runtime_config(configured)
+    return validate_live_runtime_config(
+        configured,
+        config_path=path,
+        require_local_evidence=not is_paper_trade(configured),
+    )

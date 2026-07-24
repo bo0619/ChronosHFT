@@ -354,7 +354,9 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
                         calibrator.on_orderbook(second_book)
 
                     expected_return = (
-                        (101.0 / 100.0 - 1.0) * 10000.0 / math.sqrt(dt)
+                        math.log(101.0 / 100.0)
+                        * 10_000.0
+                        / math.sqrt(dt)
                     )
                     self.assertEqual(calibrator.last_tick_source, expected_source)
                     self.assertEqual(len(calibrator.norm_returns), 1)
@@ -405,7 +407,7 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
             calibrator.on_orderbook(books[3])
 
         expected_return = (
-            (103.0 / 102.0 - 1.0) * 10000.0 / math.sqrt(0.25)
+            math.log(103.0 / 102.0) * 10_000.0 / math.sqrt(0.25)
         )
         self.assertEqual(len(calibrator.norm_returns), 1)
         self.assertAlmostEqual(calibrator.norm_returns[-1], expected_return)
@@ -506,7 +508,7 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         self.assertEqual(len(fallback_logs), 1)
         self.assertAlmostEqual(
             strategy.passive_round_trip_fee_bps("LTCUSDT", TIF_RPI),
-            7.0,
+            3.0,
         )
         self.assertAlmostEqual(
             strategy.passive_round_trip_fee_bps("LTCUSDT", TIF_GTX),
@@ -535,7 +537,7 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         )
         self.assertAlmostEqual(
             strategy.passive_round_trip_fee_bps("LTCUSDT", TIF_RPI),
-            10.0,
+            4.0,
         )
 
     def test_market_makers_enforce_order_and_inventory_notionals(self):

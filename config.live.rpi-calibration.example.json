@@ -1,0 +1,287 @@
+{
+  "_warning": "BLOCKED TEMPLATE ONLY. This stage sends real Binance USD-M RPI orders. Do not run it from mainland China or any host where Binance access or account use is not allowed. A valid independent permit and fresh local account evidence are intentionally absent.",
+  "execution": {
+    "mode": "live"
+  },
+  "paper_trade": {
+    "enabled": false
+  },
+  "testnet": false,
+  "api_key_env": "BINANCE_API_KEY",
+  "api_secret_env": "BINANCE_API_SECRET",
+  "_symbol_warning": "XAUUSDT is illustrative, not an assertion of current RPI support, minimum notional, zero commission, or account eligibility.",
+  "symbols": [
+    "XAUUSDT"
+  ],
+  "record_data": true,
+  "live_launch": {
+    "_comment": "Real-order data collection only: one symbol, 50 USDT deployed for an approximately 10,000 USDT account, with a separate signed permit bound to this config and the target canary config.",
+    "stage": "rpi_calibration_canary",
+    "deployment_id": "EDIT-ME-rpi-canary-001",
+    "declared_account_equity_usdt": 10000.0,
+    "max_deployed_capital_usdt": 50.0,
+    "max_deployment_loss_usdt": 2.0,
+    "deployment_loss_reduce_only_fraction": 0.5,
+    "rpi_only": true,
+    "calibration_permit_path": "config.live.rpi-calibration.permit.json",
+    "target_deployment_config_path": "config.live.canary.example.json",
+    "calibration_permit_trusted_signers": {},
+    "offline_evidence_path": "config.live.canary.evidence.example.json",
+    "offline_evidence_max_age_sec": 900
+  },
+  "system": {
+    "market_data": {
+      "environment": "production",
+      "testnet": false,
+      "public_only": false
+    },
+    "time_sync": {
+      "startup_required": true,
+      "require_healthy_for_trading": true
+    },
+    "evidence_recorder": {
+      "_comment": "Required raw mark-price, funding, and account evidence for deterministic OOS reconstruction.",
+      "enabled": true,
+      "path": "storage/live/EDIT-ME-rpi-canary-001/calibration/market_evidence.jsonl",
+      "queue_capacity": 8192,
+      "max_batch_records": 256,
+      "fsync_interval_sec": 1.0,
+      "close_timeout_sec": 15.0,
+      "single_writer_fence": {
+        "enabled": true,
+        "path": "storage/live/EDIT-ME-rpi-canary-001/calibration/market_evidence.jsonl.lock"
+      }
+    },
+    "shutdown": {
+      "max_attempts": 3,
+      "retry_interval_sec": 0.5
+    },
+    "strategy_runtime": {
+      "shutdown_timeout_sec": 5.0
+    },
+    "web_dashboard": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 8765,
+      "open_browser": true,
+      "snapshot_stale_after_sec": 2.0
+    }
+  },
+  "alert": {
+    "_comment": "Required Live external channel. The credential-bearing HTTPS webhook URL exists only in CHRONOSHFT_ALERT_WEBHOOK_URL and is never copied into config, logs, dashboard state, or failure records.",
+    "active": true,
+    "transport": "https_webhook",
+    "webhook_url_env": "CHRONOSHFT_ALERT_WEBHOOK_URL",
+    "minimum_level": "WARNING",
+    "queue_capacity": 128,
+    "connect_timeout_sec": 1.0,
+    "read_timeout_sec": 2.0,
+    "max_attempts": 3,
+    "retry_backoff_sec": 0.5,
+    "startup_probe_required": true,
+    "startup_probe_timeout_sec": 12.0,
+    "runtime_fail_closed": true,
+    "recovery_probe_interval_sec": 30.0,
+    "shutdown_flush_timeout_sec": 3.0,
+    "failure_spool_path": "storage/live/EDIT-ME-rpi-canary-001/calibration/external_alert_failures.jsonl",
+    "failure_spool_fsync": true
+  },
+  "account": {
+    "leverage": 1,
+    "margin_type": "ISOLATED",
+    "position_mode": "ONE_WAY",
+    "trading_budget_total": 50.0,
+    "trading_budget_by_asset": {
+      "USDT": 50.0
+    },
+    "use_bnb_fees": false
+  },
+  "oms": {
+    "journal_enabled": true,
+    "replay_journal_on_startup": true,
+    "journal_fsync": true,
+    "journal_integrity_check": true,
+    "journal_path": "storage/live/EDIT-ME-rpi-canary-001/calibration/oms_journal.jsonl",
+    "max_total_active_orders": 1,
+    "max_symbol_active_orders": 1,
+    "max_strategy_active_orders": 1,
+    "max_strategy_symbol_active_orders": 1,
+    "single_writer_fence": {
+      "enabled": true,
+      "path": "storage/live/EDIT-ME-rpi-canary-001/calibration/oms_journal.jsonl.lock"
+    },
+    "truth_monitor": {
+      "rpi_commission_poll_interval_sec": 30.0,
+      "rpi_commission_halt_threshold": 2,
+      "rpi_commission_clean_polls_to_clear": 2
+    },
+    "outbound_message_budget": {
+      "enabled": true,
+      "window_sec": 1.0,
+      "max_total_messages_per_window": 5,
+      "max_new_orders_per_window": 1,
+      "max_reduce_orders_per_window": 2,
+      "max_cancel_messages_per_window": 5,
+      "reserved_risk_messages_per_window": 2
+    },
+    "venue_dead_man_switch": {
+      "enabled": true,
+      "countdown_time_ms": 120000,
+      "renewal_interval_sec": 30.0,
+      "max_renewal_age_sec": 45.0,
+      "recovery_checks": 2
+    }
+  },
+  "risk": {
+    "active": true,
+    "limits": {
+      "max_order_qty": 10000.0,
+      "max_order_notional": 8.0,
+      "max_pos_notional": 8.0,
+      "max_account_gross_notional": 8.0,
+      "max_daily_loss": 1.0,
+      "max_drawdown_pct": 0.0002
+    },
+    "strategy_risk_budgets": {
+      "enabled": true,
+      "require_explicit_strategy": true,
+      "budgets": {
+        "GLFT_MultiScale": {
+          "auto_scale": false,
+          "max_gross_notional": 8.0,
+          "max_symbol_notional": 8.0
+        }
+      }
+    },
+    "market_data_freshness": {
+      "enabled": true,
+      "require_mark_price": true,
+      "require_book": true,
+      "max_mark_age_ms": 3000,
+      "max_book_age_ms": 1500
+    },
+    "funding_guard": {
+      "enabled": true,
+      "require_snapshot": true,
+      "max_snapshot_age_ms": 3000,
+      "pre_funding_reduce_only_sec": 600,
+      "post_funding_hold_sec": 120,
+      "max_abs_funding_rate": 0.0005,
+      "max_next_funding_horizon_sec": 32400,
+      "recovery_updates": 5
+    },
+    "margin_health": {
+      "enabled": true,
+      "require_snapshot": true,
+      "max_snapshot_age_sec": 15
+    },
+    "cash_flow_truth": {
+      "enabled": true,
+      "require_snapshot": true,
+      "max_snapshot_age_sec": 45
+    },
+    "kill_switch": {
+      "verify_interval_sec": 1.0,
+      "verify_timeout_sec": 30.0,
+      "flatten_retry_sec": 5.0,
+      "empty_snapshots_required": 2
+    },
+    "risk_control_heartbeat": {
+      "enabled": true,
+      "required_source": "independent_supervisor",
+      "max_age_sec": 2.0
+    },
+    "independent_supervisor": {
+      "enabled": true,
+      "api_key_env": "BINANCE_RISK_API_KEY",
+      "api_secret_env": "BINANCE_RISK_API_SECRET",
+      "flatten_enabled": true,
+      "state_required": true,
+      "state_fsync": true,
+      "state_path": "storage/live/EDIT-ME-rpi-canary-001/calibration/risk_supervisor_state.json",
+      "daily_loss_enabled": true,
+      "clock_sync_enabled": true,
+      "exchange_poll_interval_sec": 1.0,
+      "liquidation_proximity_enabled": true,
+      "require_liquidation_price": true,
+      "max_open_orders": 1
+    }
+  },
+  "backtest": {
+    "_comment": "Placeholders only. Live startup must replace them with fresh account-specific commission truth; zero RPI commission is never inferred here.",
+    "maker_fee": 0.001,
+    "taker_fee": 0.001,
+    "rpi_commission_rate": 0.001,
+    "rpi_commission_rates": {}
+  },
+  "strategy": {
+    "name": "GLFT_MultiScale",
+    "primary_model": "glft",
+    "registered_models": [
+      "glft"
+    ],
+    "execution_policy": "single_primary",
+    "use_rpi": true,
+    "use_rpi_for_glft": true,
+    "rpi_fallback_to_gtx": false,
+    "rpi_live_policy": {
+      "require_zero_commission": true
+    },
+    "capital_scaling": {
+      "enabled": false
+    },
+    "target_order_notional": 8.0,
+    "max_pos_usdt": 8.0,
+    "model_readiness": {
+      "_comment": "The calibration stage does not grant model live approval. It may collect only the exposure authorized by the independent signed permit.",
+      "enabled": true,
+      "min_volatility_samples": 50,
+      "min_model_samples": 30,
+      "models": {
+        "glft": {
+          "min_volatility_samples": 50,
+          "min_model_samples": 30
+        }
+      },
+      "live_approval": {
+        "manifest_path": "",
+        "min_data_duration_sec": 604800,
+        "min_oos_samples": 10000,
+        "trusted_signers": {}
+      }
+    },
+    "glft": {
+      "gamma": 0.1,
+      "cycle_interval": 10.0,
+      "alpha": {
+        "enabled": false
+      },
+      "target_inventory_notional_usdt": 0.0,
+      "inventory_lot_notional_usdt": 8.0,
+      "rpi_intensity": {
+        "_comment": "Live A/k must come from the hashed LIVE_BINANCE_RPI_ACK artifact. Public aggTrade and Paper fills are not eligible samples.",
+        "min_sample_count": 30,
+        "min_depth_level_count": 3,
+        "min_total_exposure_seconds": 60.0,
+        "min_fill_count": 10,
+        "min_depth_span_bps": 0.5,
+        "min_k_per_bps": 0.000001,
+        "max_k_per_bps": 100.0
+      },
+      "calibrator": {
+        "window": 1000,
+        "min_samples": 50,
+        "initial_sigma_bps": 10.0,
+        "initial_A": 10.0,
+        "initial_k": 0.8,
+        "learning_rate": 0.005,
+        "sigma_max_bps": 100.0,
+        "sigma_ema_alpha": 0.1,
+        "max_tick_gap_sec": 2.0
+      },
+      "execution": {
+        "min_spread_bps": 5.0
+      }
+    }
+  }
+}

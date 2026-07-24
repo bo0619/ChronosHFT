@@ -212,7 +212,7 @@ class RestApiThrottleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only supports limit=1000"):
             api.get_rpi_depth("LTCUSDT", limit=100)
 
-    def test_commission_rate_exposes_account_specific_rpi_surcharge(self):
+    def test_commission_rate_exposes_account_specific_rpi_rate(self):
         api = BinanceRestApi("key", "secret", DummySession(), testnet=True)
 
         with patch.object(api, "request", return_value=DummyResponse(200, {})) as request:
@@ -535,7 +535,7 @@ class RPICoreIntegrationTests(unittest.TestCase):
             "",
         )
 
-    def test_rpi_fee_fallback_adds_surcharge_to_standard_maker_fee(self):
+    def test_rpi_fee_fallback_uses_final_symbol_rate(self):
         oms = object.__new__(OMS)
         oms.config = {
             "backtest": {
@@ -557,7 +557,7 @@ class RPICoreIntegrationTests(unittest.TestCase):
             ),
         )
 
-        self.assertAlmostEqual(oms._get_fee_rate(order, is_maker=True), 0.00035)
+        self.assertAlmostEqual(oms._get_fee_rate(order, is_maker=True), 0.00015)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,10 @@ class StrategyRuntime:
         self.queue_warn_depth = int(self.config.get("queue_warn_depth", 100))
         self.slow_handler_ms = float(self.config.get("slow_handler_ms", 100.0))
         self.alert_interval_sec = float(self.config.get("alert_interval_sec", 5.0))
+        self.shutdown_timeout_sec = max(
+            0.0,
+            float(self.config.get("shutdown_timeout_sec", 5.0) or 0.0),
+        )
 
         self._condition = Condition()
         self._control_queue = deque()
@@ -19,6 +23,9 @@ class StrategyRuntime:
         self._pending_market = {}
         self._active = False
         self._thread = None
+        self._async_stop_thread = None
+        self._async_stop_result = None
+        self._async_stop_error = None
         self._last_alert_at = 0.0
         self._inflight = {
             "kind": "",
@@ -46,6 +53,9 @@ class StrategyRuntime:
         if self._active:
             return
         self._active = True
+        self._async_stop_thread = None
+        self._async_stop_result = None
+        self._async_stop_error = None
         if self._thread is None or not self._thread.is_alive():
             self._thread = Thread(
                 target=self._run,
@@ -55,16 +65,62 @@ class StrategyRuntime:
             self._thread.start()
         logger.info(f"[StrategyRuntime] started for {getattr(self.strategy, 'name', 'strategy')}")
 
-    def stop(self):
+    def stop(self, timeout_sec=None):
         self._active = False
         with self._condition:
             self._condition.notify_all()
+        timeout = (
+            self.shutdown_timeout_sec
+            if timeout_sec is None
+            else max(0.0, float(timeout_sec or 0.0))
+        )
+        deadline = time.perf_counter() + timeout
         if self._thread and self._thread.is_alive():
-            self._thread.join()
+            self._thread.join(
+                timeout=max(0.0, deadline - time.perf_counter())
+            )
+        if self._thread and self._thread.is_alive():
+            logger.critical(
+                "[StrategyRuntime] worker did not stop before "
+                f"timeout={timeout:.3f}s"
+            )
+            return False
         stop_async_workers = getattr(self.strategy, "stop_async_workers", None)
         if callable(stop_async_workers):
-            stop_async_workers()
+            if self._async_stop_thread is None:
+                def stop_async():
+                    try:
+                        self._async_stop_result = stop_async_workers()
+                    except BaseException as exc:
+                        self._async_stop_error = exc
+
+                self._async_stop_thread = Thread(
+                    target=stop_async,
+                    daemon=True,
+                    name=(
+                        "StrategyAsyncStop-"
+                        f"{getattr(self.strategy, 'name', 'strategy')}"
+                    ),
+                )
+                self._async_stop_thread.start()
+            self._async_stop_thread.join(
+                timeout=max(0.0, deadline - time.perf_counter())
+            )
+            if self._async_stop_thread.is_alive():
+                logger.critical(
+                    "[StrategyRuntime] strategy async workers did not stop "
+                    f"before timeout={timeout:.3f}s"
+                )
+                return False
+            if self._async_stop_error is not None:
+                raise self._async_stop_error
+            if self._async_stop_result is False:
+                logger.critical(
+                    "[StrategyRuntime] strategy async workers did not stop"
+                )
+                return False
         logger.info(f"[StrategyRuntime] stopped for {getattr(self.strategy, 'name', 'strategy')}")
+        return not self._thread or not self._thread.is_alive()
 
     def on_orderbook(self, orderbook):
         self._submit_market("orderbook", getattr(orderbook, "symbol", ""), orderbook)
@@ -90,6 +146,7 @@ class StrategyRuntime:
     def get_metrics_snapshot(self):
         with self._condition:
             snapshot = dict(self._stats)
+            snapshot["active"] = bool(self._active)
             snapshot["control_depth"] = len(self._control_queue)
             snapshot["market_depth"] = len(self._market_queue)
             now = time.perf_counter()
@@ -187,6 +244,8 @@ class StrategyRuntime:
         with self._condition:
             while block and self._active and not self._control_queue and not self._market_queue:
                 self._condition.wait(timeout=1.0)
+            if block and not self._active:
+                return None
             if not self._control_queue and not self._market_queue:
                 return None
             if self._control_queue:

@@ -442,8 +442,9 @@
   <script>
     "use strict";
     const state = {
-      paused: false, timer: null, failures: 0, data: null, selectedSymbol: "",
-      history: { account: [], symbols: {} }, maxHistory: 600
+      paused: false, timer: null, freshnessTimer: null, failures: 0, data: null, selectedSymbol: "",
+      history: { account: [], symbols: {} }, maxHistory: 600,
+      lastSequence: null, lastSequenceAt: 0, staleAfterMs: 2000
     };
     const $ = (id) => document.getElementById(id);
     const path = (obj, dotted, fallback = null) => dotted.split(".").reduce((v, k) => v != null ? v[k] : undefined, obj) ?? fallback;
@@ -554,7 +555,7 @@
       const bookAges = symbols.map(s => first(s.market?.book_age_ms, s.market?.book_age_sec != null ? s.market.book_age_sec * 1000 : null)).filter(finite);
       const worstAge = bookAges.length ? Math.max(...bookAges) : null;
       const frozenCount = Object.keys(obj(first(oms.frozen_symbols, rs.frozen_symbols, {}))).length;
-      const apiWeight = first(path(data,"runtime.api_limit.weight_used_1m"), path(gw,"api_weight"));
+      const apiWeight = first(path(gw,"api_limits.used_weight.1M.latest"), path(data,"runtime.api_limit.weight_used_1m"), path(gw,"api_weight"));
       $("statusMetrics").innerHTML = [
         metric("运行时间", finite(uptime) ? duration(uptime) : '<span class="unavailable">不可用</span>', "当前进程", "info"),
         metric("配置标的", fmt(symbols.length, 0), `${symbols.filter(s => s.contract?.supports_rpi).length} 个支持 RPI`),
@@ -608,6 +609,10 @@
       const ordersObj=obj(data.orders), perf=obj(data.performance), stats=obj(first(ordersObj.stats,ordersObj.status_counts,{}));
       const orders=arr(first(ordersObj.recent, data.recent_orders, [])), trades=arr(first(data.trades?.recent,data.recent_trades,[]));
       const context=executionContext(data), simulated=context.isPaper||ordersObj.simulated===true||data.trades?.simulated===true;
+      const restLatency=obj(path(data,"system.gateway.latency",{})), restRoutes=obj(restLatency.routes);
+      const orderRoute=findRestRoute(restRoutes,"POST","/order"), cancelRoute=findRestRoute(restRoutes,"DELETE","/order");
+      const orderRtt=first(orderRoute.latest_rtt_ms,perf.ack_latency_ms), cancelRtt=first(cancelRoute.latest_rtt_ms,perf.cancel_latency_ms);
+      const orderCancelRtt=pairText(orderRtt,cancelRtt,1," ms");
       const active=first(ordersObj.active_count, Array.isArray(ordersObj.active)?ordersObj.active.length:null, perf.active_orders);
       const total=first(ordersObj.total_count,perf.total_orders,orders.length), filled=first(stats.FILLED,perf.filled_orders), rejected=first(stats.REJECTED,perf.rejected_orders);
       const fillRatio=first(perf.fill_ratio, finite(total)&&Number(total)>0&&finite(filled)?Number(filled)/Number(total):null);
@@ -616,7 +621,7 @@
         metric("Active Orders",fmt(active,0),simulated?"本地模拟活动单":"本地活动单"), metric("Total Orders",fmt(total,0),simulated?"本地模拟会话":"当前内存/会话"),
         metric("Fill Ratio",fmtPct(fillRatio),simulated?"本地填充模型结果":"有可靠分母时计算",finite(fillRatio)?"good":"warn"), metric("Reject Ratio",fmtPct(rejectRatio),simulated?"本地模拟拒绝":"本地 + 交易所拒绝",finite(rejectRatio)&&rejectRatio>0?"bad":""),
         metric("RPI Orders",fmt(first(perf.rpi_orders,data.rpi?.total_orders),0),simulated?"模拟 TIF=RPI":"TIF=RPI","info"), metric("GTX Orders",fmt(first(perf.gtx_orders,data.rpi?.gtx_orders),0),simulated?"本地模拟被动单":"被动 API 流动性"),
-        metric("IOC Orders",fmt(first(perf.ioc_orders,data.rpi?.ioc_orders),0),simulated?"本地模拟主动单":"主动成交"), metric("Cancel / ACK latency",fmt(first(perf.cancel_latency_ms,perf.ack_latency_ms),1," ms"),simulated?"模拟延迟":"无埋点时不可用")
+        metric("IOC Orders",fmt(first(perf.ioc_orders,data.rpi?.ioc_orders),0),simulated?"本地模拟主动单":"主动成交"), metric("Order / Cancel RTT",orderCancelRtt,simulated?"模拟延迟":"POST /order · DELETE /order，最近一次 wire RTT")
       ].join("");
       $("orderCountText").textContent=`${simulated?"PAPER 模拟 · ":""}${orders.length} 条`;
       $("orderRows").innerHTML=orders.length?orders.map(o=>{
@@ -669,7 +674,7 @@
       $("timeRuntime").innerHTML=kvEntries(flatSummary(first(sys.time_service,rt.time_service,{available:false}),{max:16}),true);
       $("truthRuntime").innerHTML=kvEntries(flatSummary(first(sys.truth_monitor,rt.truth_monitor,{available:false}),{max:16}),true);
       $("venueRuntime").innerHTML=kvEntries(flatSummary(first(sys.venue_supervisor,rt.venue_supervisor,{available:false}),{max:16}),true);
-      $("gatewayRuntime").innerHTML=kvEntries(flatSummary({...obj(sys.gateway),...obj(rt.api_limit)},{max:18,exclude:["listen_key","api_key","api_secret"]}),true);
+      $("gatewayRuntime").innerHTML=renderGatewayApi(obj(sys.gateway),obj(rt.api_limit));
     }
 
     function renderRpi(data,symbols) {
@@ -735,6 +740,39 @@
       const counts=obj(first(b.counts,b.current,{})),limits=obj(first(b.limits,b.config,{})); const keys=new Set([...Object.keys(counts),...Object.keys(limits)]);
       let html=kv("Enabled",boolWord(b.enabled))+kv("Window",fmt(first(b.window_sec,b.window_seconds),2," s")); keys.forEach(k=>html+=progress(k,counts[k],limits[k])); return html+`<details><summary>完整消息预算</summary><pre>${esc(JSON.stringify(b,null,2))}</pre></details>`;
     }
+    function pairText(latest,peak,digits=0,suffix=""){
+      if(!finite(latest)&&!finite(peak))return "不可用";
+      const left=finite(latest)?strip(fmt(latest,digits,suffix)):"—",right=finite(peak)?strip(fmt(peak,digits,suffix)):"—";
+      return `${left} / ${right}`;
+    }
+    function findRestRoute(routes,method,endpointSuffix){
+      return obj(Object.values(obj(routes)).find(route=>{
+        const item=obj(route);
+        return String(item.method||"").toUpperCase()===method&&String(item.endpoint||"").endsWith(endpointSuffix);
+      }));
+    }
+    function renderGatewayApi(gateway,legacyLimit){
+      const websocket=obj(gateway.websocket),latency=obj(gateway.latency),limits=obj(gateway.api_limits),routes=obj(latency.routes);
+      const orderRoute=findRestRoute(routes,"POST","/order"),cancelRoute=findRestRoute(routes,"DELETE","/order");
+      const latestRoute=latency.latest_method&&latency.latest_endpoint?`${latency.latest_method} ${latency.latest_endpoint}`:"不可用";
+      const latestResult=finite(latency.latest_status_code)?String(Number(latency.latest_status_code)):first(latency.latest_exception_type,"不可用");
+      const rows={
+        "Gateway":first(gateway.state,gateway.status,"不可用"),
+        "WebSocket":websocket.active===true?"ACTIVE":websocket.active===false?"INACTIVE":"不可用",
+        "REST attempts / exceptions":pairText(latency.attempt_count,latency.exception_count,0),
+        "REST success / failure":pairText(latency.success_count,latency.failure_count,0),
+        "HTTP 429 / 418":pairText(limits.http_429_count,limits.http_418_count,0),
+        "RTT latest / peak":pairText(latency.latest_rtt_ms,latency.peak_rtt_ms,1," ms"),
+        "Order RTT latest / peak":pairText(orderRoute.latest_rtt_ms,orderRoute.peak_rtt_ms,1," ms"),
+        "Cancel RTT latest / peak":pairText(cancelRoute.latest_rtt_ms,cancelRoute.peak_rtt_ms,1," ms"),
+        "Latest REST route":latestRoute,
+        "Latest REST result":latestResult
+      };
+      Object.entries(obj(limits.used_weight)).forEach(([interval,sample])=>{sample=obj(sample);rows[`Weight ${interval} latest / peak`]=pairText(sample.latest,sample.peak,0);});
+      Object.entries(obj(limits.order_count)).forEach(([interval,sample])=>{sample=obj(sample);rows[`Orders ${interval} latest / peak`]=pairText(sample.latest,sample.peak,0);});
+      if(!Object.keys(obj(limits.used_weight)).length&&finite(legacyLimit.weight_used_1m))rows["Weight 1M latest / peak"]=pairText(legacyLimit.weight_used_1m,null,0);
+      return kvEntries(rows);
+    }
     function renderObject(value,depth=3){
       if(!value||typeof value!=="object"||!Object.keys(value).length)return '<span class="unavailable">暂无可用指标</span>';
       const flat=flatten(value,depth); return `<div class="kv-grid">${Object.entries(flat).map(([k,v])=>kv(k,formatAny(v))).join("")}</div>`;
@@ -756,19 +794,48 @@
     function numOrNull(v){return finite(v)?Number(v):null;}
     function strip(v){const d=document.createElement("div");d.innerHTML=String(v);return d.textContent||d.innerText||"";}
 
+    function snapshotReadiness(data){
+      const now=Date.now(),meta=obj(data.meta),readiness=obj(data.readiness);
+      const configured=Number(first(readiness.snapshot_stale_after_sec,2));
+      const staleAfterMs=Number.isFinite(configured)&&configured>0?configured*1000:2000;
+      state.staleAfterMs=staleAfterMs;
+      const sequence=Number(first(meta.sequence,-1));
+      if(sequence!==state.lastSequence){
+        state.lastSequence=sequence;
+        state.lastSequenceAt=now;
+      }
+      const generated=Number(first(meta.generated_at_unix,readiness.evaluated_at_unix));
+      const ageMs=Number.isFinite(generated)?Math.max(0,now-generated*1000):Infinity;
+      const sequenceAgeMs=state.lastSequenceAt?now-state.lastSequenceAt:Infinity;
+      const stale=ageMs>staleAfterMs||sequenceAgeMs>staleAfterMs;
+      return {ready:readiness.ready===true&&!stale,stale,ageMs,reasons:arr(readiness.reasons)};
+    }
+
     async function fetchSnapshot(){
       if(state.paused)return;
       try{
         const response=await fetch("/api/snapshot",{cache:"no-store",headers:{"Accept":"application/json"}}); if(!response.ok)throw new Error(`HTTP ${response.status}`);
-        const data=await response.json(); state.failures=0; $("connectionDot").className="dot live"; $("connectionText").textContent="实时"; $("fatalOverlay").classList.remove("visible"); render(data);
+        const data=await response.json(),health=snapshotReadiness(data); state.failures=0;
+        $("connectionDot").className=health.ready?"dot live":health.stale?"dot bad":"dot warn";
+        $("connectionText").textContent=health.ready?"就绪":health.stale?"快照陈旧":"交易锁定";
+        $("fatalOverlay").classList.remove("visible"); render(data);
       }catch(error){state.failures++; $("connectionDot").className=`dot ${state.failures>2?'bad':'warn'}`; $("connectionText").textContent=state.failures>2?"已断开":"重连中"; if(state.failures>5){$("fatalMessage").textContent=`连续 ${state.failures} 次读取失败：${error.message}。交易主程序可能未启动，或本地端口已关闭。`;$("fatalOverlay").classList.add("visible");}}
     }
     function schedule(){clearInterval(state.timer);state.timer=setInterval(fetchSnapshot,Number($("refreshSelect").value));}
-    $("pauseButton").addEventListener("click",()=>{state.paused=!state.paused;$("pauseButton").textContent=state.paused?"继续刷新":"暂停刷新";$("connectionDot").className=state.paused?"dot warn":"dot live";$("connectionText").textContent=state.paused?"已暂停":"实时";if(!state.paused)fetchSnapshot();});
+    function monitorFreshness(){
+      if(state.paused||!state.lastSequenceAt)return;
+      if(Date.now()-state.lastSequenceAt>state.staleAfterMs){
+        $("connectionDot").className="dot bad";
+        $("connectionText").textContent="快照陈旧";
+      }
+    }
+    $("pauseButton").addEventListener("click",()=>{state.paused=!state.paused;$("pauseButton").textContent=state.paused?"继续刷新":"暂停刷新";if(state.paused){$("connectionDot").className="dot warn";$("connectionText").textContent="已暂停";}else fetchSnapshot();});
     $("refreshSelect").addEventListener("change",schedule);
     $("symbolSelect").addEventListener("change",e=>{state.selectedSymbol=e.target.value;if(state.data){renderStrategy(normalizeSymbols(state.data));drawCharts(state.data,normalizeSymbols(state.data));}});
     $("retryButton").addEventListener("click",()=>{state.failures=0;$("fatalOverlay").classList.remove("visible");fetchSnapshot();});
     window.addEventListener("resize",()=>{if(state.data)drawCharts(state.data,normalizeSymbols(state.data));});
+    document.addEventListener("visibilitychange",()=>{if(!document.hidden){monitorFreshness();fetchSnapshot();}});
+    state.freshnessTimer=setInterval(monitorFreshness,250);
     schedule(); fetchSnapshot();
   </script>
 </body>

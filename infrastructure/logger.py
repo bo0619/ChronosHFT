@@ -5,8 +5,12 @@ import sys
 import queue
 import threading
 import logging
+import time
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
+
+from infrastructure.external_alerts import redact_alert_text
+
 
 class AsyncLogger:
     """
@@ -24,7 +28,8 @@ class AsyncLogger:
         return cls._instance
 
     def __init__(self):
-        if hasattr(self, "initialized"): return
+        if hasattr(self, "initialized"):
+            return
         self.initialized = True
         
         self.active = False
@@ -34,7 +39,8 @@ class AsyncLogger:
         self.logger.setLevel(logging.DEBUG)
         
         # [核心] 用于 TUI 显示的钩子函数
-        self.ui_callback = None 
+        self.ui_callback = None
+        self.alert_callback = None
 
     def init_logging(self, config: dict):
         sys_conf = config.get("system", {})
@@ -70,33 +76,71 @@ class AsyncLogger:
         """
         self.ui_callback = callback
 
+    def set_alert_callback(self, callback):
+        """Register a non-blocking WARNING+ sink executed on the log worker."""
+        self.alert_callback = callback
+
     def _worker_loop(self):
         """异步 worker，负责处理队列中的所有日志请求"""
         while self.active:
+            record = None
             try:
                 # 阻塞获取日志，超时 1s 检查一次 active 状态
                 record = self.queue.get(timeout=1.0)
                 level, msg = record
+                msg = redact_alert_text(msg, 16384)
                 
                 # A. 写入系统 Logger (进入文件)
-                if level == "INFO": self.logger.info(msg)
-                elif level == "ERROR": self.logger.error(msg)
-                elif level == "DEBUG": self.logger.debug(msg)
-                elif level == "WARNING": self.logger.warning(msg)
-                elif level == "CRITICAL": self.logger.critical(msg)
+                if level == "INFO":
+                    self.logger.info(msg)
+                elif level == "ERROR":
+                    self.logger.error(msg)
+                elif level == "DEBUG":
+                    self.logger.debug(msg)
+                elif level == "WARNING":
+                    self.logger.warning(msg)
+                elif level == "CRITICAL":
+                    self.logger.critical(msg)
                 
                 # B. [关键] 如果有 UI 回调，实时推送给 Dashboard
                 if self.ui_callback:
                     try:
                         self.ui_callback(f"[{level}] {msg}")
-                    except:
+                    except Exception:
                         # 防止 UI 崩溃导致日志线程挂掉
+                        pass
+
+                if (
+                    self.alert_callback
+                    and level in {"WARNING", "ERROR", "CRITICAL"}
+                ):
+                    try:
+                        self.alert_callback(level, msg)
+                    except Exception:
+                        # Alert delivery errors must not recurse into logging.
                         pass
                     
             except queue.Empty:
                 pass
             except Exception as e:
-                print(f"Logger Internal Error: {e}")
+                print(
+                    f"Logger Internal Error: {type(e).__name__}",
+                    flush=True,
+                )
+            finally:
+                if record is not None:
+                    self.queue.task_done()
+
+    def flush(self, timeout_sec: float = 1.0) -> bool:
+        """Wait boundedly until all records already queued are dispatched."""
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        with self.queue.all_tasks_done:
+            while self.queue.unfinished_tasks:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self.queue.all_tasks_done.wait(timeout=remaining)
+        return True
 
     def stop(self):
         self.info("Logger stopping...")

@@ -27,9 +27,18 @@ class GLFTCalibrator:
     """
 
     def __init__(self, window: int = 1000, config: dict = None):
-        cfg = (config or {}).get("strategy", {}).get("calibrator", {})
+        raw_config = config if isinstance(config, dict) else {}
+        strategy_config = raw_config.get("strategy", {})
+        if isinstance(strategy_config, dict) and strategy_config:
+            cfg = strategy_config.get("calibrator", {})
+        elif isinstance(raw_config.get("calibrator"), dict):
+            cfg = raw_config["calibrator"]
+        else:
+            cfg = raw_config
+        if not isinstance(cfg, dict):
+            cfg = {}
 
-        self.window = window
+        self.window = max(2, int(cfg.get("window", window) or window))
 
         # 用于存储时间归一化回报的环形队列
         self.norm_returns: deque = deque(maxlen=self.window)
@@ -45,6 +54,13 @@ class GLFTCalibrator:
 
         # [FIX-SIGMA] 异常 tick 过滤：超过此间隔视为断线重连，丢弃该 tick
         self.max_tick_gap: float = cfg.get("max_tick_gap_sec", 2.0)
+        self.min_samples: int = max(
+            2,
+            min(
+                self.window,
+                int(cfg.get("min_samples", 10) or 10),
+            ),
+        )
 
         # 运行时状态
         self.last_mid:       float = 0.0
@@ -55,6 +71,14 @@ class GLFTCalibrator:
         self.last_tick_monotonic: float = 0.0
         self._has_tick_reference: bool = False
         self.is_warmed_up:   bool  = False
+        # Public aggTrade events are not evidence of RPI-accessible retail
+        # flow and must never update the live A/k estimator.
+        self.public_trade_sample_count: int = 0
+        self.intensity_sample_count: int = 0
+
+    @property
+    def volatility_sample_count(self) -> int:
+        return len(self.norm_returns)
 
     # ----------------------------------------------------------
 
@@ -100,7 +124,12 @@ class GLFTCalibrator:
     def on_orderbook(self, ob: OrderBook):
         bid, _ = ob.get_best_bid()
         ask, _ = ob.get_best_ask()
-        if bid == 0:
+        if (
+            not math.isfinite(bid)
+            or not math.isfinite(ask)
+            or bid <= 0.0
+            or ask <= bid
+        ):
             return
 
         mid = (bid + ask) / 2.0
@@ -135,12 +164,13 @@ class GLFTCalibrator:
             # [FIX-SIGMA] 时间归一化回报：ret_normalized 的方差 ≈ sigma²（每秒）
             # ret_bps 除以 sqrt(dt) 使不同 tick 间隔的样本具有可比性
             if dt > 1e-4:  # 防止 dt=0 时除零
-                ret_bps        = (mid / self.last_mid - 1.0) * 10000.0
+                ret_bps = math.log(mid / self.last_mid) * 10_000.0
                 ret_normalized = ret_bps / math.sqrt(dt)
-                self.norm_returns.append(ret_normalized)
+                if math.isfinite(ret_normalized):
+                    self.norm_returns.append(ret_normalized)
 
             # 收集足够样本后才开始估计 sigma
-            if len(self.norm_returns) >= 10:
+            if len(self.norm_returns) >= self.min_samples:
                 # std(norm_returns) 的单位是 bps/sqrt(sec)
                 # sigma_bps 表示 1 秒内的价格标准差（bps），直接等于 std
                 raw_std = float(np.std(self.norm_returns))
@@ -165,23 +195,12 @@ class GLFTCalibrator:
     # ----------------------------------------------------------
 
     def on_market_trade(self, trade: AggTradeData, current_mid: float):
-        """在线梯度下降更新订单流参数 A 和 k"""
+        """Observe public flow without treating it as RPI fill evidence."""
         if not self.is_warmed_up or current_mid <= 0:
             return
 
         delta_mkt = abs(trade.price / current_mid - 1.0) * 10000.0
 
-        # 过滤极端异常值（偏离超过 1%）
         if delta_mkt > 100.0:
             return
-
-        prediction = self.A * math.exp(-self.k * delta_mkt)
-        error      = 1.0 - prediction
-
-        self.A += self.learning_rate * error * math.exp(-self.k * delta_mkt)
-        grad_k  = error * (-delta_mkt) * prediction
-        self.k -= self.learning_rate * grad_k
-
-        # 参数约束
-        self.A = max(0.1, min(200.0, self.A))
-        self.k = max(0.1, min(10.0,  self.k))
+        self.public_trade_sample_count += 1

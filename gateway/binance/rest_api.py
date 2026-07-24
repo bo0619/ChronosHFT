@@ -30,6 +30,7 @@ from .constants import (
     REST_URL_MAIN,
     REST_URL_TEST,
 )
+from .rest_metrics import BinanceRestMetrics
 
 
 class _LocalGuardResponse:
@@ -79,6 +80,7 @@ class BinanceRestApi:
         self.recv_window_ms = 5000
         self.order_clock_guard = None
         self.clock_resync_callback = None
+        self.telemetry = BinanceRestMetrics()
 
     def _sign(self, params: dict):
         query = urlencode(params)
@@ -142,6 +144,52 @@ class BinanceRestApi:
         error_code, _message = self._extract_error_details(response)
         return bool(error_code and error_code in accepted_error_codes)
 
+    def get_metrics_snapshot(self) -> dict:
+        return self.telemetry.snapshot()
+
+    def _record_response_metrics(
+        self,
+        *,
+        method,
+        endpoint,
+        response,
+        started_monotonic_ns,
+        completed_monotonic_ns,
+    ):
+        try:
+            self.telemetry.record_response(
+                method=method,
+                endpoint=endpoint,
+                status_code=response.status_code,
+                headers=getattr(response, "headers", None),
+                rtt_ns=completed_monotonic_ns - started_monotonic_ns,
+                completed_monotonic_ns=completed_monotonic_ns,
+            )
+        except Exception:
+            # Observability must never alter the REST command result.
+            return
+
+    def _record_exception_metrics(
+        self,
+        *,
+        method,
+        endpoint,
+        exc,
+        started_monotonic_ns,
+        completed_monotonic_ns,
+    ):
+        try:
+            self.telemetry.record_exception(
+                method=method,
+                endpoint=endpoint,
+                exception_type=type(exc).__name__,
+                rtt_ns=completed_monotonic_ns - started_monotonic_ns,
+                completed_monotonic_ns=completed_monotonic_ns,
+            )
+        except Exception:
+            # Preserve the original transport exception and retry path.
+            return
+
     def _run_pre_send_guard(self, guard):
         if not callable(guard):
             return None
@@ -202,7 +250,27 @@ class BinanceRestApi:
                 guard_rejection = self._run_pre_send_guard(pre_send_guard)
                 if guard_rejection is not None:
                     return guard_rejection
-                response = self.session.send(prepped, timeout=self.timeout_sec)
+                started_monotonic_ns = time.perf_counter_ns()
+                try:
+                    response = self.session.send(prepped, timeout=self.timeout_sec)
+                except Exception as exc:
+                    completed_monotonic_ns = time.perf_counter_ns()
+                    self._record_exception_metrics(
+                        method=method,
+                        endpoint=endpoint,
+                        exc=exc,
+                        started_monotonic_ns=started_monotonic_ns,
+                        completed_monotonic_ns=completed_monotonic_ns,
+                    )
+                    raise
+                completed_monotonic_ns = time.perf_counter_ns()
+                self._record_response_metrics(
+                    method=method,
+                    endpoint=endpoint,
+                    response=response,
+                    started_monotonic_ns=started_monotonic_ns,
+                    completed_monotonic_ns=completed_monotonic_ns,
+                )
                 self.endpoint_cooldown_until[endpoint] = 0.0
                 if response.status_code == 200:
                     return response
@@ -259,7 +327,7 @@ class BinanceRestApi:
         return resp.json() if resp and resp.status_code == 200 else None
 
     def get_commission_rate(self, symbol):
-        """Return account-specific maker, taker, and RPI commission rates."""
+        """Return account-specific final maker, taker, and RPI rates."""
         return self.request(
             "GET",
             EP_COMMISSION_RATE,

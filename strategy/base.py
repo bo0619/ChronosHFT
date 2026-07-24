@@ -16,6 +16,8 @@ from event.type import (
     EVENT_LOG,
 )
 from data.ref_data import ref_data_manager
+from infrastructure.commission_truth import resolve_passive_fee_rate
+from infrastructure.paper_trade import is_paper_trade
 
 
 class StrategyTemplate:
@@ -217,35 +219,21 @@ class StrategyTemplate:
         return TIF_GTX
 
     def passive_fee_rate(self, symbol: str, time_in_force: str) -> float:
-        """Return maker fee plus the account's symbol-specific RPI surcharge."""
+        """Return the final passive fee rate for the selected venue route."""
         config = getattr(self.oms, "config", {}) or {}
         fee_config = dict(config.get("backtest", {}) or {})
-        execution = config.get("execution", {}) or {}
         paper_config = config.get("paper_trade", {}) or {}
-        system = config.get("system", {}) or {}
-        execution_mode = str(execution.get("mode", "") or "").strip().lower()
-        paper_enabled = bool(paper_config.get("enabled", False)) or bool(
-            system.get("dry_run", False)
-        )
-        if execution_mode in {"paper", "paper_trade", "simulation", "sim"}:
-            paper_enabled = True
-        if paper_enabled:
+        if is_paper_trade(config):
             fee_config.update(paper_config)
-        fee_rate = float(fee_config.get("maker_fee", 0.0))
-        if str(time_in_force or "").upper() != TIF_RPI:
-            return fee_rate
-
-        symbol_rates = fee_config.get("rpi_commission_rates", {})
-        symbol_rate = None
-        if isinstance(symbol_rates, dict):
-            normalized_symbol = str(symbol or "").upper()
-            symbol_rate = symbol_rates.get(normalized_symbol)
-            if symbol_rate is None:
-                symbol_rate = symbol_rates.get(str(symbol or ""))
-        return fee_rate + float(
-            symbol_rate
-            if symbol_rate is not None
-            else fee_config.get("rpi_commission_rate", 0.0)
+        return resolve_passive_fee_rate(
+            maker_rate=fee_config.get("maker_fee", 0.0),
+            symbol=symbol,
+            is_rpi=str(time_in_force or "").upper() == TIF_RPI,
+            rpi_commission_rates=fee_config.get("rpi_commission_rates", {}),
+            default_rpi_commission_rate=fee_config.get(
+                "rpi_commission_rate",
+                0.0,
+            ),
         )
 
     def passive_round_trip_fee_bps(

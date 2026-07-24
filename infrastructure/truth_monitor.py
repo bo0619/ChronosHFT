@@ -1,7 +1,15 @@
 import threading
 import time
+from copy import deepcopy
+from decimal import Decimal
 
+from infrastructure.commission_truth import parse_commission_rate_payload
 from infrastructure.logger import logger
+from infrastructure.paper_trade import is_paper_trade
+from infrastructure.rpi_policy import (
+    effective_rpi_route_enabled,
+    requires_zero_rpi_commission,
+)
 
 
 class TruthMonitor:
@@ -40,10 +48,61 @@ class TruthMonitor:
             1.0,
             float(cash_flow_cfg.get("poll_interval_sec", 30.0) or 30.0),
         )
+        execution = self.config.get("execution", {})
+        execution_mode = (
+            str(execution.get("mode", "") or "").strip().lower()
+            if isinstance(execution, dict)
+            else ""
+        )
+        self.rpi_commission_truth_required = bool(
+            execution_mode == "live"
+            and not self.is_testnet
+            and not is_paper_trade(self.config)
+            and effective_rpi_route_enabled(self.config)
+            and requires_zero_rpi_commission(self.config)
+        )
+        self.rpi_commission_poll_interval_sec = min(
+            60.0,
+            max(
+                5.0,
+                float(
+                    cfg.get(
+                        "rpi_commission_poll_interval_sec",
+                        30.0,
+                    )
+                    or 30.0
+                ),
+            ),
+        )
+        self.rpi_commission_halt_threshold = min(
+            2,
+            max(
+                1,
+                int(cfg.get("rpi_commission_halt_threshold", 2) or 2),
+            ),
+        )
+        self.rpi_commission_clean_polls_to_clear = max(
+            2,
+            int(
+                cfg.get(
+                    "rpi_commission_clean_polls_to_clear",
+                    2,
+                )
+                or 2
+            ),
+        )
         self.last_cash_flow_poll_at = 0.0
+        self.last_rpi_commission_poll_monotonic = 0.0
+        self.last_rpi_commission_rates = {}
+        self.last_account_snapshot = None
+        self.last_positions_snapshot = None
+        self.last_open_orders_snapshot = None
+        self.last_account_snapshot_monotonic = 0.0
 
         self.consecutive_api_failures = 0
         self.consecutive_balance_drifts = 0
+        self.consecutive_rpi_commission_failures = 0
+        self.clean_rpi_commission_polls = 0
         self.clean_polls = 0
         self.active = False
         self.thread = None
@@ -66,6 +125,12 @@ class TruthMonitor:
         thread = self.thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=max(1.0, self.poll_interval_sec + 0.5))
+        stopped = not thread or not thread.is_alive()
+        if not stopped:
+            logger.critical(
+                "[TruthMonitor] Poll worker did not stop before timeout"
+            )
+        return stopped
 
     def _loop(self):
         while self.active:
@@ -74,7 +139,21 @@ class TruthMonitor:
             try:
                 self.poll_once()
             except Exception as exc:
-                logger.error(f"[TruthMonitor] Poll failed: {exc}")
+                self._handle_poll_exception(exc)
+
+    def _handle_poll_exception(self, exc: Exception) -> bool:
+        logger.error(
+            "[TruthMonitor] Poll raised an exception: "
+            f"{type(exc).__name__}:{exc}"
+        )
+        try:
+            return self._handle_api_failure()
+        except Exception as guard_exc:
+            logger.critical(
+                "[TruthMonitor] Could not apply fail-closed API guard: "
+                f"{type(guard_exc).__name__}:{guard_exc}"
+            )
+            return False
 
     def _venue_name(self):
         return getattr(
@@ -84,20 +163,262 @@ class TruthMonitor:
         )
 
     def poll_once(self):
-        account = self.snapshot_provider.get_account_info()
-        positions = self.snapshot_provider.get_all_positions()
-        open_orders = self.snapshot_provider.get_open_orders()
+        commission_truth_ok = self._poll_rpi_commission_truth()
+        try:
+            account = self.snapshot_provider.get_account_info()
+            positions = self.snapshot_provider.get_all_positions()
+            open_orders = self.snapshot_provider.get_open_orders()
+        except Exception as exc:
+            return self._handle_poll_exception(exc)
 
         if account is None or positions is None or open_orders is None:
             return self._handle_api_failure()
 
+        self.last_account_snapshot = deepcopy(account)
+        self.last_positions_snapshot = deepcopy(positions)
+        self.last_open_orders_snapshot = deepcopy(open_orders)
+        self.last_account_snapshot_monotonic = time.perf_counter()
+        try:
+            sync_margin_health = getattr(
+                self.oms,
+                "sync_account_margin_health",
+                None,
+            )
+            if callable(sync_margin_health):
+                sync_margin_health(account, snapshot_time=time.time())
+            cash_flow_truth_ok = self._poll_cash_flow_truth()
+            exchange_truth_ok = self._compare_truth(
+                account,
+                positions,
+                open_orders,
+            )
+        except Exception as exc:
+            return self._handle_poll_exception(exc)
         self._handle_api_recovery()
-        sync_margin_health = getattr(self.oms, "sync_account_margin_health", None)
-        if callable(sync_margin_health):
-            sync_margin_health(account, snapshot_time=time.time())
-        cash_flow_truth_ok = self._poll_cash_flow_truth()
-        exchange_truth_ok = self._compare_truth(account, positions, open_orders)
-        return cash_flow_truth_ok and exchange_truth_ok
+        return (
+            commission_truth_ok
+            and cash_flow_truth_ok
+            and exchange_truth_ok
+        )
+
+    def _poll_rpi_commission_truth(
+        self,
+        now_monotonic: float = None,
+    ) -> bool:
+        if not self.rpi_commission_truth_required:
+            return True
+
+        now_monotonic = float(
+            now_monotonic
+            if now_monotonic is not None
+            else time.perf_counter()
+        )
+        if (
+            self.last_rpi_commission_poll_monotonic > 0.0
+            and now_monotonic - self.last_rpi_commission_poll_monotonic
+            < self.rpi_commission_poll_interval_sec
+        ):
+            return True
+        self.last_rpi_commission_poll_monotonic = now_monotonic
+
+        query = getattr(
+            self.snapshot_provider,
+            "get_commission_rate",
+            None,
+        )
+        if not callable(query):
+            return self._handle_rpi_commission_failure(
+                "independent commission endpoint unavailable"
+            )
+
+        symbols = tuple(
+            dict.fromkeys(
+                str(symbol or "").strip().upper()
+                for symbol in self.config.get("symbols", ())
+                if str(symbol or "").strip()
+            )
+        )
+        if not symbols:
+            return self._handle_rpi_commission_failure(
+                "configured symbol set is empty"
+            )
+
+        rates_by_symbol = {}
+        for symbol in symbols:
+            try:
+                payload = query(symbol)
+            except Exception as exc:
+                return self._handle_rpi_commission_failure(
+                    f"{type(exc).__name__} during {symbol} commission query"
+                )
+            try:
+                rates_by_symbol[symbol] = parse_commission_rate_payload(
+                    payload,
+                    symbol=symbol,
+                )
+            except ValueError as exc:
+                return self._handle_rpi_commission_failure(str(exc))
+
+        nonzero_rpi_rates = {
+            symbol: rates["rpiCommissionRate"]
+            for symbol, rates in rates_by_symbol.items()
+            if rates["rpiCommissionRate"] != Decimal(0)
+        }
+        if nonzero_rpi_rates:
+            reason = "commission_truth:nonzero_rpi_rate:" + ",".join(
+                f"{symbol}={rate}"
+                for symbol, rate in sorted(nonzero_rpi_rates.items())
+            )
+            logger.critical(
+                "[TruthMonitor] Account-specific RPI commission is no "
+                f"longer zero: {reason}"
+            )
+            self._record_rpi_commission_truth(
+                rates_by_symbol,
+                accepted=False,
+                reason=reason,
+            )
+            self.oms.halt_system(reason)
+            return False
+
+        self._publish_rpi_commission_truth(rates_by_symbol)
+        if not self._record_rpi_commission_truth(
+            rates_by_symbol,
+            accepted=True,
+            reason="",
+        ):
+            return self._handle_rpi_commission_failure(
+                "durable commission-truth audit unavailable"
+            )
+        self.consecutive_rpi_commission_failures = 0
+        self.clean_rpi_commission_polls += 1
+        if (
+            self.clean_rpi_commission_polls
+            >= self.rpi_commission_clean_polls_to_clear
+        ):
+            self._clear_rpi_commission_guard()
+        return True
+
+    def _publish_rpi_commission_truth(self, rates_by_symbol) -> None:
+        maker_rates = [
+            float(rates["makerCommissionRate"])
+            for rates in rates_by_symbol.values()
+        ]
+        taker_rates = [
+            float(rates["takerCommissionRate"])
+            for rates in rates_by_symbol.values()
+        ]
+        rpi_rates = {
+            symbol: float(rates["rpiCommissionRate"])
+            for symbol, rates in rates_by_symbol.items()
+        }
+        current_fee_config = self.config.get("backtest", {})
+        next_fee_config = (
+            dict(current_fee_config)
+            if isinstance(current_fee_config, dict)
+            else {}
+        )
+        next_fee_config.update(
+            {
+                "maker_fee": max(maker_rates),
+                "taker_fee": max(taker_rates),
+                "rpi_commission_rate": max(rpi_rates.values()),
+                "rpi_commission_rates": rpi_rates,
+            }
+        )
+        self.config["backtest"] = next_fee_config
+        self.last_rpi_commission_rates = dict(rpi_rates)
+
+    def _record_rpi_commission_truth(
+        self,
+        rates_by_symbol,
+        *,
+        accepted: bool,
+        reason: str,
+    ) -> bool:
+        record = getattr(
+            self.oms,
+            "record_rpi_commission_truth",
+            None,
+        )
+        if not callable(record):
+            return False
+        try:
+            result = record(
+                {
+                    symbol: {
+                        field: str(value)
+                        for field, value in rates.items()
+                    }
+                    for symbol, rates in rates_by_symbol.items()
+                },
+                accepted=bool(accepted),
+                reason=str(reason or ""),
+                source="GET /fapi/v1/commissionRate",
+            )
+        except Exception as exc:
+            logger.critical(
+                "[TruthMonitor] Could not persist runtime RPI commission "
+                f"truth: {type(exc).__name__}:{exc}"
+            )
+            return False
+        return result is not False
+
+    def _handle_rpi_commission_failure(self, detail: str) -> bool:
+        self.consecutive_rpi_commission_failures += 1
+        self.clean_rpi_commission_polls = 0
+        reason = (
+            "commission_truth:unavailable:"
+            f"{self.consecutive_rpi_commission_failures}:"
+            f"{str(detail or 'unknown')}"
+        )
+        logger.error(
+            "[TruthMonitor] Runtime RPI commission truth unavailable "
+            f"({self.consecutive_rpi_commission_failures}/"
+            f"{self.rpi_commission_halt_threshold}): {detail}"
+        )
+        self._record_rpi_commission_truth(
+            {},
+            accepted=False,
+            reason=reason,
+        )
+        self.oms.freeze_venue(
+            self._venue_name(),
+            reason,
+            cancel_active_orders=True,
+        )
+        if (
+            self.consecutive_rpi_commission_failures
+            >= self.rpi_commission_halt_threshold
+        ):
+            self.oms.halt_system(reason)
+        return False
+
+    def _clear_rpi_commission_guard(self) -> bool:
+        get_owners = getattr(self.oms, "get_venue_freeze_owners", None)
+        clear = getattr(self.oms, "clear_venue_freeze", None)
+        if not callable(get_owners) or not callable(clear):
+            return False
+        venue = self._venue_name()
+        owners = get_owners(venue)
+        record = (
+            owners.get("commission_truth", {})
+            if isinstance(owners, dict)
+            else {}
+        )
+        reason = str(record.get("reason", "") or "")
+        epoch = int(record.get("epoch", 0) or 0)
+        if not reason or epoch <= 0:
+            return False
+        return bool(
+            clear(
+                venue,
+                reason="commission truth restored after two clean polls",
+                expected_epoch=epoch,
+                expected_reason=reason,
+                expected_owner="commission_truth",
+            )
+        )
 
     def _poll_cash_flow_truth(self, now: float = None) -> bool:
         if not self.cash_flow_truth_enabled:

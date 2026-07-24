@@ -358,9 +358,14 @@ class TimeService:
                 self._health_state = "stopped"
                 self._runtime_fault_reason = "time service stopped"
             thread = self._thread
-            self._thread = None
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=max(0.5, self.request_timeout_sec + 0.25))
+        stopped = not thread or not thread.is_alive()
+        if stopped:
+            with self._state_lock:
+                if self._thread is thread:
+                    self._thread = None
+        return stopped
 
     def synchronize_now(self):
         """Run an immediate synchronization within the active generation."""

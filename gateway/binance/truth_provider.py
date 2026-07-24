@@ -46,6 +46,11 @@ class BinanceTruthSnapshotProvider:
         response = self.rest.get_income_history(**kwargs)
         return response.json() if response and response.status_code == 200 else None
 
+    def get_commission_rate(self, symbol: str):
+        response = self.rest.get_commission_rate(symbol)
+        return response.json() if response and response.status_code == 200 else None
+
     def close(self):
         if self._owns_session and self.session:
             self.session.close()
+        return True

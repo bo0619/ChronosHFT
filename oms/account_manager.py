@@ -42,9 +42,11 @@ class AccountManager:
         self.margin_balance = self.equity
         self.maintenance_margin_ratio = 0.0
         self.margin_snapshot_time = 0.0
+        self.margin_snapshot_monotonic = 0.0
         self.margin_snapshot_synced = False
         self.external_cash_flow_total = 0.0
         self.cash_flow_snapshot_time = 0.0
+        self.cash_flow_snapshot_monotonic = 0.0
         self.cash_flow_snapshot_synced = False
 
     def force_sync(
@@ -57,6 +59,7 @@ class AccountManager:
         maintenance_margin: float = None,
         margin_balance: float = None,
         margin_snapshot_time: float = None,
+        margin_snapshot_monotonic: float = None,
     ):
         self.balance = balance
         self.exchange_balance_synced = True
@@ -65,6 +68,7 @@ class AccountManager:
             maintenance_margin,
             margin_balance,
             snapshot_time=margin_snapshot_time,
+            snapshot_monotonic=margin_snapshot_monotonic,
         )
         self.calculate(used_margin_override=used_margin, available_override=available)
 
@@ -85,11 +89,13 @@ class AccountManager:
         maintenance_margin: float,
         margin_balance: float,
         snapshot_time: float = None,
+        snapshot_monotonic: float = None,
     ) -> bool:
         if not self._set_margin_health(
             maintenance_margin,
             margin_balance,
             snapshot_time=snapshot_time,
+            snapshot_monotonic=snapshot_monotonic,
         ):
             return False
         self.calculate()
@@ -99,6 +105,7 @@ class AccountManager:
         self,
         total: float,
         snapshot_time: float = None,
+        snapshot_monotonic: float = None,
     ) -> bool:
         try:
             total = float(total)
@@ -108,6 +115,9 @@ class AccountManager:
             return False
         self.external_cash_flow_total = total
         self.cash_flow_snapshot_time = float(snapshot_time or time.time())
+        self.cash_flow_snapshot_monotonic = float(
+            snapshot_monotonic or time.perf_counter()
+        )
         self.cash_flow_snapshot_synced = True
         self.calculate()
         return True
@@ -115,6 +125,7 @@ class AccountManager:
     def mark_external_cash_flow_truth_unavailable(self):
         self.cash_flow_snapshot_synced = False
         self.cash_flow_snapshot_time = 0.0
+        self.cash_flow_snapshot_monotonic = 0.0
         self.calculate()
 
     def update_balance(self, realized_pnl, commission):
@@ -189,9 +200,11 @@ class AccountManager:
             margin_balance=self.margin_balance,
             maintenance_margin_ratio=self.maintenance_margin_ratio,
             margin_snapshot_time=self.margin_snapshot_time,
+            margin_snapshot_monotonic=self.margin_snapshot_monotonic,
             margin_snapshot_synced=self.margin_snapshot_synced,
             external_cash_flow_total=self.external_cash_flow_total,
             cash_flow_snapshot_time=self.cash_flow_snapshot_time,
+            cash_flow_snapshot_monotonic=self.cash_flow_snapshot_monotonic,
             cash_flow_snapshot_synced=self.cash_flow_snapshot_synced,
         )
         self.engine.put(Event(EVENT_ACCOUNT_UPDATE, data))
@@ -201,6 +214,7 @@ class AccountManager:
         maintenance_margin: float,
         margin_balance: float,
         snapshot_time: float = None,
+        snapshot_monotonic: float = None,
     ) -> bool:
         if maintenance_margin is None or margin_balance is None:
             return False
@@ -218,6 +232,9 @@ class AccountManager:
         self.maintenance_margin = maintenance_margin
         self.margin_balance = margin_balance
         self.margin_snapshot_time = float(snapshot_time or time.time())
+        self.margin_snapshot_monotonic = float(
+            snapshot_monotonic or time.perf_counter()
+        )
         self.margin_snapshot_synced = True
         return True
 

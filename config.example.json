@@ -49,6 +49,7 @@
             "port": 8765,
             "open_browser": true,
             "refresh_interval_ms": 1000,
+            "snapshot_stale_after_sec": 2.0,
             "history_limit": 600,
             "orders_limit": 100,
             "trades_limit": 100,
@@ -78,6 +79,19 @@
             "sync_interval_sec": 10.0,
             "unhealthy_retry_sec": 1.0,
             "max_consecutive_failures": 2
+        },
+        "evidence_recorder": {
+            "_comment": "Disabled in Paper. Live templates require a deployment-bound hash-chained JSONL recorder and independent writer fence.",
+            "enabled": false,
+            "path": "",
+            "queue_capacity": 8192,
+            "max_batch_records": 256,
+            "fsync_interval_sec": 1.0,
+            "close_timeout_sec": 15.0,
+            "single_writer_fence": {
+                "enabled": true,
+                "path": ""
+            }
         },
         "event_engine": {
             "queue_warn_depth": {
@@ -123,6 +137,10 @@
             "alert_interval_sec": 5,
             "shutdown_drain_timeout_sec": 5
         },
+        "shutdown": {
+            "max_attempts": 3,
+            "retry_interval_sec": 0.5
+        },
         "market_data": {
             "environment": "production",
             "testnet": false,
@@ -141,13 +159,15 @@
             "freeze_backlog_ms": 1500,
             "recovery_checks": 20,
             "slow_handler_ms": 100,
-            "alert_interval_sec": 5
+            "alert_interval_sec": 5,
+            "shutdown_timeout_sec": 5
         }
     },
     "alert": {
-        "active": true,
-        "telegram_token": "",
-        "telegram_chat_id": ""
+        "_comment": "Paper may leave this disabled. Live requires the full bounded HTTPS webhook policy shown in config.live.canary.example.json; never put a webhook URL or provider token in JSON.",
+        "active": false,
+        "transport": "https_webhook",
+        "webhook_url_env": "CHRONOSHFT_ALERT_WEBHOOK_URL"
     },
     "account": {
         "leverage": 8,
@@ -339,7 +359,7 @@
         "initial_capital": 100.0,
         "taker_fee": 0.0005,
         "maker_fee": 0.0002,
-        "_comment_rpi_commission_rate": "Extra RPI commission rate from GET /fapi/v1/commissionRate; added on top of maker_fee.",
+        "_comment_rpi_commission_rate": "Final RPI route rate from GET /fapi/v1/commissionRate; it replaces maker_fee for RPI fills and is never hardcoded.",
         "rpi_commission_rate": 0.0,
         "rpi_commission_rates": {},
         "latency_ms_mean": 20,
@@ -359,12 +379,14 @@
         ],
         "execution_policy": "single_primary",
         "_comment_model_policy": "All models are selectable, but exactly one primary owns order submission. Change primary_model and restart to switch; automatic failover is not enabled.",
-        "_comment_rpi": "Enable only after exchangeInfo permissionSets confirms RPI for the configured symbol; unsupported symbols fall back to GTX.",
+        "_comment_rpi": "Live startup requires every configured symbol to expose RPI permission and account-specific commission truth.",
         "use_rpi": false,
         "use_rpi_for_avellaneda_stoikov": true,
         "use_rpi_for_glft": true,
-        "use_rpi_for_passive_exit": false,
-        "rpi_fallback_to_gtx": true,
+        "rpi_fallback_to_gtx": false,
+        "rpi_live_policy": {
+            "require_zero_commission": false
+        },
         "_comment_capital_scaling": "Only change capital_multiplier. Order notional and caps scale together.",
         "capital_multiplier": 1.0,
         "capital_scaling": {
@@ -385,14 +407,63 @@
             "reference_min_notional": 5.0,
             "notional_buffer": 1.1
         },
+        "model_readiness": {
+            "_comment": "Paper collects samples in OBSERVE_ONLY until each symbol is ready. Live additionally requires hashed genuine-RPI exposure and OOS evidence; live approval remains intentionally disabled.",
+            "enabled": true,
+            "min_volatility_samples": 50,
+            "min_model_samples": 30,
+            "models": {
+                "glft": {
+                    "min_volatility_samples": 50,
+                    "min_model_samples": 30
+                },
+                "avellaneda_stoikov": {
+                    "min_volatility_samples": 50,
+                    "min_model_samples": 60
+                }
+            },
+            "live_approval": {
+                "manifest_path": "",
+                "min_data_duration_sec": 604800,
+                "min_oos_samples": 10000
+            }
+        },
         "lot_multiplier": 0.18181818,
         "spread_ratio": 0.0005,
         "skew_factor_usdt": 50.0,
         "max_pos_usdt": 18.0,
         "glft": {
-            "_comment": "Paper-validation primary. A/k and volatility must be calibrated in consistent units before any live promotion.",
+            "_comment": "Paper uses configured A/k only as a labeled proxy. Live ignores public aggTrade and requires a hashed LIVE_BINANCE_RPI_ACK exposure artifact.",
             "gamma": 0.1,
             "cycle_interval": 1.0,
+            "alpha": {
+                "enabled": false
+            },
+            "target_inventory_notional_usdt": 0.0,
+            "inventory_lot_notional_usdt": 8.0,
+            "rpi_intensity": {
+                "depth_bin_width_bps": 0.25,
+                "max_initial_book_age_seconds": 1.5,
+                "max_runtime_parameter_ratio": 3.0,
+                "min_sample_count": 30,
+                "min_depth_level_count": 3,
+                "min_total_exposure_seconds": 60.0,
+                "min_fill_count": 10,
+                "min_depth_span_bps": 0.5,
+                "min_k_per_bps": 0.000001,
+                "max_k_per_bps": 100.0
+            },
+            "calibrator": {
+                "window": 1000,
+                "min_samples": 50,
+                "initial_sigma_bps": 10.0,
+                "initial_A": 10.0,
+                "initial_k": 0.8,
+                "learning_rate": 0.005,
+                "sigma_max_bps": 100.0,
+                "sigma_ema_alpha": 0.1,
+                "max_tick_gap_sec": 2.0
+            },
             "execution": {
                 "min_spread_bps": 5.0
             }
@@ -403,6 +474,10 @@
             "k": 1.5,
             "vol_window": 60,
             "cycle_interval": 1.0,
+            "horizon_s": 1.0,
+            "min_sigma_bps": 0.1,
+            "max_tick_gap_sec": 2.0,
+            "inventory_lot_notional_usdt": 8.0,
             "min_spread_ratio": 0.0002
         }
     }

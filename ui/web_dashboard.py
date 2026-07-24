@@ -207,6 +207,166 @@ def _section_unavailable(**extra: Any) -> dict[str, Any]:
     return {"available": False, **extra}
 
 
+def _rest_telemetry_sections(
+    metrics: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Map the REST collector snapshot into stable dashboard sections."""
+    if not isinstance(metrics, Mapping):
+        return (
+            _section_unavailable(
+                instrumented=False,
+                reason="rest_metrics_unavailable",
+            ),
+            _section_unavailable(
+                instrumented=False,
+                reason="rest_metrics_unavailable",
+            ),
+        )
+
+    instrumented = any(
+        key in metrics
+        for key in (
+            "attempt_count",
+            "latest_rtt_ms",
+            "rate_limits",
+            "routes",
+        )
+    )
+    if not instrumented:
+        reason = "rest_metrics_error" if metrics.get("error") else "rest_metrics_unavailable"
+        extra = {"instrumented": False, "reason": reason}
+        if metrics.get("error"):
+            extra["error"] = _redact_text(metrics["error"], 256)
+        return _section_unavailable(**extra), _section_unavailable(**extra)
+
+    def nonnegative_int(value: Any) -> int | None:
+        parsed = _finite_int(value)
+        return max(0, parsed) if parsed is not None else None
+
+    def nonnegative_float(value: Any) -> float | None:
+        parsed = _finite_float(value)
+        return max(0.0, parsed) if parsed is not None else None
+
+    attempt_count = nonnegative_int(metrics.get("attempt_count"))
+    latest_rtt_ms = nonnegative_float(metrics.get("latest_rtt_ms"))
+    peak_rtt_ms = nonnegative_float(metrics.get("peak_rtt_ms"))
+    latest_completed_ns = nonnegative_int(
+        metrics.get("latest_completed_monotonic_ns")
+    )
+    counters = {
+        key: nonnegative_int(metrics.get(key))
+        for key in (
+            "attempt_count",
+            "success_count",
+            "failure_count",
+            "exception_count",
+            "http_429_count",
+            "http_418_count",
+        )
+    }
+
+    routes = {}
+    raw_routes = metrics.get("routes", {})
+    if isinstance(raw_routes, Mapping):
+        for raw_route_key, raw_route in list(raw_routes.items())[:100]:
+            if not isinstance(raw_route, Mapping):
+                continue
+            method = str(raw_route.get("method", "") or "").upper()
+            endpoint = _redact_text(raw_route.get("endpoint", ""), 256)
+            route_key = _redact_text(raw_route_key, 320)
+            routes[route_key] = {
+                "method": method,
+                "endpoint": endpoint,
+                "attempt_count": nonnegative_int(raw_route.get("attempt_count")),
+                "success_count": nonnegative_int(raw_route.get("success_count")),
+                "failure_count": nonnegative_int(raw_route.get("failure_count")),
+                "exception_count": nonnegative_int(
+                    raw_route.get("exception_count")
+                ),
+                "http_429_count": nonnegative_int(
+                    raw_route.get("http_429_count")
+                ),
+                "http_418_count": nonnegative_int(
+                    raw_route.get("http_418_count")
+                ),
+                "latest_status_code": _finite_int(
+                    raw_route.get("latest_status_code")
+                ),
+                "latest_exception_type": _redact_text(
+                    raw_route.get("latest_exception_type", ""),
+                    128,
+                ),
+                "latest_rtt_ms": nonnegative_float(
+                    raw_route.get("latest_rtt_ms")
+                ),
+                "peak_rtt_ms": nonnegative_float(raw_route.get("peak_rtt_ms")),
+                "latest_completed_monotonic_ns": nonnegative_int(
+                    raw_route.get("latest_completed_monotonic_ns")
+                ),
+            }
+
+    latency = {
+        "available": bool(attempt_count and latest_rtt_ms is not None),
+        "instrumented": True,
+        "source": "session.send",
+        "clock": "monotonic",
+        **counters,
+        "latest_method": str(metrics.get("latest_method", "") or "").upper(),
+        "latest_endpoint": _redact_text(metrics.get("latest_endpoint", ""), 256),
+        "latest_status_code": _finite_int(metrics.get("latest_status_code")),
+        "latest_exception_type": _redact_text(
+            metrics.get("latest_exception_type", ""),
+            128,
+        ),
+        "latest_rtt_ms": latest_rtt_ms,
+        "peak_rtt_ms": peak_rtt_ms,
+        "latest_completed_monotonic_ns": latest_completed_ns,
+        "routes": routes,
+    }
+    if not latency["available"]:
+        latency["reason"] = "awaiting_rest_attempt"
+
+    rate_limits = metrics.get("rate_limits", {})
+    normalized_limits = {
+        "used_weight": {},
+        "order_count": {},
+    }
+    if isinstance(rate_limits, Mapping):
+        for kind in normalized_limits:
+            raw_intervals = rate_limits.get(kind, {})
+            if not isinstance(raw_intervals, Mapping):
+                continue
+            for raw_interval, raw_values in list(raw_intervals.items())[:32]:
+                if not isinstance(raw_values, Mapping):
+                    continue
+                interval = str(raw_interval or "").upper()
+                if re.fullmatch(r"[1-9][0-9]*[SMHD]", interval) is None:
+                    continue
+                latest = nonnegative_int(raw_values.get("latest"))
+                peak = nonnegative_int(raw_values.get("peak"))
+                if latest is None and peak is None:
+                    continue
+                normalized_limits[kind][interval] = {
+                    "latest": latest,
+                    "peak": peak,
+                    "latest_completed_monotonic_ns": nonnegative_int(
+                        raw_values.get("latest_completed_monotonic_ns")
+                    ),
+                }
+
+    limits_available = any(normalized_limits.values())
+    api_limits = {
+        "available": limits_available,
+        "instrumented": True,
+        "source": "binance_response_headers",
+        **counters,
+        **normalized_limits,
+    }
+    if not limits_available:
+        api_limits["reason"] = "awaiting_rate_limit_headers"
+    return latency, api_limits
+
+
 class _DashboardHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -323,6 +483,16 @@ class LocalWebDashboard:
                 else web_config.get("publish_interval_sec", 0.20)
             ),
         )
+        self.snapshot_stale_after_sec = max(
+            0.5,
+            float(
+                web_config.get(
+                    "snapshot_stale_after_sec",
+                    max(2.0, self.publish_interval_sec * 5.0),
+                )
+                or max(2.0, self.publish_interval_sec * 5.0)
+            ),
+        )
 
         # Component references are only read by publish_snapshot on its caller's
         # thread.  Request handlers never dereference this dictionary.
@@ -418,6 +588,38 @@ class LocalWebDashboard:
         strategy = config.get("strategy", {}) if isinstance(config, Mapping) else {}
         risk = config.get("risk", {}) if isinstance(config, Mapping) else {}
         limits = risk.get("limits", {}) if isinstance(risk, Mapping) else {}
+        independent_supervisor = (
+            risk.get("independent_supervisor", {})
+            if isinstance(risk, Mapping)
+            else {}
+        )
+        oms = config.get("oms", {}) if isinstance(config, Mapping) else {}
+        venue_dead_man_switch = (
+            oms.get("venue_dead_man_switch", {})
+            if isinstance(oms, Mapping)
+            else {}
+        )
+        single_writer_fence = (
+            oms.get("single_writer_fence", {})
+            if isinstance(oms, Mapping)
+            else {}
+        )
+        truth_monitor = (
+            oms.get("truth_monitor", {})
+            if isinstance(oms, Mapping)
+            else {}
+        )
+        venue_supervisor = (
+            oms.get("venue_supervisor", {})
+            if isinstance(oms, Mapping)
+            else {}
+        )
+        system = config.get("system", {}) if isinstance(config, Mapping) else {}
+        time_sync = (
+            system.get("time_sync", {})
+            if isinstance(system, Mapping)
+            else {}
+        )
         execution = config.get("execution", {}) if isinstance(config, Mapping) else {}
         paper_trade = config.get("paper_trade", {}) if isinstance(config, Mapping) else {}
         raw_mode = (
@@ -499,6 +701,37 @@ class LocalWebDashboard:
             ],
             "strategy_execution_policy": execution_policy,
             "risk_limits": _safe_value(limits) if isinstance(limits, Mapping) else {},
+            "independent_supervisor_required": bool(
+                independent_supervisor.get("enabled", False)
+            )
+            if isinstance(independent_supervisor, Mapping)
+            else False,
+            "venue_dead_man_switch_required": bool(
+                venue_dead_man_switch.get("enabled", False)
+            )
+            if isinstance(venue_dead_man_switch, Mapping)
+            else False,
+            "single_writer_fence_required": bool(
+                single_writer_fence.get("enabled", False)
+            )
+            if isinstance(single_writer_fence, Mapping)
+            else False,
+            "truth_monitor_required": bool(
+                truth_monitor.get("enabled", True)
+            )
+            if isinstance(truth_monitor, Mapping)
+            else True,
+            "venue_supervisor_required": bool(
+                float(venue_supervisor.get("poll_interval_sec", 5.0) or 0.0)
+                > 0.0
+            )
+            if isinstance(venue_supervisor, Mapping)
+            else True,
+            "time_sync_required": bool(
+                time_sync.get("require_healthy_for_trading", True)
+            )
+            if isinstance(time_sync, Mapping)
+            else True,
             "rpi": {
                 "enabled": bool(strategy.get("use_rpi", False))
                 if isinstance(strategy, Mapping)
@@ -600,13 +833,13 @@ class LocalWebDashboard:
             thread.start()
             return self.url
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         """Stop the server.  This operation is idempotent."""
         with self._lifecycle_lock:
             server = self._server
             thread = self._server_thread
             if server is None:
-                return
+                return True
             with self._lock:
                 self._running = False
                 self._service_state = "stopping"
@@ -615,11 +848,18 @@ class LocalWebDashboard:
             server.server_close()
             if thread is not None and thread.is_alive() and thread is not threading.current_thread():
                 thread.join(timeout=2.0)
+            stopped = not thread or not thread.is_alive()
+            if not stopped:
+                with self._lock:
+                    self._service_state = "stop_failed"
+                self.publish_snapshot(force=True)
+                return False
             self._server = None
             self._server_thread = None
             with self._lock:
                 self._service_state = "stopped"
             self.publish_snapshot(force=True)
+            return True
 
     def __enter__(self) -> LocalWebDashboard:
         self.start()
@@ -1272,13 +1512,24 @@ class LocalWebDashboard:
         gateway = self._components.get("gateway")
         if gateway is None:
             return _section_unavailable(
-                latency={"available": False, "reason": "not_instrumented"},
-                api_limits={"available": False, "reason": "not_instrumented"},
+                latency={
+                    "available": False,
+                    "instrumented": False,
+                    "reason": "gateway_unavailable",
+                },
+                api_limits={
+                    "available": False,
+                    "instrumented": False,
+                    "reason": "gateway_unavailable",
+                },
             )
         try:
             state = _enum_value(getattr(gateway, "state", None))
             symbols = [str(symbol).upper() for symbol in getattr(gateway, "symbols", [])]
             ws = getattr(gateway, "ws", None)
+            rest = getattr(gateway, "rest", None)
+            rest_metrics = self._call_snapshot(rest, "get_metrics_snapshot")
+            latency, api_limits = _rest_telemetry_sections(rest_metrics)
             ws_active = bool(getattr(ws, "active", False)) if ws is not None else False
             streams = []
             ws_lock = getattr(ws, "lock", None)
@@ -1313,10 +1564,8 @@ class LocalWebDashboard:
                     "active": ws_active,
                     "connected_streams": streams,
                 },
-                # These fields exist in the base class but are not populated by
-                # the current gateway, so zero must not be represented as data.
-                "latency": {"available": False, "reason": "not_instrumented"},
-                "api_limits": {"available": False, "reason": "not_instrumented"},
+                "latency": latency,
+                "api_limits": api_limits,
             }
         except Exception as exc:
             return _section_unavailable(error=f"{type(exc).__name__}:{_redact_text(exc)}")
@@ -1670,6 +1919,22 @@ class LocalWebDashboard:
         if monitor is None:
             return _section_unavailable()
         try:
+            last_snapshot_monotonic = _finite_float(
+                getattr(
+                    monitor,
+                    "last_account_snapshot_monotonic",
+                    0.0,
+                ),
+                0.0,
+            ) or 0.0
+            last_commission_monotonic = _finite_float(
+                getattr(
+                    monitor,
+                    "last_rpi_commission_poll_monotonic",
+                    0.0,
+                ),
+                0.0,
+            ) or 0.0
             return {
                 "available": True,
                 "active": bool(getattr(monitor, "active", False)),
@@ -1685,6 +1950,60 @@ class LocalWebDashboard:
                 "clean_polls": _finite_int(getattr(monitor, "clean_polls", 0), 0),
                 "cash_flow_truth_enabled": bool(
                     getattr(monitor, "cash_flow_truth_enabled", False)
+                ),
+                "rpi_commission_truth_required": bool(
+                    getattr(
+                        monitor,
+                        "rpi_commission_truth_required",
+                        False,
+                    )
+                ),
+                "rpi_commission_poll_interval_sec": _finite_float(
+                    getattr(
+                        monitor,
+                        "rpi_commission_poll_interval_sec",
+                        None,
+                    )
+                ),
+                "consecutive_rpi_commission_failures": _finite_int(
+                    getattr(
+                        monitor,
+                        "consecutive_rpi_commission_failures",
+                        0,
+                    ),
+                    0,
+                ),
+                "clean_rpi_commission_polls": _finite_int(
+                    getattr(
+                        monitor,
+                        "clean_rpi_commission_polls",
+                        0,
+                    ),
+                    0,
+                ),
+                "last_rpi_commission_rates": dict(
+                    getattr(
+                        monitor,
+                        "last_rpi_commission_rates",
+                        {},
+                    )
+                    or {}
+                ),
+                "last_rpi_commission_poll_age_sec": (
+                    max(
+                        0.0,
+                        time.perf_counter() - last_commission_monotonic,
+                    )
+                    if last_commission_monotonic > 0.0
+                    else None
+                ),
+                "last_snapshot_age_sec": (
+                    max(
+                        0.0,
+                        time.perf_counter() - last_snapshot_monotonic,
+                    )
+                    if last_snapshot_monotonic > 0.0
+                    else None
                 ),
             }
         except Exception as exc:
@@ -1781,6 +2100,12 @@ class LocalWebDashboard:
             ),
             "health_event": self._system_health,
         }
+        readiness = self._build_readiness_locked(
+            now=now,
+            system=system,
+            risk_status=risk_status,
+        )
+        system["readiness"] = readiness
         account = self._account_snapshot_locked()
         environment = {
             "available": True,
@@ -1844,6 +2169,7 @@ class LocalWebDashboard:
                 "configured_symbols": list(self._config_view["symbols"]),
             },
             "startup": deepcopy(self._startup_status),
+            "readiness": readiness,
             "environment": environment,
             "system": system,
             "account": account,
@@ -1898,6 +2224,222 @@ class LocalWebDashboard:
             },
             "logs": deepcopy(list(self._logs)),
             "alerts": deepcopy(list(self._alerts)),
+        }
+
+    def _build_readiness_locked(
+        self,
+        *,
+        now: float,
+        system: Mapping[str, Any],
+        risk_status: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        reasons = []
+
+        startup = self._startup_status
+        startup_state = str(startup.get("state", "UNKNOWN") or "UNKNOWN")
+        if not self._running:
+            reasons.append("dashboard_not_running")
+        if startup_state != "RUNNING":
+            reasons.append(f"startup_state:{startup_state}")
+        if not bool(startup.get("execution_enabled", False)):
+            reasons.append("execution_disabled")
+
+        gateway = system.get("gateway", {})
+        if not isinstance(gateway, Mapping) or not gateway.get("available"):
+            reasons.append("gateway_unavailable")
+        else:
+            gateway_state = str(gateway.get("state", "") or "").upper()
+            if not gateway.get("active") or gateway_state != "READY":
+                reasons.append(
+                    f"gateway_not_ready:{gateway_state or 'UNKNOWN'}"
+                )
+
+        oms = system.get("oms", {})
+        capability = (
+            oms.get("capability", {})
+            if isinstance(oms, Mapping)
+            else {}
+        )
+        if not isinstance(oms, Mapping) or not oms.get("available"):
+            reasons.append("oms_unavailable")
+        else:
+            oms_state = str(oms.get("state", "") or "").upper()
+            capability_mode = str(
+                oms.get(
+                    "capability_mode",
+                    capability.get("mode", "")
+                    if isinstance(capability, Mapping)
+                    else "",
+                )
+                or ""
+            ).upper()
+            if oms_state != "LIVE":
+                reasons.append(f"oms_not_live:{oms_state or 'UNKNOWN'}")
+            if capability_mode != "LIVE":
+                reasons.append(
+                    "oms_capability_not_live:"
+                    f"{capability_mode or 'UNKNOWN'}"
+                )
+            outbound_gate = (
+                capability.get("outbound_gate", {})
+                if isinstance(capability, Mapping)
+                else {}
+            )
+            if (
+                not isinstance(outbound_gate, Mapping)
+                or outbound_gate.get("open") is not True
+            ):
+                reasons.append("oms_outbound_gate_closed")
+
+        if not isinstance(risk_status, Mapping) or not risk_status.get(
+            "available",
+            True,
+        ):
+            reasons.append("risk_status_unavailable")
+        else:
+            if risk_status.get("active") is not True:
+                reasons.append("risk_manager_inactive")
+            if risk_status.get("kill_switch_triggered") is True:
+                reasons.append(
+                    "kill_switch:"
+                    f"{risk_status.get('kill_state', 'UNKNOWN')}"
+                )
+            if risk_status.get("frozen_symbols"):
+                reasons.append("risk_symbol_guard_active")
+            if risk_status.get("frozen_venues"):
+                reasons.append("risk_venue_guard_active")
+
+        if self._config_view["independent_supervisor_required"]:
+            supervisor = system.get("risk_supervisor", {})
+            if (
+                not isinstance(supervisor, Mapping)
+                or not supervisor.get("available")
+                or supervisor.get("enabled") is not True
+                or supervisor.get("process_alive") is not True
+                or supervisor.get("healthy") is not True
+            ):
+                reasons.append("risk_supervisor_unhealthy")
+            elif supervisor.get("kill_latched") is True:
+                reasons.append("risk_supervisor_kill_latched")
+            elif supervisor.get("quiesced") is True:
+                reasons.append("risk_supervisor_quiesced")
+
+        if self._config_view["venue_dead_man_switch_required"]:
+            dms = (
+                capability.get("venue_dead_man_switch", {})
+                if isinstance(capability, Mapping)
+                else {}
+            )
+            if (
+                not isinstance(dms, Mapping)
+                or dms.get("enabled") is not True
+                or dms.get("valid") is not True
+            ):
+                reasons.append("venue_dead_man_switch_invalid")
+
+        if self._config_view["single_writer_fence_required"]:
+            fence = (
+                capability.get("single_writer_fence", {})
+                if isinstance(capability, Mapping)
+                else {}
+            )
+            if not isinstance(fence, Mapping) or fence.get("held") is not True:
+                reasons.append("single_writer_fence_not_held")
+
+        if self._config_view["time_sync_required"]:
+            clock = system.get("time_service", {})
+            if (
+                not isinstance(clock, Mapping)
+                or not clock.get("available")
+                or clock.get("active") is not True
+                or clock.get("ready") is not True
+            ):
+                reasons.append("clock_not_ready")
+
+        if self._config_view["truth_monitor_required"]:
+            truth = system.get("truth_monitor", {})
+            truth_age = (
+                _finite_float(truth.get("last_snapshot_age_sec"))
+                if isinstance(truth, Mapping)
+                else None
+            )
+            poll_interval = (
+                _finite_float(truth.get("poll_interval_sec"), 5.0)
+                if isinstance(truth, Mapping)
+                else 5.0
+            ) or 5.0
+            truth_stale_after = max(3.0, poll_interval * 2.5)
+            if (
+                not isinstance(truth, Mapping)
+                or not truth.get("available")
+                or truth.get("active") is not True
+            ):
+                reasons.append("truth_monitor_inactive")
+            elif int(truth.get("consecutive_api_failures", 0) or 0) > 0:
+                reasons.append("truth_monitor_api_failure")
+            elif truth_age is None or truth_age > truth_stale_after:
+                reasons.append("truth_snapshot_stale")
+            if truth.get("rpi_commission_truth_required") is True:
+                commission_failures = int(
+                    truth.get(
+                        "consecutive_rpi_commission_failures",
+                        0,
+                    )
+                    or 0
+                )
+                commission_age = _finite_float(
+                    truth.get("last_rpi_commission_poll_age_sec")
+                )
+                commission_interval = (
+                    _finite_float(
+                        truth.get("rpi_commission_poll_interval_sec")
+                    )
+                    or 30.0
+                )
+                if commission_failures > 0:
+                    reasons.append("rpi_commission_truth_failure")
+                elif (
+                    commission_age is None
+                    or commission_age
+                    > max(10.0, commission_interval * 2.5)
+                ):
+                    reasons.append("rpi_commission_truth_stale")
+
+        if self._config_view["venue_supervisor_required"]:
+            venue = system.get("venue_supervisor", {})
+            if (
+                not isinstance(venue, Mapping)
+                or not venue.get("available")
+                or venue.get("active") is not True
+            ):
+                reasons.append("venue_supervisor_inactive")
+
+        event_engine = system.get("event_engine", {})
+        if (
+            not isinstance(event_engine, Mapping)
+            or not event_engine.get("available")
+            or event_engine.get("active") is not True
+        ):
+            reasons.append("event_engine_inactive")
+
+        strategy_runtime = system.get("strategy_runtime", {})
+        if (
+            not isinstance(strategy_runtime, Mapping)
+            or not strategy_runtime.get("available")
+            or strategy_runtime.get("active") is not True
+        ):
+            reasons.append("strategy_runtime_inactive")
+
+        ready = not reasons
+        return {
+            "available": True,
+            "ready": ready,
+            "status": "ready" if ready else "not_ready",
+            "reason": reasons[0] if reasons else "",
+            "reasons": reasons,
+            "evaluated_at": _utc_iso(now),
+            "evaluated_at_unix": now,
+            "snapshot_stale_after_sec": self.snapshot_stale_after_sec,
         }
 
     def _account_snapshot_locked(self) -> dict[str, Any]:
@@ -2556,15 +3098,39 @@ class LocalWebDashboard:
 
     def _get_health_json(self) -> bytes:
         with self._lock:
-            age = max(0.0, time.time() - self._published_at) if self._published_at else None
+            age = (
+                max(
+                    0.0,
+                    time.perf_counter() - self._last_publish_monotonic,
+                )
+                if self._last_publish_monotonic
+                else None
+            )
+            stale = bool(
+                age is None or age > self.snapshot_stale_after_sec
+            )
+            readiness = self._published_snapshot.get("readiness", {})
             payload = {
-                "status": "ok" if self._running else self._service_state,
+                "status": (
+                    "stale"
+                    if self._running and stale
+                    else "ok"
+                    if self._running
+                    else self._service_state
+                ),
                 "engine_status": self._startup_status["state"],
                 "startup_blocked": self._startup_status["startup_blocked"],
                 "execution_enabled": self._startup_status["execution_enabled"],
                 "restart_required": self._startup_status["restart_required"],
+                "readiness_status": (
+                    readiness.get("status", "not_ready")
+                    if isinstance(readiness, Mapping)
+                    else "not_ready"
+                ),
                 "sequence": self._published_sequence,
                 "snapshot_age_sec": age,
+                "snapshot_stale": stale,
+                "snapshot_stale_after_sec": self.snapshot_stale_after_sec,
                 "generated_at": _utc_iso(self._published_at) if self._published_at else None,
             }
         return json.dumps(
@@ -2580,7 +3146,45 @@ class LocalWebDashboard:
             execution_enabled = bool(
                 self._startup_status.get("execution_enabled", False)
             )
-            ready = bool(self._running and state == "RUNNING" and execution_enabled)
+            age = (
+                max(
+                    0.0,
+                    time.perf_counter() - self._last_publish_monotonic,
+                )
+                if self._last_publish_monotonic
+                else None
+            )
+            published = self._published_snapshot.get("readiness", {})
+            published_ready = bool(
+                isinstance(published, Mapping)
+                and published.get("ready") is True
+            )
+            reasons = (
+                list(published.get("reasons", []))
+                if isinstance(published, Mapping)
+                and isinstance(published.get("reasons", []), list)
+                else []
+            )
+            stale = bool(
+                age is None or age > self.snapshot_stale_after_sec
+            )
+            if stale and "dashboard_snapshot_stale" not in reasons:
+                reasons.append("dashboard_snapshot_stale")
+            if not self._running and "dashboard_not_running" not in reasons:
+                reasons.append("dashboard_not_running")
+            if state != "RUNNING":
+                state_reason = f"startup_state:{state}"
+                if state_reason not in reasons:
+                    reasons.append(state_reason)
+            if not execution_enabled and "execution_disabled" not in reasons:
+                reasons.append("execution_disabled")
+            ready = bool(
+                self._running
+                and not stale
+                and state == "RUNNING"
+                and execution_enabled
+                and published_ready
+            )
             payload = {
                 "status": "ready" if ready else "not_ready",
                 "engine_status": state,
@@ -2591,7 +3195,16 @@ class LocalWebDashboard:
                 "restart_required": bool(
                     self._startup_status.get("restart_required", False)
                 ),
-                "reason": self._startup_status.get("reason", ""),
+                "reason": (
+                    reasons[0]
+                    if reasons
+                    else self._startup_status.get("reason", "")
+                ),
+                "reasons": reasons,
+                "sequence": self._published_sequence,
+                "snapshot_age_sec": age,
+                "snapshot_stale": stale,
+                "snapshot_stale_after_sec": self.snapshot_stale_after_sec,
             }
         encoded = json.dumps(
             payload,

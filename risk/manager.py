@@ -19,6 +19,20 @@ from event.type import (
 from infrastructure.logger import logger
 from infrastructure.time_service import time_service
 from oms.journal import JournalError
+from risk.deployment_loss import (
+    MAX_CANARY_DEPLOYED_EQUITY_FRACTION,
+    deployed_capital_within_equity_limit,
+    deployment_policy_fingerprint,
+    deployment_loss_action,
+    update_deployment_loss,
+)
+from risk.funding_guard import (
+    FundingGuardDecision,
+    FundingGuardPolicy,
+    FundingGuardState,
+    FundingObservation,
+    evaluate_funding_guard,
+)
 
 
 class RiskManager:
@@ -36,12 +50,17 @@ class RiskManager:
         self.engine = engine
         self.oms = oms
         self.gateway = gateway
+        self.root_config = config
         self.config = config.get("risk", {})
 
         self.active = self.config.get("active", True)
         self.independent_supervisor_enabled = bool(
             self.config.get("independent_supervisor", {}).get("enabled", False)
         )
+        self._venue_dms_renewal_authorized = True
+        self._venue_dms_supervisor_healthy = True
+        self._venue_dms_failure_reason = ""
+        self._last_venue_dms_renewal_result = None
         self.kill_switch_triggered = False
         self.kill_reason = ""
 
@@ -52,6 +71,56 @@ class RiskManager:
         self.max_account_gross_notional = limits.get("max_account_gross_notional", 0.0)
         self.max_daily_loss = limits.get("max_daily_loss", 500.0)
         self.max_drawdown_pct = limits.get("max_drawdown_pct", 0.0)
+        live_launch = config.get("live_launch", {}) or {}
+        self.deployment_id = str(
+            live_launch.get("deployment_id", "") or ""
+        ).strip()
+        self.declared_account_equity = max(
+            0.0,
+            float(
+                live_launch.get("declared_account_equity_usdt", 0.0)
+                or 0.0
+            ),
+        )
+        self.max_deployed_capital = max(
+            0.0,
+            float(
+                live_launch.get("max_deployed_capital_usdt", 0.0)
+                or 0.0
+            ),
+        )
+        self.max_deployment_loss = max(
+            0.0,
+            float(
+                live_launch.get("max_deployment_loss_usdt", 0.0)
+                or 0.0
+            ),
+        )
+        self.deployment_loss_reduce_only_fraction = min(
+            1.0,
+            max(
+                0.0,
+                float(
+                    live_launch.get(
+                        "deployment_loss_reduce_only_fraction",
+                        0.80,
+                    )
+                    or 0.0
+                ),
+            ),
+        )
+        self.deployment_policy_fingerprint = deployment_policy_fingerprint(
+            deployment_id=self.deployment_id,
+            symbols=config.get("symbols", []),
+            declared_account_equity=self.declared_account_equity,
+            max_deployed_capital=self.max_deployed_capital,
+            maximum_loss=self.max_deployment_loss,
+            reduce_only_fraction=self.deployment_loss_reduce_only_fraction,
+        )
+        self.deployment_start_equity = 0.0
+        self.deployment_start_external_cash_flow_total = 0.0
+        self.deployment_adjusted_equity = 0.0
+        self.deployment_loss = 0.0
 
         sanity = self.config.get("price_sanity", {})
         self.max_deviation_pct = sanity.get("max_deviation_pct", 0.05)
@@ -83,6 +152,47 @@ class RiskManager:
         self.freshness_breach_by_symbol = defaultdict(int)
         self.freshness_recovery_by_symbol = defaultdict(int)
 
+        funding = self.config.get("funding_guard", {})
+        funding = funding if isinstance(funding, dict) else {}
+        self.funding_guard_policy = FundingGuardPolicy(
+            enabled=bool(funding.get("enabled", False)),
+            require_snapshot=bool(
+                funding.get(
+                    "require_snapshot",
+                    funding.get("enabled", False),
+                )
+            ),
+            max_snapshot_age_ms=float(
+                funding.get("max_snapshot_age_ms", 3000.0) or 3000.0
+            ),
+            pre_funding_reduce_only_sec=float(
+                funding.get(
+                    "pre_funding_reduce_only_sec",
+                    600.0,
+                )
+                or 600.0
+            ),
+            post_funding_hold_sec=float(
+                funding.get("post_funding_hold_sec", 120.0) or 120.0
+            ),
+            max_abs_funding_rate=float(
+                funding.get("max_abs_funding_rate", 0.0005) or 0.0005
+            ),
+            max_next_funding_horizon_sec=float(
+                funding.get(
+                    "max_next_funding_horizon_sec",
+                    32_400.0,
+                )
+                or 32_400.0
+            ),
+            recovery_updates=int(
+                funding.get("recovery_updates", 5) or 5
+            ),
+        )
+        self.funding_guard_lock = threading.RLock()
+        self.funding_guard_states: dict[str, FundingGuardState] = {}
+        self.funding_guard_decisions: dict[str, FundingGuardDecision] = {}
+
         tech = self.config.get("tech_health", {})
         self.max_latency_ms = tech.get("max_latency_ms", 1000)
         self.max_processing_lag_ms = tech.get("max_processing_lag_ms", self.max_latency_ms)
@@ -109,6 +219,15 @@ class RiskManager:
             self.kill_verify_interval_sec,
             float(kill_config.get("flatten_retry_sec", 5.0) or 5.0),
         )
+        self.kill_empty_snapshots_required = max(
+            2,
+            int(kill_config.get("empty_snapshots_required", 2) or 2),
+        )
+        self._kill_empty_order_snapshots = 0
+        self._kill_empty_flat_snapshots = 0
+        self._kill_last_accepted_snapshot_at = 0.0
+        self._kill_state_lock = threading.RLock()
+        self._kill_verification_lock = threading.Lock()
         self._kill_supervisor_thread = None
         self._kill_supervisor_lock = threading.Lock()
 
@@ -259,6 +378,8 @@ class RiskManager:
         cash_flow_snapshot_time = float(
             getattr(account, "cash_flow_snapshot_time", 0.0) or 0.0
         )
+        with self.funding_guard_lock:
+            funding_guard_decisions = dict(self.funding_guard_decisions)
         now = time.time()
         return {
             "active": bool(self.active),
@@ -271,9 +392,29 @@ class RiskManager:
             "peak_drawdown_pct": peak_drawdown_pct,
             "max_daily_loss": self.max_daily_loss,
             "max_drawdown_pct": self.max_drawdown_pct,
+            "deployment_id": self.deployment_id,
+            "deployment_start_equity": self.deployment_start_equity,
+            "deployment_adjusted_equity": self.deployment_adjusted_equity,
+            "deployment_loss": self.deployment_loss,
+            "max_deployment_loss": self.max_deployment_loss,
+            "declared_account_equity": self.declared_account_equity,
+            "max_deployed_capital": self.max_deployed_capital,
+            "deployment_policy_fingerprint": (
+                self.deployment_policy_fingerprint
+            ),
             "kill_switch_triggered": bool(self.kill_switch_triggered),
             "kill_state": self.kill_state,
             "kill_reason": self.kill_reason,
+            "venue_dms_renewal_authorized": bool(
+                self._venue_dms_renewal_authorized
+            ),
+            "venue_dms_supervisor_healthy": bool(
+                self._venue_dms_supervisor_healthy
+            ),
+            "venue_dms_failure_reason": self._venue_dms_failure_reason,
+            "last_venue_dms_renewal_result": (
+                self._last_venue_dms_renewal_result
+            ),
             "maintenance_margin_ratio": float(
                 getattr(account, "maintenance_margin_ratio", 0.0) or 0.0
             ),
@@ -310,14 +451,162 @@ class RiskManager:
             "exchange_clock_offset_ms": float(
                 getattr(time_service, "offset", 0.0) or 0.0
             ),
+            "funding_guard": {
+                "enabled": bool(self.funding_guard_policy.enabled),
+                "healthy": bool(
+                    not self.funding_guard_policy.enabled
+                    or (
+                        funding_guard_decisions
+                        and all(
+                            decision.healthy
+                            for decision in funding_guard_decisions.values()
+                        )
+                    )
+                ),
+                "symbols": {
+                    symbol: {
+                        "action": decision.action,
+                        "reason": decision.reason,
+                        "funding_rate": decision.funding_rate,
+                        "seconds_to_funding": decision.seconds_to_funding,
+                        "snapshot_age_ms": decision.snapshot_age_ms,
+                        "post_hold_remaining_sec": (
+                            decision.post_hold_remaining_sec
+                        ),
+                        "healthy_updates": (
+                            decision.consecutive_healthy_updates
+                        ),
+                        "required_recovery_updates": (
+                            decision.required_recovery_updates
+                        ),
+                    }
+                    for symbol, decision in funding_guard_decisions.items()
+                },
+            },
         }
 
-    def _renew_venue_dead_man_switch(self) -> bool:
-        if self.oms is None:
-            return True
+    def set_venue_dms_supervisor_health(self, healthy: bool) -> None:
+        previous = bool(self._venue_dms_supervisor_healthy)
+        self._venue_dms_supervisor_healthy = bool(healthy)
+        if self._venue_dms_supervisor_healthy or not previous:
+            return
+        dms_enabled = bool(
+            (
+                self.root_config.get("oms", {}).get(
+                    "venue_dead_man_switch",
+                    {},
+                )
+                or {}
+            ).get("enabled", False)
+        )
         oms_state = str(
             getattr(getattr(self.oms, "state", None), "value", "") or ""
         ).upper()
+        if dms_enabled and oms_state == "LIVE":
+            self._latch_venue_dead_man_switch_failure(
+                "independent_supervisor_unhealthy"
+            )
+
+    def _latch_venue_dead_man_switch_failure(self, reason: str) -> bool:
+        reason = str(reason or "renewal_health_invalid")
+        self._venue_dms_renewal_authorized = False
+        self._venue_dms_failure_reason = reason
+        self._last_venue_dms_renewal_result = False
+        latch_reason = f"venue_dead_man_switch:{reason}"
+
+        logger.critical(
+            "[Risk] Venue dead-man switch safety latch engaged: "
+            f"{reason}"
+        )
+        handle_unhealthy = getattr(
+            self.oms,
+            "handle_venue_dead_man_switch_unhealthy",
+            None,
+        )
+        if callable(handle_unhealthy):
+            try:
+                if handle_unhealthy(reason) is False:
+                    return False
+            except Exception as exc:
+                logger.critical(
+                    "[Risk] DMS safety handler failed: "
+                    f"{type(exc).__name__}:{exc}"
+                )
+
+        freeze = getattr(self.oms, "freeze_system", None)
+        if callable(freeze):
+            try:
+                freeze(latch_reason, cancel_active_orders=True)
+                return False
+            except Exception as exc:
+                logger.critical(
+                    "[Risk] DMS freeze/cancel request failed: "
+                    f"{type(exc).__name__}:{exc}"
+                )
+
+        halt = getattr(self.oms, "halt_system", None)
+        if callable(halt):
+            try:
+                halt(latch_reason)
+            except Exception as exc:
+                logger.critical(
+                    "[Risk] DMS fallback halt/cancel request failed: "
+                    f"{type(exc).__name__}:{exc}"
+                )
+        return False
+
+    def _renew_venue_dead_man_switch(self) -> bool:
+        dms_config = (
+            self.root_config.get("oms", {}).get(
+                "venue_dead_man_switch",
+                {},
+            )
+            or {}
+        )
+        if not bool(dms_config.get("enabled", False)):
+            return True
+        if self.oms is None:
+            return False
+        if (
+            not bool(self._venue_dms_renewal_authorized)
+            or not bool(self._venue_dms_supervisor_healthy)
+        ):
+            return False
+
+        oms_state = str(
+            getattr(getattr(self.oms, "state", None), "value", "") or ""
+        ).upper()
+        if oms_state != "LIVE":
+            return True
+
+        snapshot_reader = getattr(
+            self.oms,
+            "get_venue_dead_man_switch_snapshot",
+            None,
+        )
+        if not callable(snapshot_reader):
+            return self._latch_venue_dead_man_switch_failure(
+                "health_snapshot_unavailable"
+            )
+        try:
+            snapshot = snapshot_reader()
+        except Exception as exc:
+            return self._latch_venue_dead_man_switch_failure(
+                f"health_snapshot_failed:{type(exc).__name__}:{exc}"
+            )
+        if not isinstance(snapshot, dict):
+            return self._latch_venue_dead_man_switch_failure(
+                "health_snapshot_invalid"
+            )
+        if not bool(snapshot.get("enabled", False)):
+            return self._latch_venue_dead_man_switch_failure(
+                "unexpectedly_disabled"
+            )
+        if not bool(snapshot.get("valid", False)):
+            return self._latch_venue_dead_man_switch_failure(
+                str(snapshot.get("reason", "") or "renewal_health_invalid")
+            )
+
         has_guards = any(
             bool(getattr(self.oms, name, {}))
             for name in (
@@ -327,10 +616,34 @@ class RiskManager:
                 "strategy_symbol_guards",
             )
         )
-        if oms_state in {"BOOTSTRAP", "FROZEN", "RECONCILING", "HALTED"} or has_guards:
-            # Do not extend exchange-side order lifetimes while local execution
-            # is guarded. The DMS countdown is the fallback if mass cancel fails.
-            return True
+        mode_constraints = bool(
+            getattr(self.oms, "mode_constraints", {}) or {}
+        )
+        can_open_new_risk = getattr(self.oms, "can_open_new_risk", None)
+        if (
+            not self.active
+            or self.kill_switch_triggered
+            or bool(getattr(self.oms, "_shutdown_requested", False))
+            or bool(getattr(self.oms, "_stopped", False))
+            or has_guards
+            or mode_constraints
+            or not callable(can_open_new_risk)
+            or not bool(can_open_new_risk())
+        ):
+            # Let the venue countdown expire whenever any local or independent
+            # safety constraint has stopped new risk.
+            return False
+
+        renewal_allowed = getattr(
+            self.oms,
+            "can_renew_venue_dead_man_switch",
+            None,
+        )
+        if not callable(renewal_allowed) or not bool(renewal_allowed()):
+            return self._latch_venue_dead_man_switch_failure(
+                "renewal_not_permitted"
+            )
+
         renew = getattr(
             self.oms,
             "request_venue_dead_man_switch_renewal",
@@ -339,8 +652,31 @@ class RiskManager:
         if not callable(renew):
             renew = getattr(self.oms, "renew_venue_dead_man_switch", None)
         if not callable(renew):
+            return self._latch_venue_dead_man_switch_failure(
+                "renewal_method_unavailable"
+            )
+        try:
+            renewed = bool(renew())
+        except Exception as exc:
+            return self._latch_venue_dead_man_switch_failure(
+                f"renewal_request_failed:{type(exc).__name__}:{exc}"
+            )
+
+        self._last_venue_dms_renewal_result = renewed
+        if renewed:
             return True
-        return bool(renew())
+        try:
+            failed_snapshot = snapshot_reader()
+        except Exception:
+            failed_snapshot = {}
+        failure_reason = (
+            str(failed_snapshot.get("reason", "") or "")
+            if isinstance(failed_snapshot, dict)
+            else ""
+        )
+        return self._latch_venue_dead_man_switch_failure(
+            failure_reason or "renewal_request_rejected"
+        )
 
     @staticmethod
     def _current_risk_day() -> str:
@@ -376,6 +712,66 @@ class RiskManager:
         self.kill_state = str(latest.get("kill_state", "ARMED") or "ARMED")
         self.kill_reason = str(latest.get("kill_reason", "") or "")
         self.kill_switch_triggered = bool(latest.get("kill_switch_triggered", False))
+        stored_deployment_id = str(
+            latest.get("deployment_id", "") or ""
+        ).strip()
+        if self.deployment_id and not stored_deployment_id:
+            self.kill_switch_triggered = True
+            self.kill_state = "FAILED"
+            self.kill_reason = "deployment_identity_missing_from_journal"
+            return
+        if (
+            stored_deployment_id
+            and self.deployment_id
+            and stored_deployment_id != self.deployment_id
+        ):
+            self.kill_switch_triggered = True
+            self.kill_state = "FAILED"
+            self.kill_reason = (
+                "deployment_identity_mismatch:"
+                f"{stored_deployment_id}!={self.deployment_id}"
+            )
+            return
+        if not self.deployment_id:
+            self.deployment_id = stored_deployment_id
+        stored_policy_fingerprint = str(
+            latest.get("deployment_policy_fingerprint", "") or ""
+        ).strip()
+        if (
+            self.deployment_policy_fingerprint
+            and not stored_policy_fingerprint
+        ):
+            self.kill_switch_triggered = True
+            self.kill_state = "FAILED"
+            self.kill_reason = "deployment_policy_missing_from_journal"
+            return
+        if (
+            stored_policy_fingerprint
+            and self.deployment_policy_fingerprint
+            and stored_policy_fingerprint
+            != self.deployment_policy_fingerprint
+        ):
+            self.kill_switch_triggered = True
+            self.kill_state = "FAILED"
+            self.kill_reason = "deployment_policy_mismatch"
+            return
+        self.deployment_start_equity = float(
+            latest.get("deployment_start_equity", 0.0) or 0.0
+        )
+        self.deployment_start_external_cash_flow_total = float(
+            latest.get(
+                "deployment_start_external_cash_flow_total",
+                0.0,
+            )
+            or 0.0
+        )
+        self.deployment_adjusted_equity = float(
+            latest.get("deployment_adjusted_equity", 0.0) or 0.0
+        )
+        self.deployment_loss = max(
+            0.0,
+            float(latest.get("deployment_loss", 0.0) or 0.0),
+        )
 
     def _persist_risk_state(self, reason: str):
         journal = getattr(self.oms, "journal", None)
@@ -390,6 +786,20 @@ class RiskManager:
                     "day_start_external_cash_flow_total": self.initial_external_cash_flow_total,
                     "peak_equity": self.peak_equity,
                     "last_equity": self.last_equity,
+                    "deployment_id": self.deployment_id,
+                    "deployment_policy_fingerprint": (
+                        self.deployment_policy_fingerprint
+                    ),
+                    "deployment_start_equity": (
+                        self.deployment_start_equity
+                    ),
+                    "deployment_start_external_cash_flow_total": (
+                        self.deployment_start_external_cash_flow_total
+                    ),
+                    "deployment_adjusted_equity": (
+                        self.deployment_adjusted_equity
+                    ),
+                    "deployment_loss": self.deployment_loss,
                     "kill_switch_triggered": self.kill_switch_triggered,
                     "kill_state": self.kill_state,
                     "kill_reason": self.kill_reason,
@@ -416,6 +826,7 @@ class RiskManager:
         self.kill_switch_triggered = False
         self.kill_reason = ""
         self.kill_state = "ARMED"
+        self._reset_kill_empty_snapshots()
         self._persist_risk_state("oms_manual_rearm_completed")
 
     def can_operator_rearm(self) -> bool:
@@ -441,12 +852,19 @@ class RiskManager:
             )
             self._set_kill_state("FAILED", "invalid_recovered_kill_state")
 
+        recovered_state = self.kill_state
+        if recovered_state == "FAILED":
+            with self._kill_state_lock:
+                self._reset_kill_empty_snapshots()
+                self.kill_state = "TRIGGERED"
+            self._persist_risk_state("kill_supervision_retry_after_failure")
+
         logger.critical(
-            f"[KillSwitch] Resuming interrupted sequence from {self.kill_state}: "
+            f"[KillSwitch] Resuming interrupted sequence from {recovered_state}: "
             f"{self.kill_reason or 'recovered kill switch'}"
         )
         self._persist_risk_state("kill_supervision_resumed")
-        if not self._verify_kill_state_once(allow_flatten=True):
+        if not self._verify_kill_state_safely(allow_flatten=True):
             self._start_kill_supervisor()
         return True
 
@@ -511,6 +929,8 @@ class RiskManager:
 
     def on_mark_price(self, event: Event):
         self._refresh_rearm_state()
+        if self.active and self.funding_guard_policy.enabled:
+            self._evaluate_funding_mark(event.data)
         if self.kill_switch_triggered or not self.active:
             return
 
@@ -538,6 +958,222 @@ class RiskManager:
         if symbol:
             self.divergence_breach_by_symbol[symbol] = 0
             self._recover_symbol_if_stable(symbol, prefix="divergence:")
+
+    @staticmethod
+    def _next_funding_epoch(data) -> float:
+        raw_timestamp = getattr(data, "next_funding_timestamp", 0.0)
+        try:
+            parsed = float(raw_timestamp or 0.0)
+        except (TypeError, ValueError):
+            parsed = 0.0
+        if parsed > 0.0:
+            return parsed
+        next_funding_time = getattr(data, "next_funding_time", None)
+        timestamp = getattr(next_funding_time, "timestamp", None)
+        if not callable(timestamp):
+            return 0.0
+        try:
+            return float(timestamp())
+        except (OSError, OverflowError, TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _funding_observation_id(
+        symbol: str,
+        exchange_timestamp,
+    ) -> str:
+        try:
+            exchange_timestamp = float(exchange_timestamp or 0.0)
+        except (TypeError, ValueError):
+            return ""
+        if math.isfinite(exchange_timestamp) and exchange_timestamp > 0.0:
+            return f"{symbol}:{exchange_timestamp:.6f}"
+        return ""
+
+    def _evaluate_funding_observation(
+        self,
+        symbol: str,
+        observation: FundingObservation | None,
+        *,
+        now_monotonic: float,
+    ) -> bool:
+        symbol = str(symbol or "").strip().upper()
+        if not symbol:
+            return False
+        with self.funding_guard_lock:
+            previous = self.funding_guard_states.get(symbol)
+            if previous is None:
+                previous = FundingGuardState(
+                    reason="funding_guard:startup_hold",
+                    post_hold_until_monotonic=(
+                        now_monotonic
+                        + self.funding_guard_policy.post_funding_hold_sec
+                    ),
+                )
+            decision, next_state = evaluate_funding_guard(
+                self.funding_guard_policy,
+                observation,
+                previous,
+                now_monotonic=now_monotonic,
+            )
+            self.funding_guard_states[symbol] = next_state
+            self.funding_guard_decisions[symbol] = decision
+            if decision.blocks_open_risk:
+                constraint_reason = decision.reason
+                if constraint_reason.startswith(
+                    "funding_guard:recovery_pending:"
+                ):
+                    constraint_reason = "funding_guard:recovery_pending"
+                self._set_trading_mode(
+                    OMSCapabilityMode.REDUCE_ONLY,
+                    constraint_reason,
+                )
+                return False
+            return True
+
+    def _evaluate_funding_mark(self, data) -> bool:
+        symbol = str(getattr(data, "symbol", "") or "").strip().upper()
+        now_monotonic = time.perf_counter()
+        received_monotonic = getattr(data, "received_monotonic", 0.0)
+        observation = FundingObservation(
+            observation_id=self._funding_observation_id(
+                symbol,
+                getattr(data, "exchange_timestamp", 0.0),
+            ),
+            funding_rate=getattr(data, "funding_rate", None),
+            next_funding_epoch=self._next_funding_epoch(data),
+            corrected_received_epoch=getattr(
+                data,
+                "corrected_received_timestamp",
+                0.0,
+            ),
+            received_monotonic=received_monotonic,
+            clock_healthy=bool(time_service.is_ready()),
+        )
+        healthy = self._evaluate_funding_observation(
+            symbol,
+            observation,
+            now_monotonic=now_monotonic,
+        )
+        if healthy:
+            self._clear_funding_constraint_if_healthy()
+        return healthy
+
+    def _funding_observation_from_snapshot(
+        self,
+        symbol: str,
+        snapshot: dict,
+    ) -> FundingObservation | None:
+        if not isinstance(snapshot, dict):
+            return None
+        exchange_timestamp = snapshot.get("mark_exchange_timestamp")
+        received_monotonic = snapshot.get("mark_received_monotonic")
+        observation_id = self._funding_observation_id(
+            symbol,
+            exchange_timestamp,
+        )
+        if not observation_id:
+            return None
+        return FundingObservation(
+            observation_id=observation_id,
+            funding_rate=snapshot.get("funding_rate"),
+            next_funding_epoch=snapshot.get("next_funding_epoch"),
+            corrected_received_epoch=snapshot.get(
+                "mark_corrected_received_timestamp"
+            ),
+            received_monotonic=received_monotonic,
+            clock_healthy=bool(time_service.is_ready()),
+        )
+
+    def _clear_funding_constraint_if_healthy(self) -> bool:
+        configured_symbols = {
+            str(symbol or "").strip().upper()
+            for symbol in self.root_config.get("symbols", ())
+            if str(symbol or "").strip()
+        }
+        with self.funding_guard_lock:
+            if not configured_symbols or any(
+                not self.funding_guard_decisions.get(symbol)
+                or not self.funding_guard_decisions[symbol].healthy
+                for symbol in configured_symbols
+            ):
+                return False
+            constraint_query = getattr(
+                self.oms,
+                "has_trading_mode_constraint",
+                None,
+            )
+            if callable(constraint_query) and not constraint_query(
+                ("funding_guard:",)
+            ):
+                return True
+            capability_snapshot = getattr(
+                self.oms,
+                "get_capability_snapshot",
+                None,
+            )
+            if not callable(capability_snapshot):
+                return False
+            snapshot = capability_snapshot()
+            constraints = (
+                snapshot.get("mode_constraints", {})
+                if isinstance(snapshot, dict)
+                else {}
+            )
+            record = (
+                constraints.get("funding_guard:", {})
+                if isinstance(constraints, dict)
+                else {}
+            )
+            generation = (
+                int(record.get("generation", 0) or 0)
+                if isinstance(record, dict)
+                else 0
+            )
+            reason = (
+                str(record.get("reason", "") or "")
+                if isinstance(record, dict)
+                else ""
+            )
+            if generation <= 0 or not reason.startswith("funding_guard:"):
+                return False
+            return self._clear_trading_mode(
+                reason="funding guard recovered",
+                prefixes=("funding_guard:",),
+                expected_generations={
+                    "funding_guard:": generation,
+                },
+            )
+
+    def check_funding_guard(self, now: float = None) -> bool:
+        if not self.active or self.kill_switch_triggered:
+            return False
+        if not self.funding_guard_policy.enabled:
+            return True
+
+        now_monotonic = time.perf_counter() if now is None else float(now)
+        symbols = sorted(self._tracked_symbols())
+        if not symbols:
+            return False
+        healthy = True
+        for symbol in symbols:
+            snapshot = data_cache.get_risk_snapshot(
+                symbol,
+                now=now_monotonic,
+            )
+            observation = self._funding_observation_from_snapshot(
+                symbol,
+                snapshot,
+            )
+            if not self._evaluate_funding_observation(
+                symbol,
+                observation,
+                now_monotonic=now_monotonic,
+            ):
+                healthy = False
+        if healthy:
+            return self._clear_funding_constraint_if_healthy()
+        return False
 
     def on_orderbook(self, event: Event):
         self._refresh_rearm_state()
@@ -670,6 +1306,25 @@ class RiskManager:
         account = event.data
         if self._check_cash_flow_truth(account):
             return
+        if self.max_deployed_capital > 0.0:
+            try:
+                capital_envelope_safe = (
+                    deployed_capital_within_equity_limit(
+                        equity=account.equity,
+                        max_deployed_capital=self.max_deployed_capital,
+                        maximum_fraction=(
+                            MAX_CANARY_DEPLOYED_EQUITY_FRACTION
+                        ),
+                    )
+                )
+            except ValueError:
+                capital_envelope_safe = False
+            if not capital_envelope_safe:
+                self.trigger_kill_switch(
+                    "Canary deployed capital exceeds 2% of current "
+                    "account equity"
+                )
+                return
         current_risk_day = self._current_risk_day()
         risk_state_changed = False
         if self.risk_day != current_risk_day:
@@ -695,6 +1350,22 @@ class RiskManager:
             current_external_cash_flow_total - self.initial_external_cash_flow_total
         )
         adjusted_equity = account.equity - external_cash_flow_delta
+        if self.max_deployment_loss > 0.0:
+            baseline_missing = self.deployment_start_equity <= 0.0
+            (
+                self.deployment_start_equity,
+                self.deployment_start_external_cash_flow_total,
+                self.deployment_adjusted_equity,
+                self.deployment_loss,
+            ) = update_deployment_loss(
+                equity=account.equity,
+                external_cash_flow_total=current_external_cash_flow_total,
+                start_equity=self.deployment_start_equity,
+                start_external_cash_flow_total=(
+                    self.deployment_start_external_cash_flow_total
+                ),
+            )
+            risk_state_changed = risk_state_changed or baseline_missing
         if adjusted_equity > self.peak_equity:
             self.peak_equity = adjusted_equity
             risk_state_changed = True
@@ -705,6 +1376,33 @@ class RiskManager:
 
         if self._check_margin_health(account):
             return
+
+        deployment_action = deployment_loss_action(
+            loss=self.deployment_loss,
+            maximum_loss=self.max_deployment_loss,
+            reduce_only_fraction=(
+                self.deployment_loss_reduce_only_fraction
+            ),
+        )
+        if deployment_action == "KILL":
+            self.trigger_kill_switch(
+                "Deployment loss limit breached: "
+                f"-{self.deployment_loss:.2f} "
+                f">= {self.max_deployment_loss:.2f}"
+            )
+            return
+
+        if deployment_action == "REDUCE_ONLY":
+            self._set_trading_mode(
+                OMSCapabilityMode.REDUCE_ONLY,
+                "deployment_loss_reduce_only:"
+                f"{self.deployment_loss:.6f}",
+            )
+        else:
+            self._clear_trading_mode(
+                reason="deployment loss recovered",
+                prefixes=("deployment_loss_reduce_only:",),
+            )
 
         drawdown = self.initial_equity - account.equity + external_cash_flow_delta
         if self.max_daily_loss > 0 and drawdown > self.max_daily_loss:
@@ -839,7 +1537,9 @@ class RiskManager:
         if not self.active or self.kill_switch_triggered:
             return False
         self._poll_external_cash_flow_truth()
-        self._renew_venue_dead_man_switch()
+        dms_healthy = self._renew_venue_dead_man_switch()
+        if not dms_healthy:
+            return False
         if not self.market_freshness_enabled:
             self._publish_risk_control_heartbeat("risk_live_loop")
             return True
@@ -929,26 +1629,15 @@ class RiskManager:
         return None
 
     def trigger_kill_switch(self, reason: str):
-        if self.kill_switch_triggered:
-            return
-
-        self.kill_switch_triggered = True
-        self.kill_reason = reason
-        self.kill_state = "TRIGGERED"
+        with self._kill_state_lock:
+            if self.kill_switch_triggered:
+                return
+            self._reset_kill_empty_snapshots()
+            self.kill_switch_triggered = True
+            self.kill_reason = reason
+            self.kill_state = "TRIGGERED"
         self._persist_risk_state("kill_triggered")
         logger.critical(f"KILL SWITCH TRIGGERED: {reason}")
-
-        if self.gateway:
-            symbols = set()
-            if self.oms:
-                symbols.update(self.oms.config.get("symbols", []))
-                symbols.update(self.oms.exposure.net_positions.keys())
-            for symbol in symbols:
-                try:
-                    self.gateway.cancel_all_orders(symbol)
-                except Exception as exc:
-                    logger.error(f"[KillSwitch] cancel_all_orders({symbol}) failed: {exc}")
-            self._set_kill_state("CANCEL_PENDING", "mass_cancel_requested")
 
         if self.oms:
             try:
@@ -956,13 +1645,62 @@ class RiskManager:
             except Exception as exc:
                 logger.error(f"[KillSwitch] oms.halt_system failed: {exc}")
 
-        if not self._verify_kill_state_once(allow_flatten=True):
-            self._start_kill_supervisor()
+        try:
+            self._retry_mass_cancel()
+            self._set_kill_state("CANCEL_PENDING", "mass_cancel_requested")
+        except Exception as exc:
+            logger.error(
+                "[KillSwitch] initial mass cancel failed unexpectedly: "
+                f"{type(exc).__name__}:{exc}"
+            )
+        finally:
+            if not self._verify_kill_state_safely(allow_flatten=True):
+                self._start_kill_supervisor()
+
+    def restart_kill_switch_after_truth_drift(self, reason: str) -> bool:
+        """Re-arm kill supervision when a supposedly flat account drifts."""
+        reason = str(reason or "account truth drift after flat verification")
+        with self._kill_state_lock:
+            self._reset_kill_empty_snapshots()
+            self.kill_switch_triggered = True
+            self.kill_reason = reason
+            self.kill_state = "TRIGGERED"
+        self._persist_risk_state("kill_restarted_after_truth_drift")
+        logger.critical(
+            "KILL SWITCH RESTARTED AFTER ACCOUNT TRUTH DRIFT: "
+            f"{reason}"
+        )
+
+        if self.oms:
+            try:
+                self.oms.halt_system(f"KillSwitchRestart: {reason}")
+            except Exception as exc:
+                logger.error(
+                    "[KillSwitch] OMS halt failed during truth-drift restart: "
+                    f"{exc}"
+                )
+
+        try:
+            self._retry_mass_cancel()
+            self._set_kill_state(
+                "CANCEL_PENDING",
+                "truth_drift_mass_cancel_requested",
+            )
+        except Exception as exc:
+            logger.error(
+                "[KillSwitch] truth-drift mass cancel failed unexpectedly: "
+                f"{type(exc).__name__}:{exc}"
+            )
+        finally:
+            if not self._verify_kill_state_safely(allow_flatten=True):
+                self._start_kill_supervisor()
+        return True
 
     def _set_kill_state(self, state: str, reason: str):
-        if self.kill_state == state:
-            return
-        self.kill_state = state
+        with self._kill_state_lock:
+            if self.kill_state == state:
+                return
+            self.kill_state = state
         self._persist_risk_state(reason)
         logger.warning(f"[KillSwitch] State -> {state}: {reason}")
 
@@ -983,7 +1721,7 @@ class RiskManager:
         while self.kill_switch_triggered and time.perf_counter() < deadline:
             now = time.perf_counter()
             allow_flatten = now >= next_flatten_at
-            if self._verify_kill_state_once(allow_flatten=allow_flatten):
+            if self._verify_kill_state_safely(allow_flatten=allow_flatten):
                 return
             if allow_flatten:
                 next_flatten_at = now + self.kill_flatten_retry_sec
@@ -996,41 +1734,226 @@ class RiskManager:
                 f"{self.kill_verify_timeout_sec:.1f}s"
             )
 
+    def _verify_kill_state_safely(self, allow_flatten: bool) -> bool:
+        with self._kill_verification_lock:
+            try:
+                return bool(
+                    self._verify_kill_state_once(allow_flatten=allow_flatten)
+                )
+            except Exception as exc:
+                self._reset_kill_empty_snapshots()
+                logger.error(
+                    "[KillSwitch] verification attempt failed; "
+                    "supervision remains active: "
+                    f"{type(exc).__name__}:{exc}"
+                )
+                return False
+
     def _verify_kill_state_once(self, allow_flatten: bool) -> bool:
         open_orders = self._query_kill_open_orders()
         if open_orders is None:
-            return False
-        if open_orders:
-            self._set_kill_state("CANCEL_PENDING", "open_orders_remain")
+            self._reset_kill_empty_snapshots()
             if allow_flatten:
                 self._retry_mass_cancel()
             return False
 
-        self._set_kill_state("CANCEL_VERIFIED", "no_open_orders")
+        local_order_truth = self._query_local_kill_order_truth()
+        if local_order_truth is None:
+            self._reset_kill_empty_snapshots()
+            self._set_kill_state("CANCEL_PENDING", "local_order_truth_unknown")
+            if allow_flatten:
+                self._retry_mass_cancel(remote_orders=open_orders)
+            return False
+
+        local_active_orders = local_order_truth["active_orders"]
+        order_sends_inflight = local_order_truth["order_sends_inflight"]
+        if open_orders:
+            self._reset_kill_empty_snapshots()
+            self._set_kill_state("CANCEL_PENDING", "open_orders_remain")
+            if allow_flatten:
+                self._retry_mass_cancel(
+                    remote_orders=open_orders,
+                    local_orders=local_active_orders,
+                )
+            return False
+        if local_active_orders or order_sends_inflight:
+            self._reset_kill_empty_snapshots()
+            self._set_kill_state(
+                "CANCEL_PENDING",
+                "local_orders_or_sends_remain",
+            )
+            if allow_flatten:
+                self._retry_mass_cancel(local_orders=local_active_orders)
+            return False
+
+        now = time.perf_counter()
+        if (
+            self._kill_last_accepted_snapshot_at > 0.0
+            and now - self._kill_last_accepted_snapshot_at
+            < self.kill_verify_interval_sec
+        ):
+            self._set_kill_state(
+                "CANCEL_PENDING",
+                "empty_snapshot_interval_pending",
+            )
+            return False
+        self._kill_last_accepted_snapshot_at = now
+        self._kill_empty_order_snapshots = min(
+            self.kill_empty_snapshots_required,
+            self._kill_empty_order_snapshots + 1,
+        )
         positions = self._query_kill_positions()
         if positions is None:
+            self._kill_empty_flat_snapshots = 0
             return False
-        if not positions:
-            self._set_kill_state("FLAT_VERIFIED", "orders_cancelled_and_positions_flat")
-            return True
+        if positions:
+            self._kill_empty_flat_snapshots = 0
+            self._set_kill_state("FLATTENING", "nonzero_positions_remain")
+            if (
+                allow_flatten
+                and self.oms
+                and hasattr(self.oms, "emergency_reduce_only_flatten")
+            ):
+                try:
+                    self.oms.emergency_reduce_only_flatten(
+                        f"KillSwitch: {self.kill_reason}"
+                    )
+                except Exception as exc:
+                    logger.error(f"[KillSwitch] emergency flatten failed: {exc}")
+            return False
 
-        self._set_kill_state("FLATTENING", "nonzero_positions_remain")
-        if allow_flatten and self.oms and hasattr(self.oms, "emergency_reduce_only_flatten"):
-            try:
-                self.oms.emergency_reduce_only_flatten(f"KillSwitch: {self.kill_reason}")
-            except Exception as exc:
-                logger.error(f"[KillSwitch] emergency flatten failed: {exc}")
-        return False
+        self._kill_empty_flat_snapshots = min(
+            self.kill_empty_snapshots_required,
+            self._kill_empty_flat_snapshots + 1,
+        )
+        required = self.kill_empty_snapshots_required
+        if self._kill_empty_order_snapshots < required:
+            self._set_kill_state(
+                "CANCEL_PENDING",
+                "empty_order_snapshot_confirmation_pending",
+            )
+            return False
+        self._set_kill_state("CANCEL_VERIFIED", "orders_cancelled_confirmed")
+        if self._kill_empty_flat_snapshots < required:
+            return False
+
+        self._set_kill_state(
+            "FLAT_VERIFIED",
+            "orders_cancelled_and_positions_flat_confirmed",
+        )
+        return True
+
+    def _reset_kill_empty_snapshots(self):
+        self._kill_empty_order_snapshots = 0
+        self._kill_empty_flat_snapshots = 0
+        self._kill_last_accepted_snapshot_at = 0.0
+
+    def _query_local_kill_order_truth(self):
+        if self.oms is None:
+            return {
+                "active_orders": [],
+                "order_sends_inflight": 0,
+            }
+        query = getattr(self.oms, "get_local_order_truth_snapshot", None)
+        if not callable(query):
+            logger.error("[KillSwitch] OMS local order truth snapshot is unavailable")
+            return None
+        try:
+            snapshot = query()
+        except Exception as exc:
+            logger.error(
+                "[KillSwitch] OMS local order truth snapshot failed: "
+                f"{type(exc).__name__}:{exc}"
+            )
+            return None
+        if not isinstance(snapshot, dict):
+            logger.error(
+                "[KillSwitch] OMS local order truth snapshot returned invalid "
+                f"container: {type(snapshot).__name__}"
+            )
+            return None
+
+        active_orders = snapshot.get("active_orders")
+        order_sends_inflight = snapshot.get("order_sends_inflight")
+        if not isinstance(active_orders, (list, tuple)):
+            logger.error(
+                "[KillSwitch] OMS local active-order truth is invalid: "
+                f"{type(active_orders).__name__}"
+            )
+            return None
+        if (
+            isinstance(order_sends_inflight, bool)
+            or not isinstance(order_sends_inflight, int)
+            or order_sends_inflight < 0
+        ):
+            logger.error(
+                "[KillSwitch] OMS outbound send truth is invalid: "
+                f"{order_sends_inflight!r}"
+            )
+            return None
+        for index, payload in enumerate(active_orders):
+            if not isinstance(payload, dict):
+                logger.error(
+                    "[KillSwitch] OMS local active-order row is invalid at "
+                    f"index {index}: {type(payload).__name__}"
+                )
+                return None
+            symbol = str(payload.get("symbol", "") or "").upper().strip()
+            if not symbol:
+                logger.error(
+                    "[KillSwitch] OMS local active-order row has no symbol at "
+                    f"index {index}"
+                )
+                return None
+        return {
+            "active_orders": list(active_orders),
+            "order_sends_inflight": order_sends_inflight,
+        }
 
     def _query_kill_open_orders(self):
         query = getattr(self.gateway, "get_open_orders", None)
         if not callable(query):
             return None
         try:
-            return query()
+            remote_orders = query()
         except Exception as exc:
             logger.error(f"[KillSwitch] open-order verification failed: {exc}")
             return None
+        if not isinstance(remote_orders, (list, tuple)):
+            logger.error(
+                "[KillSwitch] open-order verification returned invalid "
+                f"container: {type(remote_orders).__name__}"
+            )
+            return None
+        try:
+            for index, payload in enumerate(remote_orders):
+                if not isinstance(payload, dict):
+                    logger.error(
+                        "[KillSwitch] open-order verification returned "
+                        "invalid row at index "
+                        f"{index}: {type(payload).__name__}"
+                    )
+                    return None
+                if "symbol" not in payload:
+                    logger.error(
+                        "[KillSwitch] open-order verification row is missing "
+                        f"symbol at index {index}"
+                    )
+                    return None
+                symbol = str(payload["symbol"] or "").upper().strip()
+                if not symbol:
+                    logger.error(
+                        "[KillSwitch] open-order verification row contains "
+                        f"an empty symbol at index {index}"
+                    )
+                    return None
+        except Exception as exc:
+            logger.error(
+                "[KillSwitch] open-order verification payload could not be "
+                f"validated: {type(exc).__name__}:{exc}"
+            )
+            return None
+        return remote_orders
 
     def _query_kill_positions(self):
         query = getattr(self.gateway, "get_all_positions", None)
@@ -1044,23 +1967,233 @@ class RiskManager:
         if remote_positions is None:
             return None
 
-        nonzero = {
-            str(payload.get("symbol", "") or "").upper()
-            for payload in remote_positions
-            if abs(float(payload.get("positionAmt", 0.0) or 0.0)) > 1e-9
-        }
-        if self.oms:
-            nonzero.update(
-                str(symbol).upper()
-                for symbol, volume in getattr(self.oms.exposure, "net_positions", {}).items()
-                if abs(float(volume or 0.0)) > 1e-9
+        try:
+            return self._collect_nonzero_kill_positions(remote_positions)
+        except Exception as exc:
+            logger.error(
+                "[KillSwitch] position verification payload could not be "
+                f"validated: {type(exc).__name__}:{exc}"
             )
+            return None
+
+    def _collect_nonzero_kill_positions(self, remote_positions):
+        if not isinstance(remote_positions, (list, tuple)):
+            logger.error(
+                "[KillSwitch] position verification returned invalid "
+                f"container: {type(remote_positions).__name__}"
+            )
+            return None
+
+        nonzero = set()
+        for index, payload in enumerate(remote_positions):
+            if not isinstance(payload, dict):
+                logger.error(
+                    "[KillSwitch] position verification returned invalid "
+                    f"row at index {index}: {type(payload).__name__}"
+                )
+                return None
+            if "symbol" not in payload or "positionAmt" not in payload:
+                logger.error(
+                    "[KillSwitch] position verification row is missing "
+                    f"required fields at index {index}"
+                )
+                return None
+            try:
+                symbol = str(payload["symbol"] or "").upper().strip()
+                amount = float(payload["positionAmt"])
+            except (TypeError, ValueError, OverflowError) as exc:
+                logger.error(
+                    "[KillSwitch] position verification row is invalid "
+                    f"at index {index}: {type(exc).__name__}"
+                )
+                return None
+            except Exception as exc:
+                logger.error(
+                    "[KillSwitch] position verification row could not be "
+                    f"decoded at index {index}: {type(exc).__name__}"
+                )
+                return None
+            if not symbol or not math.isfinite(amount):
+                logger.error(
+                    "[KillSwitch] position verification row contains "
+                    f"non-finite or empty values at index {index}"
+                )
+                return None
+            if amount != 0.0:
+                nonzero.add(symbol)
+
+        if self.oms:
+            try:
+                exposure = getattr(self.oms, "exposure", None)
+                local_positions = getattr(exposure, "net_positions", None)
+            except Exception as exc:
+                logger.error(
+                    "[KillSwitch] local position ledger is unavailable: "
+                    f"{type(exc).__name__}:{exc}"
+                )
+                return None
+            if not isinstance(local_positions, dict):
+                logger.error(
+                    "[KillSwitch] local position ledger is invalid: "
+                    f"{type(local_positions).__name__}"
+                )
+                return None
+            for raw_symbol, raw_volume in local_positions.items():
+                try:
+                    symbol = str(raw_symbol or "").upper().strip()
+                    volume = float(raw_volume)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    logger.error(
+                        "[KillSwitch] local position ledger entry is invalid: "
+                        f"{type(exc).__name__}"
+                    )
+                    return None
+                except Exception as exc:
+                    logger.error(
+                        "[KillSwitch] local position ledger entry could not "
+                        f"be decoded: {type(exc).__name__}"
+                    )
+                    return None
+                if not symbol or not math.isfinite(volume):
+                    logger.error(
+                        "[KillSwitch] local position ledger contains "
+                        "non-finite or empty values"
+                    )
+                    return None
+                if volume != 0.0:
+                    nonzero.add(symbol)
         return nonzero
 
-    def _retry_mass_cancel(self):
+    def _collect_kill_cancel_symbols(self, remote_orders=None, local_orders=None):
+        symbols = set()
+
+        try:
+            root_config = getattr(self, "root_config", None)
+            configured = (
+                root_config.get("symbols")
+                if isinstance(root_config, dict)
+                else None
+            )
+            if not isinstance(configured, (list, tuple, set)):
+                raise TypeError(
+                    f"invalid root symbols: {type(configured).__name__}"
+                )
+            symbols.update(configured)
+        except Exception as exc:
+            logger.error(
+                "[KillSwitch] root symbol discovery failed: "
+                f"{type(exc).__name__}:{exc}"
+            )
+
+        try:
+            frozen_symbols = getattr(self, "frozen_symbols", {})
+            if isinstance(frozen_symbols, dict):
+                symbols.update(frozen_symbols.keys())
+            else:
+                logger.error(
+                    "[KillSwitch] frozen symbol ledger is invalid: "
+                    f"{type(frozen_symbols).__name__}"
+                )
+        except Exception as exc:
+            logger.error(
+                "[KillSwitch] frozen symbol ledger is unavailable: "
+                f"{type(exc).__name__}:{exc}"
+            )
+
+        if self.oms:
+            try:
+                oms_config = getattr(self.oms, "config", None)
+                configured = (
+                    oms_config.get("symbols")
+                    if isinstance(oms_config, dict)
+                    else None
+                )
+                if not isinstance(configured, (list, tuple, set)):
+                    raise TypeError(
+                        f"invalid configured symbols: {type(configured).__name__}"
+                    )
+                symbols.update(configured)
+            except Exception as exc:
+                logger.error(
+                    "[KillSwitch] configured symbol discovery failed: "
+                    f"{type(exc).__name__}:{exc}"
+                )
+            try:
+                exposure = getattr(self.oms, "exposure", None)
+                positions = getattr(exposure, "net_positions", None)
+                if not isinstance(positions, dict):
+                    raise TypeError(
+                        f"invalid position ledger: {type(positions).__name__}"
+                    )
+                symbols.update(positions.keys())
+            except Exception as exc:
+                logger.error(
+                    "[KillSwitch] position symbol discovery failed: "
+                    f"{type(exc).__name__}:{exc}"
+                )
+            try:
+                get_known_symbols = getattr(
+                    self.oms,
+                    "get_known_account_order_symbols",
+                    None,
+                )
+                if not callable(get_known_symbols):
+                    raise TypeError("known account symbol snapshot unavailable")
+                known_symbols = get_known_symbols()
+                if not isinstance(known_symbols, (list, tuple, set)):
+                    raise TypeError(
+                        "invalid known account symbols: "
+                        f"{type(known_symbols).__name__}"
+                    )
+                symbols.update(known_symbols)
+            except Exception as exc:
+                logger.error(
+                    "[KillSwitch] known account symbol discovery failed: "
+                    f"{type(exc).__name__}:{exc}"
+                )
+
+        for source_name, orders in (
+            ("remote", remote_orders),
+            ("local", local_orders),
+        ):
+            if orders is None:
+                continue
+            if not isinstance(orders, (list, tuple)):
+                logger.error(
+                    f"[KillSwitch] {source_name} cancel symbol source is invalid: "
+                    f"{type(orders).__name__}"
+                )
+                continue
+            for index, payload in enumerate(orders):
+                if not isinstance(payload, dict):
+                    logger.error(
+                        f"[KillSwitch] {source_name} cancel symbol row is invalid "
+                        f"at index {index}: {type(payload).__name__}"
+                    )
+                    continue
+                symbols.add(payload.get("symbol", ""))
+
+        normalized = set()
+        for raw_symbol in symbols:
+            try:
+                symbol = str(raw_symbol or "").upper().strip()
+            except Exception as exc:
+                logger.error(
+                    "[KillSwitch] cancel symbol could not be decoded: "
+                    f"{type(exc).__name__}:{exc}"
+                )
+                continue
+            if symbol:
+                normalized.add(symbol)
+        return normalized
+
+    def _retry_mass_cancel(self, remote_orders=None, local_orders=None):
         if not self.gateway:
             return
-        symbols = set(self._tracked_symbols())
+        symbols = self._collect_kill_cancel_symbols(
+            remote_orders=remote_orders,
+            local_orders=local_orders,
+        )
         for symbol in symbols:
             try:
                 self.gateway.cancel_all_orders(symbol)
@@ -1389,12 +2522,27 @@ class RiskManager:
             except Exception as exc:
                 logger.error(f"[Risk] oms.set_trading_mode({mode.value}) failed: {exc}")
 
-    def _clear_trading_mode(self, reason: str = "", prefixes=()):
+    def _clear_trading_mode(
+        self,
+        reason: str = "",
+        prefixes=(),
+        *,
+        expected_generations=None,
+    ) -> bool:
         if self.oms and hasattr(self.oms, "clear_trading_mode"):
             try:
-                self.oms.clear_trading_mode(reason=reason, prefixes=prefixes)
+                kwargs = {
+                    "reason": reason,
+                    "prefixes": prefixes,
+                }
+                if expected_generations is not None:
+                    kwargs["expected_generations"] = expected_generations
+                return bool(
+                    self.oms.clear_trading_mode(**kwargs)
+                )
             except Exception as exc:
                 logger.error(f"[Risk] oms.clear_trading_mode failed: {exc}")
+        return False
 
     def _tracked_symbols(self):
         symbols = set(self.frozen_symbols.keys())

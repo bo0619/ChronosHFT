@@ -107,9 +107,41 @@ class LiveDataCache:
                 bid = float(book.get_best_bid()[0] or 0.0)
                 ask = float(book.get_best_ask()[0] or 0.0)
 
+            next_funding_epoch = float(
+                getattr(mark, "next_funding_timestamp", 0.0) or 0.0
+            )
+            if next_funding_epoch <= 0.0 and mark is not None:
+                next_funding_time = getattr(mark, "next_funding_time", None)
+                timestamp = getattr(next_funding_time, "timestamp", None)
+                if callable(timestamp):
+                    try:
+                        next_funding_epoch = float(timestamp())
+                    except (OSError, OverflowError, TypeError, ValueError):
+                        next_funding_epoch = 0.0
+
             return {
                 "symbol": symbol,
                 "mark_price": float(getattr(mark, "mark_price", 0.0) or 0.0),
+                "funding_rate": (
+                    getattr(mark, "funding_rate", None)
+                    if mark is not None
+                    else None
+                ),
+                "next_funding_epoch": next_funding_epoch,
+                "mark_exchange_timestamp": float(
+                    getattr(mark, "exchange_timestamp", 0.0) or 0.0
+                ),
+                "mark_received_monotonic": float(
+                    getattr(mark, "received_monotonic", 0.0) or 0.0
+                ),
+                "mark_corrected_received_timestamp": float(
+                    getattr(
+                        mark,
+                        "corrected_received_timestamp",
+                        0.0,
+                    )
+                    or 0.0
+                ),
                 "bid_price": bid,
                 "ask_price": ask,
                 "last_trade_price": float(getattr(trade, "price", 0.0) or 0.0),

@@ -17,6 +17,7 @@ class OnlineRidgePredictor:
         # 内部状态缓存 (用于 update_and_predict)
         self.last_features = None
         self.last_mid = None
+        self.sample_count = 0
 
     def update(self, features, y_true):
         """核心学习步: Recursive Least Squares 更新"""
@@ -35,6 +36,7 @@ class OnlineRidgePredictor:
         
         # P = (I - K * X.T) * P
         self.P = (np.eye(self.num_features) - K @ X.T) @ self.P
+        self.sample_count += 1
 
     def predict(self, features):
         """核心预测步"""
@@ -83,6 +85,14 @@ class MultiHorizonPredictor:
         
         # 历史缓冲区: (timestamp, mid_price, features_vector)
         self.history_buffer = deque(maxlen=100) 
+        self.observation_count = 0
+
+    @property
+    def sample_count(self):
+        return min(
+            (model.sample_count for model in self.models.values()),
+            default=0,
+        )
 
     def update_and_predict(self, features: list, current_mid: float, timestamp: float):
         """
@@ -90,9 +100,11 @@ class MultiHorizonPredictor:
         """
         results = {"short": 0.0, "mid": 0.0, "long": 0.0}
         
-        if current_mid <= 0: return results
+        if current_mid <= 0:
+            return results
         
         # 1. 存入当前快照
+        self.observation_count += 1
         self.history_buffer.append({
             "ts": timestamp,
             "price": current_mid,

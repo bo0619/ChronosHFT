@@ -123,6 +123,10 @@ class EventEngine:
             if thread and thread.is_alive():
                 thread.join()
         logger.info(">>> [EventEngine] stopped")
+        return all(
+            thread is None or not thread.is_alive()
+            for thread in self._threads.values()
+        )
 
     def wait_until_idle(self, timeout_sec: float) -> bool:
         """Wait until every queued or in-flight lane dispatch has completed.
@@ -194,6 +198,7 @@ class EventEngine:
     def get_metrics_snapshot(self):
         now = time.perf_counter()
         snapshot = {
+            "active": bool(self._active),
             "queues": self.get_queue_snapshot(),
             "lanes": {},
             "config": {

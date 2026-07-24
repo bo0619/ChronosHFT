@@ -30,13 +30,16 @@ class DataRecorder:
 
     def on_orderbook(self, event: Event):
         ob: OrderBook = event.data
-        if ob.symbol not in self.depth_buffer: return
+        if ob.symbol not in self.depth_buffer:
+            return
         
         # 提取 Top 5
         sb = list(ob.get_top_bids(5))
         sa = list(ob.get_top_asks(5))
-        while len(sb) < 5: sb.append((0,0))
-        while len(sa) < 5: sa.append((0,0))
+        while len(sb) < 5:
+            sb.append((0,0))
+        while len(sa) < 5:
+            sa.append((0,0))
         
         row = {
             "datetime": ob.datetime,
@@ -55,7 +58,8 @@ class DataRecorder:
 
     def on_agg_trade(self, event: Event):
         t: AggTradeData = event.data
-        if t.symbol not in self.trade_buffer: return
+        if t.symbol not in self.trade_buffer:
+            return
         
         row = {
             "datetime": t.datetime,
@@ -77,26 +81,36 @@ class DataRecorder:
             key = data_type # HDF5 key
             
             if data_type == "depth":
-                buffer = self.depth_buffer[symbol]
-                self.depth_buffer[symbol] = [] # Clear buffer
+                source_buffer = self.depth_buffer[symbol]
             else:
-                buffer = self.trade_buffer[symbol]
-                self.trade_buffer[symbol] = []
-                
-            if not buffer: return
+                source_buffer = self.trade_buffer[symbol]
+
+            if not source_buffer:
+                return True
+            buffer = list(source_buffer)
             
             df = pd.DataFrame(buffer)
             
             # Append to HDF5
             # min_itemsize 预留字符串长度，format='table' 支持追加
             df.to_hdf(filename, key=key, mode='a', append=True, format='table', min_itemsize={'symbol': 10})
+            del source_buffer[:len(buffer)]
+            return True
             
         except Exception as e:
             logger.error(f"Flush HDF5 Failed [{symbol} {data_type}]: {e}")
+            return False
 
     def close(self):
         """程序退出时强制刷盘"""
+        clean = True
         for symbol in self.symbols:
-            self.flush(symbol, "depth")
-            self.flush(symbol, "trade")
-        logger.info("Recorder Closed & Flushed.")
+            clean = self.flush(symbol, "depth") and clean
+            clean = self.flush(symbol, "trade") and clean
+        if clean:
+            logger.info("Recorder Closed & Flushed.")
+        else:
+            logger.critical(
+                "Recorder close failed; buffered data remains in memory."
+            )
+        return clean

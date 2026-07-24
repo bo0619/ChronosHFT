@@ -240,6 +240,7 @@ class BinanceGateway(BaseGateway):
         if self.session:
             self.session.close()
         logger.info(f"[{self.gateway_name}] Closed.")
+        return True
 
     def send_order(self, req: OrderRequest, client_oid: str = None) -> GatewayCommandResult:
         if not req.reduce_only:
@@ -504,12 +505,20 @@ class BinanceGateway(BaseGateway):
             if event_type == "ORDER_TRADE_UPDATE":
                 self._handle_user_update(
                     msg,
+                    received_timestamp=received_timestamp,
+                    received_monotonic=received_monotonic,
+                    corrected_received_timestamp=corrected_received_timestamp,
+                    clock_offset_ms=clock_offset_ms,
                     expected_generation=expected_generation,
                 )
                 return
             if event_type == "ACCOUNT_UPDATE":
                 self._handle_account_update(
                     msg,
+                    received_timestamp=received_timestamp,
+                    received_monotonic=received_monotonic,
+                    corrected_received_timestamp=corrected_received_timestamp,
+                    clock_offset_ms=clock_offset_ms,
                     expected_generation=expected_generation,
                 )
                 return
@@ -604,9 +613,20 @@ class BinanceGateway(BaseGateway):
             ws_client.close()
         return True
 
-    def _handle_user_update(self, msg, *, expected_generation=None):
+    def _handle_user_update(
+        self,
+        msg,
+        *,
+        received_timestamp: float = None,
+        received_monotonic: float = None,
+        corrected_received_timestamp: float = None,
+        clock_offset_ms: float = None,
+        expected_generation=None,
+    ):
         order = msg.get("o", {})
         update_time_ms = order.get("T") or msg.get("T") or msg.get("E") or 0
+        received_timestamp = float(received_timestamp or time.time())
+        received_monotonic = float(received_monotonic or time.perf_counter())
         update = ExchangeOrderUpdate(
             # USD-M user data events do not expose a globally contiguous
             # sequence. Ordering is validated per order in the OMS instead.
@@ -626,6 +646,14 @@ class BinanceGateway(BaseGateway):
             trade_id=self._parse_optional_int(order.get("t"), default=-1),
             order_type=str(order.get("o", "") or "").upper(),
             time_in_force=str(order.get("f", "") or "").upper(),
+            received_timestamp=received_timestamp,
+            received_monotonic=received_monotonic,
+            dispatch_timestamp=time.time(),
+            dispatch_monotonic=time.perf_counter(),
+            clock_offset_ms=clock_offset_ms,
+            corrected_received_timestamp=float(
+                corrected_received_timestamp or received_timestamp
+            ),
         )
         self._dispatch_transport_callback(
             expected_generation,
@@ -633,7 +661,16 @@ class BinanceGateway(BaseGateway):
             update,
         )
 
-    def _handle_account_update(self, msg, *, expected_generation=None):
+    def _handle_account_update(
+        self,
+        msg,
+        *,
+        received_timestamp: float = None,
+        received_monotonic: float = None,
+        corrected_received_timestamp: float = None,
+        clock_offset_ms: float = None,
+        expected_generation=None,
+    ):
         payload = msg.get("a", {})
         balances = payload.get("B", [])
         balance_entry = self._select_balance_entry(balances)
@@ -654,6 +691,8 @@ class BinanceGateway(BaseGateway):
         # Event time is the delivery time and can be later even when the account
         # state belongs to an older matching-engine transaction.
         event_time_ms = msg.get("T") or msg.get("E") or 0
+        received_timestamp = float(received_timestamp or time.time())
+        received_monotonic = float(received_monotonic or time.perf_counter())
         update = ExchangeAccountUpdate(
             asset=balance_entry.get("a", "") if balance_entry else "",
             wallet_balance=(
@@ -670,6 +709,14 @@ class BinanceGateway(BaseGateway):
             positions=positions,
             reason=payload.get("m", ""),
             event_time=float(event_time_ms) / 1000.0 if event_time_ms else time.time(),
+            received_timestamp=received_timestamp,
+            received_monotonic=received_monotonic,
+            dispatch_timestamp=time.time(),
+            dispatch_monotonic=time.perf_counter(),
+            clock_offset_ms=clock_offset_ms,
+            corrected_received_timestamp=float(
+                corrected_received_timestamp or received_timestamp
+            ),
         )
         self._dispatch_transport_callback(
             expected_generation,
@@ -735,18 +782,20 @@ class BinanceGateway(BaseGateway):
             )
         elif "@markPrice" in stream:
             exchange_timestamp = float(data.get("E", event_time_ms) or 0.0) / 1000.0
+            next_funding_timestamp = float(data["T"]) / 1000.0
             mark = MarkPriceData(
                 symbol,
                 float(data["p"]),
                 float(data["i"]),
                 float(data["r"]),
-                datetime.fromtimestamp(float(data["T"]) / 1000.0),
+                datetime.fromtimestamp(next_funding_timestamp),
                 datetime.fromtimestamp(exchange_timestamp or received_timestamp),
                 exchange_timestamp=exchange_timestamp,
                 received_timestamp=received_timestamp,
                 received_monotonic=received_monotonic,
                 clock_offset_ms=clock_offset_ms,
                 corrected_received_timestamp=corrected_received_timestamp,
+                next_funding_timestamp=next_funding_timestamp,
             )
             self._dispatch_market_data(
                 EVENT_MARK_PRICE,
@@ -1235,6 +1284,7 @@ class BinanceGateway(BaseGateway):
             snapshot[asset] = {
                 "wallet_balance": float(entry.get("wb", 0.0) or 0.0),
                 "available_balance": self._parse_optional_float(entry.get("cw")),
+                "balance_change": self._parse_optional_float(entry.get("bc")),
             }
         return snapshot
 

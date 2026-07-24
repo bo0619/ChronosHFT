@@ -138,6 +138,9 @@ class OrderIntent:
     reduce_only: bool = False
     policy: ExecutionPolicy = ExecutionPolicy.PASSIVE
     tag: str = ""
+    calibration_permit_id: str = ""
+    calibration_depth_bps: Optional[float] = None
+    calibration_reference_mid: Optional[float] = None
 
     def __post_init__(self):
         self.order_type = str(self.order_type or "LIMIT").upper()
@@ -294,6 +297,7 @@ class MarkPriceData:
     dispatch_monotonic: float = 0.0
     clock_offset_ms: Optional[float] = None
     corrected_received_timestamp: float = 0.0
+    next_funding_timestamp: float = 0.0
 
 
 @dataclass(slots=True)
@@ -331,6 +335,12 @@ class ExchangeOrderUpdate:
     trade_id: int = -1
     order_type: str = ""
     time_in_force: str = ""
+    received_timestamp: float = 0.0
+    received_monotonic: float = 0.0
+    dispatch_timestamp: float = 0.0
+    dispatch_monotonic: float = 0.0
+    clock_offset_ms: Optional[float] = None
+    corrected_received_timestamp: float = 0.0
 
 
 @dataclass
@@ -348,6 +358,10 @@ class OrderStateSnapshot:
     time_in_force: str = TIF_GTC
     is_post_only: bool = False
     is_rpi: bool = False
+    side: Optional[Side] = None
+    created_monotonic: float = 0.0
+    updated_monotonic: float = 0.0
+    recovered_from_journal: bool = False
 
 
 @dataclass
@@ -382,6 +396,12 @@ class ExchangeAccountUpdate:
     positions: Dict[str, Dict[str, float]] = field(default_factory=dict)
     reason: str = ""
     event_time: float = 0.0
+    received_timestamp: float = 0.0
+    received_monotonic: float = 0.0
+    dispatch_timestamp: float = 0.0
+    dispatch_monotonic: float = 0.0
+    clock_offset_ms: Optional[float] = None
+    corrected_received_timestamp: float = 0.0
 
 
 @dataclass
@@ -408,9 +428,11 @@ class AccountData:
     margin_balance: float = 0.0
     maintenance_margin_ratio: float = 0.0
     margin_snapshot_time: float = 0.0
+    margin_snapshot_monotonic: float = 0.0
     margin_snapshot_synced: bool = False
     external_cash_flow_total: float = 0.0
     cash_flow_snapshot_time: float = 0.0
+    cash_flow_snapshot_monotonic: float = 0.0
     cash_flow_snapshot_synced: bool = False
 
 

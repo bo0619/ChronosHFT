@@ -1,0 +1,31 @@
+{
+  "_warning": "BLOCKED TEMPLATE ONLY. approved must remain false. Provision a trusted Ed25519 public key in the live config and obtain a genuine signature from an offline private-key holder; do not invent either value.",
+  "schema": "chronoshft.calibration_approval.v2",
+  "model": "glft",
+  "symbols": [
+    "XAUUSDT"
+  ],
+  "units_version": "chronoshft.log_bps_seconds_fixed_notional_lot.v1",
+  "validated_formula_version": "glft.log_bps_asymptotic_model_a.v2",
+  "deployment_config_sha256": "",
+  "data_duration_sec": 0,
+  "oos_samples": 0,
+  "approved": false,
+  "approved_by": "",
+  "approved_at": "",
+  "artifact_path": "config.live.canary.calibration.example.json",
+  "artifact_sha256": "",
+  "source_data_path": "config.live.canary.source-evidence.example.json",
+  "source_data_sha256": "",
+  "oos_evidence_sha256": "",
+  "evidence_bundle_sha256": "",
+  "formula_sha256": "",
+  "strategy_config_sha256": "",
+  "signature": {
+    "algorithm": "ED25519",
+    "key_id": "",
+    "signer": "",
+    "signed_payload_sha256": "",
+    "signature_base64": ""
+  }
+}

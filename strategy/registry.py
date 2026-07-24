@@ -55,6 +55,15 @@ _REGISTRY_CONTROL_KEYS = {
     "models",
 }
 
+_ROOT_TRUST_KEYS = frozenset(
+    {
+        "_rpi_sampling_identity",
+        "_validated_calibration",
+        "_validated_rpi_calibration_permit",
+        "model_readiness",
+    }
+)
+
 
 def canonical_model_key(model_key: Any) -> str:
     """Return a canonical model key or fail before any model is constructed."""
@@ -127,6 +136,7 @@ def _merged_model_config(
     explicit_shared = strategy_config.get("shared", {})
     if explicit_shared is not None and not isinstance(explicit_shared, Mapping):
         raise TypeError("strategy.shared must be a mapping")
+    _reject_protected_overrides(explicit_shared or {}, "strategy.shared")
     shared = _deep_merge(shared, explicit_shared or {})
 
     model_config: dict[str, Any] = {}
@@ -136,6 +146,10 @@ def _merged_model_config(
         legacy_as_config = strategy_config.get("as_parameters", {})
         if legacy_as_config is not None and not isinstance(legacy_as_config, Mapping):
             raise TypeError("strategy.as_parameters must be a mapping")
+        _reject_protected_overrides(
+            legacy_as_config or {},
+            "strategy.as_parameters",
+        )
         model_config = _deep_merge(model_config, legacy_as_config or {})
 
     for key, value in strategy_config.items():
@@ -143,6 +157,7 @@ def _merged_model_config(
             continue
         if not isinstance(value, Mapping):
             raise TypeError(f"strategy.{key} must be a mapping")
+        _reject_protected_overrides(value, f"strategy.{key}")
         model_config = _deep_merge(model_config, value)
 
     models = strategy_config.get("models", {})
@@ -153,14 +168,31 @@ def _merged_model_config(
             continue
         if not isinstance(value, Mapping):
             raise TypeError(f"strategy.models.{key} must be a mapping")
+        _reject_protected_overrides(value, f"strategy.models.{key}")
         model_config = _deep_merge(model_config, value)
 
     merged = _deep_merge(shared, model_config)
+    for key in _ROOT_TRUST_KEYS:
+        if key in strategy_config:
+            merged[key] = deepcopy(strategy_config[key])
     if model_key == "glft":
         merged["glft"] = deepcopy(model_config)
     elif model_key == "avellaneda_stoikov":
         merged["as_parameters"] = deepcopy(model_config)
     return merged
+
+
+def _reject_protected_overrides(
+    value: Mapping[str, Any],
+    location: str,
+) -> None:
+    protected = sorted(_ROOT_TRUST_KEYS.intersection(value))
+    if protected:
+        fields = ", ".join(protected)
+        raise ValueError(
+            f"{location} cannot override root-validated strategy fields: "
+            f"{fields}"
+        )
 
 
 def _primary_model_key(
@@ -184,12 +216,10 @@ def _primary_model_key(
     return primary_model
 
 
-def create_primary_strategy(
-    engine: Any,
-    oms: Any,
+def effective_primary_strategy_config(
     config: Mapping[str, Any],
-) -> Any:
-    """Validate registrations and construct the sole primary strategy."""
+) -> dict[str, Any]:
+    """Return the exact strategy parameters consumed by the primary model."""
     strategy_config = _strategy_config(config)
     execution_policy = str(
         strategy_config.get("execution_policy", "single_primary")
@@ -202,9 +232,46 @@ def create_primary_strategy(
         )
     registered_models = registered_model_keys(config)
     primary_model = _primary_model_key(strategy_config, registered_models)
-    merged_config = _merged_model_config(strategy_config, primary_model)
+    return _merged_model_config(strategy_config, primary_model)
+
+
+def create_primary_strategy(
+    engine: Any,
+    oms: Any,
+    config: Mapping[str, Any],
+) -> Any:
+    """Validate registrations and construct the sole primary strategy."""
+    strategy_config = _strategy_config(config)
+    registered_models = registered_model_keys(config)
+    primary_model = _primary_model_key(strategy_config, registered_models)
+    merged_config = effective_primary_strategy_config(config)
 
     if primary_model == "glft":
+        from strategy.model_readiness import (
+            implementation_sha256_for_model,
+            strategy_policy_sha256,
+        )
+
+        live_launch = config.get("live_launch", {})
+        if not isinstance(live_launch, Mapping):
+            live_launch = {}
+        merged_config["_rpi_sampling_identity"] = {
+            "deployment_id": str(
+                live_launch.get("deployment_id", "") or ""
+            ).strip(),
+            "strategy_policy_sha256": strategy_policy_sha256(
+                config,
+                primary_model,
+            ),
+            "implementation_sha256": implementation_sha256_for_model(
+                primary_model
+            ),
+        }
+        validated_permit = config.get("_validated_rpi_calibration_permit")
+        if validated_permit is not None:
+            merged_config["_validated_rpi_calibration_permit"] = deepcopy(
+                validated_permit
+            )
         from strategy.glft import GLFTStrategy
 
         strategy = GLFTStrategy(engine, oms, strategy_config=merged_config)
@@ -233,6 +300,7 @@ __all__ = [
     "StrategyRegistration",
     "canonical_model_key",
     "create_primary_strategy",
+    "effective_primary_strategy_config",
     "registered_model_keys",
     "strategy_id_for_model",
 ]

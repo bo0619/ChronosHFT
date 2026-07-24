@@ -1260,7 +1260,7 @@ class PaperGatewayTests(unittest.TestCase):
         self.assertEqual(float(rpi_order["executedQty"]), 0.0)
         self.assertEqual(rpi_order["_paperFillModel"], "rpi_disabled")
 
-    def test_rpi_proxy_fill_is_explicitly_simulated_and_charges_local_fee(self):
+    def test_rpi_proxy_fill_is_simulated_and_uses_final_rpi_fee(self):
         gateway = self.start_offline(rpi_fill_model="public_trade_proxy")
         with patch(
             "gateway.binance.paper_gateway.ref_data_manager.get_info",
@@ -1302,10 +1302,10 @@ class PaperGatewayTests(unittest.TestCase):
         self.assertTrue(trade["maker"])
         self.assertTrue(trade["_simulated"])
         self.assertEqual(trade["_fillModel"], "rpi_public_trade_proxy")
-        self.assertAlmostEqual(float(trade["commission"]), 0.005)
+        self.assertAlmostEqual(float(trade["commission"]), 0.003)
         self.assertAlmostEqual(
             float(gateway.get_account_info()["totalWalletBalance"]),
-            99.995,
+            99.997,
         )
 
     def test_rpi_always_queues_behind_same_price_non_rpi_even_if_it_arrived_first(self):
