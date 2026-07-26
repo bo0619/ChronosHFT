@@ -275,14 +275,15 @@ class DurableCommandRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = os.path.join(temp_dir, "oms.jsonl")
             oms, gateway = self._make_live_oms(path)
-            original_append = oms.journal.append
+            original_append_batch = oms.journal.append_batch
 
-            def fail_command_prepare(kind, payload):
-                if kind == "command_prepared":
+            def fail_command_prepare(records):
+                records = list(records)
+                if any(kind == "command_prepared" for kind, _payload in records):
                     raise JournalWriteError("simulated disk failure")
-                return original_append(kind, payload)
+                return original_append_batch(records)
 
-            oms.journal.append = fail_command_prepare
+            oms.journal.append_batch = fail_command_prepare
             try:
                 result = oms.submit_order(
                     OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 1.0)
@@ -293,7 +294,7 @@ class DurableCommandRecoveryTests(unittest.TestCase):
                 self.assertEqual(oms.state, LifecycleState.HALTED)
                 self.assertTrue(oms.manual_rearm_required)
             finally:
-                oms.journal.append = original_append
+                oms.journal.append_batch = original_append_batch
                 oms.stop()
 
 

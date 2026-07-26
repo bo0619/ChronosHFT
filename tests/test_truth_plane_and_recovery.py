@@ -215,6 +215,21 @@ class VenueSupervisorTests(unittest.TestCase):
         self.assertTrue(recovered)
         self.assertEqual(supervisor.gateway.calls, 1)
 
+    def test_supervisor_recovers_on_listen_key_keep_alive_failure(self):
+        supervisor = VenueSupervisor(
+            DummyOms(
+                "system_health:USER_STREAM_KEEPALIVE_FAILED:status=503"
+            ),
+            DummyGateway(recover_result=True),
+            self.make_config(),
+            start_thread=False,
+        )
+
+        recovered = supervisor.poll_once()
+
+        self.assertTrue(recovered)
+        self.assertEqual(supervisor.gateway.calls, 1)
+
     def test_supervisor_ignores_non_recoverable_venue_freeze(self):
         supervisor = VenueSupervisor(
             DummyOms("truth_plane:api_unreachable:2"),
@@ -290,6 +305,20 @@ class MarketTimestampTests(unittest.TestCase):
 
 
 class GatewayRecoveryTests(unittest.TestCase):
+    @staticmethod
+    def make_keep_alive_gateway():
+        gateway = BinanceGateway.__new__(BinanceGateway)
+        gateway.event_engine = DummyEngine()
+        gateway.gateway_name = "BINANCE"
+        gateway._book_lock = threading.RLock()
+        gateway._book_generation = 1
+        gateway.keep_alive_generation = 1
+        gateway.active = True
+        gateway.state = GatewayState.READY
+        gateway.set_state = lambda state: setattr(gateway, "state", state)
+        gateway.ws = SimpleNamespace(close=lambda: None)
+        return gateway
+
     def test_orderbook_recovery_freeze_and_clear_share_unique_token(self):
         gateway = BinanceGateway.__new__(BinanceGateway)
         gateway.event_engine = DummyEngine()
@@ -484,6 +513,52 @@ class GatewayRecoveryTests(unittest.TestCase):
         self.assertEqual(gateway.state, GatewayState.READY)
         self.assertTrue(gateway.active)
         self.assertEqual(closed, [])
+
+    def test_listen_key_keep_alive_failure_freezes_current_transport(self):
+        gateway = self.make_keep_alive_gateway()
+        closed = []
+        gateway.ws = SimpleNamespace(close=lambda: closed.append(True))
+        gateway.rest = SimpleNamespace(
+            keep_alive_listen_key=lambda: SimpleNamespace(status_code=503)
+        )
+
+        self.assertFalse(
+            gateway._keep_alive_once(1, transport_generation=1)
+        )
+
+        self.assertFalse(gateway.active)
+        self.assertEqual(gateway.state, GatewayState.ERROR)
+        self.assertEqual(closed, [True])
+        self.assertEqual(
+            gateway.event_engine.events[-1].data,
+            "FREEZE_VENUE:BINANCE:USER_STREAM_KEEPALIVE_FAILED: status=503",
+        )
+
+    def test_stale_keep_alive_failure_cannot_fault_replacement_transport(self):
+        gateway = self.make_keep_alive_gateway()
+        replacement_closed = []
+        gateway.ws = SimpleNamespace(
+            close=lambda: replacement_closed.append(True)
+        )
+
+        def stale_failure():
+            with gateway._book_lock:
+                gateway._book_generation = 2
+                gateway.keep_alive_generation = 2
+            return SimpleNamespace(status_code=503)
+
+        gateway.rest = SimpleNamespace(
+            keep_alive_listen_key=stale_failure
+        )
+
+        self.assertFalse(
+            gateway._keep_alive_once(1, transport_generation=1)
+        )
+
+        self.assertTrue(gateway.active)
+        self.assertEqual(gateway.state, GatewayState.READY)
+        self.assertEqual(gateway.event_engine.events, [])
+        self.assertEqual(replacement_closed, [])
 
     def test_resync_serializes_delta_at_snapshot_cutover(self):
         gateway = BinanceGateway.__new__(BinanceGateway)
@@ -706,7 +781,7 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway.stream_ready_timeout_sec = 1.0
         gateway.state = GatewayState.ERROR
         gateway.ws = SimpleNamespace(close=lambda: None)
-        gateway._start_streams = lambda: True
+        gateway._start_streams = lambda **_kwargs: True
         gateway._resync_book = lambda symbol, **_kwargs: True
 
         recovered = gateway.recover_connectivity()
@@ -742,7 +817,7 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway.stream_ready_timeout_sec = 1.0
         gateway.state = GatewayState.ERROR
         gateway.ws = SimpleNamespace(close=lambda: None)
-        gateway._start_streams = lambda: True
+        gateway._start_streams = lambda **_kwargs: True
         gateway._resync_book = lambda symbol, **_kwargs: True
 
         recovered = gateway.recover_connectivity(
@@ -786,7 +861,7 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway.stream_ready_timeout_sec = 1.0
         gateway.state = GatewayState.ERROR
         gateway.ws = SimpleNamespace(close=lambda: None)
-        gateway._start_streams = lambda: True
+        gateway._start_streams = lambda **_kwargs: True
 
         def fault_during_resync(_symbol, **_kwargs):
             gateway.active = False
@@ -842,7 +917,7 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway.ws = SimpleNamespace(close=lambda: None)
         gateway.session = SimpleNamespace(close=lambda: None)
         gateway._closing = False
-        gateway._start_streams = lambda: True
+        gateway._start_streams = lambda **_kwargs: True
 
         def blocked_resync(_symbol, **_kwargs):
             entered_resync.set()
@@ -963,7 +1038,7 @@ class GatewayRecoveryTests(unittest.TestCase):
             set_leverage=lambda *_args, **_kwargs: None,
         )
         gateway.ws = SimpleNamespace(close=lambda: None)
-        gateway._start_streams = lambda: False
+        gateway._start_streams = lambda **_kwargs: False
 
         gateway.connect(["BTCUSDT"])
 
@@ -1008,7 +1083,7 @@ class GatewayRecoveryTests(unittest.TestCase):
             set_leverage=lambda *_args, **_kwargs: FailedResponse(),
         )
         gateway.ws = SimpleNamespace(close=lambda: None)
-        gateway._start_streams = lambda: True
+        gateway._start_streams = lambda **_kwargs: True
 
         gateway.connect(["BTCUSDT"])
 

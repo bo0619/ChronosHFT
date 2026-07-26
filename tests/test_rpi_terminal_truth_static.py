@@ -4,6 +4,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / "oms" / "engine.py"
+OMS_IMPLEMENTATION = (
+    ROOT / "oms" / "exchange_event_processor.py",
+    ROOT / "oms" / "order_submission.py",
+    ROOT / "oms" / "submit_settlement.py",
+    ROOT / "oms" / "cancellation_manager.py",
+    ROOT / "oms" / "account_truth.py",
+    ROOT / "oms" / "lifecycle_controller.py",
+    ROOT / "oms" / "rpi_calibration_runtime.py",
+    ENGINE,
+)
 BASE_GATEWAY = ROOT / "gateway" / "base_gateway.py"
 REST_API = ROOT / "gateway" / "binance" / "rest_api.py"
 LIVE_GATEWAY = ROOT / "gateway" / "binance" / "gateway.py"
@@ -12,6 +22,18 @@ SYSTEM_HEALTH = ROOT / "infrastructure" / "system_health.py"
 MAIN = ROOT / "main.py"
 RISK_SUPERVISOR = ROOT / "risk" / "independent_supervisor.py"
 RPI_MANAGER = ROOT / "oms" / "rpi_calibration_manager.py"
+
+
+def _oms_implementation_source() -> str:
+    chunks = ["from __future__ import annotations\n"]
+    for path in OMS_IMPLEMENTATION:
+        source = path.read_text(encoding="utf-8").replace(
+            "from __future__ import annotations\n",
+            "",
+            1,
+        )
+        chunks.append(f"\n# source: {path.name}\n{source}\n")
+    return "".join(chunks)
 
 
 def _function(tree: ast.AST, name: str) -> ast.FunctionDef:
@@ -86,7 +108,7 @@ def _marker_line(node: ast.AST, marker: str) -> int:
 
 
 def test_expired_permit_invalidates_terminal_proof_on_uncertain_order_truth():
-    source = ENGINE.read_text(encoding="utf-8")
+    source = _oms_implementation_source()
     tree = ast.parse(source)
     apply_event = _function(tree, "_apply_event")
 
@@ -141,7 +163,7 @@ def test_expired_permit_invalidates_terminal_proof_on_uncertain_order_truth():
 
 
 def test_execution_gap_invalidates_expired_permit_terminal_proof():
-    source = ENGINE.read_text(encoding="utf-8")
+    source = _oms_implementation_source()
     tree = ast.parse(source)
     apply_event = _function(tree, "_apply_event")
     quarantine = _function(tree, "_quarantine_execution_gap_locked")
@@ -163,7 +185,7 @@ def test_execution_gap_invalidates_expired_permit_terminal_proof():
 
 
 def test_only_stale_and_safe_tombstone_paths_keep_terminal_proof():
-    source = ENGINE.read_text(encoding="utf-8")
+    source = _oms_implementation_source()
     tree = ast.parse(source)
     apply_event = _function(tree, "_apply_event")
 
@@ -199,7 +221,7 @@ def test_only_stale_and_safe_tombstone_paths_keep_terminal_proof():
 
 
 def test_all_gateway_order_sends_pass_the_post_prepare_final_fence():
-    source = ENGINE.read_text(encoding="utf-8")
+    source = _oms_implementation_source()
     tree = ast.parse(source)
     dispatch = _function(tree, "_dispatch_gateway_order_with_final_fence")
     submit = _function(tree, "submit_order")
@@ -234,7 +256,7 @@ def test_all_gateway_order_sends_pass_the_post_prepare_final_fence():
 
 
 def test_submit_prepare_batch_is_outside_the_oms_state_lock():
-    source = ENGINE.read_text(encoding="utf-8")
+    source = _oms_implementation_source()
     tree = ast.parse(source)
     for function_name in ("submit_order", "_submit_internal_order"):
         function = _function(tree, function_name)
@@ -272,7 +294,7 @@ def test_submit_prepare_batch_is_outside_the_oms_state_lock():
 
 
 def test_oms_uses_only_the_bounded_background_executor():
-    tree = ast.parse(ENGINE.read_text(encoding="utf-8"))
+    tree = ast.parse(_oms_implementation_source())
     oms = next(
         node
         for node in tree.body
@@ -329,7 +351,7 @@ def test_oms_uses_only_the_bounded_background_executor():
 
 
 def test_submit_cancel_is_coordinated_through_durable_settlement():
-    source = ENGINE.read_text(encoding="utf-8")
+    source = _oms_implementation_source()
     tree = ast.parse(source)
     assert "_pre_dispatch_submission_oids" not in source
 
@@ -381,7 +403,7 @@ def test_submit_cancel_is_coordinated_through_durable_settlement():
 
 
 def test_rpi_permit_configuration_is_owned_by_composed_manager():
-    engine_source = ENGINE.read_text(encoding="utf-8")
+    engine_source = _oms_implementation_source()
     engine_tree = ast.parse(engine_source)
     oms = next(
         node
@@ -429,7 +451,7 @@ def test_rpi_permit_configuration_is_owned_by_composed_manager():
 
 
 def test_final_send_fence_rechecks_dynamic_gate_and_calibration_truth():
-    source = ENGINE.read_text(encoding="utf-8")
+    source = _oms_implementation_source()
     tree = ast.parse(source)
     fence = _function(tree, "_get_final_outbound_send_rejection_locked")
     fence_source = _source_for(fence, source)
@@ -461,7 +483,7 @@ def test_final_send_fence_rechecks_dynamic_gate_and_calibration_truth():
 
 
 def test_recovered_and_internal_orders_invalidate_expired_terminal_proof():
-    source = ENGINE.read_text(encoding="utf-8")
+    source = _oms_implementation_source()
     tree = ast.parse(source)
 
     recovered = _function(tree, "_create_recovered_order")
@@ -518,7 +540,7 @@ def test_transport_guard_runs_at_the_actual_rest_send_boundary():
 
 
 def test_expiry_and_terminal_enforcement_wait_for_submits_to_settle():
-    source = ENGINE.read_text(encoding="utf-8")
+    source = _oms_implementation_source()
     tree = ast.parse(source)
     expire = _function(tree, "expire_rpi_calibration_permit")
     terminal = _function(tree, "_enforce_rpi_calibration_terminal_once")
@@ -546,7 +568,7 @@ def test_expiry_and_terminal_enforcement_wait_for_submits_to_settle():
 
 
 def test_submit_leases_outlive_transport_and_durable_local_settlement():
-    source = ENGINE.read_text(encoding="utf-8")
+    source = _oms_implementation_source()
     tree = ast.parse(source)
     for function_name in ("_submit_internal_order", "submit_order"):
         function = _function(tree, function_name)
@@ -621,7 +643,7 @@ def test_submit_leases_outlive_transport_and_durable_local_settlement():
 
 
 def test_fail_closed_and_stop_seal_every_new_order_before_draining():
-    source = ENGINE.read_text(encoding="utf-8")
+    source = _oms_implementation_source()
     tree = ast.parse(source)
     acquire = _function(tree, "_acquire_outbound_order_send_permit_locked")
     fence = _function(tree, "_get_final_outbound_send_rejection_locked")
@@ -654,7 +676,7 @@ def test_fail_closed_and_stop_seal_every_new_order_before_draining():
 
 
 def test_submit_journal_failures_seal_before_releasing_outbound_lease():
-    source = ENGINE.read_text(encoding="utf-8")
+    source = _oms_implementation_source()
     tree = ast.parse(source)
     for function_name in ("_submit_internal_order", "submit_order"):
         function = _function(tree, function_name)
@@ -724,7 +746,7 @@ def test_halt_handoff_reaches_sidecar_and_has_stale_parent_fallback():
 
 
 def test_position_and_rest_snapshot_uncertainty_invalidate_terminal_proof_first():
-    source = ENGINE.read_text(encoding="utf-8")
+    source = _oms_implementation_source()
     tree = ast.parse(source)
     account_update = _function(tree, "on_exchange_account_update")
     account_calls = _terminal_invalidation_calls(account_update)
@@ -761,7 +783,7 @@ def test_position_and_rest_snapshot_uncertainty_invalidate_terminal_proof_first(
 
 
 def test_terminal_verified_is_published_only_after_durable_audit():
-    source = ENGINE.read_text(encoding="utf-8")
+    source = _oms_implementation_source()
     tree = ast.parse(source)
     terminal = _function(tree, "_enforce_rpi_calibration_terminal_once")
     terminal_source = _source_for(terminal, source)

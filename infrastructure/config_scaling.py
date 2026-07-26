@@ -157,6 +157,21 @@ LIVE_EVIDENCE_RECORDER_DEFAULTS = {
 }
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON number {value!r} is not allowed")
+
+
+def _reject_duplicate_json_keys(pairs):
+    payload = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError(
+                f"duplicate JSON object key {key!r} is not allowed"
+            )
+        payload[key] = value
+    return payload
+
+
 def _to_float(value, default):
     try:
         return float(value)
@@ -717,7 +732,11 @@ def load_root_config(path: str = "config.json") -> dict:
     config_path = os.path.abspath(os.fspath(path))
     try:
         with open(config_path, "r", encoding="utf-8") as handle:
-            raw = json.load(handle)
+            raw = json.load(
+                handle,
+                parse_constant=_reject_json_constant,
+                object_pairs_hook=_reject_duplicate_json_keys,
+            )
     except FileNotFoundError as exc:
         raise FileNotFoundError(
             f"root config file not found: {config_path}"
@@ -726,6 +745,10 @@ def load_root_config(path: str = "config.json") -> dict:
         raise ValueError(
             "root config JSON is malformed at "
             f"{config_path}:{exc.lineno}:{exc.colno}: {exc.msg}"
+        ) from exc
+    except ValueError as exc:
+        raise ValueError(
+            f"root config JSON is invalid at {config_path}: {exc}"
         ) from exc
     except (OSError, UnicodeError) as exc:
         raise OSError(

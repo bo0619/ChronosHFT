@@ -1,9 +1,10 @@
 # file: data/ref_data.py
 
-import requests
 import math
-from decimal import Decimal, ROUND_DOWN
 from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP
+
+import requests
 from infrastructure.logger import logger
 
 
@@ -126,12 +127,28 @@ class ReferenceDataManager:
         info = self.get_info(symbol)
         return bool(info and info.supports_rpi)
 
-    def round_price(self, symbol, price):
-        """将价格修整为符合 tick_size"""
+    def round_price(self, symbol, price, direction="nearest"):
+        """Round a price to an exchange tick, optionally toward one side."""
         info = self.get_info(symbol)
-        if not info:
+        if not info or info.tick_size <= 0:
             return price
-        return round(price, info.price_precision)
+
+        rounding_modes = {
+            "nearest": ROUND_HALF_UP,
+            "down": ROUND_FLOOR,
+            "up": ROUND_CEILING,
+        }
+        try:
+            rounding = rounding_modes[str(direction or "nearest").lower()]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unsupported price rounding direction: {direction}"
+            ) from exc
+
+        price_dec = Decimal(str(price))
+        tick_dec = Decimal(str(info.tick_size))
+        ticks = (price_dec / tick_dec).to_integral_value(rounding=rounding)
+        return float(ticks * tick_dec)
 
     def round_qty(self, symbol, qty):
         """将数量修整为符合 step_size"""

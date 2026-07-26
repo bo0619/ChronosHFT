@@ -171,7 +171,7 @@ class BinanceGateway(BaseGateway):
         if old_ws is not None:
             old_ws.close()
 
-        if not self._start_streams():
+        if not self._start_streams(expected_generation=generation):
             candidate_ws.close()
             if self._mark_transport_failure_if_current(
                 generation,
@@ -427,7 +427,7 @@ class BinanceGateway(BaseGateway):
         resp = self.rest.get_commission_rate(symbol)
         return resp.json() if resp and resp.status_code == 200 else None
 
-    def _start_streams(self):
+    def _start_streams(self, *, expected_generation=None):
         if self.ws is None:
             return False
         self.ws.start_market_stream(self.symbols)
@@ -442,7 +442,7 @@ class BinanceGateway(BaseGateway):
         self.keep_alive_generation += 1
         threading.Thread(
             target=self._keep_alive_loop,
-            args=(self.keep_alive_generation,),
+            args=(self.keep_alive_generation, expected_generation),
             daemon=True,
         ).start()
         return True
@@ -538,12 +538,50 @@ class BinanceGateway(BaseGateway):
             return False
         return True
 
-    def _keep_alive_loop(self, generation):
+    def _keep_alive_loop(self, generation, transport_generation=None):
         while self.active and generation == self.keep_alive_generation:
             time.sleep(1800)
             if not self.active or generation != self.keep_alive_generation:
                 return
-            self.rest.keep_alive_listen_key()
+            if not self._keep_alive_once(
+                generation,
+                transport_generation=transport_generation,
+            ):
+                return
+
+    def _keep_alive_once(
+        self,
+        generation,
+        *,
+        transport_generation=None,
+    ) -> bool:
+        with self._book_lock:
+            if (
+                getattr(self, "_closing", False)
+                or not self.active
+                or generation != self.keep_alive_generation
+                or not self._book_generation_matches_locked(
+                    transport_generation
+                )
+            ):
+                return False
+
+        try:
+            response = self.rest.keep_alive_listen_key()
+            status_code = getattr(response, "status_code", None)
+            if status_code == 200:
+                return True
+            detail = f"status={status_code or 'unavailable'}"
+        except Exception as exc:
+            detail = f"{type(exc).__name__}:{exc}"
+
+        self._emit_ws_fault(
+            "USER_STREAM_KEEPALIVE_FAILED",
+            detail,
+            expected_generation=transport_generation,
+            expected_keep_alive_generation=generation,
+        )
+        return False
 
     def _new_ws(self, generation: int):
         return BinanceWsApi(
@@ -662,6 +700,7 @@ class BinanceGateway(BaseGateway):
         payload=None,
         *,
         expected_generation=None,
+        expected_keep_alive_generation=None,
     ):
         message = f"{code}: {detail}" if detail else code
         if payload is not None:
@@ -673,7 +712,14 @@ class BinanceGateway(BaseGateway):
             logger.error(f"[{self.gateway_name}] {message}")
 
         with self._book_lock:
-            if not self._book_generation_matches_locked(expected_generation):
+            if (
+                not self._book_generation_matches_locked(expected_generation)
+                or (
+                    expected_keep_alive_generation is not None
+                    and self.keep_alive_generation
+                    != expected_keep_alive_generation
+                )
+            ):
                 return False
             self.active = False
             ws_client = getattr(self, "ws", None)
@@ -1120,7 +1166,7 @@ class BinanceGateway(BaseGateway):
 
             committed = False
             try:
-                if not self._start_streams():
+                if not self._start_streams(expected_generation=generation):
                     logger.error(
                         f"[{self.gateway_name}] Recovery failed: "
                         "listen key unavailable"

@@ -10,6 +10,7 @@ import statistics
 import threading
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 from risk.deployment_loss import (
     MAX_CANARY_DEPLOYED_EQUITY_FRACTION,
@@ -539,6 +540,41 @@ class BinanceRiskSidecarExchange:
             return False, None, f"{label}_payload_invalid"
         return True, payload, ""
 
+    @staticmethod
+    def _position_risk_fingerprint(positions) -> tuple:
+        def normalized_number(value):
+            try:
+                parsed = Decimal(str(value or "0"))
+            except (InvalidOperation, ValueError):
+                return str(value or "").strip()
+            if not parsed.is_finite():
+                return str(value or "").strip()
+            return str(parsed.normalize())
+
+        rows = []
+        for position in positions:
+            if not isinstance(position, dict):
+                rows.append(("<invalid>", repr(position)))
+                continue
+            rows.append(
+                (
+                    str(position.get("symbol", "") or "").upper(),
+                    str(
+                        position.get("positionSide", "BOTH") or "BOTH"
+                    ).upper(),
+                    normalized_number(position.get("positionAmt")),
+                    normalized_number(position.get("entryPrice")),
+                    normalized_number(position.get("breakEvenPrice")),
+                    normalized_number(position.get("isolatedWallet")),
+                    normalized_number(position.get("liquidationPrice")),
+                    normalized_number(position.get("leverage")),
+                    str(position.get("marginType", "") or "").upper(),
+                    str(position.get("isolated", "") or "").lower(),
+                    normalized_number(position.get("updateTime")),
+                )
+            )
+        return tuple(sorted(rows))
+
     def _corrected_epoch_at(self, observed_monotonic: float):
         try:
             observed_monotonic = float(observed_monotonic)
@@ -643,6 +679,25 @@ class BinanceRiskSidecarExchange:
             )
             if not orders_ok:
                 return False, {}, reason
+            positions_after_ok, positions_after, reason = (
+                self._response_payload(
+                    self.rest.get_positions(),
+                    list,
+                    "positions_after_open_orders",
+                )
+            )
+            if not positions_after_ok:
+                return False, {}, reason
+            if self._position_risk_fingerprint(
+                positions
+            ) != self._position_risk_fingerprint(positions_after):
+                return (
+                    False,
+                    {},
+                    "snapshot_inconsistent:positions_changed_during_"
+                    "open_orders_query",
+                )
+            positions = positions_after
             external_cash_flow_total = 0.0
             if getattr(self, "daily_loss_enabled", False):
                 cash_flow_ok, external_cash_flow_total, reason = (

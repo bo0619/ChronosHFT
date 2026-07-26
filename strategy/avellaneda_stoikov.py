@@ -79,7 +79,7 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
             2.0,
         )
         self.vol_window = max(2, int(self.as_conf.get("vol_window", 60) or 60))
-        self.interval = self._positive_finite(
+        self.interval = self._nonnegative_finite(
             self.config.get(
                 "cycle_interval",
                 self.as_conf.get("cycle_interval", 1.0),
@@ -363,8 +363,16 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
         tick = float(info.tick_size or 0.0)
         if tick <= 0.0:
             return
-        target_bid = ref_data_manager.round_price(ob.symbol, target_bid)
-        target_ask = ref_data_manager.round_price(ob.symbol, target_ask)
+        target_bid = ref_data_manager.round_price(
+            ob.symbol,
+            target_bid,
+            direction="down",
+        )
+        target_ask = ref_data_manager.round_price(
+            ob.symbol,
+            target_ask,
+            direction="up",
+        )
         if target_bid >= ask_1:
             target_bid = ask_1 - tick
         if target_ask <= bid_1:

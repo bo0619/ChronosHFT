@@ -1451,6 +1451,14 @@ class LiveConfigGuardTests(unittest.TestCase):
             "malformed": ("{", "JSON is malformed"),
             "array": ("[]", "must be a JSON object"),
             "empty": ("{}", "must not be an empty JSON object"),
+            "duplicate": (
+                '{"execution":{"mode":"paper"},"execution":{}}',
+                "duplicate JSON object key",
+            ),
+            "non_standard_number": (
+                '{"execution":{"mode":"paper"},"value":NaN}',
+                "non-standard JSON number",
+            ),
         }
         for name, (payload, expected) in cases.items():
             with self.subTest(name=name):

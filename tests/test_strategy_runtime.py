@@ -72,6 +72,29 @@ class StrategyRuntimeTests(unittest.TestCase):
         finally:
             runtime.stop()
 
+    def test_handler_exception_invokes_fail_closed_callback(self):
+        class FailedStrategy(DummyStrategy):
+            def on_order(self, _snapshot):
+                raise ValueError("forced strategy failure")
+
+        failures = []
+        runtime = StrategyRuntime(
+            FailedStrategy(),
+            start_thread=False,
+            failure_callback=failures.append,
+        )
+        runtime.on_order(SimpleNamespace(order_id="oid-failed"))
+
+        self.assertEqual(runtime.process_pending(), 1)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["phase"], "handler")
+        self.assertEqual(failures[0]["kind"], "order")
+        self.assertIn("ValueError:forced strategy failure", failures[0]["message"])
+        metrics = runtime.get_metrics_snapshot()
+        self.assertEqual(metrics["handler_error_count"], 1)
+        self.assertEqual(metrics["processed"], 0)
+        self.assertEqual(metrics["last_error_kind"], "order")
+
 
 if __name__ == "__main__":
     unittest.main()

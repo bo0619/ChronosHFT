@@ -6,9 +6,18 @@ from infrastructure.logger import logger
 
 
 class StrategyRuntime:
-    def __init__(self, strategy, config=None, start_thread=True):
+    def __init__(
+        self,
+        strategy,
+        config=None,
+        start_thread=True,
+        failure_callback=None,
+    ):
         self.strategy = strategy
         self.config = config or {}
+        if failure_callback is not None and not callable(failure_callback):
+            raise TypeError("strategy runtime failure callback must be callable")
+        self.failure_callback = failure_callback
         self.queue_warn_depth = int(self.config.get("queue_warn_depth", 100))
         self.slow_handler_ms = float(self.config.get("slow_handler_ms", 100.0))
         self.alert_interval_sec = float(self.config.get("alert_interval_sec", 5.0))
@@ -45,6 +54,11 @@ class StrategyRuntime:
             "last_handler_ms": 0.0,
             "max_handler_ms": 0.0,
             "slow_handler_count": 0,
+            "handler_error_count": 0,
+            "async_error_count": 0,
+            "last_error_at": 0.0,
+            "last_error_kind": "",
+            "last_error_message": "",
         }
         if start_thread:
             self.start()
@@ -277,9 +291,19 @@ class StrategyRuntime:
         try:
             handler(payload)
         except Exception as exc:
-            logger.error(f"[StrategyRuntime] handler failed {kind}: {exc}")
+            logger.error(
+                f"[StrategyRuntime] handler failed {kind}: "
+                f"{type(exc).__name__}:{exc}"
+            )
             with self._condition:
                 self._inflight = {"kind": "", "started_at": 0.0, "enqueued_at": 0.0}
+            self._report_failure(
+                kind=kind,
+                payload=payload,
+                handler=handler,
+                error=exc,
+                phase="handler",
+            )
             return
 
         elapsed_ms = max(0.0, (time.perf_counter() - started_at) * 1000.0)
@@ -309,6 +333,63 @@ class StrategyRuntime:
                 poll()
             except Exception as exc:
                 logger.error(f"[StrategyRuntime] async worker poll failed: {exc}")
+                self._report_failure(
+                    kind="async_worker",
+                    payload=None,
+                    handler=poll,
+                    error=exc,
+                    phase="async_poll",
+                )
+
+    def _report_failure(
+        self,
+        *,
+        kind: str,
+        payload,
+        handler,
+        error: BaseException,
+        phase: str,
+    ) -> None:
+        failed_at = time.time()
+        message = f"{type(error).__name__}:{error}"
+        with self._condition:
+            counter = (
+                "async_error_count"
+                if phase.startswith("async")
+                else "handler_error_count"
+            )
+            self._stats[counter] += 1
+            self._stats["last_error_at"] = failed_at
+            self._stats["last_error_kind"] = kind
+            self._stats["last_error_message"] = message
+
+        if self.failure_callback is None:
+            logger.critical(
+                "[StrategyRuntime] failure callback unavailable: "
+                f"phase={phase} kind={kind}"
+            )
+            return
+        try:
+            self.failure_callback(
+                {
+                    "phase": phase,
+                    "kind": kind,
+                    "payload": payload,
+                    "handler_name": getattr(
+                        handler,
+                        "__qualname__",
+                        getattr(handler, "__name__", repr(handler)),
+                    ),
+                    "error": error,
+                    "message": message,
+                    "failed_at": failed_at,
+                }
+            )
+        except BaseException as callback_error:
+            logger.critical(
+                "[StrategyRuntime] fail-closed callback raised: "
+                f"{type(callback_error).__name__}:{callback_error}"
+            )
 
     def _get_async_worker_metrics(self):
         get_metrics = getattr(self.strategy, "get_async_worker_metrics", None)

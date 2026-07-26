@@ -3,7 +3,7 @@ import sys
 import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, mock_open, patch, call
+from unittest.mock import MagicMock, patch, call
 
 if "requests" not in sys.modules:
     requests_module = types.ModuleType("requests")
@@ -68,8 +68,9 @@ from infrastructure.config_scaling import (
     apply_capital_scaling,
     apply_production_safety_defaults,
     finalize_strategy_risk_budgets,
-    load_root_config,
     normalize_strategy_registration,
+    normalize_root_config_preapproval,
+    resolve_runtime_secrets,
 )
 from infrastructure.paper_trade import apply_paper_trade_mode, is_paper_trade
 from main import run_live_risk_checks
@@ -121,6 +122,12 @@ class DummySession:
 
 
 class LeverageAndLotMultiplierTests(unittest.TestCase):
+    @staticmethod
+    def normalize_runtime_config(payload):
+        return resolve_runtime_secrets(
+            normalize_root_config_preapproval(payload)
+        )
+
     def test_live_risk_checks_poll_market_data_freshness(self):
         risk = SimpleNamespace(freshness_checks=0)
 
@@ -128,6 +135,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             risk.freshness_checks += 1
 
         risk.check_market_data_freshness = check_market_data_freshness
+        risk.check_funding_guard = lambda: True
 
         run_live_risk_checks(risk)
 
@@ -137,17 +145,17 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
         calls = []
         supervisor = SimpleNamespace(tick=lambda: calls.append("supervisor") or True)
         risk = SimpleNamespace(
+            check_funding_guard=lambda: calls.append("funding") or True,
             check_market_data_freshness=lambda: calls.append("risk") or True
         )
 
         self.assertTrue(run_live_risk_checks(risk, supervisor))
-        self.assertEqual(calls, ["supervisor", "risk"])
+        self.assertEqual(calls, ["supervisor", "funding", "risk"])
 
     def test_root_config_injects_fail_closed_market_freshness_defaults(self):
         payload = {"symbols": ["BTCUSDT"], "risk": {"limits": {}}}
 
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+        loaded = self.normalize_runtime_config(payload)
 
         self.assertEqual(
             loaded["risk"]["market_data_freshness"],
@@ -165,8 +173,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             }
         }
 
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+        loaded = self.normalize_runtime_config(payload)
 
         freshness = loaded["risk"]["market_data_freshness"]
         self.assertFalse(freshness["enabled"])
@@ -178,8 +185,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
     def test_root_config_injects_fail_closed_cash_flow_truth_defaults(self):
         payload = {"symbols": ["BTCUSDT"], "risk": {"limits": {}}}
 
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+        loaded = self.normalize_runtime_config(payload)
 
         self.assertEqual(
             loaded["risk"]["cash_flow_truth"],
@@ -212,8 +218,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
     def test_root_config_injects_fail_closed_risk_heartbeat_defaults(self):
         payload = {"symbols": ["BTCUSDT"], "risk": {"limits": {}}}
 
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+        loaded = self.normalize_runtime_config(payload)
 
         self.assertEqual(
             loaded["risk"]["risk_control_heartbeat"],
@@ -239,13 +244,18 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
     def test_root_config_enables_independent_risk_supervisor(self):
         payload = {"symbols": ["BTCUSDT"], "risk": {"limits": {}}}
 
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+        loaded = self.normalize_runtime_config(payload)
 
+        supervisor = loaded["risk"]["independent_supervisor"]
         self.assertEqual(
-            loaded["risk"]["independent_supervisor"],
+            {
+                key: supervisor[key]
+                for key in INDEPENDENT_RISK_SUPERVISOR_DEFAULTS
+            },
             INDEPENDENT_RISK_SUPERVISOR_DEFAULTS,
         )
+        self.assertEqual(supervisor["api_key"], "")
+        self.assertEqual(supervisor["api_secret"], "")
         self.assertEqual(
             loaded["risk"]["risk_control_heartbeat"]["required_source"],
             "independent_supervisor",
@@ -269,8 +279,6 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
         payload = {
             "api_key_env": "CHRONOS_TEST_API_KEY",
             "api_secret_env": "CHRONOS_TEST_API_SECRET",
-            "api_key": "file-key",
-            "api_secret": "file-secret",
         }
 
         with patch.dict(
@@ -279,8 +287,8 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
                 "CHRONOS_TEST_API_KEY": "environment-key",
                 "CHRONOS_TEST_API_SECRET": "environment-secret",
             },
-        ), patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+        ):
+            loaded = self.normalize_runtime_config(payload)
 
         self.assertEqual(loaded["api_key"], "environment-key")
         self.assertEqual(loaded["api_secret"], "environment-secret")
@@ -301,8 +309,8 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
                 "CHRONOS_TEST_RISK_KEY": "risk-only-key",
                 "CHRONOS_TEST_RISK_SECRET": "risk-only-secret",
             },
-        ), patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+        ):
+            loaded = self.normalize_runtime_config(payload)
 
         supervisor = loaded["risk"]["independent_supervisor"]
         self.assertEqual(supervisor["api_key"], "risk-only-key")
@@ -320,8 +328,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
     def test_root_config_injects_outbound_message_budget_defaults(self):
         payload = {"symbols": ["BTCUSDT"], "oms": {}, "risk": {}}
 
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+        loaded = self.normalize_runtime_config(payload)
 
         self.assertEqual(
             loaded["oms"]["outbound_message_budget"],
@@ -338,8 +345,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             }
         }
 
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+        loaded = self.normalize_runtime_config(payload)
 
         budget = loaded["oms"]["outbound_message_budget"]
         self.assertFalse(budget["enabled"])
@@ -349,8 +355,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
     def test_root_config_injects_self_trade_prevention_defaults(self):
         payload = {"symbols": ["BTCUSDT"], "oms": {}, "risk": {}}
 
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+        loaded = self.normalize_runtime_config(payload)
 
         self.assertEqual(
             loaded["oms"]["self_trade_prevention"],
@@ -367,8 +372,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             }
         }
 
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+        loaded = self.normalize_runtime_config(payload)
 
         stp = loaded["oms"]["self_trade_prevention"]
         self.assertFalse(stp["enabled"])
@@ -378,8 +382,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
     def test_root_config_enables_single_writer_fence(self):
         payload = {"symbols": ["BTCUSDT"], "oms": {}, "risk": {}}
 
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+        loaded = self.normalize_runtime_config(payload)
 
         self.assertEqual(
             loaded["oms"]["single_writer_fence"],
@@ -389,8 +392,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
     def test_root_config_enables_venue_dead_man_switch(self):
         payload = {"symbols": ["BTCUSDT"], "oms": {}, "risk": {}}
 
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+        loaded = self.normalize_runtime_config(payload)
 
         self.assertEqual(
             loaded["oms"]["venue_dead_man_switch"],
@@ -412,8 +414,7 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             },
         }
 
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+        loaded = self.normalize_runtime_config(payload)
 
         budget_config = loaded["risk"]["strategy_risk_budgets"]
         self.assertTrue(budget_config["enabled"])

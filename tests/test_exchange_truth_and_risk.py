@@ -126,6 +126,7 @@ class DummyGateway:
 class DummyOMS:
     def __init__(self):
         self.config = {"symbols": ["BTCUSDT"]}
+        self.state = LifecycleState.LIVE
         self.exposure = types.SimpleNamespace(net_positions={})
         self.halt_reasons = []
         self.frozen_symbols = []
@@ -145,6 +146,13 @@ class DummyOMS:
         self.dead_man_renewals = 0
         self.mode_override = None
         self.mode_override_reason = ""
+        self.symbol_guards = {}
+        self.venue_guards = {}
+        self.strategy_guards = {}
+        self.strategy_symbol_guards = {}
+        self.mode_constraints = {}
+        self._shutdown_requested = False
+        self._stopped = False
 
     def halt_system(self, reason):
         self.halt_reasons.append(reason)
@@ -247,6 +255,12 @@ class DummyOMS:
         self.flatten_reasons.append(reason)
         return 0
 
+    def get_local_order_truth_snapshot(self):
+        return {
+            "active_orders": [],
+            "order_sends_inflight": 0,
+        }
+
     def record_risk_control_heartbeat(
         self,
         source="risk_manager",
@@ -258,6 +272,23 @@ class DummyOMS:
 
     def renew_venue_dead_man_switch(self):
         self.dead_man_renewals += 1
+        return True
+
+    request_venue_dead_man_switch_renewal = (
+        renew_venue_dead_man_switch
+    )
+
+    def get_venue_dead_man_switch_snapshot(self):
+        return {
+            "enabled": True,
+            "valid": True,
+            "reason": "",
+        }
+
+    def can_open_new_risk(self):
+        return True
+
+    def can_renew_venue_dead_man_switch(self):
         return True
 
 
@@ -558,7 +589,9 @@ class ExchangeTruthTests(unittest.TestCase):
         gateway.state = GatewayState.READY
         gateway.book_resyncing = set()
         gateway.ws_buffer = {"BTCUSDT": None}
-        gateway.rest = types.SimpleNamespace(new_order=lambda _req, _client_oid: None)
+        gateway.rest = types.SimpleNamespace(
+            new_order=lambda _req, _client_oid, **_kwargs: None
+        )
         request = OrderRequest(
             symbol="BTCUSDT",
             price=100.0,
@@ -581,7 +614,7 @@ class ExchangeTruthTests(unittest.TestCase):
         gateway.book_resyncing = set()
         gateway.ws_buffer = {"BTCUSDT": None}
         gateway.rest = types.SimpleNamespace(
-            new_order=lambda _req, _client_oid: DummyResponse(
+            new_order=lambda _req, _client_oid, **_kwargs: DummyResponse(
                 {"code": -1006, "msg": "Unexpected response from message bus"},
                 status_code=400,
             )
@@ -620,7 +653,9 @@ class ExchangeTruthTests(unittest.TestCase):
         gateway.book_resyncing = set()
         gateway.ws_buffer = {"BTCUSDT": None}
         gateway.rest = types.SimpleNamespace(
-            new_order=lambda req, client_oid: calls.append((req, client_oid))
+            new_order=lambda req, client_oid, **_kwargs: calls.append(
+                (req, client_oid)
+            )
         )
         opening = OrderRequest(
             symbol="BTCUSDT",
@@ -1093,6 +1128,9 @@ class RiskExecutionTests(unittest.TestCase):
         oms = DummyOMS()
         config = self.make_risk_config()
         config["risk"]["market_data_freshness"] = {"enabled": False}
+        config["oms"] = {
+            "venue_dead_man_switch": {"enabled": True}
+        }
         risk = RiskManager(engine, config, oms=oms, gateway=gateway)
         oms.risk_heartbeats.clear()
 
@@ -1681,6 +1719,10 @@ class RiskExecutionTests(unittest.TestCase):
                 "journal_integrity_check": True,
                 "journal_path": os.path.join(tmpdir, "oms_journal.jsonl"),
             }
+            config["risk"]["kill_switch"] = {
+                "verify_interval_sec": 0.05,
+                "verify_timeout_sec": 1.0,
+            }
             writer = OMSJournal(config)
             writer.append(
                 "risk_state",
@@ -1708,6 +1750,12 @@ class RiskExecutionTests(unittest.TestCase):
             self.assertTrue(risk.kill_switch_triggered)
             self.assertEqual(risk.kill_state, "CANCEL_PENDING")
             self.assertTrue(risk.resume_kill_switch_supervision())
+            deadline = time.perf_counter() + 1.0
+            while (
+                risk.kill_state != "FLAT_VERIFIED"
+                and time.perf_counter() < deadline
+            ):
+                time.sleep(0.01)
             self.assertEqual(risk.kill_state, "FLAT_VERIFIED")
             self.assertTrue(risk.kill_switch_triggered)
 
@@ -1782,7 +1830,13 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
     def test_sidecar_stale_parent_cancels_and_exits_after_orphan_window(self):
         exchange = DummySidecarExchange(healthy=True)
         core = RiskSidecarCore(exchange, self.make_settings(), now=100.0)
-        self.assertTrue(core.receive_parent_heartbeat(1, now=100.1))
+        self.assertTrue(
+            core.receive_parent_heartbeat(
+                1,
+                sent_monotonic=100.1,
+                now=100.1,
+            )
+        )
 
         healthy, keep_running = core.step(now=100.1)
         self.assertTrue(healthy["healthy"])
@@ -1809,7 +1863,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
     def test_sidecar_exchange_failure_is_unhealthy_and_cancels_immediately(self):
         exchange = DummySidecarExchange(False, "account_status=503")
         core = RiskSidecarCore(exchange, self.make_settings(), now=200.0)
-        core.receive_parent_heartbeat(1, now=200.1)
+        core.receive_parent_heartbeat(1, sent_monotonic=200.1, now=200.1)
 
         status, keep_running = core.step(now=200.1)
 
@@ -1848,7 +1902,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             self.make_settings(max_account_gross_notional=450.0),
             now=250.0,
         )
-        core.receive_parent_heartbeat(1, now=250.1)
+        core.receive_parent_heartbeat(1, sent_monotonic=250.1, now=250.1)
 
         status, keep_running = core.step(now=250.1)
 
@@ -1889,7 +1943,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             }
         )
         core = RiskSidecarCore(exchange, self.make_settings(), now=300.0)
-        core.receive_parent_heartbeat(1, now=300.1)
+        core.receive_parent_heartbeat(1, sent_monotonic=300.1, now=300.1)
 
         triggered, keep_running = core.step(now=300.1)
 
@@ -1901,6 +1955,11 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         self.assertEqual(exchange.flatten_calls, 1)
         self.assertEqual(triggered["last_flatten_count"], 1)
 
+        core.receive_parent_heartbeat(
+            2,
+            sent_monotonic=301.2,
+            now=301.2,
+        )
         verified, keep_running = core.step(now=301.2)
 
         self.assertTrue(keep_running)
@@ -1927,8 +1986,13 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             }
         )
         core = RiskSidecarCore(exchange, self.make_settings(), now=350.0)
-        core.receive_parent_heartbeat(1, now=350.1)
+        core.receive_parent_heartbeat(1, sent_monotonic=350.1, now=350.1)
         core.step(now=350.1)
+        core.receive_parent_heartbeat(
+            2,
+            sent_monotonic=351.2,
+            now=351.2,
+        )
         verified, _ = core.step(now=351.2)
         self.assertEqual(verified["stage"], "FLAT_VERIFIED")
 
@@ -1939,6 +2003,11 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                 "markPrice": "50",
             }
         ]
+        core.receive_parent_heartbeat(
+            3,
+            sent_monotonic=352.3,
+            now=352.3,
+        )
         reopened, _ = core.step(now=352.3)
 
         self.assertEqual(reopened["stage"], "FLATTENING")
@@ -1962,7 +2031,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             }
         )
         core = RiskSidecarCore(exchange, self.make_settings(), now=400.0)
-        core.receive_parent_heartbeat(1, now=400.1)
+        core.receive_parent_heartbeat(1, sent_monotonic=400.1, now=400.1)
         core.step(now=400.1)
 
         stale, _ = core.step(now=401.2)
@@ -2006,14 +2075,14 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             ),
             now=700.0,
         )
-        core.receive_parent_heartbeat(1, now=700.1)
+        core.receive_parent_heartbeat(1, sent_monotonic=700.1, now=700.1)
         initial, _ = core.step(now=700.1)
         self.assertTrue(initial["healthy"])
 
         exchange.risk_snapshot.update(
             self.make_daily_snapshot(1040.0, 100.0, day_time + 60)
         )
-        core.receive_parent_heartbeat(2, now=701.1)
+        core.receive_parent_heartbeat(2, sent_monotonic=701.1, now=701.1)
         reduced, _ = core.step(now=701.2)
         self.assertEqual(reduced["risk_action"], "REDUCE_ONLY")
         self.assertEqual(
@@ -2028,7 +2097,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         exchange.risk_snapshot.update(
             self.make_daily_snapshot(1090.0, 200.0, day_time + 120)
         )
-        core.receive_parent_heartbeat(3, now=702.1)
+        core.receive_parent_heartbeat(3, sent_monotonic=702.1, now=702.1)
         killed, _ = core.step(now=702.3)
         self.assertEqual(killed["risk_action"], "KILL")
         self.assertIn("daily_loss_kill", killed["reason"])
@@ -2055,17 +2124,17 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             ),
             now=720.0,
         )
-        core.receive_parent_heartbeat(1, now=720.1)
+        core.receive_parent_heartbeat(1, sent_monotonic=720.1, now=720.1)
         core.step(now=720.1)
         exchange.risk_snapshot.update(
             self.make_daily_snapshot(1100.0, 0.0, day_time + 60)
         )
-        core.receive_parent_heartbeat(2, now=721.1)
+        core.receive_parent_heartbeat(2, sent_monotonic=721.1, now=721.1)
         core.step(now=721.2)
         exchange.risk_snapshot.update(
             self.make_daily_snapshot(1040.0, 0.0, day_time + 120)
         )
-        core.receive_parent_heartbeat(3, now=722.1)
+        core.receive_parent_heartbeat(3, sent_monotonic=722.1, now=722.1)
 
         killed, _ = core.step(now=722.3)
 
@@ -2105,12 +2174,12 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             ),
             now=740.0,
         )
-        core.receive_parent_heartbeat(1, now=740.1)
+        core.receive_parent_heartbeat(1, sent_monotonic=740.1, now=740.1)
         core.step(now=740.1)
         exchange.risk_snapshot.update(
             self.make_daily_snapshot(900.0, 0.0, day_two)
         )
-        core.receive_parent_heartbeat(2, now=741.1)
+        core.receive_parent_heartbeat(2, sent_monotonic=741.1, now=741.1)
 
         reset, _ = core.step(now=741.2)
 
@@ -2143,19 +2212,31 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                 )
             )
             first = RiskSidecarCore(exchange, settings, now=760.0)
-            first.receive_parent_heartbeat(1, now=760.1)
+            first.receive_parent_heartbeat(
+                1,
+                sent_monotonic=760.1,
+                now=760.1,
+            )
             first.step(now=760.1)
             exchange.risk_snapshot.update(
                 self.make_daily_snapshot(980.0, 0.0, day_time + 60)
             )
-            first.receive_parent_heartbeat(2, now=761.1)
+            first.receive_parent_heartbeat(
+                2,
+                sent_monotonic=761.1,
+                now=761.1,
+            )
             first.step(now=761.2)
 
             exchange.risk_snapshot.update(
                 self.make_daily_snapshot(890.0, 0.0, day_time + 120)
             )
             recovered = RiskSidecarCore(exchange, settings, now=762.0)
-            recovered.receive_parent_heartbeat(1, now=762.1)
+            recovered.receive_parent_heartbeat(
+                1,
+                sent_monotonic=762.1,
+                now=762.1,
+            )
             killed, _ = recovered.step(now=762.1)
 
             self.assertTrue(recovered.state_recovered)
@@ -2179,7 +2260,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             self.make_settings(daily_loss_enabled=True),
             now=780.0,
         )
-        core.receive_parent_heartbeat(1, now=780.1)
+        core.receive_parent_heartbeat(1, sent_monotonic=780.1, now=780.1)
 
         status, _ = core.step(now=780.1)
 
@@ -2212,7 +2293,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             risk_snapshot={**base_snapshot, "clock_phase_error_ms": 0.0}
         )
         stable = RiskSidecarCore(stable_exchange, settings, now=790.0)
-        stable.receive_parent_heartbeat(1, now=790.1)
+        stable.receive_parent_heartbeat(1, sent_monotonic=790.1, now=790.1)
         stable_status, _ = stable.step(now=790.1)
         self.assertEqual(stable_status["risk_action"], "NONE")
 
@@ -2220,7 +2301,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             risk_snapshot={**base_snapshot, "clock_phase_error_ms": 30.0}
         )
         soft = RiskSidecarCore(soft_exchange, settings, now=800.0)
-        soft.receive_parent_heartbeat(1, now=800.1)
+        soft.receive_parent_heartbeat(1, sent_monotonic=800.1, now=800.1)
         soft_status, _ = soft.step(now=800.1)
         self.assertEqual(soft_status["risk_action"], "REDUCE_ONLY")
         self.assertIn("clock_phase_error_reduce_only", soft_status["reason"])
@@ -2229,7 +2310,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             risk_snapshot={**base_snapshot, "clock_phase_error_ms": -120.0}
         )
         hard = RiskSidecarCore(hard_exchange, settings, now=810.0)
-        hard.receive_parent_heartbeat(1, now=810.1)
+        hard.receive_parent_heartbeat(1, sent_monotonic=810.1, now=810.1)
         hard_status, _ = hard.step(now=810.1)
         self.assertEqual(hard_status["risk_action"], "KILL")
         self.assertIn("clock_phase_error_kill", hard_status["reason"])
@@ -2244,7 +2325,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             self.make_settings(clock_sync_enabled=True),
             now=815.0,
         )
-        core.receive_parent_heartbeat(1, now=815.1)
+        core.receive_parent_heartbeat(1, sent_monotonic=815.1, now=815.1)
 
         status, _ = core.step(now=815.1)
 
@@ -2298,7 +2379,12 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                 settings,
                 now=820.0 + index,
             )
-            core.receive_parent_heartbeat(1, now=820.1 + index)
+            heartbeat_at = 820.1 + index
+            core.receive_parent_heartbeat(
+                1,
+                sent_monotonic=heartbeat_at,
+                now=heartbeat_at,
+            )
             status, _ = core.step(now=820.1 + index)
             self.assertEqual(status["risk_action"], "REDUCE_ONLY")
             self.assertIn(expected_reason, status["reason"])
@@ -2323,14 +2409,22 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             settings,
             now=829.0,
         )
-        invalid.receive_parent_heartbeat(1, now=829.1)
+        invalid.receive_parent_heartbeat(
+            1,
+            sent_monotonic=829.1,
+            now=829.1,
+        )
         invalid_status, _ = invalid.step(now=829.1)
         self.assertEqual(invalid_status["risk_action"], "REDUCE_ONLY")
         self.assertEqual(invalid_status["reason"], "clock_snapshot_invalid")
 
         missing_exchange = DummySidecarExchange()
         missing = RiskSidecarCore(missing_exchange, settings, now=830.0)
-        missing.receive_parent_heartbeat(1, now=830.1)
+        missing.receive_parent_heartbeat(
+            1,
+            sent_monotonic=830.1,
+            now=830.1,
+        )
         missing_status, _ = missing.step(now=830.1)
         self.assertEqual(missing_status["risk_action"], "REDUCE_ONLY")
         self.assertEqual(missing_status["reason"], "clock_snapshot_invalid")
@@ -2363,7 +2457,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             ),
             now=840.0,
         )
-        core.receive_parent_heartbeat(1, now=840.1)
+        core.receive_parent_heartbeat(1, sent_monotonic=840.1, now=840.1)
 
         status, _ = core.step(now=840.1)
 
@@ -2402,7 +2496,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             ),
             now=850.0,
         )
-        core.receive_parent_heartbeat(1, now=850.1)
+        core.receive_parent_heartbeat(1, sent_monotonic=850.1, now=850.1)
 
         status, _ = core.step(now=850.1)
 
@@ -2436,7 +2530,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             ),
             now=860.0,
         )
-        core.receive_parent_heartbeat(1, now=860.1)
+        core.receive_parent_heartbeat(1, sent_monotonic=860.1, now=860.1)
 
         status, _ = core.step(now=860.1)
 
@@ -2468,7 +2562,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             }
         )
         core = RiskSidecarCore(exchange, self.make_settings(), now=870.0)
-        core.receive_parent_heartbeat(1, now=870.1)
+        core.receive_parent_heartbeat(1, sent_monotonic=870.1, now=870.1)
 
         status, _ = core.step(now=870.1)
 
@@ -2504,7 +2598,11 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                 }
             )
             first = RiskSidecarCore(exchange, settings, now=500.0)
-            first.receive_parent_heartbeat(1, now=500.1)
+            first.receive_parent_heartbeat(
+                1,
+                sent_monotonic=500.1,
+                now=500.1,
+            )
             triggered, _ = first.step(now=500.1)
 
             self.assertTrue(triggered["kill_latched"])
@@ -2521,7 +2619,11 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             self.assertTrue(recovered.state_recovered)
             self.assertTrue(recovered.kill_latched)
             self.assertEqual(recovered.stage, "FLATTENING")
-            recovered.receive_parent_heartbeat(1, now=501.1)
+            recovered.receive_parent_heartbeat(
+                1,
+                sent_monotonic=501.1,
+                now=501.1,
+            )
             verified, _ = recovered.step(now=501.1)
             self.assertEqual(verified["stage"], "FLAT_VERIFIED")
 
@@ -2563,13 +2665,13 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             }
         )
         core = RiskSidecarCore(exchange, self.make_settings(), now=550.0)
-        core.receive_parent_heartbeat(1, now=550.1)
+        core.receive_parent_heartbeat(1, sent_monotonic=550.1, now=550.1)
         core.step(now=550.1)
         exchange.risk_snapshot["account"] = {
             "totalMaintMargin": "0",
             "totalMarginBalance": "1000",
         }
-        core.receive_parent_heartbeat(2, now=551.15)
+        core.receive_parent_heartbeat(2, sent_monotonic=551.15, now=551.15)
         core.step(now=551.2)
         prepared, token, reason = core.prepare_rearm(
             "prepare-2",
@@ -2660,6 +2762,53 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             self.assertTrue(request.reduce_only)
             self.assertLessEqual(len(client_oid), 36)
         self.assertNotEqual(long_oid, short_oid)
+
+    def test_binance_sidecar_rejects_fill_race_across_snapshot_queries(self):
+        class FillDuringOpenOrdersRest(DummyRiskSidecarRest):
+            def __init__(self):
+                super().__init__(
+                    positions=[
+                        {
+                            "symbol": "BTCUSDT",
+                            "positionSide": "BOTH",
+                            "positionAmt": "0",
+                            "entryPrice": "0",
+                            "updateTime": 1,
+                        }
+                    ],
+                    open_orders=[{"symbol": "BTCUSDT", "orderId": 7}],
+                )
+                self.position_reads = 0
+
+            def get_positions(self):
+                self.position_reads += 1
+                if self.position_reads == 1:
+                    return DummyResponse(self.positions)
+                return DummyResponse(
+                    [
+                        {
+                            "symbol": "BTCUSDT",
+                            "positionSide": "BOTH",
+                            "positionAmt": "0.25",
+                            "entryPrice": "100",
+                            "updateTime": 2,
+                        }
+                    ]
+                )
+
+        exchange = BinanceRiskSidecarExchange.__new__(
+            BinanceRiskSidecarExchange
+        )
+        exchange.rest = FillDuringOpenOrdersRest()
+
+        ok, snapshot, reason = exchange.get_risk_snapshot()
+
+        self.assertFalse(ok)
+        self.assertEqual(snapshot, {})
+        self.assertEqual(
+            reason,
+            "snapshot_inconsistent:positions_changed_during_open_orders_query",
+        )
 
     def test_binance_sidecar_cash_flow_truth_deduplicates_transfers(self):
         rest = DummyRiskSidecarRest(
@@ -3059,22 +3208,21 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         self.assertTrue(exchange.closed)
 
     def test_sidecar_loop_runs_across_a_spawned_process_boundary(self):
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
         context = multiprocessing.get_context("spawn")
         command_queue = context.Queue(maxsize=8)
         status_queue = context.Queue(maxsize=8)
         settings = self.make_settings(
             session_id="spawn-session",
             status_interval_sec=0.05,
-            parent_heartbeat_timeout_sec=1.0,
-            orphan_exit_sec=2.0,
-        )
-        command_queue.put(
-            {
-                "type": "HEARTBEAT",
-                "session_id": "spawn-session",
-                "sequence": 1,
-                "sent_monotonic": time.perf_counter(),
-            }
+            parent_heartbeat_timeout_sec=5.0,
+            orphan_exit_sec=10.0,
+            exchange_poll_interval_sec=0.1,
+            exchange_max_age_sec=1.0,
+            state_path=os.path.join(state_dir.name, "sidecar-state.json"),
+            state_required=True,
+            state_fsync=False,
         )
         process = context.Process(
             target=run_sidecar_loop,
@@ -3087,13 +3235,57 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         )
         process.start()
         try:
-            status = status_queue.get(timeout=5.0)
+            command_queue.put(
+                {
+                    "type": "HEARTBEAT",
+                    "session_id": "spawn-session",
+                    "sequence": 1,
+                    "sent_monotonic": time.perf_counter(),
+                }
+            )
+            deadline = time.time() + 5.0
+            status = {}
+            while time.time() < deadline:
+                status = status_queue.get(timeout=5.0)
+                if status.get("healthy") and status.get("parent_sequence") == 1:
+                    break
             self.assertTrue(status["healthy"])
             self.assertEqual(status["parent_sequence"], 1)
             command_queue.put(
                 {
+                    "type": "HEARTBEAT",
+                    "session_id": "spawn-session",
+                    "sequence": 2,
+                    "sent_monotonic": time.perf_counter(),
+                }
+            )
+            command_queue.put(
+                {
+                    "type": "QUIESCE",
+                    "session_id": "spawn-session",
+                    "request_id": "spawn-quiesce",
+                    "reason": "test_complete",
+                }
+            )
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                status = status_queue.get(timeout=5.0)
+                if status.get("quiesced"):
+                    break
+            self.assertTrue(status.get("quiesced"))
+            command_queue.put(
+                {
+                    "type": "HEARTBEAT",
+                    "session_id": "spawn-session",
+                    "sequence": 3,
+                    "sent_monotonic": time.perf_counter(),
+                }
+            )
+            command_queue.put(
+                {
                     "type": "STOP",
                     "session_id": "spawn-session",
+                    "request_id": "spawn-stop",
                     "cancel_orders": False,
                 }
             )
@@ -3200,6 +3392,8 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                 "independent_supervisor": {
                     "enabled": True,
                     "recovery_checks": 2,
+                    "api_key": "risk-test-key",
+                    "api_secret": "risk-test-secret",
                 },
             },
         }
@@ -3210,11 +3404,20 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         )
         self.assertEqual(oms.mode_override, OMSCapabilityMode.REDUCE_ONLY)
 
-        supervisor.last_status = {"sequence": 1}
+        captured_at = time.perf_counter()
+        supervisor.last_status = {
+            "sequence": 1,
+            "risk_snapshot_sequence": 1,
+            "risk_snapshot_captured_monotonic": captured_at,
+        }
         self.assertFalse(supervisor._apply_oms_health(True, ""))
         self.assertEqual(oms.mode_override, OMSCapabilityMode.REDUCE_ONLY)
 
-        supervisor.last_status = {"sequence": 2}
+        supervisor.last_status = {
+            "sequence": 2,
+            "risk_snapshot_sequence": 2,
+            "risk_snapshot_captured_monotonic": time.perf_counter(),
+        }
         self.assertTrue(supervisor._apply_oms_health(True, ""))
         self.assertIsNone(oms.mode_override)
         self.assertEqual(
@@ -3232,7 +3435,11 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                     "enabled": True,
                     "required_source": "independent_supervisor",
                 },
-                "independent_supervisor": {"enabled": True},
+                "independent_supervisor": {
+                    "enabled": True,
+                    "api_key": "risk-test-key",
+                    "api_secret": "risk-test-secret",
+                },
             },
         }
         supervisor = IndependentRiskSupervisor(
@@ -3256,6 +3463,8 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         self.assertEqual(oms.mode_override, OMSCapabilityMode.REDUCE_ONLY)
 
     def test_parent_supervisor_executes_two_phase_rearm_over_sidecar_channel(self):
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
         oms = DummyOMS()
         config = {
             "symbols": ["BTCUSDT"],
@@ -3268,6 +3477,17 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                     "enabled": True,
                     "status_interval_sec": 0.02,
                     "rearm_command_timeout_sec": 1.0,
+                    "exchange_poll_interval_sec": 0.05,
+                    "exchange_max_age_sec": 1.0,
+                    "flat_verification_checks": 1,
+                    "api_key": "risk-test-key",
+                    "api_secret": "risk-test-secret",
+                    "state_path": os.path.join(
+                        state_dir.name,
+                        "sidecar-state.json",
+                    ),
+                    "state_required": True,
+                    "state_fsync": False,
                 },
             },
         }
@@ -3275,7 +3495,16 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         supervisor.command_queue = queue.Queue()
         supervisor.status_queue = queue.Queue()
         settings = dict(supervisor.settings)
-        exchange = DummySidecarExchange()
+        exchange = DummySidecarExchange(
+            risk_snapshot={
+                "account": {
+                    "totalMaintMargin": "95",
+                    "totalMarginBalance": "100",
+                },
+                "positions": [],
+                "open_orders": [],
+            }
+        )
         worker = threading.Thread(
             target=run_sidecar_loop,
             args=(
@@ -3289,13 +3518,74 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         worker.start()
         supervisor.process = ThreadProcessHandle(worker)
 
-        prepared = supervisor.prepare_rearm("operator_ack")
+        deadline = time.perf_counter() + 1.0
+        while time.perf_counter() < deadline:
+            supervisor.tick()
+            if (
+                supervisor.last_status.get("kill_latched")
+                and supervisor.last_status.get("stage") == "FLAT_VERIFIED"
+            ):
+                break
+            time.sleep(0.02)
+        self.assertTrue(supervisor.last_status.get("kill_latched"))
+        self.assertEqual(
+            supervisor.last_status.get("stage"),
+            "FLAT_VERIFIED",
+        )
+
+        exchange.risk_snapshot["account"] = {
+            "totalMaintMargin": "0",
+            "totalMarginBalance": "1000",
+        }
+        breached_snapshot_sequence = int(
+            supervisor.last_status.get("risk_snapshot_sequence", 0) or 0
+        )
+        deadline = time.perf_counter() + 1.0
+        while time.perf_counter() < deadline:
+            supervisor.tick()
+            if (
+                int(
+                    supervisor.last_status.get(
+                        "risk_snapshot_sequence",
+                        0,
+                    )
+                    or 0
+                )
+                > breached_snapshot_sequence
+                and not supervisor.last_status.get("risk_reason")
+            ):
+                break
+            time.sleep(0.02)
+        self.assertGreater(
+            int(
+                supervisor.last_status.get("risk_snapshot_sequence", 0) or 0
+            ),
+            breached_snapshot_sequence,
+        )
+        self.assertEqual(supervisor.last_status.get("risk_reason"), "")
+        self.assertEqual(supervisor.last_status.get("risk_action"), "KILL")
+
+        deadline = time.perf_counter() + 1.0
+        prepared = {"accepted": False, "reason": "prepare_not_attempted"}
+        while time.perf_counter() < deadline:
+            prepared = supervisor.prepare_rearm("operator_ack")
+            if prepared["accepted"]:
+                break
+            self.assertEqual(
+                prepared["reason"],
+                "exchange_snapshot_refresh_pending",
+            )
+            time.sleep(0.02)
         self.assertTrue(prepared["accepted"], prepared["reason"])
         self.assertTrue(prepared["token"])
         committed = supervisor.commit_rearm(prepared["token"])
         self.assertTrue(committed["accepted"], committed["reason"])
 
-        supervisor.stop(cancel_orders=False)
+        quiesced = supervisor.quiesce("test_complete")
+        self.assertTrue(quiesced["accepted"], quiesced["reason"])
+        self.assertTrue(quiesced["quiesced"])
+        stopped = supervisor.stop(cancel_orders=False)
+        self.assertTrue(stopped["accepted"], stopped["reason"])
         worker.join(1.0)
         self.assertFalse(worker.is_alive())
 

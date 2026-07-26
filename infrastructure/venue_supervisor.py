@@ -21,6 +21,7 @@ class VenueSupervisor:
                     "system_health:WS_PARSE_ERROR",
                     "system_health:WS_HANDLER_FAILURE",
                     "system_health:USER_STREAM_EXPIRED",
+                    "system_health:USER_STREAM_KEEPALIVE_FAILED",
                     "system_health:MARKET_DATA_STALE",
                 ],
             )

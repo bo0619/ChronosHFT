@@ -196,7 +196,7 @@ class GLFTStrategy(StrategyTemplate):
             0.1,
         )
         self.configure_quote_sizing(self.strat_conf)
-        self.cycle_interval = self._positive_finite(
+        self.cycle_interval = self._nonnegative_finite(
             self.strat_conf.get(
                 "cycle_interval",
                 self.glft_conf.get("cycle_interval", 1.0),
@@ -878,8 +878,16 @@ class GLFTStrategy(StrategyTemplate):
         tick = float(info.tick_size or 0.0)
         if tick <= 0.0:
             return
-        target_bid = ref_data_manager.round_price(symbol, target_bid)
-        target_ask = ref_data_manager.round_price(symbol, target_ask)
+        target_bid = ref_data_manager.round_price(
+            symbol,
+            target_bid,
+            direction="down",
+        )
+        target_ask = ref_data_manager.round_price(
+            symbol,
+            target_ask,
+            direction="up",
+        )
         if target_bid >= ask_1:
             target_bid = ask_1 - tick
         if target_ask <= bid_1:

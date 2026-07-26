@@ -2,7 +2,6 @@ import threading
 import time
 import tempfile
 import unittest
-from unittest.mock import patch
 
 from event.type import (
     CommandOutcome,
@@ -354,6 +353,7 @@ class InstitutionalRecoveryTests(unittest.TestCase):
         oms._rpi_calibration = {
             "enabled": True,
             "permit_id": "permit-test",
+            "deployment_id": "deployment-test",
             "symbol": "BTCUSDT",
         }
         oms._rpi_calibration_expired = True
@@ -446,6 +446,7 @@ class InstitutionalRecoveryTests(unittest.TestCase):
         oms._rpi_calibration = {
             "enabled": True,
             "permit_id": "permit-test",
+            "deployment_id": "deployment-test",
             "symbol": "BTCUSDT",
         }
         oms._rpi_calibration_expired = True
@@ -453,21 +454,17 @@ class InstitutionalRecoveryTests(unittest.TestCase):
         oms._rpi_calibration_terminal_verified = False
 
         real_thread = threading.Thread
-        enforcer_start_entered = threading.Event()
-        allow_enforcer_start = threading.Event()
+        enforcer_entered = threading.Event()
+        allow_enforcer_finish = threading.Event()
         shutdown_entered = threading.Event()
         shutdown_returned = threading.Event()
-        created_enforcers = []
         schedule_results = []
         shutdown_results = []
 
-        class ControlledEnforcerThread(real_thread):
-            def start(self):
-                if self.name == "RpiCalibrationRuntimeEnforcer":
-                    created_enforcers.append(self)
-                    enforcer_start_entered.set()
-                    allow_enforcer_start.wait(timeout=2.0)
-                return super().start()
+        def blocking_enforce():
+            enforcer_entered.set()
+            allow_enforcer_finish.wait(timeout=2.0)
+            return False
 
         def schedule_enforcer():
             schedule_results.append(
@@ -483,35 +480,31 @@ class InstitutionalRecoveryTests(unittest.TestCase):
         shutdown = real_thread(target=begin_shutdown)
         returned_before_enforcer_started = False
         try:
-            oms._enforce_rpi_calibration_terminal_once = lambda: False
-            with patch("oms.engine.threading.Thread", ControlledEnforcerThread):
-                scheduler.start()
-                self.assertTrue(enforcer_start_entered.wait(timeout=1.0))
+            oms._enforce_rpi_calibration_terminal_once = blocking_enforce
+            scheduler.start()
+            self.assertTrue(enforcer_entered.wait(timeout=1.0))
 
-                shutdown.start()
-                self.assertTrue(shutdown_entered.wait(timeout=1.0))
-                returned_before_enforcer_started = shutdown_returned.wait(
-                    timeout=0.1
-                )
-                allow_enforcer_start.set()
+            shutdown.start()
+            self.assertTrue(shutdown_entered.wait(timeout=1.0))
+            returned_before_enforcer_started = shutdown_returned.wait(
+                timeout=0.1
+            )
+            allow_enforcer_finish.set()
 
-                scheduler.join(timeout=2.0)
-                shutdown.join(timeout=2.0)
+            scheduler.join(timeout=2.0)
+            shutdown.join(timeout=2.0)
 
             self.assertFalse(returned_before_enforcer_started)
             self.assertFalse(scheduler.is_alive())
             self.assertFalse(shutdown.is_alive())
             self.assertEqual(schedule_results, [True])
             self.assertEqual(shutdown_results, [True])
-            self.assertEqual(len(created_enforcers), 1)
-            self.assertFalse(created_enforcers[0].is_alive())
-
             # main.py begins the final account shutdown proof only after this
             # call returns, so no permit enforcer may remain at this handoff.
             self.assertIsNone(oms._rpi_calibration_enforcement_thread)
             self.assertFalse(oms._rpi_calibration_enforcement_inflight)
         finally:
-            allow_enforcer_start.set()
+            allow_enforcer_finish.set()
             scheduler.join(timeout=2.0)
             if shutdown.ident is not None:
                 shutdown.join(timeout=2.0)

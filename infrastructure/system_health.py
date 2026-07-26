@@ -80,16 +80,9 @@ def handle_system_health_event(
                         f"HALT handoff: {type(suspend_exc).__name__}:"
                         f"{suspend_exc}"
                     )
-        if risk_controller is not None:
-            try:
-                risk_controller.trigger_kill_switch(
-                    f"SystemHealth: {message}"
-                )
-            except Exception as exc:
-                logger.critical(
-                    "Parent risk kill failed after OMS HALT: "
-                    f"{type(exc).__name__}:{exc}"
-                )
+        # HALT is emitted after the OMS has already latched its terminal
+        # state. Feeding that echo back into RiskManager would start a second
+        # kill sequence and can recurse through another HALT event.
         return
 
     if message.startswith("FREEZE_SYMBOL:") and oms is not None:
@@ -191,6 +184,7 @@ def handle_system_health_event(
             "WS_PARSE_ERROR",
             "WS_HANDLER_FAILURE",
             "USER_STREAM_EXPIRED",
+            "USER_STREAM_KEEPALIVE_FAILED",
             "MARKET_DATA_STALE",
         )
     ):

@@ -53,6 +53,16 @@ class StrategyTemplate:
             return float(default)
         return parsed
 
+    @staticmethod
+    def _nonnegative_finite(value, default: float = 0.0) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if not math.isfinite(parsed) or parsed < 0.0:
+            return float(default)
+        return parsed
+
     def configure_quote_sizing(self, strategy_config: dict | None):
         """Load quote sizing while keeping legacy lot_multiplier configs valid."""
         config = strategy_config if isinstance(strategy_config, dict) else {}

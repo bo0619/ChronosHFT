@@ -114,9 +114,12 @@ class AccountManager:
         if not math.isfinite(total):
             return False
         self.external_cash_flow_total = total
-        self.cash_flow_snapshot_time = float(snapshot_time or time.time())
-        self.cash_flow_snapshot_monotonic = float(
-            snapshot_monotonic or time.perf_counter()
+        (
+            self.cash_flow_snapshot_time,
+            self.cash_flow_snapshot_monotonic,
+        ) = self._snapshot_times(
+            snapshot_time,
+            snapshot_monotonic,
         )
         self.cash_flow_snapshot_synced = True
         self.calculate()
@@ -231,12 +234,30 @@ class AccountManager:
             return False
         self.maintenance_margin = maintenance_margin
         self.margin_balance = margin_balance
-        self.margin_snapshot_time = float(snapshot_time or time.time())
-        self.margin_snapshot_monotonic = float(
-            snapshot_monotonic or time.perf_counter()
+        (
+            self.margin_snapshot_time,
+            self.margin_snapshot_monotonic,
+        ) = self._snapshot_times(
+            snapshot_time,
+            snapshot_monotonic,
         )
         self.margin_snapshot_synced = True
         return True
+
+    @staticmethod
+    def _snapshot_times(
+        snapshot_time: float | None,
+        snapshot_monotonic: float | None,
+    ) -> tuple[float, float]:
+        if snapshot_time is None and snapshot_monotonic is None:
+            return time.time(), time.perf_counter()
+        wall_time = time.time() if snapshot_time is None else float(snapshot_time)
+        monotonic_time = (
+            0.0
+            if snapshot_monotonic is None
+            else float(snapshot_monotonic)
+        )
+        return wall_time, monotonic_time
 
     def _sync_balance_maps(self, asset: str = "", balance: float = None, available: float = None, balances: dict = None):
         if balances:

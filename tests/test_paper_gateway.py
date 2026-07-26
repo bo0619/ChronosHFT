@@ -41,6 +41,7 @@ from infrastructure.truth_monitor import TruthMonitor
 from infrastructure.venue_supervisor import VenueSupervisor
 from main import build_gateway_bundle
 from oms.engine import OMS
+from oms.guard_manager import OMSGuardManager
 
 
 SYMBOL = "SOXLUSDT"
@@ -606,6 +607,7 @@ class PaperGatewayTests(unittest.TestCase):
         oms._cancel_all_orders_unchecked = (
             lambda *_args, **_kwargs: True
         )
+        oms.guard_manager = OMSGuardManager(oms)
         self.engine.register(
             EVENT_SYSTEM_HEALTH,
             lambda event: handle_system_health_event(event, None, oms),

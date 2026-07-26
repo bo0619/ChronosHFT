@@ -17,7 +17,16 @@ class _ComponentMethod:
     def __get__(self, instance, _owner=None):
         if instance is None:
             return self
-        component = getattr(instance, self.component_name)
+        try:
+            component = getattr(instance, self.component_name)
+        except AttributeError:
+            factories = getattr(_owner, "_component_factories", {})
+            factory = factories.get(self.component_name)
+            if factory is None:
+                raise
+            component = factory(instance)
+            vars(instance).setdefault(self.component_name, component)
+            component = vars(instance)[self.component_name]
         return getattr(component, self.method_name)
 
 

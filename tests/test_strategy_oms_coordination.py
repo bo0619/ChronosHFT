@@ -102,6 +102,8 @@ class DummyStrategy(StrategyTemplate):
 class PassiveQuoteOMS:
     def __init__(self):
         self.config = {
+            "execution": {"mode": "paper"},
+            "paper_trade": {"enabled": True},
             "backtest": {
                 "maker_fee": 0.0002,
                 "rpi_commission_rate": 0.0001,
@@ -164,6 +166,42 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
             get_best_bid=lambda: (mid - 0.1, 1.0),
             get_best_ask=lambda: (mid + 0.1, 1.0),
         )
+
+    def test_price_rounding_uses_tick_size_and_quote_direction(self):
+        contract = ContractInfo(
+            symbol="ODDTICK",
+            tick_size=0.25,
+            step_size=0.01,
+            min_qty=0.01,
+            min_notional=5.0,
+            price_precision=2,
+            qty_precision=2,
+        )
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"ODDTICK": contract},
+            clear=True,
+        ):
+            self.assertEqual(
+                ref_data_manager.round_price("ODDTICK", 100.13),
+                100.25,
+            )
+            self.assertEqual(
+                ref_data_manager.round_price(
+                    "ODDTICK",
+                    100.13,
+                    direction="down",
+                ),
+                100.0,
+            )
+            self.assertEqual(
+                ref_data_manager.round_price(
+                    "ODDTICK",
+                    100.13,
+                    direction="up",
+                ),
+                100.25,
+            )
 
     def test_avellaneda_cycle_uses_monotonic_time(self):
         engine = DispatchingEngine()
@@ -781,8 +819,8 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             )
             self.assertIn("reservation_price", telemetry.params)
             self.assertIn("inventory_risk_adjustment", telemetry.params)
-            self.assertIn("optimal_spread", telemetry.params)
-            self.assertIn("volatility_adjustment", telemetry.params)
+            self.assertIn("formula_half_spread_bps", telemetry.params)
+            self.assertIn("sigma_bps", telemetry.params)
             self.assertIn("final_spread_bps", telemetry.params)
             json.dumps(telemetry.params)
 
@@ -942,7 +980,7 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         self.assertEqual(params["schema"], "market_making.v1")
         self.assertEqual(params["time_in_force"], TIF_RPI)
         self.assertEqual(params["signals"], {"short": 2.0, "mid": 1.0, "long": 0.25})
-        self.assertEqual(params["target_position_notional"], 18.0)
+        self.assertEqual(params["target_position_notional"], 0.0)
         self.assertEqual(params["target_order_notional"], 8.0)
         self.assertEqual(params["max_position_notional"], 18.0)
         self.assertLessEqual(params["bid_quote_qty"] * params["target_bid"], 8.0)
@@ -950,15 +988,15 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         self.assertEqual(params["bid_order_id"], "passive-1")
         self.assertEqual(params["ask_order_id"], "passive-2")
         for field in (
-            "gamma",
-            "k",
-            "A",
+            "gamma_per_bps",
+            "k_per_bps",
+            "A_per_s",
             "sigma_bps",
             "target_position_notional",
             "effective_position_notional",
-            "q_norm",
-            "base_half_spread_bps",
-            "inventory_skew_bps",
+            "inventory_lots",
+            "formula_half_spread_bps",
+            "inventory_center_offset_bps",
             "effective_min_spread_bps",
         ):
             self.assertIn(field, params)

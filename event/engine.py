@@ -1,6 +1,6 @@
 from collections import defaultdict, deque
-from queue import Empty, Queue
-from threading import Condition, Lock, Thread
+from queue import Empty, Full, Queue
+from threading import Condition, Lock, Thread, local
 import time
 
 from infrastructure.logger import logger
@@ -12,7 +12,11 @@ class EventEngine:
 
     def __init__(self, profile_config=None):
         self._active = False
-        self._queues = {lane: Queue() for lane in self.ALL_LANES}
+        self.profile_config = self._build_profile_config(profile_config or {})
+        self._queues = {
+            lane: Queue(maxsize=self.profile_config["queue_capacity"][lane])
+            for lane in self.ALL_LANES
+        }
         self._threads = {}
         self._handlers = {lane: defaultdict(list) for lane in self.ALL_LANES}
         self._queue_timestamps = {lane: deque() for lane in self.ALL_LANES}
@@ -25,6 +29,13 @@ class EventEngine:
                 "last_duration_ms": 0.0,
                 "max_duration_ms": 0.0,
                 "slow_handler_count": 0,
+                "handler_error_count": 0,
+                "queue_overflow_count": 0,
+                "last_error_at": 0.0,
+                "last_error_kind": "",
+                "last_error_event_type": "",
+                "last_error_handler_name": "",
+                "last_error_message": "",
                 "last_processed_at": 0.0,
             }
             for lane in self.ALL_LANES
@@ -48,7 +59,8 @@ class EventEngine:
         self._last_depth_alert_at = {}
         self._last_backlog_alert_at = {}
         self._last_slow_handler_alert_at = {}
-        self.profile_config = self._build_profile_config(profile_config or {})
+        self._failure_handler = None
+        self._failure_context = local()
         self._reset_threads()
 
     def _build_profile_config(self, profile_config):
@@ -68,6 +80,11 @@ class EventEngine:
                 "execution": 20.0,
                 "cold": 100.0,
             },
+            "queue_capacity": {
+                "market": 4096,
+                "execution": 2048,
+                "cold": 8192,
+            },
             "alert_interval_sec": 5.0,
         }
         normalized = {}
@@ -76,6 +93,18 @@ class EventEngine:
                 profile_config.get(key),
                 defaults[key],
             )
+        normalized["queue_capacity"] = {
+            lane: max(
+                1,
+                int(
+                    self._normalize_lane_thresholds(
+                        profile_config.get("queue_capacity"),
+                        defaults["queue_capacity"],
+                    )[lane]
+                ),
+            )
+            for lane in self.ALL_LANES
+        }
         normalized["alert_interval_sec"] = float(
             profile_config.get("alert_interval_sec", defaults["alert_interval_sec"])
         )
@@ -151,7 +180,7 @@ class EventEngine:
         hot_lanes = [lane for lane in self.HOT_LANES if event.type in self._handlers[lane]]
         cold_registered = event.type in self._handlers["cold"]
         if not hot_lanes and not cold_registered:
-            return
+            return True
 
         if cold_registered and hot_lanes:
             with self._lock:
@@ -160,11 +189,17 @@ class EventEngine:
                     "remaining": len(hot_lanes),
                 }
 
+        accepted = True
         for lane in hot_lanes:
-            self._enqueue(lane, dispatch_id, event)
+            if self._enqueue(lane, dispatch_id, event):
+                continue
+            accepted = False
+            if cold_registered:
+                accepted = self._handoff_to_cold(dispatch_id) and accepted
 
         if cold_registered and not hot_lanes:
-            self._enqueue("cold", dispatch_id, event)
+            accepted = self._enqueue("cold", dispatch_id, event)
+        return accepted
 
     def register(self, type_, handler):
         self.register_cold(type_, handler)
@@ -180,6 +215,11 @@ class EventEngine:
 
     def register_cold(self, type_, handler):
         self._handlers["cold"][type_].append(handler)
+
+    def set_failure_handler(self, handler):
+        if handler is not None and not callable(handler):
+            raise TypeError("event-engine failure handler must be callable")
+        self._failure_handler = handler
 
     def get_queue_snapshot(self):
         market_depth = self._queues["market"].qsize()
@@ -205,6 +245,7 @@ class EventEngine:
                 "queue_warn_depth": dict(self.profile_config["queue_warn_depth"]),
                 "backlog_warn_ms": dict(self.profile_config["backlog_warn_ms"]),
                 "handler_slow_ms": dict(self.profile_config["handler_slow_ms"]),
+                "queue_capacity": dict(self.profile_config["queue_capacity"]),
             },
         }
         with self._lock:
@@ -257,13 +298,38 @@ class EventEngine:
             self._dispatch_seq += 1
             return self._dispatch_seq
 
-    def _enqueue(self, lane: str, dispatch_id: int, event):
+    def _enqueue(self, lane: str, dispatch_id: int, event) -> bool:
         enqueued_at = time.perf_counter()
+        overflow = False
         with self._idle_condition:
             self._queue_timestamps[lane].append(enqueued_at)
             self._pending_work += 1
-        self._queues[lane].put((dispatch_id, enqueued_at, event))
+            try:
+                self._queues[lane].put_nowait(
+                    (dispatch_id, enqueued_at, event)
+                )
+            except Full:
+                overflow = True
+                self._queue_timestamps[lane].pop()
+                self._pending_work -= 1
+                if self._pending_work == 0:
+                    self._idle_condition.notify_all()
+        if overflow:
+            capacity = self.profile_config["queue_capacity"][lane]
+            error = RuntimeError(
+                f"event queue full: lane={lane} capacity={capacity}"
+            )
+            logger.critical(f"[EventEngine:{lane}] {error}")
+            self._report_failure(
+                lane=lane,
+                event=event,
+                handler_name="",
+                error=error,
+                kind="queue_overflow",
+            )
+            return False
         self._maybe_alert_queue_depth(lane)
+        return True
 
     def _run_lane(self, lane: str):
         while self._active:
@@ -292,20 +358,21 @@ class EventEngine:
             if self._queue_timestamps[lane]:
                 self._queue_timestamps[lane].popleft()
 
-    def _handoff_to_cold(self, dispatch_id: int):
+    def _handoff_to_cold(self, dispatch_id: int) -> bool:
         if dispatch_id is None:
-            return
+            return True
         with self._lock:
             pending = self._pending_cold.get(dispatch_id)
             if not pending:
-                return
+                return True
             pending["remaining"] -= 1
             if pending["remaining"] > 0:
-                return
+                return True
             event = pending["event"]
             del self._pending_cold[dispatch_id]
         if event.type in self._handlers["cold"]:
-            self._enqueue("cold", dispatch_id, event)
+            return self._enqueue("cold", dispatch_id, event)
+        return True
 
     def _process_lane(self, lane: str, event, enqueued_at: float):
         handlers = self._handlers[lane].get(event.type, ())
@@ -323,7 +390,17 @@ class EventEngine:
                 try:
                     handler(event)
                 except Exception as exc:
-                    logger.error(f"[EventEngine:{lane}] handler failed {event.type}: {exc}")
+                    logger.error(
+                        f"[EventEngine:{lane}] handler failed {event.type}: "
+                        f"{type(exc).__name__}:{exc}"
+                    )
+                    self._report_failure(
+                        lane=lane,
+                        event=event,
+                        handler_name=handler_name,
+                        error=exc,
+                        kind="handler_exception",
+                    )
                 finally:
                     elapsed_ms = max(0.0, (time.perf_counter() - handler_started_at) * 1000.0)
                     self._record_handler_metrics(lane, event.type, handler_name, elapsed_ms)
@@ -385,6 +462,9 @@ class EventEngine:
                     "last_ms": 0.0,
                     "max_ms": 0.0,
                     "slow_count": 0,
+                    "error_count": 0,
+                    "last_error_at": 0.0,
+                    "last_error_message": "",
                 },
             )
             stats["count"] += 1
@@ -395,6 +475,85 @@ class EventEngine:
             if elapsed_ms > slow_threshold_ms:
                 stats["slow_count"] += 1
                 self._lane_stats[lane]["slow_handler_count"] += 1
+
+    def _report_failure(
+        self,
+        *,
+        lane: str,
+        event,
+        handler_name: str,
+        error: BaseException,
+        kind: str,
+    ) -> None:
+        event_type = str(getattr(event, "type", "") or "")
+        message = f"{type(error).__name__}:{error}"
+        failed_at = time.time()
+        with self._lock:
+            lane_stats = self._lane_stats[lane]
+            if kind == "queue_overflow":
+                lane_stats["queue_overflow_count"] += 1
+            else:
+                lane_stats["handler_error_count"] += 1
+            lane_stats["last_error_at"] = failed_at
+            lane_stats["last_error_kind"] = kind
+            lane_stats["last_error_event_type"] = event_type
+            lane_stats["last_error_handler_name"] = handler_name
+            lane_stats["last_error_message"] = message
+            if handler_name:
+                key = (lane, event_type, handler_name)
+                handler_stats = self._handler_stats.setdefault(
+                    key,
+                    {
+                        "count": 0,
+                        "total_ms": 0.0,
+                        "avg_ms": 0.0,
+                        "last_ms": 0.0,
+                        "max_ms": 0.0,
+                        "slow_count": 0,
+                        "error_count": 0,
+                        "last_error_at": 0.0,
+                        "last_error_message": "",
+                    },
+                )
+                handler_stats["error_count"] += 1
+                handler_stats["last_error_at"] = failed_at
+                handler_stats["last_error_message"] = message
+
+        failure_handler = self._failure_handler
+        if failure_handler is None:
+            logger.critical(
+                "[EventEngine] failure handler unavailable: "
+                f"kind={kind} lane={lane} event={event_type}"
+            )
+            return
+        if getattr(self._failure_context, "active", False):
+            logger.critical(
+                "[EventEngine] recursive failure callback suppressed: "
+                f"kind={kind} lane={lane} event={event_type}"
+            )
+            return
+
+        self._failure_context.active = True
+        try:
+            failure_handler(
+                {
+                    "kind": kind,
+                    "lane": lane,
+                    "event": event,
+                    "event_type": event_type,
+                    "handler_name": handler_name,
+                    "error": error,
+                    "message": message,
+                    "failed_at": failed_at,
+                }
+            )
+        except BaseException as callback_error:
+            logger.critical(
+                "[EventEngine] fail-closed callback raised: "
+                f"{type(callback_error).__name__}:{callback_error}"
+            )
+        finally:
+            self._failure_context.active = False
 
     def _maybe_alert_queue_depth(self, lane: str):
         warn_depth = self.profile_config["queue_warn_depth"][lane]

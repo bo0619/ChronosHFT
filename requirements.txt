@@ -1,9 +1,7 @@
-requests
-websocket-client
-orjson
-rich
-numpy
-pandas
-tables
-h5py
+requests>=2.32,<3
+websocket-client>=1.8,<2
+rich>=13.9,<15
+numpy>=2.0,<3
+pandas>=2.2,<3
+tables>=3.10,<4
 cryptography>=45.0.0,<47.0.0

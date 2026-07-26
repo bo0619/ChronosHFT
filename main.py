@@ -73,6 +73,11 @@ def parse_cli_args(argv=None):
         help="Path to the root config JSON file.",
     )
     parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help="Validate and summarize configuration without starting runtime components.",
+    )
+    parser.add_argument(
         "--rearm",
         action="store_true",
         help="If the recovered OMS state requires manual rearm, execute it automatically at startup.",
@@ -845,6 +850,18 @@ def _run_main(argv=None, runtime=None):
     if paper_trade:
         config = apply_paper_trade_mode(config)
 
+    if args.check_config:
+        strategy = config.get("strategy", {}) or {}
+        mode = "paper" if paper_trade else "live"
+        print(
+            "CONFIG_OK "
+            f"mode={mode} "
+            f"symbols={len(config.get('symbols', []) or [])} "
+            f"primary_model={strategy.get('primary_model', '')}",
+            flush=True,
+        )
+        return 0
+
     missing_credentials = [
         field
         for field in ("api_key", "api_secret")
@@ -886,12 +903,12 @@ def _run_main(argv=None, runtime=None):
     if clock_startup_required and not (
         initial_clock_sync_ok and time_service.is_ready()
     ):
-        run_startup_blocked_dashboard(
+        diagnostics_available = run_startup_blocked_dashboard(
             config,
             read_clock_health(time_service),
             clock_service=time_service,
         )
-        return
+        return 0 if diagnostics_available else 2
 
     runtime["time_service"] = time_service
 
@@ -971,10 +988,78 @@ def _run_main(argv=None, runtime=None):
         f"registered={','.join(strategy.registered_models)} "
         "execution_policy=single_primary"
     )
+    def fail_closed_runtime(
+        *,
+        scope: str,
+        reason: str,
+        freeze_action,
+    ) -> None:
+        try:
+            freeze_action()
+        except BaseException as exc:
+            logger.critical(
+                f"[{scope}] Fail-closed freeze raised: "
+                f"{type(exc).__name__}:{exc}; escalating kill-switch"
+            )
+            risk_controller.trigger_kill_switch(
+                f"{reason}:freeze_failed:{type(exc).__name__}"
+            )
+
+    def on_event_engine_failure(failure: dict) -> None:
+        lane = str(failure.get("lane", "") or "unknown")
+        event_type = str(failure.get("event_type", "") or "unknown")
+        failure_kind = str(failure.get("kind", "") or "unknown")
+        handler_name = str(
+            failure.get("handler_name", "") or "unavailable"
+        )
+        reason = (
+            f"event_engine_failure:{failure_kind}:{lane}:"
+            f"{event_type}:{handler_name}"
+        )
+        if lane == "cold":
+            fail_closed_runtime(
+                scope="EventEngine",
+                reason=reason,
+                freeze_action=lambda: oms_system.freeze_strategy(
+                    strategy.name,
+                    reason,
+                    cancel_active_orders=True,
+                ),
+            )
+            return
+        fail_closed_runtime(
+            scope="EventEngine",
+            reason=reason,
+            freeze_action=lambda: oms_system.freeze_venue(
+                getattr(gateway, "gateway_name", "UNKNOWN"),
+                reason,
+                cancel_active_orders=True,
+            ),
+        )
+
+    def on_strategy_runtime_failure(failure: dict) -> None:
+        reason = (
+            "strategy_runtime_failure:"
+            f"{failure.get('phase', 'unknown')}:"
+            f"{failure.get('kind', 'unknown')}:"
+            f"{failure.get('handler_name', 'unavailable')}"
+        )
+        fail_closed_runtime(
+            scope="StrategyRuntime",
+            reason=reason,
+            freeze_action=lambda: oms_system.freeze_strategy(
+                strategy.name,
+                reason,
+                cancel_active_orders=True,
+            ),
+        )
+
+    engine.set_failure_handler(on_event_engine_failure)
     strategy_runtime = StrategyRuntime(
         strategy,
         config.get("system", {}).get("strategy_runtime", {}),
         start_thread=False,
+        failure_callback=on_strategy_runtime_failure,
     )
     runtime["strategy_runtime"] = strategy_runtime
     data_recorder = (

@@ -1,19 +1,23 @@
-# file: launcher.py
+"""Paper-only process watchdog for the ChronosHFT runtime."""
+
+from __future__ import annotations
 
 import subprocess
-import time
 import sys
-import os
+import time
 from datetime import datetime
+from pathlib import Path
 
 from infrastructure.config_scaling import load_root_config
 from infrastructure.paper_trade import is_paper_trade
 
-# 配置
-TARGET_SCRIPT = "main.py"
-CONFIG_PATH = "config.json"
-RESTART_INTERVAL = 5 # 重启等待时间 (秒)
-MAX_RESTARTS_PER_HOUR = 10 # 防止无限重启死循环
+
+WORKSPACE_DIR = Path(__file__).resolve().parent
+TARGET_SCRIPT = WORKSPACE_DIR / "main.py"
+CONFIG_PATH = WORKSPACE_DIR / "config.json"
+RESTART_INTERVAL_SEC = 5.0
+MAX_RESTARTS_PER_HOUR = 10
+NONRETRYABLE_EXIT_CODES = frozenset({2})
 
 
 def launcher_allows_runtime(config_path=CONFIG_PATH):
@@ -31,59 +35,93 @@ def launcher_allows_runtime(config_path=CONFIG_PATH):
         )
     return True, ""
 
+
 class ProcessWatchdog:
-    def __init__(self):
+    """Restart one Paper runtime with a bounded hourly retry budget."""
+
+    def __init__(
+        self,
+        *,
+        target_script=TARGET_SCRIPT,
+        config_path=CONFIG_PATH,
+        restart_interval_sec=RESTART_INTERVAL_SEC,
+    ):
+        self.target_script = Path(target_script).resolve()
+        self.config_path = Path(config_path).resolve()
+        self.restart_interval_sec = max(0.0, float(restart_interval_sec))
         self.restart_history = []
 
     def run(self):
-        print(f"🔥 HFT Launcher Started. Monitoring: {TARGET_SCRIPT}")
-        
+        print(f"HFT Paper Launcher started: {self.target_script}")
+
         while True:
-            # 1. 检查重启频率
             self._cleanup_history()
             if len(self.restart_history) >= MAX_RESTARTS_PER_HOUR:
-                print("🚨 Max restarts reached. System is unstable. Stopping watchdog.")
-                break
-                
-            # 2. 启动子进程
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Process...")
+                print("Maximum restart rate reached; watchdog is stopping.")
+                return 1
+
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting process...")
+            process = None
             try:
-                # 使用 sys.executable 确保使用当前相同的 Python 解释器
-                process = subprocess.Popen([sys.executable, TARGET_SCRIPT])
-                
-                # 3. 阻塞等待进程结束
-                exit_code = process.wait()
-                
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(self.target_script),
+                        "--config",
+                        str(self.config_path),
+                    ],
+                    cwd=str(WORKSPACE_DIR),
+                )
+                exit_code = int(process.wait())
             except KeyboardInterrupt:
-                print("\n🛑 Launcher stopped by user.")
-                # 尝试优雅关闭子进程
-                if process:
+                print("\nLauncher stopped by user.")
+                if process is not None and process.poll() is None:
                     process.terminate()
-                break
-                
-            # 4. 进程退出处理
-            print(f"⚠️ Process exited with code: {exit_code}")
-            
+                    try:
+                        process.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5.0)
+                return 130
+            except OSError as exc:
+                print(f"Could not start Paper runtime: {type(exc).__name__}: {exc}")
+                return 2
+
+            print(f"Process exited with code: {exit_code}")
             if exit_code == 0:
-                print("Process exited normally. Watchdog stopping.")
-                break
-            else:
-                print(f"Process crashed! Restarting in {RESTART_INTERVAL} seconds...")
-                self.restart_history.append(time.time())
-                time.sleep(RESTART_INTERVAL)
+                print("Process exited normally; watchdog is stopping.")
+                return 0
+            if exit_code in NONRETRYABLE_EXIT_CODES:
+                print("Runtime reported a non-retryable startup error.")
+                return exit_code
+
+            self.restart_history.append(time.time())
+            print(
+                "Process failed; restarting in "
+                f"{self.restart_interval_sec:g} seconds..."
+            )
+            time.sleep(self.restart_interval_sec)
 
     def _cleanup_history(self):
-        """清除1小时前的重启记录"""
         now = time.time()
-        self.restart_history = [t for t in self.restart_history if now - t < 3600]
+        self.restart_history = [
+            timestamp
+            for timestamp in self.restart_history
+            if now - timestamp < 3600.0
+        ]
+
+
+def main() -> int:
+    if not TARGET_SCRIPT.is_file():
+        print(f"Error: runtime entrypoint not found: {TARGET_SCRIPT}")
+        return 2
+
+    allowed, reason = launcher_allows_runtime(CONFIG_PATH)
+    if not allowed:
+        print(f"Error: {reason}")
+        return 2
+    return ProcessWatchdog().run()
+
 
 if __name__ == "__main__":
-    if not os.path.exists(TARGET_SCRIPT):
-        print(f"Error: {TARGET_SCRIPT} not found!")
-    else:
-        allowed, reason = launcher_allows_runtime()
-        if not allowed:
-            print(f"Error: {reason}")
-        else:
-            watchdog = ProcessWatchdog()
-            watchdog.run()
+    raise SystemExit(main())

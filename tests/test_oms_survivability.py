@@ -1230,8 +1230,14 @@ class OMSSurvivabilityTests(unittest.TestCase):
         }
         oms = OMS(DummyEngine(), gateway, config)
         try:
+            with oms.lock:
+                oms.state = LifecycleState.LIVE
+                oms.venue_dead_man_armed_symbols = {"BTCUSDT"}
+                oms.last_venue_dead_man_success_monotonic = time.perf_counter()
+                oms.last_venue_dead_man_success_time = time.time()
+            oms._sync_capability_mode("test_live")
             started_at = time.perf_counter()
-            self.assertFalse(oms.request_venue_dead_man_switch_renewal())
+            self.assertTrue(oms.request_venue_dead_man_switch_renewal())
             elapsed = time.perf_counter() - started_at
 
             self.assertLess(elapsed, 0.05)
@@ -2128,7 +2134,8 @@ class OMSSurvivabilityTests(unittest.TestCase):
             "max_new_orders_per_window": 5,
             "max_reduce_orders_per_window": 10,
             "max_cancel_messages_per_window": 20,
-            "reserved_risk_messages_per_window": 0,
+            "reserved_risk_messages_per_window": 1,
+            "reserved_cancel_messages_per_window": 1,
         }
         oms = OMS(DummyEngine(), gateway, config)
         results = []
@@ -2182,18 +2189,19 @@ class OMSSurvivabilityTests(unittest.TestCase):
                 data_cache.mark_prices.pop("BTCUSDT", None)
                 data_cache.mark_update_times.pop("BTCUSDT", None)
 
-    def test_cancel_is_deferred_and_retried_when_budget_is_temporarily_full(self):
+    def test_cancel_capacity_is_reserved_when_order_budget_is_full(self):
         gateway = DummyGateway()
         gateway.cancel_response = DummyResponse(200, {})
         config = self.make_config()
         config["oms"]["outbound_message_budget"] = {
             "enabled": True,
             "window_sec": 0.05,
-            "max_total_messages_per_window": 1,
+            "max_total_messages_per_window": 2,
             "max_new_orders_per_window": 1,
             "max_reduce_orders_per_window": 1,
             "max_cancel_messages_per_window": 1,
-            "reserved_risk_messages_per_window": 0,
+            "reserved_risk_messages_per_window": 1,
+            "reserved_cancel_messages_per_window": 1,
         }
         oms = OMS(DummyEngine(), gateway, config)
         try:
@@ -2212,12 +2220,6 @@ class OMSSurvivabilityTests(unittest.TestCase):
             self.assertTrue(submitted.accepted)
 
             self.assertTrue(oms.cancel_order(submitted.client_oid))
-            self.assertEqual(gateway.cancel_requests, [])
-
-            deadline = time.time() + 1.0
-            while not gateway.cancel_requests and time.time() < deadline:
-                time.sleep(0.01)
-
             self.assertEqual(len(gateway.cancel_requests), 1)
             self.assertNotIn(
                 submitted.client_oid,
@@ -3088,6 +3090,29 @@ class SystemHealthHandlerTests(unittest.TestCase):
         self.assertEqual(
             oms.venue_freezes,
             [("BINANCE", "system_health:MARKET_DATA_STALE:last=10.0 now=80.0", True)],
+        )
+
+    def test_keep_alive_failure_freezes_venue_without_kill(self):
+        risk_controller = DummyRiskController()
+        oms = DummyScopedOms()
+        handle_system_health_event(
+            Event(
+                "eSystemHealth",
+                "USER_STREAM_KEEPALIVE_FAILED: status=503",
+            ),
+            risk_controller,
+            oms,
+        )
+        self.assertEqual(risk_controller.reasons, [])
+        self.assertEqual(
+            oms.venue_freezes,
+            [
+                (
+                    "BINANCE",
+                    "system_health:USER_STREAM_KEEPALIVE_FAILED: status=503",
+                    True,
+                )
+            ],
         )
 
 

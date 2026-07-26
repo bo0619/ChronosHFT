@@ -10,6 +10,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import Mock, patch
 
+import launcher as launcher_module
 import main as main_module
 
 
@@ -164,6 +165,54 @@ class MainDashboardStartupTests(unittest.TestCase):
         gateway_builder.assert_not_called()
         oms_type.assert_not_called()
         strategy_factory.assert_not_called()
+
+    def test_config_check_does_not_construct_runtime_components(self):
+        config = self.config()
+        config["strategy"] = {"primary_model": "glft"}
+        with (
+            patch.object(main_module, "load_config", return_value=config),
+            patch.object(main_module, "EventEngine") as event_engine_type,
+            patch.object(main_module, "build_gateway_bundle") as gateway_builder,
+            patch.object(main_module, "OMS") as oms_type,
+        ):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = main_module._run_main(
+                    ["--config", "config.json", "--check-config"],
+                    runtime={},
+                )
+
+        self.assertEqual(result, 0)
+        self.assertIn("CONFIG_OK mode=live symbols=1 primary_model=glft", output.getvalue())
+        event_engine_type.assert_not_called()
+        gateway_builder.assert_not_called()
+        oms_type.assert_not_called()
+
+    def test_clock_gate_returns_error_when_diagnostics_cannot_start(self):
+        clock = FailedClock()
+        with (
+            patch.object(main_module, "load_config", return_value=self.config()),
+            patch.object(main_module, "time_service", clock),
+            patch.object(main_module, "logger", FakeLogger()),
+            patch.object(
+                main_module,
+                "start_external_alert_service",
+                return_value=None,
+            ),
+            patch.object(
+                main_module,
+                "run_startup_blocked_dashboard",
+                return_value=False,
+            ),
+            patch.object(main_module, "EventEngine") as event_engine_type,
+        ):
+            result = main_module._run_main(
+                ["--config", "config.json"],
+                runtime={},
+            )
+
+        self.assertEqual(result, 2)
+        event_engine_type.assert_not_called()
 
     def test_shutdown_runtime_verifies_cancel_before_closing_truth_and_clock(self):
         calls = []
@@ -341,6 +390,48 @@ class MainDashboardStartupTests(unittest.TestCase):
             source.index("start_local_dashboard("),
             source.index("connect_gateway_with_risk_heartbeat("),
         )
+
+
+class PaperLauncherTests(unittest.TestCase):
+    def test_watchdog_uses_workspace_and_explicit_config_path(self):
+        process = Mock()
+        process.wait.return_value = 0
+        watchdog = launcher_module.ProcessWatchdog(
+            target_script=launcher_module.TARGET_SCRIPT,
+            config_path=launcher_module.CONFIG_PATH,
+            restart_interval_sec=0.0,
+        )
+
+        with patch.object(
+            launcher_module.subprocess,
+            "Popen",
+            return_value=process,
+        ) as popen:
+            result = watchdog.run()
+
+        self.assertEqual(result, 0)
+        command = popen.call_args.args[0]
+        self.assertEqual(command[0], launcher_module.sys.executable)
+        self.assertEqual(command[1], str(launcher_module.TARGET_SCRIPT))
+        self.assertEqual(command[2:], ["--config", str(launcher_module.CONFIG_PATH)])
+        self.assertEqual(
+            popen.call_args.kwargs["cwd"],
+            str(launcher_module.WORKSPACE_DIR),
+        )
+
+    def test_launcher_returns_error_when_config_is_rejected(self):
+        with (
+            patch.object(
+                launcher_module,
+                "launcher_allows_runtime",
+                return_value=(False, "bad config"),
+            ),
+            patch.object(launcher_module, "ProcessWatchdog") as watchdog_type,
+        ):
+            result = launcher_module.main()
+
+        self.assertEqual(result, 2)
+        watchdog_type.assert_not_called()
 
 
 class MainShutdownLatchOrderStaticTests(unittest.TestCase):

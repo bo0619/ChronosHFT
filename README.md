@@ -34,8 +34,21 @@ the main program. No credential environment variables are needed:
 Copy-Item config.example.json config.json
 ```
 
+Run the offline configuration gate before starting any runtime component:
+
+```powershell
+.\.venv\Scripts\python.exe main.py --config config.json --check-config
+```
+
 ```powershell
 .\.venv\Scripts\python.exe main.py --config config.json
+```
+
+For an automatically restarted Paper process, `launcher.py` resolves both
+files from its own directory and refuses Live configuration:
+
+```powershell
+.\.venv\Scripts\python.exe launcher.py
 ```
 
 The read-only monitoring page starts with the engine at

@@ -444,7 +444,7 @@ class BinanceRestApi:
         return resp.json().get("listenKey") if resp and resp.status_code == 200 else None
 
     def keep_alive_listen_key(self):
-        self.request("PUT", EP_LISTEN_KEY, signed=True)
+        return self.request("PUT", EP_LISTEN_KEY, signed=True)
 
     def set_leverage(self, symbol, leverage):
         params = {"symbol": symbol, "leverage": leverage}

@@ -139,6 +139,8 @@ class RestApiThrottleTests(unittest.TestCase):
                 "selfTradePreventionMode": "EXPIRE_MAKER",
             },
             signed=True,
+            pre_send_guard=(),
+            max_attempts=1,
         )
 
     def test_rpi_order_preserves_tif_and_omits_ineligible_exchange_stp(self):
@@ -171,6 +173,8 @@ class RestApiThrottleTests(unittest.TestCase):
                 "timeInForce": "RPI",
             },
             signed=True,
+            pre_send_guard=(),
+            max_attempts=1,
         )
 
     def test_legacy_post_only_order_is_normalized_to_gtx_before_send(self):
@@ -488,6 +492,7 @@ class RPICoreIntegrationTests(unittest.TestCase):
         oms = object.__new__(OMS)
         oms.orders = {}
         oms.exchange_id_map = {}
+        oms._rpi_calibration = {"enabled": False}
         oms._audit = lambda *args, **kwargs: None
         order = oms._create_recovered_order(
             {

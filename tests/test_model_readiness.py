@@ -11,9 +11,28 @@ from unittest.mock import patch
 
 from alpha.factors import GLFTCalibrator
 from alpha.signal import MultiHorizonPredictor
+from data.oos_reconstruction import (
+    OOS_RECONSTRUCTION_SCHEMA,
+    RAW_OOS_EVIDENCE_SCHEMA,
+)
 from event.type import OrderBook
-from infrastructure.config_scaling import load_root_config
+from infrastructure.config_scaling import (
+    load_root_config,
+    normalize_root_config_preapproval,
+)
+from infrastructure.rpi_calibration_permit import (
+    RPI_CALIBRATION_PERMIT_SCHEMA,
+    RPI_CALIBRATION_SIGNATURE_ALGORITHM,
+    RPI_CALIBRATION_STAGE,
+    RPI_CALIBRATION_VENUE,
+    rpi_calibration_permit_sha256,
+    rpi_calibration_permit_signature_payload,
+)
 from scripts.build_rpi_calibration_artifact import (
+    CALIBRATION_ACTIVATION_KIND,
+    CALIBRATION_EXPIRY_KIND,
+    CALIBRATION_JOURNAL_SCHEMA,
+    CALIBRATION_RESERVATION_KIND,
     EXPECTED_DATA_SOURCE,
     EXPECTED_STRATEGY,
     SAMPLE_KIND,
@@ -73,8 +92,17 @@ def _test_signature_verifier(algorithm, key_id, payload, signature):
     )
 
 
-def _fixture_intent(symbol, side, price, quantity):
-    return {
+def _fixture_intent(
+    symbol,
+    side,
+    price,
+    quantity,
+    *,
+    permit_id="",
+    depth_bps=None,
+    reference_mid=None,
+):
+    intent = {
         "strategy_id": EXPECTED_STRATEGY,
         "symbol": symbol,
         "side": side,
@@ -85,8 +113,128 @@ def _fixture_intent(symbol, side, price, quantity):
         "is_post_only": True,
         "reduce_only": False,
         "policy": "PASSIVE",
-        "tag": "glft_quote",
+        "tag": "rpi_calibration_canary" if permit_id else "glft_quote",
     }
+    if permit_id:
+        intent.update(
+            {
+                "calibration_permit_id": permit_id,
+                "calibration_depth_bps": depth_bps,
+                "calibration_reference_mid": reference_mid,
+            }
+        )
+    return intent
+
+
+def _utc_text(value):
+    return (
+        value.astimezone(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _set_test_state_paths(config, lane):
+    deployment_id = config["live_launch"]["deployment_id"]
+    base = f"{deployment_id}/{lane}"
+    config.setdefault("oms", {}).update(
+        {
+            "journal_path": f"{base}/oms-journal.jsonl",
+            "single_writer_fence": {
+                "enabled": True,
+                "path": f"{base}/oms-journal.jsonl.lock",
+            },
+        }
+    )
+    config.setdefault("risk", {}).setdefault(
+        "independent_supervisor",
+        {},
+    )["state_path"] = f"{base}/risk-supervisor-state.json"
+    system = config.setdefault("system", {})
+    system.setdefault("admin_control", {})["path"] = f"{base}/admin"
+    system.setdefault("evidence_recorder", {}).update(
+        {
+            "path": f"{base}/market-evidence.jsonl",
+            "single_writer_fence": {
+                "enabled": True,
+                "path": f"{base}/market-evidence.jsonl.lock",
+            },
+        }
+    )
+    config.setdefault("alert", {})["failure_spool_path"] = (
+        f"{base}/alert-failures.jsonl"
+    )
+
+
+def _signed_test_calibration_permit(
+    *,
+    index,
+    ack_time,
+    terminal_time,
+    calibration_config,
+    target_config,
+):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+    )
+
+    permit = {
+        "schema": RPI_CALIBRATION_PERMIT_SCHEMA,
+        "permit_id": f"readiness-permit-{index:04d}",
+        "authorized_by": "offline-test-operator",
+        "deployment_id": calibration_config["live_launch"]["deployment_id"],
+        "stage": RPI_CALIBRATION_STAGE,
+        "venue": RPI_CALIBRATION_VENUE,
+        "symbol": "XAUUSDT",
+        "model": "glft",
+        "issued_at_utc": _utc_text(
+            datetime.fromtimestamp(ack_time - 180.0, tz=timezone.utc)
+        ),
+        "not_before_utc": _utc_text(
+            datetime.fromtimestamp(ack_time - 120.0, tz=timezone.utc)
+        ),
+        "expires_at_utc": _utc_text(
+            datetime.fromtimestamp(terminal_time + 60.0, tz=timezone.utc)
+        ),
+        "calibration_config_sha256": deployment_config_sha256(
+            calibration_config
+        ),
+        "target_deployment_config_sha256": deployment_config_sha256(
+            target_config
+        ),
+        "strategy_policy_sha256": strategy_policy_sha256(
+            calibration_config,
+            "glft",
+        ),
+        "implementation_sha256": implementation_sha256_for_model("glft"),
+        "policy": {
+            "fixed_depths_bps": [0.5, 1.0, 1.5],
+            "order_ttl_sec": 30,
+            "min_order_interval_sec": 30,
+            "max_active_orders": 1,
+            "max_order_count": 1,
+            "min_order_notional_usdt": 5.0,
+            "max_order_notional_usdt": 8.0,
+            "max_cumulative_submitted_notional_usdt": 8.0,
+            "max_calibration_loss_usdt": 2.0,
+        },
+    }
+    payload = rpi_calibration_permit_signature_payload(permit)
+    private_key = Ed25519PrivateKey.from_private_bytes(
+        bytes.fromhex(
+            "9d61b19deffd5a60ba844af492ec2cc4"
+            "4449c5697b326919703bac031cae7f60"
+        )
+    )
+    signature = private_key.sign(payload)
+    permit["signature"] = {
+        "algorithm": RPI_CALIBRATION_SIGNATURE_ALGORITHM,
+        "key_id": "readiness-test-key",
+        "signer": permit["authorized_by"],
+        "signed_payload_sha256": hashlib.sha256(payload).hexdigest(),
+        "signature_base64": base64.b64encode(signature).decode("ascii"),
+    }
+    return permit
 
 
 def _fixture_snapshot(
@@ -140,28 +288,151 @@ def _write_v2_calibration_journal(
     policy_sha256,
     implementation_sha256,
     deployment_id,
+    calibration_config,
+    target_config,
+    calibration_config_path,
+    target_config_path,
 ):
     symbol = "XAUUSDT"
     entries = [("runtime_state", {"state": "READY"})]
     started_at = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    calibration_sha256 = deployment_config_sha256(calibration_config)
+    target_sha256 = deployment_config_sha256(target_config)
+    submitted_notional_microu = 6_000_000
+    effective_loss_cap_microu = 2_000_000
+    deployment_start_equity_microu = 1_000_000_000
     index = 0
-    for depth_bps, filled_orders in ((0.0, 10), (1.0, 6), (2.0, 3)):
+    for depth_bps, filled_orders in ((0.5, 10), (1.0, 6), (1.5, 3)):
         for group_index in range(10):
             filled = group_index < filled_orders
             client_oid = f"readiness-rpi-{index:04d}"
             exchange_oid = f"exchange-{index:04d}"
             price = 2000.0
-            quantity = 1.0
+            quantity = 0.003
             side = "BUY"
             ack_time = started_at.timestamp() + index * 24_000.0
             terminal_time = ack_time + 10.0
             ack_monotonic = 10_000.0 + index * 20.0
             terminal_monotonic = ack_monotonic + 10.0
+            reference_mid = price * math.exp(
+                (depth_bps + 0.1) / 10_000.0
+            )
+            permit = _signed_test_calibration_permit(
+                index=index,
+                ack_time=ack_time,
+                terminal_time=terminal_time,
+                calibration_config=calibration_config,
+                target_config=target_config,
+            )
+            permit_id = permit["permit_id"]
+            permit_sha256 = rpi_calibration_permit_sha256(permit)
+            not_before_ns = int((ack_time - 120.0) * 1_000_000_000)
+            expires_at_ns = int((terminal_time + 60.0) * 1_000_000_000)
+            cumulative_notional_microu = (
+                submitted_notional_microu * (index + 1)
+            )
+            entries.extend(
+                [
+                    (
+                        CALIBRATION_ACTIVATION_KIND,
+                        {
+                            "schema": CALIBRATION_JOURNAL_SCHEMA,
+                            "signed_permit": permit,
+                            "permit_id": permit_id,
+                            "permit_sha256": permit_sha256,
+                            "deployment_id": deployment_id,
+                            "stage": RPI_CALIBRATION_STAGE,
+                            "venue": RPI_CALIBRATION_VENUE,
+                            "symbol": symbol,
+                            "model": "glft",
+                            "calibration_config_sha256": calibration_sha256,
+                            "target_deployment_config_sha256": target_sha256,
+                            "strategy_policy_sha256": policy_sha256,
+                            "implementation_sha256": implementation_sha256,
+                            "activated_at_exchange_ns": int(
+                                (ack_time - 60.0) * 1_000_000_000
+                            ),
+                            "not_before_exchange_ns": not_before_ns,
+                            "expires_at_exchange_ns": expires_at_ns,
+                            "fixed_depths_bps": [0.5, 1.0, 1.5],
+                            "order_ttl_ns": 30_000_000_000,
+                            "min_order_interval_ns": 30_000_000_000,
+                            "max_active_orders": 1,
+                            "max_order_count": 1,
+                            "min_order_notional_microu": 5_000_000,
+                            "max_order_notional_microu": 8_000_000,
+                            "max_cumulative_submitted_notional_microu": (
+                                8_000_000
+                            ),
+                            "max_calibration_loss_microu": 2_000_000,
+                            "effective_deployment_loss_cap_microu": (
+                                effective_loss_cap_microu
+                            ),
+                            "deployment_start_equity_microu": (
+                                deployment_start_equity_microu
+                            ),
+                            "deployment_start_external_cash_flow_microu": 0,
+                            "peak_observed_loss_microu": 0,
+                            "starting_reserved_order_count": index,
+                            "starting_cumulative_submitted_notional_microu": (
+                                submitted_notional_microu * index
+                            ),
+                        },
+                    ),
+                    (
+                        CALIBRATION_RESERVATION_KIND,
+                        {
+                            "schema": CALIBRATION_JOURNAL_SCHEMA,
+                            "reservation_seq": index + 1,
+                            "permit_reservation_seq": 1,
+                            "reservation_id": client_oid,
+                            "client_oid": client_oid,
+                            "permit_id": permit_id,
+                            "permit_sha256": permit_sha256,
+                            "deployment_id": deployment_id,
+                            "calibration_config_sha256": calibration_sha256,
+                            "target_deployment_config_sha256": target_sha256,
+                            "strategy_policy_sha256": policy_sha256,
+                            "implementation_sha256": implementation_sha256,
+                            "reserved_at_exchange_ns": int(
+                                (ack_time - 30.0) * 1_000_000_000
+                            ),
+                            "symbol": symbol,
+                            "strategy_id": EXPECTED_STRATEGY,
+                            "side": side,
+                            "price": "2000",
+                            "quantity": "0.003",
+                            "declared_depth_bps": str(depth_bps),
+                            "calibration_reference_mid": str(reference_mid),
+                            "order_type": "LIMIT",
+                            "time_in_force": "RPI",
+                            "post_only": True,
+                            "reduce_only": False,
+                            "submitted_notional_microu": (
+                                submitted_notional_microu
+                            ),
+                            "cumulative_submitted_notional_microu": (
+                                cumulative_notional_microu
+                            ),
+                            "permit_cumulative_submitted_notional_microu": (
+                                submitted_notional_microu
+                            ),
+                            "loss_before_send_microu": 0,
+                            "effective_deployment_loss_cap_microu": (
+                                effective_loss_cap_microu
+                            ),
+                        },
+                    ),
+                ]
+            )
             intent = _fixture_intent(
                 symbol,
                 side,
                 price,
                 quantity,
+                permit_id=permit_id,
+                depth_bps=depth_bps,
+                reference_mid=reference_mid,
             )
             common = {
                 "client_oid": client_oid,
@@ -223,9 +494,9 @@ def _write_v2_calibration_journal(
                             "strategy_id": EXPECTED_STRATEGY,
                             "symbol": symbol,
                             "side": side,
-                            "fill_qty": 1.0,
+                            "fill_qty": quantity,
                             "fill_price": price,
-                            "cum_filled_qty": 1.0,
+                            "cum_filled_qty": quantity,
                             "exchange_status": "FILLED",
                             "exchange_time": ack_time + 5.0,
                             "trade_id": trade_id,
@@ -250,7 +521,7 @@ def _write_v2_calibration_journal(
                         source="exchange_update",
                         updated_at=terminal_time,
                         updated_monotonic=terminal_monotonic,
-                        filled_volume=1.0 if filled else 0.0,
+                        filled_volume=quantity if filled else 0.0,
                         exchange_status=terminal_exchange_status,
                     ),
                 )
@@ -292,19 +563,63 @@ def _write_v2_calibration_journal(
                     },
                 )
             )
+            entries.append(
+                (
+                    CALIBRATION_EXPIRY_KIND,
+                    {
+                        "schema": CALIBRATION_JOURNAL_SCHEMA,
+                        "signed_permit": permit,
+                        "permit_id": permit_id,
+                        "permit_sha256": permit_sha256,
+                        "deployment_id": deployment_id,
+                        "symbol": symbol,
+                        "calibration_config_sha256": calibration_sha256,
+                        "target_deployment_config_sha256": target_sha256,
+                        "strategy_policy_sha256": policy_sha256,
+                        "implementation_sha256": implementation_sha256,
+                        "reason": "test_permit_complete",
+                        "budget_exhausted": True,
+                        "expired_at_exchange_ns": int(
+                            (terminal_time + 30.0) * 1_000_000_000
+                        ),
+                        "reserved_order_count": index + 1,
+                        "cumulative_submitted_notional_microu": (
+                            cumulative_notional_microu
+                        ),
+                        "deployment_start_equity_microu": (
+                            deployment_start_equity_microu
+                        ),
+                        "deployment_start_external_cash_flow_microu": 0,
+                        "peak_observed_loss_microu": 0,
+                        "effective_deployment_loss_cap_microu": (
+                            effective_loss_cap_microu
+                        ),
+                    },
+                )
+            )
             index += 1
+
+    entries.append(("oms_stopped", {"cancel_verified": True}))
 
     records = []
     previous_hash = ""
     for offset, (kind, payload) in enumerate(entries):
-        if kind == SAMPLE_KIND:
+        if kind == CALIBRATION_ACTIVATION_KIND:
+            record_epoch = payload["activated_at_exchange_ns"] / 1_000_000_000
+        elif kind == CALIBRATION_RESERVATION_KIND:
+            record_epoch = payload["reserved_at_exchange_ns"] / 1_000_000_000
+        elif kind == CALIBRATION_EXPIRY_KIND:
+            record_epoch = payload["expired_at_exchange_ns"] / 1_000_000_000
+        elif kind == SAMPLE_KIND:
             record_epoch = float(payload["terminal_time"]) + 0.001
         elif kind == "order_snapshot":
             record_epoch = float(payload["updated_at"])
         elif kind == "execution_record":
             record_epoch = float(payload["exchange_time"])
+        elif kind == "oms_stopped":
+            record_epoch = terminal_time + 31.0
         else:
-            record_epoch = started_at.timestamp() - 1.0
+            record_epoch = started_at.timestamp() - 181.0
         record_at = datetime.fromtimestamp(record_epoch, tz=timezone.utc)
         unsigned = {
             "version": 2,
@@ -328,7 +643,14 @@ def _write_v2_calibration_journal(
         "\n".join(_canonical_json(record) for record in records) + "\n",
         encoding="utf-8",
     )
-    return validate_rpi_calibration_journal(path, symbol=symbol)
+    return validate_rpi_calibration_journal(
+        path,
+        symbol=symbol,
+        calibration_config=calibration_config,
+        target_deployment_config=target_config,
+        calibration_config_path=calibration_config_path,
+        target_deployment_config_path=target_config_path,
+    )
 
 
 class ModelReadinessTests(unittest.TestCase):
@@ -558,17 +880,65 @@ class ModelReadinessTests(unittest.TestCase):
             model = "glft"
             formula_version = formula_version_for_model(model)
             manifest_path = root / "approval.json"
-            config = self._live_config(manifest_path.name)
+            target_config_path = root / "config.json"
+            raw_target_config = self._live_config(manifest_path.name)
+            config = normalize_root_config_preapproval(raw_target_config)
+            raw_calibration_config = json.loads(
+                json.dumps(raw_target_config)
+            )
+            raw_calibration_config["live_launch"].update(
+                {
+                    "stage": RPI_CALIBRATION_STAGE,
+                    "max_deployment_loss_usdt": 2.0,
+                    "calibration_permit_path": "test-permit.json",
+                    "target_deployment_config_path": (
+                        target_config_path.name
+                    ),
+                    "calibration_permit_trusted_signers": {
+                        "readiness-test-key": {
+                            "algorithm": RPI_CALIBRATION_SIGNATURE_ALGORITHM,
+                            "public_key_base64": (
+                                "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMl"
+                                "rwIaaPcHURo="
+                            ),
+                        }
+                    },
+                }
+            )
+            _set_test_state_paths(raw_calibration_config, "calibration")
+            calibration_config = normalize_root_config_preapproval(
+                raw_calibration_config
+            )
+            calibration_config_path = root / "calibration-config.json"
+            target_config_path.write_text(
+                json.dumps(config),
+                encoding="utf-8",
+            )
+            calibration_config_path.write_text(
+                json.dumps(calibration_config),
+                encoding="utf-8",
+            )
             policy_sha256 = strategy_policy_sha256(config, model)
+            self.assertEqual(
+                strategy_policy_sha256(calibration_config, model),
+                policy_sha256,
+            )
             deployment_sha256 = deployment_config_sha256(config)
             implementation_sha256 = implementation_sha256_for_model(model)
             deployment_id = config["live_launch"]["deployment_id"]
-            journal = root / "oms-journal.jsonl"
+            journal = root / calibration_config["oms"]["journal_path"]
+            journal.parent.mkdir(parents=True, exist_ok=True)
+            journal_fence = Path(f"{journal}.lock")
+            journal_fence.write_bytes(b"\0")
             summary = _write_v2_calibration_journal(
                 journal,
                 policy_sha256=policy_sha256,
                 implementation_sha256=implementation_sha256,
                 deployment_id=deployment_id,
+                calibration_config=calibration_config,
+                target_config=config,
+                calibration_config_path=calibration_config_path,
+                target_config_path=target_config_path,
             )
             artifact = root / "glft-calibration.json"
             build_rpi_calibration_artifact(
@@ -576,6 +946,10 @@ class ModelReadinessTests(unittest.TestCase):
                 artifact,
                 symbol="XAUUSDT",
                 deployment_config_sha256=deployment_sha256,
+                calibration_config=calibration_config,
+                target_deployment_config=config,
+                calibration_config_path=calibration_config_path,
+                target_deployment_config_path=target_config_path,
             )
             capture_started = datetime.fromisoformat(
                 summary.first_ack_at_utc.replace("Z", "+00:00")
@@ -590,33 +964,69 @@ class ModelReadinessTests(unittest.TestCase):
                 seconds=data_duration_sec * 0.6
             )
 
-            def utc_text(value):
-                return (
-                    value.astimezone(timezone.utc)
-                    .isoformat(timespec="milliseconds")
-                    .replace("+00:00", "Z")
-                )
-
             source_data = root / "source-data-manifest.json"
             oos = {
                 "method": "WALK_FORWARD",
-                "training_ended_at_utc": utc_text(training_ended),
-                "started_at_utc": utc_text(training_ended),
+                "training_ended_at_utc": _utc_text(training_ended),
+                "started_at_utc": _utc_text(training_ended),
                 "ended_at_utc": summary.last_terminal_at_utc,
                 "sample_count": 10_000,
                 "fill_count": 100,
                 "maker_fill_fraction": 1.0,
+                "rpi_fill_fraction": 1.0,
                 "rpi_commission_rate": "0",
+                "total_commission_usdt": 0.0,
+                "total_booked_fee_usdt": 0.0,
+                "funding_pnl_usdt": 0.0,
                 "net_pnl_usdt": 1.0,
+                "exchange_net_pnl_usdt": 1.0,
                 "max_drawdown_usdt": 4.0,
                 "markout": {
                     "1000": {
                         "sample_count": 100,
+                        "mean_net_edge_bps": 0.2,
                         "net_edge_bps_lcb95": 0.1,
+                        "cluster_count": 5,
+                        "cluster_unit": "UTC_DAY",
+                        "estimator": "T_DISTRIBUTION_CLUSTER_MEAN",
+                        "max_mark_lag_ms": 2000,
                     },
                     "5000": {
                         "sample_count": 100,
+                        "mean_net_edge_bps": 0.1,
                         "net_edge_bps_lcb95": 0.05,
+                        "cluster_count": 5,
+                        "cluster_unit": "UTC_DAY",
+                        "estimator": "T_DISTRIBUTION_CLUSTER_MEAN",
+                        "max_mark_lag_ms": 2000,
+                    },
+                },
+                "raw_evidence": {
+                    "schema": RAW_OOS_EVIDENCE_SCHEMA,
+                    "deployment_id": deployment_id,
+                    "deployment_config_sha256": deployment_sha256,
+                    "oms_journal": {
+                        "sha256": summary.journal_sha256,
+                        "record_count": summary.record_count,
+                        "first_seq": summary.first_seq,
+                        "last_seq": summary.last_seq,
+                        "final_hash": summary.final_hash,
+                        "last_kind": "oms_stopped",
+                    },
+                    "market_evidence_journal": {
+                        "sha256": "a" * 64,
+                        "record_count": 10_102,
+                        "final_hash": "b" * 64,
+                        "mark_price_count": 10_000,
+                        "account_update_count": 100,
+                        "last_kind": "clean_stop",
+                    },
+                    "reconstruction": {
+                        "schema": OOS_RECONSTRUCTION_SCHEMA,
+                        "flat_tolerance": 0.000001,
+                        "pnl_crosscheck_tolerance_usdt": 0.000001,
+                        "max_markout_lag_ms": 2000,
+                        "min_utc_day_clusters": 5,
                     },
                 },
             }
@@ -632,13 +1042,17 @@ class ModelReadinessTests(unittest.TestCase):
                 "implementation_sha256": implementation_sha256,
                 "deployment_id": deployment_id,
                 "calibration_artifact_sha256": sha256_file(artifact),
+                "calibration_config_path": calibration_config_path.name,
+                "calibration_config_sha256": (
+                    summary.calibration_config_sha256
+                ),
                 "symbols": ["XAUUSDT"],
                 "capture_started_at_utc": summary.first_ack_at_utc,
                 "capture_ended_at_utc": summary.last_terminal_at_utc,
                 "order_sample_count": 30,
                 "unique_order_count": 30,
                 "journal": {
-                    "path": journal.name,
+                    "path": journal.relative_to(root).as_posix(),
                     "sha256": summary.journal_sha256,
                     "deployment_id": deployment_id,
                     "first_seq": summary.first_seq,
@@ -658,6 +1072,20 @@ class ModelReadinessTests(unittest.TestCase):
                     ),
                     "strategy_policy_sha256": policy_sha256,
                     "implementation_sha256": implementation_sha256,
+                    "calibration_config_sha256": (
+                        summary.calibration_config_sha256
+                    ),
+                    "target_deployment_config_sha256": (
+                        summary.target_deployment_config_sha256
+                    ),
+                    "permit_activation_count": (
+                        summary.permit_activation_count
+                    ),
+                    "permit_sha256s": list(summary.permit_sha256s),
+                    "reservation_count": summary.reservation_count,
+                    "cumulative_submitted_notional_microu": (
+                        summary.cumulative_submitted_notional_microu
+                    ),
                 },
                 "oos_evidence_sha256": oos_evidence_sha256(oos),
                 "oos": oos,
@@ -680,7 +1108,7 @@ class ModelReadinessTests(unittest.TestCase):
                 "oos_samples": 10_000,
                 "approved": True,
                 "approved_by": "offline-review",
-                "approved_at": utc_text(
+                "approved_at": _utc_text(
                     capture_ended + timedelta(hours=12)
                 ),
                 "artifact_path": artifact.name,
@@ -756,7 +1184,9 @@ class ModelReadinessTests(unittest.TestCase):
             manifest = json.loads(json.dumps(valid_manifest))
 
             altered_source = json.loads(source_text)
-            altered_source["oos"]["net_pnl_usdt"] = 2.0
+            altered_source["oos"]["markout"]["1000"][
+                "mean_net_edge_bps"
+            ] = 0.3
             altered_source["oos_evidence_sha256"] = oos_evidence_sha256(
                 altered_source["oos"]
             )
@@ -840,7 +1270,7 @@ class ModelReadinessTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     ValueError,
-                    "cryptography Ed25519 verification backend is unavailable",
+                    "RPI calibration permit Ed25519 verifier failed closed",
                 ):
                     validate_live_calibration_approval(
                         config,
@@ -894,6 +1324,7 @@ class ModelReadinessTests(unittest.TestCase):
                 json.dumps(
                     {
                         "execution": {"mode": "live"},
+                        "live_launch": {"stage": "canary"},
                         "symbols": ["XAUUSDT"],
                         "strategy": {
                             "primary_model": "glft",
@@ -909,11 +1340,21 @@ class ModelReadinessTests(unittest.TestCase):
 
     @staticmethod
     def _live_config(manifest_path):
-        return {
+        config = {
+            "execution": {"mode": "live"},
+            "paper_trade": {"enabled": False},
+            "testnet": False,
             "symbols": ["XAUUSDT"],
             "live_launch": {
+                "stage": "canary",
                 "deployment_id": "readiness-test-deployment",
+                "max_deployed_capital_usdt": 100.0,
                 "max_deployment_loss_usdt": 5.0,
+            },
+            "risk": {
+                "limits": {
+                    "max_order_notional": 8.0,
+                },
             },
             "strategy": {
                 "primary_model": "glft",
@@ -938,6 +1379,8 @@ class ModelReadinessTests(unittest.TestCase):
                 },
             },
         }
+        _set_test_state_paths(config, "target")
+        return config
 
 
 if __name__ == "__main__":
