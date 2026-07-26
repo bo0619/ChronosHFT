@@ -1,6 +1,5 @@
 # file: alpha/engine.py
 
-import math
 import numpy as np
 from collections import defaultdict
 from event.type import OrderBook, AggTradeData
@@ -61,7 +60,8 @@ class FeatureEngine:
         bid_1_p, bid_1_v = ob.get_best_bid()
         ask_1_p, ask_1_v = ob.get_best_ask()
         
-        if bid_1_p == 0 or ask_1_p == 0: return
+        if bid_1_p == 0 or ask_1_p == 0:
+            return
 
         mid = (bid_1_p + ask_1_p) / 2.0
         spread = ask_1_p - bid_1_p

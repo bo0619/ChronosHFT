@@ -15,6 +15,68 @@ from .journal import JournalError
 class OMSCancellationManager(OMSComponent):
     """Own cancel dispatch, retries and verified account-wide cancellation."""
 
+    def _schedule_cancel_order_retry(self, client_oid: str) -> bool:
+        with self.lock:
+            if self._stopped or client_oid in self._deferred_cancel_oids:
+                return False
+            self._deferred_cancel_oids.add(client_oid)
+
+        def retry():
+            with self.lock:
+                self._deferred_cancel_oids.discard(client_oid)
+                stopped = self._stopped
+            if not stopped:
+                self.cancel_order(client_oid)
+
+        handle = self._submit_background_task(
+            f"cancel-retry:{client_oid}",
+            retry,
+            name=f"CancelRetry-{client_oid}",
+            safety=True,
+            delay_sec=self.outbound_message_window_sec + 0.01,
+        )
+        if handle is None:
+            with self.lock:
+                self._deferred_cancel_oids.discard(client_oid)
+            return False
+        return True
+
+    def _schedule_cancel_all_retry(self, symbol: str, source: str) -> bool:
+        symbol = str(symbol or "").upper()
+        with self.lock:
+            if self._stopped or symbol in self._deferred_cancel_all_symbols:
+                return False
+            self._deferred_cancel_all_symbols.add(symbol)
+
+        def retry():
+            with self.lock:
+                self._deferred_cancel_all_symbols.discard(symbol)
+                stopped = self._stopped
+            if stopped:
+                return
+            retry_source = (
+                source
+                if source.startswith("deferred:")
+                else f"deferred:{source}"
+            )
+            self._cancel_all_orders_unchecked(
+                symbol,
+                source=retry_source,
+            )
+
+        handle = self._submit_background_task(
+            f"cancel-all-retry:{symbol}",
+            retry,
+            name=f"CancelAllRetry-{symbol}",
+            safety=True,
+            delay_sec=self.outbound_message_window_sec + 0.01,
+        )
+        if handle is None:
+            with self.lock:
+                self._deferred_cancel_all_symbols.discard(symbol)
+            return False
+        return True
+
     def cancel_order(self, client_oid: str):
         if not self.can_cancel_orders():
             self._audit(

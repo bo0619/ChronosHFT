@@ -23,6 +23,33 @@ from .order import Order
 class OMSOrderSubmission(OMSComponent):
     """Own prepare, fence, dispatch and durable submit settlement."""
 
+    def _reject_intent_locally(
+        self,
+        intent: OrderIntent,
+        client_oid: str,
+        reason: str,
+        **extra,
+    ):
+        order = Order(client_oid, intent)
+        order.mark_rejected_locally(reason)
+        with self.lock:
+            self._record_order_snapshot(order, "intent_rejected", **extra)
+            self._emit_order_update(order)
+        self._write_tombstone(order)
+        audit_payload = {
+            "reason": reason,
+            "intent": self._serialize_intent(intent),
+            "client_oid": client_oid,
+        }
+        audit_payload.update(extra)
+        self._audit("intent_rejected", **audit_payload)
+        return OrderSubmitResult(
+            accepted=False,
+            client_oid=client_oid,
+            reason=reason,
+            state=self.state.value,
+        )
+
     def _submit_internal_order(
         self,
         intent: OrderIntent,

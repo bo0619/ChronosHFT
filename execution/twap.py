@@ -14,7 +14,8 @@ class TWAPAlgo(AlgoTemplate):
         self.end_time = time.time() + duration
 
     def on_tick(self, ob):
-        if self.finished: return
+        if self.finished:
+            return
         
         now = time.time()
         if now > self.end_time:

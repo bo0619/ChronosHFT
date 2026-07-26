@@ -16,6 +16,114 @@ from .component import OMSComponent
 class OMSReconciler(OMSComponent):
     """Own truth reconciliation, retry and full-reset workflows."""
 
+    def _normalize_remote_open_orders(self, remote_orders):
+        if not isinstance(remote_orders, (list, tuple)):
+            raise ValueError("remote open-orders snapshot must be a list")
+        normalized = []
+        for order in remote_orders:
+            if not isinstance(order, dict):
+                raise ValueError("remote open-orders entry must be an object")
+            symbol = str(order.get("symbol", "") or "").upper().strip()
+            if not symbol:
+                raise ValueError("remote open-orders entry is missing symbol")
+            identifiers = tuple(
+                sorted(
+                    oid
+                    for oid in [
+                        (
+                            str(order.get("orderId"))
+                            if order.get("orderId") is not None
+                            else ""
+                        ),
+                        order.get("clientOrderId") or "",
+                    ]
+                    if oid
+                )
+            )
+            normalized.append(
+                {
+                    "symbol": symbol,
+                    "identifiers": identifiers,
+                    "side": str(order.get("side", "") or "").upper(),
+                }
+            )
+        with self.lock:
+            self._known_account_order_symbols.update(
+                item["symbol"] for item in normalized
+            )
+        normalized.sort(
+            key=lambda item: (
+                item["symbol"],
+                item["identifiers"],
+                item["side"],
+            )
+        )
+        return normalized
+
+    def _collect_local_active_orders_locked(self):
+        normalized = []
+        for order in self.orders.values():
+            if not order.is_active():
+                continue
+            identifiers = tuple(
+                sorted(
+                    oid
+                    for oid in [order.client_oid, order.exchange_oid]
+                    if oid
+                )
+            )
+            normalized.append(
+                {
+                    "symbol": str(order.intent.symbol or "").upper(),
+                    "identifiers": identifiers,
+                    "side": order.intent.side.value,
+                }
+            )
+        normalized.sort(
+            key=lambda item: (
+                item["symbol"],
+                item["identifiers"],
+                item["side"],
+            )
+        )
+        return normalized
+
+    def _collect_exchange_position_drift_locked(
+        self,
+        exchange_positions,
+        tracked_symbols=None,
+    ):
+        drift = {}
+        symbols = set(tracked_symbols or [])
+        symbols.update(exchange_positions.keys())
+        symbols.update(
+            symbol
+            for symbol, volume in self.exposure.net_positions.items()
+            if abs(volume) > 1e-6 and (not symbols or symbol in symbols)
+        )
+
+        for symbol in symbols:
+            local_pos = self.exposure.net_positions.get(symbol, 0.0)
+            payload = exchange_positions.get(symbol, {})
+            exchange_pos = float(payload.get("volume", 0.0))
+            if abs(local_pos - exchange_pos) > 1e-6:
+                drift[symbol] = {
+                    "local": local_pos,
+                    "exchange": exchange_pos,
+                    "entry_price": float(payload.get("entry_price", 0.0)),
+                }
+        return drift
+
+    def _has_active_orders_locked(self, symbols=None):
+        tracked_symbols = set(symbols or [])
+        for order in self.orders.values():
+            if not order.is_active():
+                continue
+            if tracked_symbols and order.intent.symbol not in tracked_symbols:
+                continue
+            return True
+        return False
+
     def _schedule_pending_reconcile_requests(
         self,
         *,
@@ -937,4 +1045,3 @@ class OMSReconciler(OMSComponent):
 
         except Exception as exc:
             self.halt_system(f"Reset failed: {exc}")
-

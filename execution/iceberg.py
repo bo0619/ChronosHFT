@@ -18,13 +18,15 @@ class IcebergAlgo(AlgoTemplate):
             self.replenish()
 
     def replenish(self):
-        if self.finished: return
+        if self.finished:
+            return
         
         left_vol = self.total_vol - self.traded_vol
         # 不能超过剩余量，也不能超过每次可见量
         order_vol = min(left_vol, self.visible_vol)
         
-        if order_vol <= 0: return
+        if order_vol <= 0:
+            return
         
         # 简单实现：挂 Limit 单在限价位
         # 进阶实现：可以挂在买一价，或者 Pegging

@@ -730,7 +730,7 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         oms.state = LifecycleState.LIVE
         try:
             with patch(
-                "oms.engine.time_service.health_snapshot",
+                "oms.order_policy.time_service.health_snapshot",
                 return_value={
                     "ready": False,
                     "state": "halt",

@@ -14,7 +14,8 @@ class ChaseAlgo(AlgoTemplate):
         self.last_price = 0
 
     def on_tick(self, ob):
-        if self.finished: return
+        if self.finished:
+            return
         
         # 目标价格：盘口最优价
         target_price = 0
@@ -44,7 +45,8 @@ class ChaseAlgo(AlgoTemplate):
 
     def _send_new(self, price):
         left = self.total_vol - self.traded_vol
-        if left <= 0: return
+        if left <= 0:
+            return
         
         if self.direction == "BUY":
             # 使用 PostOnly (GTX) 确保只做 Maker

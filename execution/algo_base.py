@@ -1,6 +1,6 @@
 # file: execution/algo_base.py
 
-from event.type import OrderRequest, OrderData, TradeData, OrderBook
+from event.type import OrderData, OrderBook
 from event.type import Status_ALLTRADED, Status_CANCELLED, Status_REJECTED
 
 class AlgoTemplate:

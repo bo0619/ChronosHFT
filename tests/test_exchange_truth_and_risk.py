@@ -16,6 +16,7 @@ if "requests" not in sys.modules:
     requests_module = types.ModuleType("requests")
     requests_module.Session = lambda: None
     requests_module.Request = object
+    requests_module.get = lambda *args, **kwargs: None
     sys.modules["requests"] = requests_module
 
 if "requests.adapters" not in sys.modules:

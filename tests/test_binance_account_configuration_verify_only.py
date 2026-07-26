@@ -174,7 +174,9 @@ def test_gateway_verify_only_method_has_no_mutating_rest_call():
 
 
 def test_oms_wires_account_configuration_mode_to_gateway_statically():
-    tree = ast.parse((ROOT / "oms" / "engine.py").read_text(encoding="utf-8"))
+    tree = ast.parse(
+        (ROOT / "oms" / "initializer.py").read_text(encoding="utf-8")
+    )
     assignments = [
         node
         for node in ast.walk(tree)

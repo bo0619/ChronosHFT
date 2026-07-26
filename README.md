@@ -444,11 +444,12 @@ that deployment host. Multi-host active/passive operation is not supported.
       toxicity-conditioned markout, parameter-drift governance, regime/event
       controls, and multi-level quoting. Paper fills and public aggregate
       trades must not be used as substitutes for RPI execution evidence.
-- [ ] Remove the remaining legacy TUI modules, tests, and Rich dependency. The
-      main runtime and event/log wiring are now web-only. Redesign the web UI around a
-      top-tier institutional trading-console hierarchy with fewer simultaneous
-      panels, stronger prioritization, progressive disclosure, and materially
-      lower visual noise while retaining full telemetry access.
+- [x] Remove the remaining legacy TUI modules, tests, and Rich dependency. The
+      main runtime and event/log wiring are now web-only.
+- [ ] Redesign the web UI around a top-tier institutional trading-console
+      hierarchy with fewer simultaneous panels, stronger prioritization,
+      progressive disclosure, and materially lower visual noise while retaining
+      full telemetry access.
 
 # Key Features:
 🚀 Asynchronous Event-Driven Architecture: Ultra-low latency signal processing.

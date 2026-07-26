@@ -17,11 +17,26 @@ from event.type import (
     TIF_GTX,
     TIF_IOC,
 )
+from infrastructure.time_service import time_service
+
 from .component import OMSComponent
 
 
 class OMSOrderPolicy(OMSComponent):
     """Own pre-trade gates, mode adaptation and emergency reduce-only policy."""
+
+    def _get_clock_health_rejection_locked(self, intent: OrderIntent) -> str:
+        if intent.reduce_only or not self.require_healthy_clock:
+            return ""
+        try:
+            snapshot = time_service.health_snapshot(notify_listeners=False)
+        except Exception as exc:
+            return f"clock_health_unavailable:{type(exc).__name__}"
+        if bool(snapshot.get("ready", False)):
+            return ""
+        state = str(snapshot.get("state", "unhealthy") or "unhealthy")
+        reason = str(snapshot.get("reason", "") or "unsynchronized")
+        return f"clock_health:{state}:{reason}"
 
     def adapt_intent_for_trading_mode(self, intent: OrderIntent):
         self._ensure_capability_mode_consistent()

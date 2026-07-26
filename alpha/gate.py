@@ -1,7 +1,5 @@
 # file: alpha/gate.py
 
-import math
-
 class AlphaGate:
     """
     Alpha 信号守门员

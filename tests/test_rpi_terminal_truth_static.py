@@ -5,7 +5,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / "oms" / "engine.py"
 OMS_IMPLEMENTATION = (
+    ROOT / "oms" / "durability_manager.py",
     ROOT / "oms" / "exchange_event_processor.py",
+    ROOT / "oms" / "initializer.py",
     ROOT / "oms" / "order_submission.py",
     ROOT / "oms" / "submit_settlement.py",
     ROOT / "oms" / "cancellation_manager.py",

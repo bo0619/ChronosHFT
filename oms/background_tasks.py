@@ -10,6 +10,11 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from event.type import LifecycleState
+from infrastructure.logger import logger
+
+from .component import OMSComponent
+
 
 class BackgroundTaskRejected(RuntimeError):
     """Raised when bounded background work cannot be accepted."""
@@ -698,3 +703,97 @@ class OMSBackgroundTaskExecutor:
                 "reruns": len(self._rerun_by_key),
                 "active": active,
             }
+
+
+class OMSBackgroundTaskManager(OMSComponent):
+    """Own OMS admission policy and fail-closed handling for background work."""
+
+    def _latch_background_task_failure(
+        self,
+        key: str,
+        reason: str,
+    ) -> None:
+        failure_reason = (
+            f"background_task_unavailable:{str(key or 'unknown')}:"
+            f"{str(reason or 'rejected')}"
+        )
+        with self.lock:
+            self._background_task_rejection_count += 1
+            self._close_outbound_gate_locked(
+                failure_reason,
+                hold="background_task_failure",
+            )
+            if self.state != LifecycleState.HALTED:
+                self._lifecycle_generation += 1
+            self.state = LifecycleState.HALTED
+            self.manual_rearm_required = True
+            self.last_halt_reason = failure_reason
+            self.last_freeze_reason = ""
+            self._sync_capability_mode(failure_reason)
+        logger.critical(f"[OMS] {failure_reason}")
+        try:
+            self._audit(
+                "background_task_failure",
+                task_key=key,
+                reason=reason,
+                rejection_count=self._background_task_rejection_count,
+            )
+        except Exception as exc:
+            logger.critical(
+                "[OMS] Could not persist background task failure: "
+                f"{type(exc).__name__}:{exc}"
+            )
+
+    def _on_background_task_error(
+        self,
+        key: str,
+        name: str,
+        exc: BaseException,
+    ) -> None:
+        self._latch_background_task_failure(
+            key,
+            f"{name}:{type(exc).__name__}:{exc}",
+        )
+
+    def _submit_background_task(
+        self,
+        key: str,
+        callback,
+        *args,
+        name: str = "",
+        safety: bool = False,
+        delay_sec: float = 0.0,
+        resubmit_after_current: bool = False,
+        fail_closed: bool = True,
+        **kwargs,
+    ):
+        lane = (
+            OMSBackgroundTaskExecutor.SAFETY_LANE
+            if safety
+            else OMSBackgroundTaskExecutor.DEFAULT_LANE
+        )
+        submission = self._background_tasks.submit(
+            key,
+            callback,
+            *args,
+            name=name,
+            lane=lane,
+            delay_sec=delay_sec,
+            resubmit_after_current=resubmit_after_current,
+            **kwargs,
+        )
+        if submission.accepted:
+            return submission.handle
+        if fail_closed:
+            self._latch_background_task_failure(key, submission.reason)
+        else:
+            logger.error(
+                f"[OMS] Background task rejected key={key}: "
+                f"{submission.reason}"
+            )
+        return None
+
+    def get_background_task_snapshot(self) -> dict:
+        snapshot = self._background_tasks.snapshot()
+        snapshot["rejection_count"] = self._background_task_rejection_count
+        return snapshot
