@@ -27,6 +27,7 @@ TIME_SYNC_DEFAULTS = {
     "low_rtt_sample_count": 3,
     "sample_spacing_ms": 10.0,
     "request_timeout_sec": 1.0,
+    "connection_warmup_timeout_sec": 3.0,
     "max_initial_offset_ms": 5000.0,
     "max_phase_error_ms": 25.0,
     "halt_phase_error_ms": 100.0,

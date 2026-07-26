@@ -25,6 +25,7 @@ class TimeService:
         self._sync_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = None
+        self._http_session = None
         self._generation = 0
         self._offset_ms = 0.0
         self.active = False
@@ -49,6 +50,7 @@ class TimeService:
         self.low_rtt_sample_count = 3
         self.sample_spacing_ms = 10.0
         self.request_timeout_sec = 1.0
+        self.connection_warmup_timeout_sec = 3.0
         self.max_offset_dispersion_ms = 10.0
         self.max_sync_age_sec = 30.0
         self.max_wall_clock_step_ms = 25.0
@@ -224,6 +226,15 @@ class TimeService:
                 minimum=0.0,
             ),
         )
+        self.connection_warmup_timeout_sec = max(
+            self.request_timeout_sec,
+            self._float_config(
+                config,
+                "connection_warmup_timeout_sec",
+                self.connection_warmup_timeout_sec,
+                minimum=0.0,
+            ),
+        )
         self.max_offset_dispersion_ms = max(
             0.0,
             self._float_config(
@@ -301,6 +312,7 @@ class TimeService:
             if testnet
             else "https://fapi.binance.com/fapi/v1/time"
         )
+        http_session = requests.Session()
         with self._state_lock:
             self._generation += 1
             generation = self._generation
@@ -308,6 +320,7 @@ class TimeService:
             sync_lock = threading.Lock()
             self._stop_event = stop_event
             self._sync_lock = sync_lock
+            self._http_session = http_session
             self.active = True
             self._health_state = "starting"
             self._synchronized = False
@@ -325,6 +338,10 @@ class TimeService:
             self.halt_breach_count = 0
             self.recovery_success_count = 0
         logger.info(f"TimeService connecting to: {self.url}")
+        self._warm_up_connection(
+            generation=generation,
+            stop_event=stop_event,
+        )
         initial_sync_ok = self._sync(
             generation=generation,
             stop_event=stop_event,
@@ -358,9 +375,18 @@ class TimeService:
                 self._health_state = "stopped"
                 self._runtime_fault_reason = "time service stopped"
             thread = self._thread
+            http_session = self._http_session
+            self._http_session = None
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=max(0.5, self.request_timeout_sec + 0.25))
         stopped = not thread or not thread.is_alive()
+        if http_session is not None:
+            try:
+                http_session.close()
+            except Exception as exc:
+                logger.warning(
+                    f"TimeService HTTP session close failed: {type(exc).__name__}"
+                )
         if stopped:
             with self._state_lock:
                 if self._thread is thread:
@@ -519,17 +545,51 @@ class TimeService:
                 logger.error(f"TimeService listener failed: {exc}")
         return True
 
-    def _request_sample(self):
-        mono_start_ns = self.monotonic_ns()
-        wall_start_ns = self._wall_time_ns()
-        response = requests.get(self.url, timeout=self.request_timeout_sec)
-        wall_end_ns = self._wall_time_ns()
-        mono_end_ns = self.monotonic_ns()
+    def _request_server_time_ms(self, *, timeout_sec=None):
+        with self._state_lock:
+            http_session = self._http_session
+        if http_session is None:
+            raise RuntimeError("time sync HTTP session is not available")
+        timeout = self.request_timeout_sec if timeout_sec is None else float(timeout_sec)
+        response = http_session.get(self.url, timeout=timeout)
         if hasattr(response, "raise_for_status"):
             response.raise_for_status()
         server_time_ms = float(response.json()["serverTime"])
         if not math.isfinite(server_time_ms) or server_time_ms <= 0:
             raise ValueError("invalid serverTime in exchange clock response")
+        return server_time_ms
+
+    def _warm_up_connection(self, *, generation, stop_event):
+        """Establish the reusable TLS connection outside measured samples."""
+
+        if not self._sync_context_active(generation, stop_event):
+            return False
+        started_ns = self.monotonic_ns()
+        try:
+            self._request_server_time_ms(
+                timeout_sec=self.connection_warmup_timeout_sec,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Time Sync HTTP connection warm-up failed; "
+                f"formal sampling will retry: {type(exc).__name__}"
+            )
+            return False
+        if not self._sync_context_active(generation, stop_event):
+            return False
+        elapsed_ms = max(
+            0.0,
+            (self.monotonic_ns() - started_ns) / 1_000_000.0,
+        )
+        logger.info(f"Time Sync HTTP connection warmed in {elapsed_ms:.1f}ms")
+        return True
+
+    def _request_sample(self):
+        mono_start_ns = self.monotonic_ns()
+        wall_start_ns = self._wall_time_ns()
+        server_time_ms = self._request_server_time_ms()
+        wall_end_ns = self._wall_time_ns()
+        mono_end_ns = self.monotonic_ns()
         rtt_ms = max(0.0, (mono_end_ns - mono_start_ns) / 1_000_000.0)
         wall_elapsed_ms = (wall_end_ns - wall_start_ns) / 1_000_000.0
         wall_step_ms = wall_elapsed_ms - rtt_ms

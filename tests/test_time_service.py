@@ -1,24 +1,7 @@
-import sys
 import threading
 import time
-import types
 import unittest
-from unittest.mock import patch
-
-if "requests" not in sys.modules:
-    requests_stub = types.ModuleType("requests")
-
-    class Request:
-        def __init__(self, method, url, params=None, headers=None):
-            self.method = method
-            self.url = url
-            self.params = params or {}
-            self.headers = headers or {}
-
-    requests_stub.Request = Request
-    requests_stub.Session = lambda: None
-    requests_stub.get = lambda *args, **kwargs: None
-    sys.modules["requests"] = requests_stub
+from unittest.mock import Mock, patch
 
 from infrastructure.time_service import TimeService
 
@@ -277,9 +260,10 @@ class TimeServiceTests(unittest.TestCase):
         self.assertEqual(snapshot["selected_samples"], 3)
         self.assertTrue(snapshot["ready"])
 
-    @patch("infrastructure.time_service.requests.get")
-    def test_request_sample_uses_monotonic_rtt_and_midpoint(self, mock_get):
-        mock_get.return_value = DummyResponse({"serverTime": 1_000_103.0})
+    def test_request_sample_uses_persistent_session_monotonic_rtt_and_midpoint(self):
+        session = Mock()
+        session.get.return_value = DummyResponse({"serverTime": 1_000_103.0})
+        self.service._http_session = session
         with (
             patch.object(
                 self.service,
@@ -296,13 +280,14 @@ class TimeServiceTests(unittest.TestCase):
 
         self.assertAlmostEqual(sample["rtt_ms"], 4.0)
         self.assertAlmostEqual(sample["offset_ms"], 101.0)
-        mock_get.assert_called_once_with(
+        session.get.assert_called_once_with(
             self.service.url, timeout=self.service.request_timeout_sec
         )
 
-    @patch("infrastructure.time_service.requests.get")
-    def test_request_sample_rejects_wall_step(self, mock_get):
-        mock_get.return_value = DummyResponse({"serverTime": 1_000_103.0})
+    def test_request_sample_rejects_wall_step(self):
+        session = Mock()
+        session.get.return_value = DummyResponse({"serverTime": 1_000_103.0})
+        self.service._http_session = session
         self.service.max_wall_clock_step_ms = 20.0
         with (
             patch.object(
@@ -318,6 +303,37 @@ class TimeServiceTests(unittest.TestCase):
             self.assertRaisesRegex(ValueError, "wall clock stepped"),
         ):
             self.service._request_sample()
+
+    def test_start_warms_and_reuses_one_session_for_all_samples(self):
+        self.service.configure(
+            {
+                "sample_count": 2,
+                "min_successful_samples": 2,
+                "low_rtt_sample_count": 2,
+                "sync_interval_sec": 60.0,
+            }
+        )
+        session = Mock()
+        session.get.side_effect = lambda *_args, **_kwargs: DummyResponse(
+            {"serverTime": time.time() * 1000.0}
+        )
+
+        with patch(
+            "infrastructure.time_service.requests.Session",
+            return_value=session,
+        ) as session_factory:
+            self.assertTrue(self.service.start(testnet=False))
+            snapshot = self.service.health_snapshot()
+            self.assertTrue(self.service.stop())
+
+        session_factory.assert_called_once_with()
+        self.assertEqual(session.get.call_count, 3)
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in session.get.call_args_list],
+            [self.service.connection_warmup_timeout_sec] + [self.service.request_timeout_sec] * 2,
+        )
+        self.assertEqual(snapshot["samples"], 2)
+        session.close.assert_called_once_with()
 
     def test_startup_sync_failure_is_immediately_fail_closed(self):
         with patch.object(
