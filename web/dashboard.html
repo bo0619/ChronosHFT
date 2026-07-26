@@ -188,6 +188,10 @@
     .kv { min-width: 0; display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid #18222d; }
     .kv span:first-child { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
     .kv span:last-child { font: 11px var(--mono); text-align: right; overflow: hidden; text-overflow: ellipsis; }
+    .acceptance-hashes .kv { align-items: flex-start; }
+    .acceptance-hashes .kv span:last-child {
+      white-space: normal; overflow-wrap: anywhere; word-break: break-all;
+    }
     .progress-row { margin: 10px 0; }
     .progress-label { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; }
     .progress { height: 4px; margin-top: 5px; background: #1c2732; overflow: hidden; }
@@ -326,7 +330,7 @@
   </div>
 
   <nav class="subnav" aria-label="页面区域">
-    <a href="#overview">总览</a><a href="#market">市场</a><a href="#execution">执行</a><a href="#strategy">策略</a><a href="#risk">风控</a><a href="#runtime">运行时</a><a href="#rpi">RPI</a><a href="#logs">日志</a>
+    <a href="#overview">总览</a><a href="#market">市场</a><a href="#execution">执行</a><a href="#strategy">策略</a><a href="#risk">风控</a><a href="#acceptance">实盘验收</a><a href="#runtime">运行时</a><a href="#rpi">RPI</a><a href="#logs">日志</a>
     <span class="spacer"></span><span id="asOf">尚未收到快照</span>
   </nav>
 
@@ -394,6 +398,19 @@
         <article class="panel"><div class="panel-head"><h3>冻结 / Kill Switch</h3></div><div id="riskGuards" class="panel-body kv-grid"></div></article>
         <article class="panel"><div class="panel-head"><h3>独立风险进程</h3></div><div id="independentRisk" class="panel-body kv-grid"></div></article>
       </div>
+    </section>
+
+    <section id="acceptance">
+      <div class="section-head"><h2>实盘验收</h2><p>RPI calibration 许可、额度与独立运行保障</p></div>
+      <div id="acceptanceMetrics" class="grid status-grid"></div>
+      <div style="height:10px"></div>
+      <div class="grid triple">
+        <article class="panel"><div class="panel-head"><h3>许可与额度</h3></div><div id="acceptancePermit" class="panel-body kv-grid"></div></article>
+        <article class="panel"><div class="panel-head"><h3>外部告警</h3></div><div id="acceptanceAlerts" class="panel-body kv-grid"></div></article>
+        <article class="panel"><div class="panel-head"><h3>实时证据</h3></div><div id="acceptanceEvidence" class="panel-body kv-grid"></div></article>
+      </div>
+      <div style="height:10px"></div>
+      <article class="panel acceptance-hashes"><div class="panel-head"><h3>Permit 绑定摘要</h3></div><div id="acceptanceDigests" class="panel-body kv-grid"></div></article>
     </section>
 
     <section id="runtime">
@@ -665,6 +682,38 @@
       $("independentRisk").innerHTML=kvEntries(flatSummary(sup,{max:18}),true);
     }
 
+    function renderAcceptance(data) {
+      const calibration=obj(path(data,"system.oms.capability.outbound_gate.rpi_calibration",{}));
+      const runtime=obj(data.runtime), alerts=obj(runtime.external_alerts), evidence=obj(runtime.live_evidence);
+      const healthValue=x=>x.healthy===true?'<span class="positive">HEALTHY</span>':x.healthy===false?'<span class="negative">UNHEALTHY</span>':'<span class="unavailable">不可用</span>';
+      const healthTone=x=>x.healthy===true?"good":x.healthy===false?"bad":"warn";
+      const permitId=String(first(calibration.permit_id,"—"));
+      const quota=`${strip(fmt(calibration.permit_reserved_order_count,0))} / ${strip(fmt(calibration.max_order_count,0))}`;
+      $("acceptanceMetrics").innerHTML=[
+        metric("Stage",esc(first(calibration.stage,calibration.enabled===false?"NOT CALIBRATION":"不可用")),"live launch stage","info"),
+        metric("Permit ID",`<span title="${esc(permitId)}">${esc(permitId)}</span>`,esc(first(calibration.deployment_id,"deployment 不可用")),"info"),
+        metric("Permit Activated",calibration.permit_activated===true?'<span class="positive">YES</span>':calibration.permit_activated===false?'<span class="warning">NO</span>':'<span class="unavailable">不可用</span>',esc(first(calibration.last_reserved_exchange_time_utc,"尚无 reservation")),calibration.permit_activated===true?"good":"warn"),
+        metric("Permit Expired",calibration.expired===true?'<span class="negative">EXPIRED</span>':calibration.expired===false?'<span class="positive">VALID</span>':'<span class="unavailable">不可用</span>',esc(first(calibration.expiry_reason,calibration.expires_at,"")),calibration.expired===true?"bad":"good"),
+        metric("Order Quota",quota,"permit reservations",calibration.budget_exhausted===true?"bad":""),
+        metric("Terminal Flat",calibration.terminal_convergence_verified===true?'<span class="positive">VERIFIED</span>':calibration.expired===true?'<span class="warning">PENDING</span>':'<span class="muted">NOT STARTED</span>',`${strip(fmt(calibration.terminal_empty_snapshots,0))} confirmations; ${esc(first(calibration.terminal_pending_reason,"no pending reason"))}`,calibration.terminal_convergence_verified===true?"good":calibration.expired===true?"warn":""),
+        metric("Budget",calibration.budget_exhausted===true?'<span class="negative">EXHAUSTED</span>':calibration.budget_exhausted===false?'<span class="positive">AVAILABLE</span>':'<span class="unavailable">不可用</span>',`${strip(fmt(calibration.permit_cumulative_submitted_notional_usdt,2))} / ${strip(fmt(calibration.max_cumulative_submitted_notional_usdt,2))} USDT`,calibration.budget_exhausted===true?"bad":"good"),
+        metric("External Alerts",healthValue(alerts),esc(first(alerts.reason,"未发布")),healthTone(alerts)),
+        metric("Live Evidence",healthValue(evidence),esc(first(evidence.failure_reason,"未发布")),healthTone(evidence))
+      ].join("");
+      $("acceptancePermit").innerHTML=kvEntries({
+        "Stage":first(calibration.stage,"不可用"),"Permit ID":first(calibration.permit_id,"不可用"),"Activated":boolWord(calibration.permit_activated),"Expired":boolWord(calibration.expired),"Expiry reason":first(calibration.expiry_reason,"无"),"Expires at":first(calibration.expires_at,"不可用"),"Budget exhausted":boolWord(calibration.budget_exhausted),"Reserved orders":first(calibration.permit_reserved_order_count,calibration.reserved_order_count),"Max orders":calibration.max_order_count,"Active / max":`${first(calibration.active_order_count,"—")} / ${first(calibration.max_active_orders,"—")}`,"Submitted USDT":calibration.permit_cumulative_submitted_notional_usdt,"Max submitted USDT":calibration.max_cumulative_submitted_notional_usdt,"Peak loss USDT":calibration.peak_observed_calibration_loss_usdt,"Loss cap USDT":calibration.max_calibration_loss_usdt
+      },true);
+      $("acceptanceAlerts").innerHTML=kvEntries({
+        "Available":boolWord(alerts.available),"Enabled":boolWord(alerts.enabled),"Healthy":healthValue(alerts),"Reason":first(alerts.reason,"不可用"),"Worker alive":boolWord(alerts.worker_alive),"Startup probe":boolWord(alerts.startup_probe_succeeded),"Queue depth / cap":`${first(alerts.queue_depth,"—")} / ${first(alerts.queue_capacity,"—")}`,"Inflight":alerts.inflight,"Successful":alerts.successful_deliveries,"Failed":alerts.failed_deliveries,"Consecutive failures":alerts.consecutive_failures,"Dropped":alerts.dropped_alerts
+      },true);
+      $("acceptanceEvidence").innerHTML=kvEntries({
+        "Available":boolWord(evidence.available),"Enabled":boolWord(evidence.enabled),"Healthy":healthValue(evidence),"Reason":first(evidence.failure_reason,"无"),"Fence held":boolWord(evidence.fence_held),"Queue depth / cap":`${first(evidence.queue_depth,"—")} / ${first(evidence.queue_capacity,"—")}`,"Committed seq":evidence.committed_seq,"Last fsync age":finite(evidence.last_fsync_age_sec)?`${Number(evidence.last_fsync_age_sec).toFixed(3)}s`:"不可用","Dropped records":evidence.dropped_records,"Closing":boolWord(evidence.closing),"Closed":boolWord(evidence.closed)
+      },true);
+      $("acceptanceDigests").innerHTML=kvEntries({
+        "Permit SHA-256":first(calibration.permit_sha256,"不可用"),"Calibration config SHA-256":first(calibration.calibration_config_sha256,"不可用"),"Target config SHA-256":first(calibration.target_deployment_config_sha256,"不可用"),"Strategy policy SHA-256":first(calibration.strategy_policy_sha256,"不可用"),"Implementation SHA-256":first(calibration.implementation_sha256,"不可用")
+      });
+    }
+
     function renderRuntime(data) {
       const sys=obj(data.system), rt=obj(data.runtime), event=obj(first(sys.event_engine,rt.event_engine,{})), strat=obj(first(sys.strategy_runtime,rt.strategy_runtime,{}));
       const oms=obj(sys.oms), budget=obj(first(oms.outbound_message_budget,path(oms,"capability.outbound_message_budget"),rt.outbound_message_budget,{}));
@@ -702,7 +751,7 @@
 
     function render(data) {
       state.data=data; const symbols=normalizeSymbols(data); ensureSymbol(symbols);
-      setTop(data); renderOverview(data,symbols); renderMarket(symbols); renderExecution(data); renderStrategy(symbols); renderRisk(data); renderRuntime(data); renderRpi(data,symbols); renderLogs(data); updateHistory(data,symbols); drawCharts(data,symbols);
+      setTop(data); renderOverview(data,symbols); renderMarket(symbols); renderExecution(data); renderStrategy(symbols); renderRisk(data); renderAcceptance(data); renderRuntime(data); renderRpi(data,symbols); renderLogs(data); updateHistory(data,symbols); drawCharts(data,symbols);
       $("rawTelemetry").textContent=JSON.stringify(data,null,2);
     }
 

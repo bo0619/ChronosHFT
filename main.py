@@ -1,6 +1,5 @@
 import argparse
 import multiprocessing
-import os
 import threading
 import time
 import webbrowser
@@ -21,7 +20,6 @@ from event.type import (
     EVENT_LOG,
     EVENT_MARK_PRICE,
     EVENT_ORDERBOOK,
-    EVENT_ORDER_SUBMITTED,
     EVENT_ORDER_UPDATE,
     EVENT_POSITION_UPDATE,
     EVENT_STRATEGY_UPDATE,
@@ -34,6 +32,7 @@ from gateway.binance.truth_provider import BinanceTruthSnapshotProvider
 from infrastructure.admin_control import (
     AdminControlServer,
     coordinated_rearm,
+    load_admin_control_config,
     submit_admin_command,
 )
 from infrastructure.config_scaling import load_root_config
@@ -103,12 +102,7 @@ def parse_cli_args(argv=None):
 
 
 def load_config(path="config.json"):
-    config = load_root_config(path)
-    if config:
-        return config
-    if not os.path.exists(path):
-        print(f"Error: {path} not found.")
-    return None
+    return load_root_config(path)
 
 
 def bootstrap_or_rearm(
@@ -515,9 +509,16 @@ def read_clock_health(clock_service):
     return health if isinstance(health, dict) else {}
 
 
-def start_local_dashboard(web_dashboard, web_dashboard_config):
+def start_local_dashboard(
+    web_dashboard,
+    web_dashboard_config,
+    *,
+    required: bool = False,
+):
     """Bind the local dashboard, print its URL, and optionally open it."""
     if web_dashboard is None:
+        if required:
+            raise RuntimeError("Live canary requires the local web dashboard")
         return ""
     try:
         dashboard_url = web_dashboard.start()
@@ -525,6 +526,16 @@ def start_local_dashboard(web_dashboard, web_dashboard_config):
         message = f"Local dashboard failed to start: {exc}"
         logger.error(message)
         print(message, flush=True)
+        if required:
+            raise RuntimeError(message) from exc
+        return ""
+
+    if not str(dashboard_url or "").strip():
+        message = "Local dashboard failed to return a listening URL"
+        logger.error(message)
+        print(message, flush=True)
+        if required:
+            raise RuntimeError(message)
         return ""
 
     logger.info(f"Local dashboard ready: {dashboard_url}")
@@ -805,9 +816,30 @@ def enforce_live_evidence_health(recorder, oms_system) -> bool:
 def _run_main(argv=None, runtime=None):
     runtime = runtime if runtime is not None else {}
     args = parse_cli_args(argv)
+    if args.admin_command:
+        admin_config = load_admin_control_config(args.config)
+        result = submit_admin_command(
+            action=args.admin_command,
+            reason=str(args.admin_reason or "operator_ack"),
+            config=admin_config,
+            wait_timeout_sec=float(args.admin_timeout or 5.0),
+        )
+        snapshot = result.get("snapshot", {}) or {}
+        print(
+            f"admin_command={args.admin_command} accepted={result.get('accepted')} "
+            f"status={result.get('status')} message={result.get('message')}"
+        )
+        if snapshot:
+            print(
+                "snapshot="
+                f"state={snapshot.get('state')} "
+                f"mode={snapshot.get('capability_mode')} "
+                f"manual_rearm_required={snapshot.get('manual_rearm_required')} "
+                f"halt_reason={snapshot.get('last_halt_reason')}"
+            )
+        return 0 if bool(result.get("accepted", False)) else 2
+
     config = load_config(args.config)
-    if not config:
-        return
 
     paper_trade = is_paper_trade(config)
     if paper_trade:
@@ -827,29 +859,7 @@ def _run_main(argv=None, runtime=None):
             "Error: missing Binance credentials. Set environment variables: "
             + ", ".join(name for name in env_names if name)
         )
-        return
-
-    if args.admin_command:
-        result = submit_admin_command(
-            action=args.admin_command,
-            reason=str(args.admin_reason or "operator_ack"),
-            config=config,
-            wait_timeout_sec=float(args.admin_timeout or 5.0),
-        )
-        snapshot = result.get("snapshot", {}) or {}
-        print(
-            f"admin_command={args.admin_command} accepted={result.get('accepted')} "
-            f"status={result.get('status')} message={result.get('message')}"
-        )
-        if snapshot:
-            print(
-                "snapshot="
-                f"state={snapshot.get('state')} "
-                f"mode={snapshot.get('capability_mode')} "
-                f"manual_rearm_required={snapshot.get('manual_rearm_required')} "
-                f"halt_reason={snapshot.get('last_halt_reason')}"
-            )
-        return
+        return 2
 
     logger.init_logging(config)
     logger.set_ui_callback(None)
@@ -1060,10 +1070,14 @@ def _run_main(argv=None, runtime=None):
     register_market(EVENT_ORDERBOOK, on_hot_tick)
     register_execution(EVENT_EXCHANGE_ORDER_UPDATE, oms_system.on_exchange_update)
     register_execution(EVENT_EXCHANGE_ACCOUNT_UPDATE, oms_system.on_exchange_account_update)
-    register_execution(EVENT_ORDER_SUBMITTED, lambda e: oms_system.order_monitor.on_order_submitted(e))
     register_execution(
         EVENT_SYSTEM_HEALTH,
-        lambda e: handle_system_health_event(e, risk_controller, oms_system),
+        lambda e: handle_system_health_event(
+            e,
+            risk_controller,
+            oms_system,
+            risk_supervisor,
+        ),
     )
 
     def on_orderbook_cold(event):
@@ -1138,7 +1152,6 @@ def _run_main(argv=None, runtime=None):
     )
 
     engine.start()
-    strategy_runtime.start()
     risk_supervisor_started = False
     try:
         risk_supervisor_started = bool(risk_supervisor.start())
@@ -1154,7 +1167,18 @@ def _run_main(argv=None, runtime=None):
         )
     if not risk_supervisor_started:
         raise RuntimeError("IndependentRiskSupervisor failed to start")
-    start_local_dashboard(web_dashboard, web_dashboard_config)
+    live_launch_stage = str(
+        (config.get("live_launch", {}) or {}).get("stage", "") or ""
+    ).strip().lower()
+    dashboard_required = bool(
+        not paper_trade
+        and live_launch_stage in {"canary", "rpi_calibration_canary"}
+    )
+    start_local_dashboard(
+        web_dashboard,
+        web_dashboard_config,
+        required=dashboard_required,
+    )
     gateway_connected = connect_gateway_with_risk_heartbeat(
         gateway,
         config["symbols"],
@@ -1291,6 +1315,7 @@ def _run_main(argv=None, runtime=None):
     clock_runtime_armed["value"] = True
     truth_monitor.start()
     venue_supervisor.start()
+    strategy_runtime.start()
 
     if web_dashboard is not None:
         capability_mode = getattr(oms_system, "capability_mode", "READ_ONLY")
@@ -1581,6 +1606,30 @@ def shutdown_runtime(runtime, reason: str = "main_exit") -> bool:
             and result.get("persisted") is True
         )
 
+    def restart_parent_kill_after_truth_drift(
+        drift_reason: str,
+        step_name: str,
+    ) -> bool:
+        restart_kill = getattr(
+            risk_controller,
+            "restart_kill_switch_after_truth_drift",
+            None,
+        )
+        if not callable(restart_kill):
+            return False
+        _restart_ok, restart_result = run_step(
+            step_name,
+            lambda: restart_kill(drift_reason),
+        )
+        return bool(
+            _restart_ok
+            and restart_result is not False
+            and wait_for_kill_flatten_verification(
+                risk_controller,
+                risk_supervisor,
+            )
+        )
+
     def publish_shutdown_blocked(block_reason: str) -> None:
         runtime["_shutdown_verified"] = False
         runtime["_shutdown_retryable"] = True
@@ -1639,27 +1688,6 @@ def shutdown_runtime(runtime, reason: str = "main_exit") -> bool:
                 )
             shutdown_phase["outbound_gate_closed"] = (
                 outbound_gate_closed
-            )
-
-        if not gateway_shutdown_latched:
-            begin_gateway_shutdown = getattr(
-                gateway,
-                "begin_shutdown",
-                None,
-            )
-            if callable(begin_gateway_shutdown):
-                _ok, latch_result = run_step(
-                    "gateway_begin_shutdown",
-                    begin_gateway_shutdown,
-                )
-                gateway_shutdown_latched = step_acknowledged(
-                    _ok,
-                    latch_result,
-                )
-            else:
-                gateway_shutdown_latched = gateway is None
-            shutdown_phase["gateway_shutdown_latched"] = (
-                gateway_shutdown_latched
             )
 
         if not strategy_stopped:
@@ -1723,15 +1751,53 @@ def shutdown_runtime(runtime, reason: str = "main_exit") -> bool:
                                 resume_kill,
                             )
                     kill_flatten_verified = (
-                        wait_for_kill_flatten_verification(
+                        bool(
+                            getattr(
+                                risk_controller,
+                                "kill_switch_triggered",
+                                False,
+                            )
+                        )
+                        and wait_for_kill_flatten_verification(
                             risk_controller,
                             risk_supervisor,
                         )
+                        and bool(
+                            getattr(
+                                risk_controller,
+                                "kill_switch_triggered",
+                                False,
+                            )
+                        )
+                        and str(
+                            getattr(
+                                risk_controller,
+                                "kill_state",
+                                "",
+                            )
+                            or ""
+                        ).upper()
+                        == "FLAT_VERIFIED"
                     )
                 else:
                     kill_flatten_verified = False
             else:
                 kill_flatten_verified = True
+
+            if (
+                account_shutdown_proof_required
+                and not kill_flatten_verified
+            ):
+                publish_shutdown_blocked(
+                    "kill/flatten did not reach FLAT_VERIFIED before "
+                    "shutdown latches"
+                )
+                logger.critical(
+                    "[Shutdown] OMS and Gateway shutdown latches were "
+                    "deferred so emergency cancellation and reduce-only "
+                    "flattening remain retryable"
+                )
+                return False
 
             if not shutdown_latched:
                 _ok, latch_result = run_step(
@@ -1744,15 +1810,58 @@ def shutdown_runtime(runtime, reason: str = "main_exit") -> bool:
                 )
                 shutdown_phase["shutdown_latched"] = shutdown_latched
 
-            cancel_verified = verify_account_orders(
-                "process_shutdown_pre_quiesce"
+            if shutdown_latched and not gateway_shutdown_latched:
+                begin_gateway_shutdown = getattr(
+                    gateway,
+                    "begin_shutdown",
+                    None,
+                )
+                if callable(begin_gateway_shutdown):
+                    _ok, latch_result = run_step(
+                        "gateway_begin_shutdown",
+                        begin_gateway_shutdown,
+                    )
+                    gateway_shutdown_latched = step_acknowledged(
+                        _ok,
+                        latch_result,
+                    )
+                else:
+                    gateway_shutdown_latched = gateway is None
+                shutdown_phase["gateway_shutdown_latched"] = (
+                    gateway_shutdown_latched
+                )
+
+            final_truth_ready = bool(
+                shutdown_latched and gateway_shutdown_latched
             )
-            independently_flat = verify_account_positions(
-                "process_shutdown_pre_quiesce"
+            cancel_verified = bool(
+                final_truth_ready
+                and verify_account_orders(
+                    "process_shutdown_pre_quiesce"
+                )
+            )
+            independently_flat = bool(
+                final_truth_ready
+                and verify_account_positions(
+                    "process_shutdown_pre_quiesce"
+                )
             )
             flatten_verified = bool(
                 kill_flatten_verified and independently_flat
             )
+
+            if final_truth_ready and (
+                not cancel_verified or not flatten_verified
+            ):
+                kill_flatten_verified = (
+                    restart_parent_kill_after_truth_drift(
+                        "Pre-quiesce account truth drift",
+                        "risk_restart_after_pre_quiesce_drift",
+                    )
+                )
+                cancel_verified = False
+                independently_flat = False
+                flatten_verified = False
 
             if supervisor_started and not supervisor_quiesced:
                 pre_quiesce_barrier = bool(
@@ -1820,30 +1929,18 @@ def shutdown_runtime(runtime, reason: str = "main_exit") -> bool:
                         supervisor_stopped = False
                         shutdown_phase["supervisor_quiesced"] = False
                         shutdown_phase["supervisor_stopped"] = False
-                        restart_kill = getattr(
-                            risk_controller,
-                            "restart_kill_switch_after_truth_drift",
-                            None,
-                        )
-                        if callable(restart_kill):
-                            run_step(
-                                "risk_restart_after_post_quiesce_drift",
-                                lambda: restart_kill(
-                                    "Post-quiesce account truth drift"
-                                ),
-                            )
-                            kill_flatten_verified = (
-                                wait_for_kill_flatten_verification(
-                                    risk_controller,
-                                    risk_supervisor,
-                                )
-                            )
                     else:
                         logger.critical(
                             "[Shutdown] Post-quiesce account truth failed "
                             "and the independent shutdown guard could not "
                             "be resumed"
                         )
+                    kill_flatten_verified = (
+                        restart_parent_kill_after_truth_drift(
+                            "Post-quiesce account truth drift",
+                            "risk_restart_after_post_quiesce_drift",
+                        )
+                    )
                     cancel_verified = False
                     independently_flat = False
                     flatten_verified = False

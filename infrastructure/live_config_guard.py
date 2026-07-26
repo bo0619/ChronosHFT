@@ -2,8 +2,10 @@ import hashlib
 import hmac
 import json
 import math
+import ntpath
 import os
 import re
+import stat
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -95,16 +97,48 @@ CALIBRATION_PERMIT_POLICY_FIELDS = frozenset(
         "max_calibration_loss_usdt",
     }
 )
-LIVE_CANARY_EVIDENCE_SCHEMA = "chronoshft.live_canary_evidence.v2"
+LIVE_CANARY_EVIDENCE_SCHEMA = "chronoshft.live_canary_evidence.v4"
+LIVE_CANARY_EVIDENCE_INTEGRITY_SCHEMA = (
+    "chronoshft.live_canary_evidence_integrity.v1"
+)
+LIVE_CANARY_EVIDENCE_INTEGRITY_ALGORITHM = "HMAC-SHA256"
+LIVE_CANARY_EVIDENCE_CANONICALIZATION = "SORTED-COMPACT-ASCII-JSON-V1"
+LIVE_CANARY_EVIDENCE_INTEGRITY_FIELDS = frozenset(
+    {
+        "schema",
+        "algorithm",
+        "canonicalization",
+        "primary_hmac_sha256",
+        "supervisor_hmac_sha256",
+    }
+)
+_LIVE_CANARY_PRIMARY_HMAC_DOMAIN = (
+    b"ChronosHFT/live-canary-evidence/v4/primary\x00"
+)
+_LIVE_CANARY_SUPERVISOR_HMAC_DOMAIN = (
+    b"ChronosHFT/live-canary-evidence/v4/supervisor\x00"
+)
 LIVE_CANARY_ACCOUNT_SOURCE = "GET /fapi/v3/account"
 LIVE_CANARY_API_RESTRICTIONS_SOURCE = (
     "GET /sapi/v1/account/apiRestrictions"
 )
 LIVE_CANARY_RPI_EXCHANGE_INFO_SOURCE = "GET /fapi/v1/exchangeInfo"
 LIVE_CANARY_RPI_COMMISSION_SOURCE = "GET /fapi/v1/commissionRate"
+LIVE_CANARY_OPEN_ORDERS_SOURCE = "GET /fapi/v1/openOrders"
+LIVE_CANARY_POSITION_RISK_SOURCE = "GET /fapi/v2/positionRisk"
+LIVE_CANARY_POSITION_MODE_SOURCE = "GET /fapi/v1/positionSide/dual"
 DEFAULT_LIVE_EVIDENCE_MAX_AGE_SEC = 900.0
 MAX_LIVE_EVIDENCE_MAX_AGE_SEC = 3600.0
 _DEPLOYMENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{5,127}$")
+_DEPLOYMENT_PLACEHOLDER_TOKENS = (
+    "EDIT-ME",
+    "EDIT_ME",
+    "EDIT.ME",
+    "CHANGE-ME",
+    "CHANGE_ME",
+    "CHANGEME",
+    "PLACEHOLDER",
+)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{1,127}$")
 MIN_EXTERNAL_ALERT_QUEUE_CAPACITY = 32
@@ -684,6 +718,7 @@ def validate_live_state_path_bindings(
     system = _section(config, "system")
     evidence = _section(system, "evidence_recorder")
     evidence_fence = _section(evidence, "single_writer_fence")
+    admin_control = _section(system, "admin_control")
     alert = _section(config, "alert")
     deployment_id = str(
         live_launch.get("deployment_id", "") or ""
@@ -701,6 +736,7 @@ def validate_live_state_path_bindings(
         "system.evidence_recorder.single_writer_fence.path": (
             evidence_fence.get("path")
         ),
+        "system.admin_control.path": admin_control.get("path"),
         "alert.failure_spool_path": alert.get("failure_spool_path"),
     }
     identities: dict[str, str] = {}
@@ -769,10 +805,23 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-standard JSON number {value!r} is not allowed")
 
 
+def _reject_duplicate_json_keys(pairs):
+    payload = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError("duplicate JSON object keys are not allowed")
+        payload[key] = value
+    return payload
+
+
 def _read_json_object(path: Path, label: str) -> dict:
     try:
         with path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle, parse_constant=_reject_json_constant)
+            payload = json.load(
+                handle,
+                parse_constant=_reject_json_constant,
+                object_pairs_hook=_reject_duplicate_json_keys,
+            )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read {label} at {path}: {exc}") from exc
     if not isinstance(payload, dict):
@@ -854,11 +903,111 @@ def _configured_symbol(config: Mapping) -> str:
     return str(symbols[0] or "").strip().upper()
 
 
-def _resolve_live_evidence_path(
+def _path_is_reparse_or_symlink(path: Path) -> bool:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ValueError(f"cannot inspect local evidence path {path}") from exc
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    file_attributes = getattr(metadata, "st_file_attributes", 0)
+    return stat.S_ISLNK(metadata.st_mode) or bool(file_attributes & reparse_flag)
+
+
+def _path_uses_remote_drive(path: Path) -> bool:
+    if os.name != "nt":
+        return False
+    anchor = path.anchor
+    if not anchor:
+        return False
+    try:
+        import ctypes
+
+        get_drive_type = ctypes.windll.kernel32.GetDriveTypeW
+        get_drive_type.argtypes = [ctypes.c_wchar_p]
+        get_drive_type.restype = ctypes.c_uint
+        return get_drive_type(anchor) == 4  # DRIVE_REMOTE
+    except (AttributeError, OSError):
+        return True
+
+
+def _require_local_path_chain(path: Path, *, label: str) -> None:
+    absolute = Path(os.path.abspath(path))
+    if _path_uses_remote_drive(absolute):
+        raise ValueError(f"{label} must not use a mapped network drive")
+    existing: list[Path] = []
+    current = absolute
+    while True:
+        if os.path.lexists(current):
+            existing.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    for component in reversed(existing):
+        if _path_is_reparse_or_symlink(component):
+            raise ValueError(
+                f"{label} must not traverse a symlink or reparse point"
+            )
+
+
+def _reject_nonlocal_path_syntax(raw: str, *, label: str) -> None:
+    if os.name != "nt" and raw.startswith("/") and not raw.startswith("//"):
+        return
+    windows_path = raw.replace("/", "\\")
+    if windows_path.startswith(("\\\\", "\\??\\")):
+        raise ValueError(f"{label} must not use UNC or device storage")
+    drive, tail = ntpath.splitdrive(windows_path)
+    if drive and not ntpath.isabs(windows_path):
+        raise ValueError(f"{label} must not be drive-relative")
+    if not drive and ntpath.isabs(windows_path):
+        raise ValueError(f"{label} must not be root-relative")
+    reserved = {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CONIN$",
+        "CONOUT$",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+    }
+    for component in (part for part in tail.split("\\") if part):
+        if ":" in component:
+            raise ValueError(f"{label} must not use alternate data streams")
+        if component != component.rstrip(" ."):
+            raise ValueError(f"{label} must not use trailing dots or spaces")
+        device_name = component.split(".", 1)[0].rstrip(" ").upper()
+        if device_name in reserved:
+            raise ValueError(f"{label} must not use Windows device names")
+
+
+def validate_live_canary_evidence_destination(path: Path) -> None:
+    """Reject non-local or link-backed evidence output destinations."""
+    absolute = Path(os.path.abspath(path))
+    _require_local_path_chain(
+        absolute.parent,
+        label="live canary evidence parent",
+    )
+    if not absolute.parent.is_dir():
+        raise ValueError("live canary evidence parent must be a directory")
+    if os.path.lexists(absolute):
+        if _path_is_reparse_or_symlink(absolute):
+            raise ValueError(
+                "live canary evidence file must not be a symlink or reparse point"
+            )
+        if not absolute.is_file():
+            raise ValueError("live canary evidence path must be a regular file")
+
+
+def resolve_live_canary_evidence_path(
     config: Mapping,
     *,
     config_path: str | Path,
+    require_existing_file: bool = True,
 ) -> Path:
+    """Resolve evidence to a local regular file inside the config directory."""
     live_launch = _section(config, "live_launch")
     raw = str(live_launch.get("offline_evidence_path", "") or "").strip()
     if not raw:
@@ -867,17 +1016,181 @@ def _resolve_live_evidence_path(
         raise ValueError(
             "live_launch.offline_evidence_path must not contain '..' components"
         )
+    _reject_nonlocal_path_syntax(
+        raw,
+        label="live_launch.offline_evidence_path",
+    )
+
+    raw_config_path = os.fspath(config_path)
+    _reject_nonlocal_path_syntax(
+        raw_config_path,
+        label="Live canary config path",
+    )
+    config_file = Path(os.path.abspath(raw_config_path))
+    _require_local_path_chain(config_file, label="Live canary config path")
+    if not config_file.is_file():
+        raise ValueError("Live canary config path must be an existing regular file")
+    try:
+        config_directory = config_file.parent.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("Live canary config directory cannot be resolved") from exc
+
     normalized = raw.replace("\\", os.sep).replace("/", os.sep)
     candidate = Path(normalized)
-    config_file = Path(config_path).resolve(strict=False)
     if not candidate.is_absolute():
-        candidate = config_file.parent / candidate
+        candidate = config_directory / candidate
+    _require_local_path_chain(
+        candidate.parent,
+        label="live canary evidence parent",
+    )
     try:
-        return candidate.resolve(strict=True)
+        parent = candidate.parent.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
+        raise ValueError("live canary evidence parent cannot be resolved") from exc
+    if not parent.is_dir():
+        raise ValueError("live canary evidence parent must be a directory")
+    output_path = parent / candidate.name
+    try:
+        within_config_tree = (
+            os.path.commonpath(
+                (
+                    os.path.normcase(str(config_directory)),
+                    os.path.normcase(str(output_path)),
+                )
+            )
+            == os.path.normcase(str(config_directory))
+        )
+    except (OSError, ValueError):
+        within_config_tree = False
+    if not within_config_tree:
         raise ValueError(
-            f"live canary evidence path cannot be resolved: {exc}"
+            "live_launch.offline_evidence_path must stay within the config directory"
+        )
+    validate_live_canary_evidence_destination(output_path)
+    if require_existing_file and not output_path.is_file():
+        raise ValueError("live canary evidence path must be an existing regular file")
+    return output_path
+
+
+def _canonical_live_canary_evidence_bytes(evidence: Mapping) -> bytes:
+    if not isinstance(evidence, Mapping):
+        raise ValueError("live canary evidence must be a JSON object")
+    payload = dict(evidence)
+    payload.pop("integrity", None)
+    try:
+        canonical = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "live canary evidence is not canonical strict JSON"
         ) from exc
+    return canonical.encode("ascii")
+
+
+def build_live_canary_evidence_integrity(
+    evidence: Mapping,
+    *,
+    primary_api_secret: str,
+    supervisor_api_secret: str,
+) -> dict[str, str]:
+    """Build role-separated HMAC tags without retaining either API secret."""
+    primary_secret = str(primary_api_secret or "")
+    supervisor_secret = str(supervisor_api_secret or "")
+    if not primary_secret or not supervisor_secret:
+        raise ValueError("both Live evidence API secrets are required")
+    canonical = _canonical_live_canary_evidence_bytes(evidence)
+    return {
+        "schema": LIVE_CANARY_EVIDENCE_INTEGRITY_SCHEMA,
+        "algorithm": LIVE_CANARY_EVIDENCE_INTEGRITY_ALGORITHM,
+        "canonicalization": LIVE_CANARY_EVIDENCE_CANONICALIZATION,
+        "primary_hmac_sha256": hmac.new(
+            primary_secret.encode("utf-8"),
+            _LIVE_CANARY_PRIMARY_HMAC_DOMAIN + canonical,
+            hashlib.sha256,
+        ).hexdigest(),
+        "supervisor_hmac_sha256": hmac.new(
+            supervisor_secret.encode("utf-8"),
+            _LIVE_CANARY_SUPERVISOR_HMAC_DOMAIN + canonical,
+            hashlib.sha256,
+        ).hexdigest(),
+    }
+
+
+def sign_live_canary_evidence(
+    evidence: Mapping,
+    *,
+    primary_api_secret: str,
+    supervisor_api_secret: str,
+) -> dict:
+    signed = dict(evidence)
+    signed.pop("integrity", None)
+    signed["integrity"] = build_live_canary_evidence_integrity(
+        signed,
+        primary_api_secret=primary_api_secret,
+        supervisor_api_secret=supervisor_api_secret,
+    )
+    return signed
+
+
+def validate_live_canary_evidence_integrity(
+    evidence: Mapping,
+    *,
+    primary_api_secret: str | None = None,
+    supervisor_api_secret: str | None = None,
+    require_secret_binding: bool = True,
+) -> Mapping:
+    """Validate the v4 integrity envelope, optionally without offline secrets."""
+    integrity = evidence.get("integrity") if isinstance(evidence, Mapping) else None
+    if not isinstance(integrity, Mapping):
+        raise ValueError("live canary evidence integrity must be an object")
+    if frozenset(integrity) != LIVE_CANARY_EVIDENCE_INTEGRITY_FIELDS:
+        raise ValueError("live canary evidence integrity fields are invalid")
+    expected_metadata = {
+        "schema": LIVE_CANARY_EVIDENCE_INTEGRITY_SCHEMA,
+        "algorithm": LIVE_CANARY_EVIDENCE_INTEGRITY_ALGORITHM,
+        "canonicalization": LIVE_CANARY_EVIDENCE_CANONICALIZATION,
+    }
+    for field, expected in expected_metadata.items():
+        if integrity.get(field) != expected:
+            raise ValueError(f"live canary evidence integrity {field} is invalid")
+    for field in ("primary_hmac_sha256", "supervisor_hmac_sha256"):
+        tag = str(integrity.get(field, "") or "")
+        if not _SHA256_RE.fullmatch(tag):
+            raise ValueError(f"live canary evidence integrity {field} is invalid")
+
+    primary_secret = str(primary_api_secret or "")
+    supervisor_secret = str(supervisor_api_secret or "")
+    if require_secret_binding and (not primary_secret or not supervisor_secret):
+        raise ValueError(
+            "both resolved API secrets are required to verify Live evidence"
+        )
+    if primary_secret or supervisor_secret:
+        if not primary_secret or not supervisor_secret:
+            raise ValueError(
+                "both resolved API secrets are required to verify Live evidence"
+            )
+        expected = build_live_canary_evidence_integrity(
+            evidence,
+            primary_api_secret=primary_secret,
+            supervisor_api_secret=supervisor_secret,
+        )
+        for field, role in (
+            ("primary_hmac_sha256", "primary"),
+            ("supervisor_hmac_sha256", "supervisor"),
+        ):
+            if not hmac.compare_digest(
+                str(integrity.get(field, "") or ""),
+                expected[field],
+            ):
+                raise ValueError(
+                    f"live canary evidence {role} integrity verification failed"
+                )
+    return integrity
 
 
 def _validate_live_evidence_binding(
@@ -1021,6 +1334,268 @@ def validate_live_flat_start_truth(
     return {
         "position_row_count": len(positions),
         "open_order_count": 0,
+    }
+
+
+def _validate_evidence_key_fingerprint(
+    payload: Mapping,
+    *,
+    field_prefix: str,
+    api_key: str | None,
+    require_api_key_binding: bool,
+) -> str:
+    fingerprint = str(
+        payload.get("api_key_fingerprint_sha256", "") or ""
+    ).strip()
+    if not _SHA256_RE.fullmatch(fingerprint):
+        raise ValueError(
+            f"{field_prefix}.api_key_fingerprint_sha256 must be a lowercase "
+            "SHA-256 digest"
+        )
+    key = str(api_key or "")
+    if require_api_key_binding and not key:
+        raise ValueError(
+            f"{field_prefix} API key is required to bind exchange truth"
+        )
+    if key:
+        expected = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        if not hmac.compare_digest(fingerprint, expected):
+            raise ValueError(
+                f"{field_prefix} was captured with a different primary API key"
+            )
+    return fingerprint
+
+
+def validate_live_flat_start_evidence(
+    config: Mapping,
+    evidence: Mapping,
+    *,
+    now_utc: datetime | None = None,
+    primary_api_key: str | None = None,
+    require_api_key_binding: bool = True,
+) -> dict[str, int]:
+    """Validate fresh, primary-key-bound raw account-wide flat-start truth."""
+    truth = evidence.get("flat_start_truth")
+    if not isinstance(truth, Mapping):
+        raise ValueError(
+            "live canary evidence flat_start_truth must be an object"
+        )
+    if truth.get("open_orders_source") != LIVE_CANARY_OPEN_ORDERS_SOURCE:
+        raise ValueError(
+            "flat_start_truth.open_orders_source must be "
+            f"{LIVE_CANARY_OPEN_ORDERS_SOURCE!r}"
+        )
+    if truth.get("positions_source") != LIVE_CANARY_POSITION_RISK_SOURCE:
+        raise ValueError(
+            "flat_start_truth.positions_source must be "
+            f"{LIVE_CANARY_POSITION_RISK_SOURCE!r}"
+        )
+    effective_now = _effective_now_utc(now_utc)
+    _validate_fresh_capture(
+        truth,
+        field_prefix="flat_start_truth",
+        now_utc=effective_now,
+        max_age_sec=_live_evidence_max_age(_section(config, "live_launch")),
+    )
+    _validate_evidence_key_fingerprint(
+        truth,
+        field_prefix="flat_start_truth",
+        api_key=primary_api_key,
+        require_api_key_binding=require_api_key_binding,
+    )
+    return validate_live_flat_start_truth(
+        truth.get("positions"),
+        truth.get("open_orders"),
+    )
+
+
+def _flatten_exchange_permissions(value: object) -> frozenset[str]:
+    pending = [value]
+    permissions: set[str] = set()
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            permissions.add(current.strip().upper())
+        elif isinstance(current, (list, tuple)):
+            pending.extend(current)
+    return frozenset(item for item in permissions if item)
+
+
+def _exchange_min_notional(exchange_symbol: Mapping) -> Decimal:
+    filters = exchange_symbol.get("filters")
+    if not isinstance(filters, (list, tuple)):
+        raise ValueError(
+            "symbol_configuration_truth.exchange_symbol.filters must be a list"
+        )
+    candidates: list[Decimal] = []
+    for index, row in enumerate(filters):
+        if not isinstance(row, Mapping):
+            raise ValueError(
+                "symbol_configuration_truth.exchange_symbol.filters"
+                f"[{index}] must be an object"
+            )
+        if str(row.get("filterType", "") or "").strip().upper() not in {
+            "MIN_NOTIONAL",
+            "NOTIONAL",
+        }:
+            continue
+        raw = row.get("notional", row.get("minNotional"))
+        value = _finite_decimal(
+            raw,
+            "symbol_configuration_truth.exchange_symbol minimum notional",
+        )
+        if value < 0:
+            raise ValueError(
+                "symbol_configuration_truth exchange minimum notional must "
+                "not be negative"
+            )
+        candidates.append(value)
+    if not candidates:
+        raise ValueError(
+            "symbol_configuration_truth exchange_symbol has no minimum "
+            "notional filter"
+        )
+    return max(candidates)
+
+
+def validate_live_symbol_configuration_evidence(
+    config: Mapping,
+    evidence: Mapping,
+    *,
+    now_utc: datetime | None = None,
+    primary_api_key: str | None = None,
+    require_api_key_binding: bool = True,
+) -> dict[str, object]:
+    """Validate raw one-way, isolated, 1x and minimum-notional truth."""
+    truth = evidence.get("symbol_configuration_truth")
+    if not isinstance(truth, Mapping):
+        raise ValueError(
+            "live canary evidence symbol_configuration_truth must be an object"
+        )
+    expected_sources = {
+        "position_mode_source": LIVE_CANARY_POSITION_MODE_SOURCE,
+        "position_risk_source": LIVE_CANARY_POSITION_RISK_SOURCE,
+        "exchange_info_source": LIVE_CANARY_RPI_EXCHANGE_INFO_SOURCE,
+    }
+    for field, expected in expected_sources.items():
+        if truth.get(field) != expected:
+            raise ValueError(
+                f"symbol_configuration_truth.{field} must be {expected!r}"
+            )
+    effective_now = _effective_now_utc(now_utc)
+    _validate_fresh_capture(
+        truth,
+        field_prefix="symbol_configuration_truth",
+        now_utc=effective_now,
+        max_age_sec=_live_evidence_max_age(_section(config, "live_launch")),
+    )
+    _validate_evidence_key_fingerprint(
+        truth,
+        field_prefix="symbol_configuration_truth",
+        api_key=primary_api_key,
+        require_api_key_binding=require_api_key_binding,
+    )
+
+    mode = truth.get("position_mode")
+    if not isinstance(mode, Mapping) or mode.get("dualSidePosition") is not False:
+        raise ValueError(
+            "symbol_configuration_truth.position_mode must show ONE_WAY "
+            "(dualSidePosition=false)"
+        )
+
+    symbol = _configured_symbol(config)
+    rows = truth.get("symbol_position_rows")
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError(
+            "symbol_configuration_truth.symbol_position_rows must contain "
+            "the configured symbol"
+        )
+    matching_rows = [
+        row
+        for row in rows
+        if isinstance(row, Mapping)
+        and str(row.get("symbol", "") or "").strip().upper() == symbol
+    ]
+    if len(matching_rows) != 1:
+        raise ValueError(
+            "symbol_configuration_truth must contain exactly one ONE_WAY "
+            "position row for the configured symbol"
+        )
+    row = matching_rows[0]
+    if str(row.get("positionSide", "") or "").strip().upper() != "BOTH":
+        raise ValueError(
+            "symbol_configuration_truth configured symbol must use "
+            "positionSide=BOTH"
+        )
+    expected_margin = str(
+        _section(config, "account").get("margin_type", "") or ""
+    ).strip().upper()
+    actual_margin = str(row.get("marginType", "") or "").strip().upper()
+    if actual_margin != expected_margin or actual_margin != "ISOLATED":
+        raise ValueError(
+            "symbol_configuration_truth configured symbol must use ISOLATED "
+            "margin matching account.margin_type"
+        )
+    expected_leverage = _finite_decimal(
+        _section(config, "account").get("leverage"),
+        "account.leverage",
+    )
+    actual_leverage = _finite_decimal(
+        row.get("leverage"),
+        "symbol_configuration_truth.symbol_position_rows[0].leverage",
+    )
+    if actual_leverage != expected_leverage or actual_leverage != Decimal(1):
+        raise ValueError(
+            "symbol_configuration_truth configured symbol leverage must "
+            "match account.leverage=1"
+        )
+    if _finite_decimal(
+        row.get("positionAmt"),
+        "symbol_configuration_truth.symbol_position_rows[0].positionAmt",
+    ) != Decimal(0):
+        raise ValueError(
+            "symbol_configuration_truth configured symbol position must be flat"
+        )
+
+    exchange_symbol = truth.get("exchange_symbol")
+    if not isinstance(exchange_symbol, Mapping):
+        raise ValueError(
+            "symbol_configuration_truth.exchange_symbol must be an object"
+        )
+    if (
+        str(exchange_symbol.get("symbol", "") or "").strip().upper()
+        != symbol
+    ):
+        raise ValueError(
+            "symbol_configuration_truth.exchange_symbol must match the config"
+        )
+    if str(exchange_symbol.get("status", "") or "").strip().upper() != "TRADING":
+        raise ValueError(
+            "symbol_configuration_truth.exchange_symbol must be TRADING"
+        )
+    permissions = _flatten_exchange_permissions(
+        exchange_symbol.get("permissionSets", [])
+    )
+    if "RPI" not in permissions:
+        raise ValueError(
+            "symbol_configuration_truth.exchange_symbol must explicitly "
+            "include RPI permission"
+        )
+    min_notional = _exchange_min_notional(exchange_symbol)
+    target_notional = _finite_decimal(
+        _section(config, "strategy").get("target_order_notional"),
+        "strategy.target_order_notional",
+    )
+    if target_notional < min_notional:
+        raise ValueError(
+            "strategy.target_order_notional is below the exchange minimum "
+            f"notional ({target_notional} < {min_notional})"
+        )
+    return {
+        "position_mode": "ONE_WAY",
+        "margin_type": actual_margin,
+        "leverage": actual_leverage,
+        "minimum_notional": min_notional,
     }
 
 
@@ -1323,25 +1898,30 @@ def _validate_live_rpi_truth(
         )
 
 
-def validate_live_canary_local_evidence(
+def validate_live_canary_evidence_payload(
     config: Mapping,
+    evidence: Mapping,
     *,
-    config_path: str | Path,
     now_utc: datetime | None = None,
+    primary_api_key: str | None = None,
+    supervisor_api_key: str | None = None,
+    primary_api_secret: str | None = None,
+    supervisor_api_secret: str | None = None,
     require_api_key_binding: bool = True,
+    require_integrity_binding: bool = True,
 ) -> dict:
-    """Fail closed on stale, unbound, or nonzero-fee local Live evidence."""
-    evidence_path = _resolve_live_evidence_path(
-        config,
-        config_path=config_path,
-    )
-    evidence = _read_json_object(evidence_path, "live canary evidence")
+    """Validate a complete in-memory v4 Live canary evidence payload."""
+    if not isinstance(evidence, dict):
+        raise ValueError("live canary evidence must be a JSON object")
     _validate_live_evidence_binding(config, evidence)
+    validate_live_canary_evidence_integrity(
+        evidence,
+        primary_api_secret=primary_api_secret,
+        supervisor_api_secret=supervisor_api_secret,
+        require_secret_binding=require_integrity_binding,
+    )
     _validate_live_attestations(evidence)
     effective_now = _effective_now_utc(now_utc)
-    supervisor = _section(_section(config, "risk"), "independent_supervisor")
-    primary_api_key = str(config.get("api_key", "") or "")
-    supervisor_api_key = str(supervisor.get("api_key", "") or "")
     validate_live_api_restrictions_evidence(
         config,
         evidence,
@@ -1358,8 +1938,52 @@ def validate_live_canary_local_evidence(
         supervisor_api_key=supervisor_api_key,
         require_api_key_binding=require_api_key_binding,
     )
+    validate_live_flat_start_evidence(
+        config,
+        evidence,
+        now_utc=effective_now,
+        primary_api_key=primary_api_key,
+        require_api_key_binding=require_api_key_binding,
+    )
+    validate_live_symbol_configuration_evidence(
+        config,
+        evidence,
+        now_utc=effective_now,
+        primary_api_key=primary_api_key,
+        require_api_key_binding=require_api_key_binding,
+    )
     _validate_live_rpi_truth(config, evidence, now_utc=effective_now)
     return evidence
+
+
+def validate_live_canary_local_evidence(
+    config: Mapping,
+    *,
+    config_path: str | Path,
+    now_utc: datetime | None = None,
+    require_api_key_binding: bool = True,
+) -> dict:
+    """Fail closed on stale, unbound, or nonzero-fee local Live evidence."""
+    evidence_path = resolve_live_canary_evidence_path(
+        config,
+        config_path=config_path,
+    )
+    evidence = _read_json_object(evidence_path, "live canary evidence")
+    supervisor = _section(_section(config, "risk"), "independent_supervisor")
+    primary_api_key = str(config.get("api_key", "") or "")
+    primary_api_secret = str(config.get("api_secret", "") or "")
+    supervisor_api_key = str(supervisor.get("api_key", "") or "")
+    supervisor_api_secret = str(supervisor.get("api_secret", "") or "")
+    return validate_live_canary_evidence_payload(
+        config,
+        evidence,
+        now_utc=now_utc,
+        primary_api_key=primary_api_key,
+        supervisor_api_key=supervisor_api_key,
+        primary_api_secret=primary_api_secret,
+        supervisor_api_secret=supervisor_api_secret,
+        require_api_key_binding=require_api_key_binding,
+    )
 
 
 def _append_cap_violation(
@@ -1749,6 +2373,8 @@ def validate_live_runtime_config(
     system = _section(config, "system")
     market_data = _section(system, "market_data")
     time_sync = _section(system, "time_sync")
+    web_dashboard = _section(system, "web_dashboard")
+    admin_control = _section(system, "admin_control")
     account = _section(config, "account")
     root_strategy = _section(config, "strategy")
     try:
@@ -1776,8 +2402,10 @@ def validate_live_runtime_config(
     execution_mode = str(execution.get("mode", "") or "").strip().lower()
     if execution_mode != "live":
         violations.append("execution.mode must be explicitly set to 'live'")
-    if _enabled(config.get("testnet")):
-        violations.append("testnet must be false for a live mainnet runtime")
+    if config.get("testnet") is not False:
+        violations.append(
+            "testnet must be the JSON boolean false for a live mainnet runtime"
+        )
     market_environment = str(
         market_data.get("environment", "") or ""
     ).strip().lower()
@@ -1785,8 +2413,52 @@ def validate_live_runtime_config(
         violations.append(
             "system.market_data.environment must be 'production' or 'mainnet'"
         )
-    if _enabled(market_data.get("testnet")):
-        violations.append("system.market_data.testnet must be false")
+    if market_data.get("testnet") is not False:
+        violations.append(
+            "system.market_data.testnet must be the JSON boolean false"
+        )
+    if web_dashboard.get("enabled") is not True:
+        violations.append("system.web_dashboard.enabled must be JSON true")
+    dashboard_host = str(
+        web_dashboard.get("host", "") or ""
+    ).strip().lower()
+    if dashboard_host not in {"127.0.0.1", "::1", "localhost"}:
+        violations.append(
+            "system.web_dashboard.host must be an explicit loopback address"
+        )
+    dashboard_port = web_dashboard.get("port")
+    if (
+        isinstance(dashboard_port, bool)
+        or not isinstance(dashboard_port, int)
+        or not 1 <= dashboard_port <= 65535
+    ):
+        violations.append(
+            "system.web_dashboard.port must be an integer from 1 to 65535"
+        )
+    admin_command_ttl = _positive_finite_value(
+        admin_control.get("command_ttl_sec")
+    )
+    if admin_command_ttl is None or admin_command_ttl > 30.0:
+        violations.append(
+            "system.admin_control.command_ttl_sec must be positive and no "
+            "more than 30 seconds"
+        )
+    admin_session_max_age = _positive_finite_value(
+        admin_control.get("session_max_age_sec")
+    )
+    if admin_session_max_age is None or admin_session_max_age > 5.0:
+        violations.append(
+            "system.admin_control.session_max_age_sec must be positive and "
+            "no more than 5 seconds"
+        )
+    elif (
+        admin_command_ttl is not None
+        and admin_session_max_age >= admin_command_ttl
+    ):
+        violations.append(
+            "system.admin_control.session_max_age_sec must be less than "
+            "command_ttl_sec"
+        )
 
     try:
         validate_live_external_alert_config(
@@ -2166,6 +2838,17 @@ def validate_live_runtime_config(
     ).strip()
     if not deployment_id:
         violations.append("live_launch.deployment_id must be configured")
+    elif not _DEPLOYMENT_ID_RE.fullmatch(deployment_id):
+        violations.append(
+            "live_launch.deployment_id must be 6-128 path-safe characters"
+        )
+    elif any(
+        token in deployment_id.upper()
+        for token in _DEPLOYMENT_PLACEHOLDER_TOKENS
+    ):
+        violations.append(
+            "live_launch.deployment_id must replace the EDIT-ME placeholder"
+        )
     if is_calibration_canary:
         if config_path is None:
             violations.append(
@@ -2332,6 +3015,14 @@ def validate_live_runtime_config(
     if leverage != 1.0:
         violations.append(
             "live_launch canary requires account.leverage=1"
+        )
+    configuration_mode = str(
+        account.get("configuration_mode", "") or ""
+    ).strip().upper()
+    if configuration_mode != "VERIFY_ONLY":
+        violations.append(
+            "live_launch canary requires "
+            "account.configuration_mode='VERIFY_ONLY'"
         )
 
     declared_equity = _positive_finite_value(

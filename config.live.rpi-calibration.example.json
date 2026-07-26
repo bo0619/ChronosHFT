@@ -15,7 +15,7 @@
   ],
   "record_data": true,
   "live_launch": {
-    "_comment": "Real-order data collection only: one symbol, 50 USDT deployed for an approximately 10,000 USDT account, with a separate signed permit bound to this config and the target canary config.",
+    "_comment": "Real-order framework validation only: one symbol, an 8 USDT gross exposure cap inside a 50 USDT deployment budget for an approximately 10,000 USDT account, with a separate signed permit bound to this config and the target canary config.",
     "stage": "rpi_calibration_canary",
     "deployment_id": "EDIT-ME-rpi-canary-001",
     "declared_account_equity_usdt": 10000.0,
@@ -59,6 +59,11 @@
     "strategy_runtime": {
       "shutdown_timeout_sec": 5.0
     },
+    "admin_control": {
+      "path": "storage/live/EDIT-ME-rpi-canary-001/calibration/admin",
+      "command_ttl_sec": 10.0,
+      "session_max_age_sec": 2.0
+    },
     "web_dashboard": {
       "enabled": true,
       "host": "127.0.0.1",
@@ -87,6 +92,7 @@
     "failure_spool_fsync": true
   },
   "account": {
+    "configuration_mode": "VERIFY_ONLY",
     "leverage": 1,
     "margin_type": "ISOLATED",
     "position_mode": "ONE_WAY",
@@ -122,7 +128,8 @@
       "max_new_orders_per_window": 1,
       "max_reduce_orders_per_window": 2,
       "max_cancel_messages_per_window": 5,
-      "reserved_risk_messages_per_window": 2
+      "reserved_risk_messages_per_window": 2,
+      "reserved_cancel_messages_per_window": 1
     },
     "venue_dead_man_switch": {
       "enabled": true,
@@ -233,7 +240,7 @@
     "target_order_notional": 8.0,
     "max_pos_usdt": 8.0,
     "model_readiness": {
-      "_comment": "The calibration stage does not grant model live approval. It may collect only the exposure authorized by the independent signed permit.",
+      "_comment": "These statistical thresholds are retained for target-strategy metadata and digest compatibility; they do not gate the permit-bound calibration order path. The calibration stage does not grant model live approval.",
       "enabled": true,
       "min_volatility_samples": 50,
       "min_model_samples": 30,

@@ -25,11 +25,20 @@ from event.type import (
     EVENT_SYSTEM_HEALTH,
 )
 from gateway.base_gateway import BaseGateway
+from infrastructure.binance_account_configuration import (
+    AccountConfigurationVerificationError,
+    verify_account_configuration,
+)
 from infrastructure.logger import logger
 from infrastructure.time_service import time_service
 from data.orderbook import LocalOrderBook
 
 from .rest_api import BinanceRestApi
+from .constants import (
+    ACCOUNT_CONFIGURATION_MODE_APPLY,
+    ACCOUNT_CONFIGURATION_MODE_VERIFY_ONLY,
+    ACCOUNT_CONFIGURATION_MODES,
+)
 from .ws_api import BinanceWsApi
 
 
@@ -43,6 +52,8 @@ class HFTAdapter(HTTPAdapter):
 
 
 class BinanceGateway(BaseGateway):
+    supports_outbound_send_guard = True
+
     def __init__(self, event_engine, api_key, api_secret, testnet=True, market_data_config=None):
         super().__init__(event_engine, "BINANCE")
         self.api_key = api_key
@@ -100,6 +111,7 @@ class BinanceGateway(BaseGateway):
         self.target_leverage = 0
         self.target_margin_type = "CROSSED"
         self.target_position_mode = "ONE_WAY"
+        self.account_configuration_mode = ACCOUNT_CONFIGURATION_MODE_APPLY
         self.recovery_lock = threading.Lock()
         self.keep_alive_generation = 0
         self._closing = False
@@ -242,7 +254,13 @@ class BinanceGateway(BaseGateway):
         logger.info(f"[{self.gateway_name}] Closed.")
         return True
 
-    def send_order(self, req: OrderRequest, client_oid: str = None) -> GatewayCommandResult:
+    def send_order(
+        self,
+        req: OrderRequest,
+        client_oid: str = None,
+        *,
+        pre_send_guard=None,
+    ) -> GatewayCommandResult:
         if not req.reduce_only:
             symbol = str(req.symbol or "").upper()
             with self._book_lock:
@@ -268,7 +286,11 @@ class BinanceGateway(BaseGateway):
                     error_code=error_code,
                     error_message=error_message,
                 )
-        resp = self.rest.new_order(req, client_oid)
+        resp = self.rest.new_order(
+            req,
+            client_oid,
+            pre_send_guard=pre_send_guard,
+        )
         if resp and resp.status_code == 200:
             try:
                 data = resp.json()
@@ -438,6 +460,27 @@ class BinanceGateway(BaseGateway):
             )
             return False
 
+        configuration_mode = str(
+            getattr(
+                self,
+                "account_configuration_mode",
+                ACCOUNT_CONFIGURATION_MODE_APPLY,
+            )
+            or ACCOUNT_CONFIGURATION_MODE_APPLY
+        ).upper()
+        if configuration_mode not in ACCOUNT_CONFIGURATION_MODES:
+            logger.critical(
+                f"[{self.gateway_name}] Refusing unsupported account configuration mode "
+                f"{configuration_mode}"
+            )
+            return False
+        if configuration_mode == ACCOUNT_CONFIGURATION_MODE_VERIFY_ONLY:
+            return self._verify_account_trading_configuration(
+                target_leverage=target_leverage,
+                target_margin_type=target_margin_type,
+                target_position_mode=target_position_mode,
+            )
+
         response = self.rest.set_position_mode(target_position_mode)
         if not self.rest.response_succeeded(response, accepted_error_codes={"-4059"}):
             logger.error(f"[{self.gateway_name}] Failed to set position mode {target_position_mode}")
@@ -458,6 +501,41 @@ class BinanceGateway(BaseGateway):
                         f"[{self.gateway_name}] Failed to set leverage {target_leverage} for {symbol}"
                     )
                     return False
+        return True
+
+    def _verify_account_trading_configuration(
+        self,
+        *,
+        target_leverage: int,
+        target_margin_type: str,
+        target_position_mode: str,
+    ) -> bool:
+        try:
+            position_mode_response = self.rest.get_position_mode()
+            if not self.rest.response_succeeded(position_mode_response):
+                raise AccountConfigurationVerificationError(
+                    "failed to read account position mode"
+                )
+
+            position_risk_response = self.rest.get_positions()
+            if not self.rest.response_succeeded(position_risk_response):
+                raise AccountConfigurationVerificationError(
+                    "failed to read account position configuration"
+                )
+
+            verify_account_configuration(
+                position_mode_payload=position_mode_response.json(),
+                position_risk_payload=position_risk_response.json(),
+                symbols=self.symbols,
+                target_position_mode=target_position_mode,
+                target_margin_type=target_margin_type,
+                target_leverage=target_leverage,
+            )
+        except Exception as exc:
+            logger.critical(
+                f"[{self.gateway_name}] Account configuration verification failed: {exc}"
+            )
+            return False
         return True
 
     def _keep_alive_loop(self, generation):

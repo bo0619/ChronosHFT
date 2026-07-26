@@ -19,6 +19,16 @@ EP_LEVERAGE = "/fapi/v1/leverage"
 EP_MARGIN_TYPE = "/fapi/v1/marginType"
 EP_POSITION_MODE = "/fapi/v1/positionSide/dual"
 
+# Account trading configuration modes
+ACCOUNT_CONFIGURATION_MODE_APPLY = "APPLY"
+ACCOUNT_CONFIGURATION_MODE_VERIFY_ONLY = "VERIFY_ONLY"
+ACCOUNT_CONFIGURATION_MODES = frozenset(
+    {
+        ACCOUNT_CONFIGURATION_MODE_APPLY,
+        ACCOUNT_CONFIGURATION_MODE_VERIFY_ONLY,
+    }
+)
+
 # Account
 EP_ACCOUNT = "/fapi/v2/account"
 EP_POSITION_RISK = "/fapi/v2/positionRisk"

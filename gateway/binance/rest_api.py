@@ -191,26 +191,36 @@ class BinanceRestApi:
             return
 
     def _run_pre_send_guard(self, guard):
-        if not callable(guard):
+        guards = (
+            tuple(item for item in guard if callable(item))
+            if isinstance(guard, (list, tuple))
+            else ((guard,) if callable(guard) else ())
+        )
+        if not guards:
             return None
-        try:
-            result = guard()
-        except Exception as exc:
-            return _LocalGuardResponse(
-                "CLOCK_HEALTH_UNAVAILABLE",
-                f"{type(exc).__name__}:{exc}",
-            )
-        if isinstance(result, tuple):
-            allowed = bool(result[0]) if result else False
-            code = str(result[1]) if len(result) > 1 else "CLOCK_UNHEALTHY"
-            message = str(result[2]) if len(result) > 2 else code
-        else:
-            allowed = bool(result)
-            code = "CLOCK_UNHEALTHY"
-            message = "exchange clock unavailable"
-        if allowed:
-            return None
-        return _LocalGuardResponse(code, message)
+        for candidate in guards:
+            try:
+                result = candidate()
+            except Exception as exc:
+                return _LocalGuardResponse(
+                    "PRE_SEND_GUARD_UNAVAILABLE",
+                    f"{type(exc).__name__}:{exc}",
+                )
+            if isinstance(result, tuple):
+                allowed = bool(result[0]) if result else False
+                code = (
+                    str(result[1])
+                    if len(result) > 1
+                    else "PRE_SEND_GUARD_REJECTED"
+                )
+                message = str(result[2]) if len(result) > 2 else code
+            else:
+                allowed = bool(result)
+                code = "PRE_SEND_GUARD_REJECTED"
+                message = "pre-send guard rejected the request"
+            if not allowed:
+                return _LocalGuardResponse(code, message)
+        return None
 
     def _resynchronize_exchange_clock(self):
         callback = self.clock_resync_callback
@@ -229,13 +239,19 @@ class BinanceRestApi:
         signed=True,
         suppress_error_codes=None,
         pre_send_guard=None,
+        max_attempts=None,
     ):
         url = self.base_url + endpoint
         base_params = dict(params or {})
         headers = {"X-MBX-APIKEY": self.api_key} if signed else {}
         suppress_error_codes = {str(code) for code in (suppress_error_codes or set())}
 
-        for attempt in range(1, self.max_retries + 1):
+        attempt_limit = (
+            self.max_retries
+            if max_attempts is None
+            else max(1, int(max_attempts))
+        )
+        for attempt in range(1, attempt_limit + 1):
             self._throttle(endpoint, signed)
             req_params = dict(base_params)
 
@@ -285,27 +301,36 @@ class BinanceRestApi:
 
                 if signed and error_code == "-1021":
                     sync_ok = self._resynchronize_exchange_clock()
-                    if attempt < self.max_retries and sync_ok:
+                    if attempt < attempt_limit and sync_ok:
                         logger.warning(
-                            f"REST retry [{endpoint}] attempt {attempt}/{self.max_retries} after timestamp resync"
+                            f"REST retry [{endpoint}] attempt "
+                            f"{attempt}/{attempt_limit} after timestamp resync"
                         )
                         continue
 
-                if attempt < self.max_retries and self._is_retryable_response(response.status_code, error_code):
+                if (
+                    attempt < attempt_limit
+                    and self._is_retryable_response(
+                        response.status_code,
+                        error_code,
+                    )
+                ):
                     cooldown_sec = self._mark_failure_cooldown(endpoint, attempt)
                     logger.warning(
-                        f"REST retry [{endpoint}] attempt {attempt}/{self.max_retries} after "
+                        f"REST retry [{endpoint}] attempt "
+                        f"{attempt}/{attempt_limit} after "
                         f"{cooldown_sec:.2f}s: status={response.status_code} code={error_code or '-'}"
                     )
                     continue
                 return response
             except Exception as exc:
                 cooldown_sec = self._mark_failure_cooldown(endpoint, attempt)
-                if attempt >= self.max_retries:
+                if attempt >= attempt_limit:
                     logger.error(f"REST Exception [{endpoint}]: {exc}")
                     return None
                 logger.warning(
-                    f"REST retry [{endpoint}] attempt {attempt}/{self.max_retries} after {cooldown_sec:.2f}s: {exc}"
+                    f"REST retry [{endpoint}] attempt "
+                    f"{attempt}/{attempt_limit} after {cooldown_sec:.2f}s: {exc}"
                 )
 
         return None
@@ -335,7 +360,12 @@ class BinanceRestApi:
             signed=True,
         )
 
-    def new_order(self, req: OrderRequest, client_oid: str = None):
+    def new_order(
+        self,
+        req: OrderRequest,
+        client_oid: str = None,
+        pre_send_guard=None,
+    ):
         if req.is_rpi and req.order_type != "LIMIT":
             raise ValueError("Binance RPI requires a LIMIT order")
         if req.post_only and req.time_in_force not in {"GTX", "RPI"}:
@@ -369,15 +399,21 @@ class BinanceRestApi:
             params["price"] = req.price
             params["timeInForce"] = req.time_in_force
 
-        order_clock_guard = None if req.reduce_only else self.order_clock_guard
-        if order_clock_guard is None:
-            return self.request("POST", EP_ORDER, params, signed=True)
+        guards = []
+        if not req.reduce_only and self.order_clock_guard is not None:
+            guards.append(self.order_clock_guard)
+        if pre_send_guard is not None:
+            guards.append(pre_send_guard)
         return self.request(
             "POST",
             EP_ORDER,
             params,
             signed=True,
-            pre_send_guard=order_clock_guard,
+            pre_send_guard=tuple(guards),
+            # A client order ID makes recovery possible; blindly replaying a
+            # timed-out POST can instead turn an unknown outcome into a false
+            # rejection or a second transport race.
+            max_attempts=1,
         )
 
     def cancel_order(self, req: CancelRequest):
@@ -435,6 +471,9 @@ class BinanceRestApi:
             signed=True,
             suppress_error_codes={"-4059"},
         )
+
+    def get_position_mode(self):
+        return self.request("GET", EP_POSITION_MODE, signed=True)
 
     def get_account(self):
         return self.request("GET", EP_ACCOUNT, signed=True)

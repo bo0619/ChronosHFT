@@ -1,11 +1,153 @@
 import json
+import math
 import os
+import re
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 DEFAULT_ADMIN_DIR = os.path.join("storage", "admin")
+DEFAULT_COMMAND_TTL_SEC = 10.0
+DEFAULT_SESSION_MAX_AGE_SEC = 2.0
+ADMIN_SESSION_SCHEMA = "chronoshft.admin_session.v1"
+ADMIN_COMMAND_SCHEMA = "chronoshft.admin_command.v1"
+_WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
+_COMMAND_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON number {value!r} is not allowed")
+
+
+def _reject_duplicate_json_keys(pairs):
+    payload = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError(f"duplicate JSON object key {key!r} is not allowed")
+        payload[key] = value
+    return payload
+
+
+def _load_strict_json_object(path: str, label: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(
+                handle,
+                parse_constant=_reject_json_constant,
+                object_pairs_hook=_reject_duplicate_json_keys,
+            )
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read {label} at {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must be a JSON object: {path}")
+    return payload
+
+
+def _validate_admin_control_path(value, *, base_dir: str = "") -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(
+            "system.admin_control.path must be a non-empty text path"
+        )
+    if "\x00" in value:
+        raise ValueError("system.admin_control.path must not contain NUL")
+    if os.path.expanduser(value) != value or os.path.expandvars(value) != value:
+        raise ValueError(
+            "system.admin_control.path must not use user or environment expansion"
+        )
+
+    windows_value = value.replace("/", "\\")
+    if windows_value.startswith("\\\\"):
+        raise ValueError(
+            "system.admin_control.path must not use UNC or device storage"
+        )
+    drive_match = _WINDOWS_DRIVE_PREFIX_RE.match(windows_value)
+    if drive_match is not None and (
+        len(windows_value) == 2 or windows_value[2] != "\\"
+    ):
+        raise ValueError(
+            "system.admin_control.path must not use a drive-relative path"
+        )
+    if any(part == ".." for part in windows_value.split("\\")):
+        raise ValueError(
+            "system.admin_control.path must not contain parent traversal"
+        )
+
+    resolution_base = os.path.abspath(base_dir or os.curdir)
+    candidate = value
+    if not os.path.isabs(candidate):
+        candidate = os.path.join(resolution_base, candidate)
+    resolved = os.path.abspath(candidate)
+    if os.path.dirname(resolved) == resolved:
+        raise ValueError(
+            "system.admin_control.path must not resolve to a filesystem root"
+        )
+    if os.path.normcase(resolved) in {
+        os.path.normcase(resolution_base),
+        os.path.normcase(os.path.abspath(os.curdir)),
+    }:
+        raise ValueError(
+            "system.admin_control.path must not resolve to the working directory "
+            "or config directory"
+        )
+    if os.path.normcase(os.path.realpath(resolved)) != os.path.normcase(resolved):
+        raise ValueError(
+            "system.admin_control.path must not traverse a symlink or reparse point"
+        )
+    return resolved
+
+
+def load_admin_control_config(path: str = "config.json") -> dict:
+    """Read only the admin inbox location without loading Live credentials."""
+    config_path = os.path.abspath(os.fspath(path))
+    try:
+        raw = _load_strict_json_object(config_path, "admin root config")
+    except ValueError as exc:
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(
+                f"admin root config file not found: {config_path}"
+            ) from exc
+        raise
+
+    system = raw.get("system", {})
+    if system is None:
+        system = {}
+    if not isinstance(system, dict):
+        raise ValueError("root config system must be a JSON object for admin access")
+    admin_control = system.get("admin_control", {})
+    if admin_control is None:
+        admin_control = {}
+    if not isinstance(admin_control, dict):
+        raise ValueError("system.admin_control must be a JSON object")
+    admin_path = _validate_admin_control_path(
+        admin_control.get("path", DEFAULT_ADMIN_DIR),
+        base_dir=os.path.dirname(config_path),
+    )
+    live_launch = raw.get("live_launch", {})
+    if live_launch is None:
+        live_launch = {}
+    if not isinstance(live_launch, dict):
+        raise ValueError("root config live_launch must be a JSON object")
+    return {
+        "live_launch": {
+            "deployment_id": str(
+                live_launch.get("deployment_id", "") or ""
+            ).strip(),
+        },
+        "system": {
+            "admin_control": {
+                "path": admin_path,
+                "command_ttl_sec": admin_control.get(
+                    "command_ttl_sec",
+                    DEFAULT_COMMAND_TTL_SEC,
+                ),
+                "session_max_age_sec": admin_control.get(
+                    "session_max_age_sec",
+                    DEFAULT_SESSION_MAX_AGE_SEC,
+                ),
+            },
+        },
+    }
 
 
 def _ensure_dir(path: str):
@@ -14,7 +156,87 @@ def _ensure_dir(path: str):
 
 
 def _utc_now_iso() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _parse_utc_timestamp(value, field: str) -> float:
+    if not isinstance(value, str) or value != value.strip() or not value:
+        raise ValueError(f"{field} must be an ISO-8601 UTC timestamp")
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an ISO-8601 UTC timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise ValueError(f"{field} must include an explicit UTC offset")
+    return parsed.timestamp()
+
+
+def _bounded_positive_float(value, *, field: str, maximum: float) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a finite positive number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a finite positive number") from exc
+    if not math.isfinite(parsed) or parsed <= 0.0 or parsed > maximum:
+        raise ValueError(
+            f"{field} must be positive and no more than {maximum:g} seconds"
+        )
+    return parsed
+
+
+def _admin_settings(config: dict | None) -> tuple[str, float, float]:
+    root = config or {}
+    live_launch = root.get("live_launch", {}) or {}
+    deployment_id = str(
+        live_launch.get("deployment_id", "")
+        if isinstance(live_launch, dict)
+        else ""
+    ).strip()
+    system = root.get("system", {}) or {}
+    admin = system.get("admin_control", {}) if isinstance(system, dict) else {}
+    admin = admin if isinstance(admin, dict) else {}
+    command_ttl_sec = _bounded_positive_float(
+        admin.get("command_ttl_sec", DEFAULT_COMMAND_TTL_SEC),
+        field="system.admin_control.command_ttl_sec",
+        maximum=30.0,
+    )
+    session_max_age_sec = _bounded_positive_float(
+        admin.get("session_max_age_sec", DEFAULT_SESSION_MAX_AGE_SEC),
+        field="system.admin_control.session_max_age_sec",
+        maximum=5.0,
+    )
+    if session_max_age_sec >= command_ttl_sec:
+        raise ValueError(
+            "system.admin_control.session_max_age_sec must be less than "
+            "command_ttl_sec"
+        )
+    return deployment_id, command_ttl_sec, session_max_age_sec
+
+
+def _atomic_write_json(path: str, payload: dict) -> None:
+    directory = os.path.dirname(path)
+    _ensure_dir(directory)
+    temporary_path = os.path.join(
+        directory,
+        f".{os.path.basename(path)}.{uuid.uuid4().hex}.tmp",
+    )
+    try:
+        with open(temporary_path, "x", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=True, allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        try:
+            os.remove(temporary_path)
+        except FileNotFoundError:
+            pass
 
 
 def resolve_admin_paths(config: dict = None, override_dir: str = "") -> dict:
@@ -25,7 +247,7 @@ def resolve_admin_paths(config: dict = None, override_dir: str = "") -> dict:
             .get("admin_control", {})
             .get("path", DEFAULT_ADMIN_DIR)
         )
-    base_dir = os.path.abspath(base_dir)
+    base_dir = _validate_admin_control_path(base_dir)
     inbox_dir = _ensure_dir(os.path.join(base_dir, "inbox"))
     results_dir = _ensure_dir(os.path.join(base_dir, "results"))
     archive_dir = _ensure_dir(os.path.join(base_dir, "archive"))
@@ -34,7 +256,35 @@ def resolve_admin_paths(config: dict = None, override_dir: str = "") -> dict:
         "inbox_dir": inbox_dir,
         "results_dir": results_dir,
         "archive_dir": archive_dir,
+        "session_path": os.path.join(base_dir, "active_session.json"),
     }
+
+
+def _load_active_session(paths: dict, config: dict | None) -> dict:
+    deployment_id, _command_ttl_sec, session_max_age_sec = _admin_settings(config)
+    session_path = paths["session_path"]
+    try:
+        session = _load_strict_json_object(
+            session_path,
+            "admin-control session",
+        )
+    except ValueError as exc:
+        raise RuntimeError("no valid running admin-control session") from exc
+    if session.get("schema") != ADMIN_SESSION_SCHEMA:
+        raise RuntimeError("admin-control session schema is invalid")
+    session_id = str(session.get("session_id", "") or "")
+    if not _COMMAND_ID_RE.fullmatch(session_id):
+        raise RuntimeError("admin-control session identity is invalid")
+    if str(session.get("deployment_id", "") or "") != deployment_id:
+        raise RuntimeError("admin-control session belongs to another deployment")
+    heartbeat_at = _parse_utc_timestamp(
+        session.get("heartbeat_at"),
+        "admin session heartbeat_at",
+    )
+    heartbeat_age = time.time() - heartbeat_at
+    if heartbeat_age < -1.0 or heartbeat_age > session_max_age_sec:
+        raise RuntimeError("no fresh running admin-control session")
+    return session
 
 
 def submit_admin_command(
@@ -45,9 +295,23 @@ def submit_admin_command(
     wait_timeout_sec: float = 5.0,
 ):
     paths = resolve_admin_paths(config, admin_dir)
+    try:
+        session = _load_active_session(paths, config)
+    except (RuntimeError, ValueError) as exc:
+        return {
+            "id": "",
+            "accepted": False,
+            "status": "unavailable",
+            "message": str(exc),
+            "result_path": "",
+        }
+    deployment_id, _command_ttl_sec, _session_max_age_sec = _admin_settings(config)
     command_id = uuid.uuid4().hex
     payload = {
+        "schema": ADMIN_COMMAND_SCHEMA,
         "id": command_id,
+        "session_id": session["session_id"],
+        "deployment_id": deployment_id,
         "action": str(action or "").strip().lower(),
         "reason": str(reason or "").strip(),
         "created_at": _utc_now_iso(),
@@ -55,14 +319,15 @@ def submit_admin_command(
     command_path = os.path.join(paths["inbox_dir"], f"{command_id}.json")
     result_path = os.path.join(paths["results_dir"], f"{command_id}.json")
 
-    with open(command_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=True)
+    _atomic_write_json(command_path, payload)
 
     deadline = time.time() + max(0.0, float(wait_timeout_sec or 0.0))
     while time.time() <= deadline:
         if os.path.exists(result_path):
-            with open(result_path, "r", encoding="utf-8") as handle:
-                return json.load(handle)
+            return _load_strict_json_object(
+                result_path,
+                "admin command result",
+            )
         time.sleep(0.1)
 
     return {
@@ -152,9 +417,33 @@ class AdminControlServer:
         self.oms = oms
         self.risk_manager = risk_manager
         self.risk_supervisor = risk_supervisor
-        self.paths = resolve_admin_paths(config or {}, admin_dir)
+        self.config = config or {}
+        self.paths = resolve_admin_paths(self.config, admin_dir)
+        (
+            self.deployment_id,
+            self.command_ttl_sec,
+            self.session_max_age_sec,
+        ) = _admin_settings(self.config)
+        self.session_id = uuid.uuid4().hex
+        self.started_at_wall = time.time()
+        self.started_at_utc = _utc_now_iso()
+        self._publish_session()
+
+    def _publish_session(self):
+        _atomic_write_json(
+            self.paths["session_path"],
+            {
+                "schema": ADMIN_SESSION_SCHEMA,
+                "session_id": self.session_id,
+                "deployment_id": self.deployment_id,
+                "process_id": os.getpid(),
+                "started_at": self.started_at_utc,
+                "heartbeat_at": _utc_now_iso(),
+            },
+        )
 
     def poll_once(self):
+        self._publish_session()
         inbox_dir = self.paths["inbox_dir"]
         for name in sorted(os.listdir(inbox_dir)):
             if not name.endswith(".json"):
@@ -164,8 +453,10 @@ class AdminControlServer:
 
     def _process_command_file(self, command_path: str):
         try:
-            with open(command_path, "r", encoding="utf-8") as handle:
-                command = json.load(handle)
+            command = _load_strict_json_object(
+                command_path,
+                "admin command",
+            )
         except Exception as exc:
             self._write_result(
                 command_id=os.path.splitext(os.path.basename(command_path))[0],
@@ -179,6 +470,40 @@ class AdminControlServer:
         command_id = str(command.get("id", "") or os.path.splitext(os.path.basename(command_path))[0])
         action = str(command.get("action", "") or "").strip().lower()
         reason = str(command.get("reason", "") or "").strip() or "admin"
+
+        try:
+            file_id = os.path.splitext(os.path.basename(command_path))[0]
+            if command.get("schema") != ADMIN_COMMAND_SCHEMA:
+                raise ValueError("admin command schema is invalid")
+            if not _COMMAND_ID_RE.fullmatch(command_id) or command_id != file_id:
+                raise ValueError("admin command ID does not match its file name")
+            if str(command.get("session_id", "") or "") != self.session_id:
+                raise ValueError("admin command belongs to an inactive session")
+            if str(command.get("deployment_id", "") or "") != self.deployment_id:
+                raise ValueError("admin command belongs to another deployment")
+            created_at = _parse_utc_timestamp(
+                command.get("created_at"),
+                "admin command created_at",
+            )
+            command_age = time.time() - created_at
+            if created_at + 1.0 < self.started_at_wall:
+                raise ValueError("admin command predates the active session")
+            if command_age < -1.0 or command_age > self.command_ttl_sec:
+                raise ValueError("admin command is outside its validity window")
+        except ValueError as exc:
+            self._write_result(
+                command_id=(
+                    command_id
+                    if _COMMAND_ID_RE.fullmatch(command_id)
+                    else os.path.splitext(os.path.basename(command_path))[0]
+                ),
+                accepted=False,
+                status="invalid",
+                message=str(exc),
+                snapshot=self._status_snapshot(),
+            )
+            self._archive_command(command_path)
+            return
 
         if action == "rearm":
             rearm_result = coordinated_rearm(
@@ -295,8 +620,7 @@ class AdminControlServer:
             "handled_at": _utc_now_iso(),
             "snapshot": snapshot or {},
         }
-        with open(result_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=True)
+        _atomic_write_json(result_path, payload)
 
     def _archive_command(self, command_path: str):
         archive_name = os.path.basename(command_path)

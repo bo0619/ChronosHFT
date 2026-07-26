@@ -197,6 +197,8 @@ class _EngineCommand:
 class BinancePaperGateway(BaseGateway):
     """Binance production-public-data gateway with a local paper venue."""
 
+    supports_outbound_send_guard = True
+
     def __init__(self, event_engine, config: dict, market_data_config: dict | None = None):
         super().__init__(event_engine, "BINANCE_PAPER")
         self.config = dict(config or {})
@@ -1099,6 +1101,8 @@ class BinancePaperGateway(BaseGateway):
         self,
         req: OrderRequest,
         client_oid: str = None,
+        *,
+        pre_send_guard=None,
     ) -> GatewayCommandResult:
         if not self._accepting_orders or self.state != GatewayState.READY:
             return GatewayCommandResult(
@@ -1129,6 +1133,37 @@ class BinancePaperGateway(BaseGateway):
             )
         if not client_oid:
             client_oid = f"PAPER_CLIENT_{time.time_ns()}"
+        if callable(pre_send_guard):
+            try:
+                guard_result = pre_send_guard()
+            except Exception as exc:
+                return GatewayCommandResult(
+                    CommandOutcome.REJECTED,
+                    error_code="PRE_SEND_GUARD_UNAVAILABLE",
+                    error_message=f"{type(exc).__name__}:{exc}",
+                )
+            if isinstance(guard_result, tuple):
+                allowed = bool(guard_result[0]) if guard_result else False
+                error_code = (
+                    str(guard_result[1])
+                    if len(guard_result) > 1
+                    else "PRE_SEND_GUARD_REJECTED"
+                )
+                error_message = (
+                    str(guard_result[2])
+                    if len(guard_result) > 2
+                    else error_code
+                )
+            else:
+                allowed = bool(guard_result)
+                error_code = "PRE_SEND_GUARD_REJECTED"
+                error_message = "pre-send guard rejected the paper order"
+            if not allowed:
+                return GatewayCommandResult(
+                    CommandOutcome.REJECTED,
+                    error_code=error_code,
+                    error_message=error_message,
+                )
         try:
             result = self._call_worker(
                 "stage_order",

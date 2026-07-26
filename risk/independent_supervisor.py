@@ -5,6 +5,7 @@ import multiprocessing
 import os
 import queue
 import secrets
+import signal
 import statistics
 import threading
 import time
@@ -59,6 +60,12 @@ def _is_truthy(value) -> bool:
 def _clock_failure_requires_kill(reason: str) -> bool:
     normalized = str(reason or "").strip().lower()
     return normalized.startswith(_HARD_CLOCK_FAILURE_PREFIXES)
+
+
+def _isolate_sidecar_console_interrupts() -> None:
+    if os.name == "nt":
+        # The parent owns coordinated shutdown for the shared Windows console.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 class BinanceRiskSidecarExchange:
@@ -1427,9 +1434,11 @@ class RiskSidecarCore:
         self.stage = "ARMED"
         self.unsafe_since = 0.0
         self.parent_stale_since = 0.0
+        self.parent_stale_snapshot_sequence = 0
         self.quiesced = False
         self.quiesce_reason = ""
         self.quiesced_at = 0.0
+        self.quiesce_snapshot_sequence = 0
         self.stop_requested = False
         self.stop_request_id = ""
         self.cancel_on_stop = True
@@ -1885,6 +1894,7 @@ class RiskSidecarCore:
         self.quiesce_reason = str(reason or "operator_quiesce")
         if self.quiesced_at <= 0.0:
             self.quiesced_at = time.time()
+        self.quiesce_snapshot_sequence = self.risk_snapshot_sequence
         self.stage = "QUIESCED"
         self.prepared_rearm = None
         if not self.state_path:
@@ -1901,6 +1911,7 @@ class RiskSidecarCore:
         self.quiesced = False
         self.quiesce_reason = ""
         self.quiesced_at = 0.0
+        self.quiesce_snapshot_sequence = 0
         self.kill_latched = True
         self.kill_reason = (
             self.state_persist_error or "quiesce_state_persist_failed"
@@ -1946,6 +1957,22 @@ class RiskSidecarCore:
         )
         return accepted, result_reason
 
+    def _takeover_from_quiesce(self, reason: str, event: str) -> bool:
+        """Resume active kill supervision before attempting persistence."""
+        self.quiesced = False
+        self.quiesce_reason = ""
+        self.quiesced_at = 0.0
+        self.quiesce_snapshot_sequence = 0
+        self.kill_latched = True
+        self.kill_reason = str(reason or "quiesce_safety_takeover")
+        self.stage = "FLATTENING"
+        self.prepared_rearm = None
+        self.flat_verification_count = 0
+        self.last_verified_snapshot_sequence = 0
+        self.last_cancel_attempt_at = 0.0
+        self.last_flatten_attempt_at = 0.0
+        return self._persist_durable_state(event, force=True)
+
     def _set_shutdown_resume_result(
         self,
         request_id: str,
@@ -1974,22 +2001,9 @@ class RiskSidecarCore:
             )
             return False, "request_id_missing"
 
-        self.quiesced = False
-        self.quiesce_reason = ""
-        self.quiesced_at = 0.0
-        self.kill_latched = True
-        self.kill_reason = str(
-            reason or "shutdown account truth drift"
-        )
-        self.stage = "FLATTENING"
-        self.prepared_rearm = None
-        self.flat_verification_count = 0
-        self.last_verified_snapshot_sequence = 0
-        self.last_cancel_attempt_at = 0.0
-        self.last_flatten_attempt_at = 0.0
-        persisted = self._persist_durable_state(
+        persisted = self._takeover_from_quiesce(
+            str(reason or "shutdown account truth drift"),
             "supervisor_shutdown_guard_resumed",
-            force=True,
         )
         accepted = bool(persisted)
         result_reason = (
@@ -2034,43 +2048,69 @@ class RiskSidecarCore:
             None if cancel_ok is None else bool(cancel_ok)
         )
 
-    def _complete_stop_request(self, now: float) -> bool:
+    def _complete_stop_request(self, now: float) -> bool | None:
         cancel_requested = bool(self.cancel_on_stop)
         cancel_attempted = False
         cancel_ok = None
         accepted = False
 
-        if cancel_requested and self.quiesced:
-            reason = "stop_cancel_suppressed_supervisor_quiesced"
-        elif cancel_requested:
-            cancel_attempted = True
-            cancel_ok = self._emergency_cancel(now)
-            if not cancel_ok:
-                reason = self.last_cancel_reason or "stop_cancel_failed"
+        if self.quiesced:
+            self._service_exchange_risk(
+                now,
+                force=(
+                    self.risk_snapshot_sequence
+                    <= self.quiesce_snapshot_sequence
+                ),
+            )
+            exchange_valid = self._exchange_snapshot_valid(now)
+            open_order_count, nonzero_position_count = (
+                self._account_truth_counts()
+            )
+            if not exchange_valid:
+                reason = self.exchange_reason or "stop_exchange_truth_stale"
+                self._takeover_from_quiesce(
+                    f"stop_guard_exchange_truth_invalid:{reason}",
+                    "supervisor_stop_guard_takeover",
+                )
+            elif open_order_count or nonzero_position_count:
+                reason = (
+                    "stop_guard_account_not_flat:"
+                    f"open_orders={open_order_count}:"
+                    f"positions={nonzero_position_count}"
+                )
+                self._takeover_from_quiesce(
+                    reason,
+                    "supervisor_stop_guard_takeover",
+                )
+            elif (
+                self.risk_snapshot_sequence
+                <= self.quiesce_snapshot_sequence
+            ):
+                return None
             else:
                 persisted = self._enter_quiesced(
-                    "stop_after_cancel",
+                    self.quiesce_reason or "stop_after_flat_snapshot",
                     "supervisor_stop_quiesced",
                 )
                 accepted = bool(persisted)
+                cancel_ok = True if cancel_requested else None
                 reason = (
                     "supervisor_stop_ack"
                     if accepted
                     else self.state_persist_error
                     or "stop_quiesce_state_persist_failed"
                 )
+        elif cancel_requested:
+            cancel_attempted = True
+            cancel_ok = self._emergency_cancel(now)
+            if not cancel_ok:
+                reason = self.last_cancel_reason or "stop_cancel_failed"
+            else:
+                reason = (
+                    "stop_after_cancel_requires_fresh_quiesce"
+                )
         else:
-            persisted = self._enter_quiesced(
-                self.quiesce_reason or "stop_without_cancel",
-                "supervisor_stop_quiesced",
-            )
-            accepted = bool(persisted)
-            reason = (
-                "supervisor_stop_ack"
-                if accepted
-                else self.state_persist_error
-                or "stop_quiesce_state_persist_failed"
-            )
+            reason = "stop_without_cancel_requires_quiesced"
 
         self._set_stop_result(
             accepted=accepted,
@@ -3167,6 +3207,56 @@ class RiskSidecarCore:
             self.last_exchange_poll_at = now
             self._poll_exchange_risk(now)
 
+    def _exchange_snapshot_valid(self, now: float) -> bool:
+        success_at = self.last_exchange_success_at
+        captured_at = self.risk_snapshot_captured_monotonic
+        return bool(
+            self.exchange_healthy
+            and self.risk_snapshot_sequence > 0
+            and math.isfinite(success_at)
+            and math.isfinite(captured_at)
+            and 0.0 < success_at <= now
+            and 0.0 < captured_at <= now
+            and success_at == captured_at
+            and now - success_at <= self.exchange_max_age_sec
+            and now - captured_at <= self.exchange_max_age_sec
+        )
+
+    def _account_truth_counts(self):
+        return (
+            max(
+                0,
+                int(self.risk_metrics.get("open_order_count", 0) or 0),
+            ),
+            max(
+                0,
+                int(
+                    self.risk_metrics.get(
+                        "nonzero_position_count",
+                        0,
+                    )
+                    or 0
+                ),
+            ),
+        )
+
+    def _update_parent_stale_state(
+        self,
+        parent_healthy: bool,
+        now: float,
+    ) -> None:
+        if parent_healthy:
+            self.parent_stale_since = 0.0
+            self.parent_stale_snapshot_sequence = 0
+            return
+        if self.parent_stale_since <= 0.0:
+            self.parent_stale_since = now
+            self.parent_stale_snapshot_sequence = (
+                self.risk_snapshot_sequence
+            )
+            self.flat_verification_count = 0
+            self.last_verified_snapshot_sequence = 0
+
     def _emergency_cancel(self, now: float):
         if self.quiesced:
             self.last_cancel_reason = "supervisor_quiesced"
@@ -3207,43 +3297,82 @@ class RiskSidecarCore:
         return self.last_flatten_ok
 
     def _step_quiesced(self, now: float):
+        self._service_exchange_risk(
+            now,
+            force=(
+                self.risk_snapshot_sequence
+                <= self.quiesce_snapshot_sequence
+            ),
+        )
         parent_age = max(0.0, now - self.last_parent_heartbeat_at)
         parent_healthy = bool(
             not self.parent_heartbeat_error
             and parent_age <= self.parent_heartbeat_timeout_sec
         )
-        if parent_healthy:
-            self.parent_stale_since = 0.0
-        elif self.parent_stale_since <= 0.0:
-            self.parent_stale_since = now
+        self._update_parent_stale_state(parent_healthy, now)
+        exchange_valid = self._exchange_snapshot_valid(now)
+        open_order_count, nonzero_position_count = (
+            self._account_truth_counts()
+        )
 
-        keep_running = not (
-            not parent_healthy
-            and self.parent_stale_since > 0.0
-            and now - self.parent_stale_since >= self.orphan_exit_sec
-        )
-        reason = (
-            "supervisor_quiesced"
-            if parent_healthy
-            else "supervisor_quiesced_parent_stale"
-        )
+        takeover_reason = ""
+        if not parent_healthy:
+            takeover_reason = (
+                self.parent_heartbeat_error
+                or "quiesce_parent_heartbeat_stale"
+            )
+        elif not exchange_valid:
+            takeover_reason = (
+                self.exchange_reason or "quiesce_exchange_truth_stale"
+            )
+        elif open_order_count or nonzero_position_count:
+            takeover_reason = (
+                "quiesce_account_truth_drift:"
+                f"open_orders={open_order_count}:"
+                f"positions={nonzero_position_count}"
+            )
+
+        if takeover_reason:
+            self._takeover_from_quiesce(
+                takeover_reason,
+                "supervisor_quiesce_safety_takeover",
+            )
+            if self.stop_requested:
+                self._set_stop_result(
+                    accepted=False,
+                    reason=f"stop_guard_takeover:{takeover_reason}",
+                    cancel_requested=bool(self.cancel_on_stop),
+                    cancel_attempted=False,
+                    cancel_ok=None,
+                )
+                self.stop_requested = False
+            return self.step(now, exchange_serviced=True)
+
+        reason = "supervisor_quiesced"
         action = "KILL" if self.kill_latched else "REDUCE_ONLY"
-        return self._status(False, reason, action, now), keep_running
+        return self._status(False, reason, action, now), True
 
-    def step(self, now: float = None):
+    def step(
+        self,
+        now: float = None,
+        *,
+        exchange_serviced: bool = False,
+    ):
         now = time.perf_counter() if now is None else float(now)
         if self.stop_requested:
             stop_accepted = self._complete_stop_request(now)
-            return self._status(
-                False,
-                self.last_stop_reason or "supervisor_stop_failed",
-                "KILL" if self.kill_latched else "REDUCE_ONLY",
-                now,
-            ), not stop_accepted
+            if stop_accepted is not None:
+                return self._status(
+                    False,
+                    self.last_stop_reason or "supervisor_stop_failed",
+                    "KILL" if self.kill_latched else "REDUCE_ONLY",
+                    now,
+                ), not stop_accepted
         if self.quiesced:
             return self._step_quiesced(now)
 
-        self._service_exchange_risk(now)
+        if not exchange_serviced:
+            self._service_exchange_risk(now)
         funding_action, funding_reason = self._evaluate_funding_guard(now)
 
         parent_age = max(0.0, now - self.last_parent_heartbeat_at)
@@ -3251,21 +3380,8 @@ class RiskSidecarCore:
             not self.parent_heartbeat_error
             and parent_age <= self.parent_heartbeat_timeout_sec
         )
-        exchange_age = (
-            max(0.0, now - self.last_exchange_success_at)
-            if self.last_exchange_success_at > 0.0
-            else None
-        )
-        exchange_valid = bool(
-            self.exchange_healthy
-            and exchange_age is not None
-            and exchange_age <= self.exchange_max_age_sec
-        )
-
-        if parent_healthy:
-            self.parent_stale_since = 0.0
-        elif self.parent_stale_since <= 0.0:
-            self.parent_stale_since = now
+        exchange_valid = self._exchange_snapshot_valid(now)
+        self._update_parent_stale_state(parent_healthy, now)
 
         action = (
             self.risk_action
@@ -3315,6 +3431,9 @@ class RiskSidecarCore:
             reason = self.kill_reason or "independent_hard_risk_breach"
 
         healthy = parent_healthy and exchange_valid and action == "NONE"
+        open_order_count, nonzero_position_count = (
+            self._account_truth_counts()
+        )
         if healthy:
             self.unsafe_since = 0.0
             self.stage = "ARMED"
@@ -3325,17 +3444,15 @@ class RiskSidecarCore:
                 self.unsafe_since = now
             if (
                 self.stage == "FLAT_VERIFIED"
-                and exchange_valid
-                and action == "KILL"
                 and (
-                    int(self.risk_metrics.get("open_order_count", 0) or 0)
-                    or int(
-                        self.risk_metrics.get("nonzero_position_count", 0) or 0
-                    )
+                    not exchange_valid
+                    or open_order_count
+                    or nonzero_position_count
                 )
             ):
                 self.stage = "FLATTENING"
                 self.flat_verification_count = 0
+                self.last_verified_snapshot_sequence = 0
             if self.stage != "FLAT_VERIFIED":
                 if (
                     self.last_cancel_attempt_at <= 0.0
@@ -3365,16 +3482,15 @@ class RiskSidecarCore:
                         self._emergency_flatten(now)
 
             if exchange_valid:
-                open_order_count = int(
-                    self.risk_metrics.get("open_order_count", 0) or 0
-                )
-                nonzero_position_count = int(
-                    self.risk_metrics.get("nonzero_position_count", 0) or 0
-                )
                 if action == "KILL" and self.flatten_enabled:
                     if (
                         open_order_count == 0
                         and nonzero_position_count == 0
+                        and (
+                            parent_healthy
+                            or self.risk_snapshot_sequence
+                            > self.parent_stale_snapshot_sequence
+                        )
                         and self.risk_snapshot_sequence
                         > self.last_verified_snapshot_sequence
                     ):
@@ -3406,6 +3522,15 @@ class RiskSidecarCore:
             and self.parent_stale_since > 0.0
             and now - self.parent_stale_since >= self.orphan_exit_sec
             and self.stage == "FLAT_VERIFIED"
+            and exchange_valid
+            and open_order_count == 0
+            and nonzero_position_count == 0
+            and self.flat_verification_count
+            >= self.flat_verification_checks
+            and self.last_verified_snapshot_sequence
+            == self.risk_snapshot_sequence
+            and self.last_verified_snapshot_sequence
+            > self.parent_stale_snapshot_sequence
         )
         return self._status(healthy, reason, action, now), keep_running
 
@@ -3432,6 +3557,10 @@ class RiskSidecarCore:
             "parent_sequence": self.last_parent_sequence,
             "parent_age_sec": max(0.0, now - self.last_parent_heartbeat_at),
             "parent_heartbeat_error": self.parent_heartbeat_error,
+            "parent_stale_since": self.parent_stale_since,
+            "parent_stale_snapshot_sequence": (
+                self.parent_stale_snapshot_sequence
+            ),
             "parent_heartbeat_sent_monotonic": (
                 self.last_parent_heartbeat_sent_monotonic
             ),
@@ -3449,7 +3578,13 @@ class RiskSidecarCore:
             "last_flatten_reason": self.last_flatten_reason,
             "flat_verification_count": self.flat_verification_count,
             "flat_verification_checks": self.flat_verification_checks,
+            "last_verified_snapshot_sequence": (
+                self.last_verified_snapshot_sequence
+            ),
             "risk_snapshot_sequence": self.risk_snapshot_sequence,
+            "quiesce_snapshot_sequence": (
+                self.quiesce_snapshot_sequence
+            ),
             "risk_snapshot_captured_at": self.risk_snapshot_captured_at,
             "risk_snapshot_captured_monotonic": (
                 self.risk_snapshot_captured_monotonic
@@ -3709,6 +3844,7 @@ def _risk_sidecar_process(
     exchange = None
     snapshot_exchange = None
     try:
+        _isolate_sidecar_console_interrupts()
         api_key = str(settings.get("api_key", "") or "")
         api_secret = str(settings.get("api_secret", "") or "")
         if not api_key or not api_secret:
@@ -3992,6 +4128,7 @@ class IndependentRiskSupervisor:
         self.process = None
         self.heartbeat_sequence = 0
         self.last_heartbeat_sent_at = 0.0
+        self.parent_heartbeat_suspended_reason = ""
         self.last_status = {}
         self.last_status_received_at = 0.0
         self.started_at = 0.0
@@ -4034,6 +4171,8 @@ class IndependentRiskSupervisor:
         """Emit only the liveness pulse, without applying parent-side risk state."""
         if not self.enabled:
             return True
+        if self.parent_heartbeat_suspended_reason:
+            return False
         process = self.process
         if process is None or not process.is_alive():
             return False
@@ -4041,6 +4180,8 @@ class IndependentRiskSupervisor:
         return True
 
     def _send_heartbeat(self, now: float):
+        if self.parent_heartbeat_suspended_reason:
+            return
         if now - self.last_heartbeat_sent_at < self.heartbeat_interval_sec:
             return
         self.heartbeat_sequence += 1
@@ -4531,7 +4672,25 @@ class IndependentRiskSupervisor:
                 False,
                 "supervisor_shutdown_guard_active",
             )
+        if self.enabled and not (
+            result.get("accepted") is True
+            and result.get("kill_latched") is True
+            and result.get("persisted") is True
+        ):
+            self.suspend_parent_heartbeat(
+                "shutdown_guard_handoff_unconfirmed:"
+                f"{result.get('reason', 'unknown')}"
+            )
         return result
+
+    def suspend_parent_heartbeat(self, reason: str) -> bool:
+        """Force the sidecar stale-parent kill path after control-plane loss."""
+        if not self.enabled:
+            return False
+        self.parent_heartbeat_suspended_reason = str(
+            reason or "parent_requested_sidecar_takeover"
+        )
+        return True
 
     def abort_rearm(self, token: str) -> bool:
         if not self.enabled:
@@ -4559,6 +4718,9 @@ class IndependentRiskSupervisor:
         return {
             "enabled": self.enabled,
             "process_alive": process_alive,
+            "parent_heartbeat_suspended_reason": (
+                self.parent_heartbeat_suspended_reason
+            ),
             "pid": getattr(self.process, "pid", None),
             "healthy": bool(
                 not self.enabled

@@ -2,6 +2,7 @@ import json
 import multiprocessing
 import os
 import queue
+import signal
 import sys
 import tempfile
 import threading
@@ -68,6 +69,7 @@ from infrastructure.watchdog import emit_event_engine_backlog_if_needed
 from oms.engine import OMS
 from oms.journal import OMSJournal
 from oms.order import Order
+import risk.independent_supervisor as independent_supervisor_module
 from risk.independent_supervisor import (
     BinanceRiskSidecarExchange,
     IndependentRiskSupervisor,
@@ -3031,6 +3033,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                 "type": "HEARTBEAT",
                 "session_id": "test-session",
                 "sequence": 1,
+                "sent_monotonic": time.perf_counter(),
             }
         )
         worker = threading.Thread(
@@ -3070,6 +3073,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                 "type": "HEARTBEAT",
                 "session_id": "spawn-session",
                 "sequence": 1,
+                "sent_monotonic": time.perf_counter(),
             }
         )
         process = context.Process(
@@ -3102,6 +3106,87 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                 process.join(2.0)
             command_queue.close()
             status_queue.close()
+
+    def test_sidecar_process_ignores_windows_sigint_before_exchange_init(self):
+        events = []
+        command_queue = queue.Queue()
+        status_queue = queue.Queue()
+        settings = self.make_settings(
+            api_key="risk-key",
+            api_secret="risk-secret",
+        )
+
+        def record_signal(signum, handler):
+            events.append(("signal", signum, handler))
+
+        def make_exchange(*_args, **_kwargs):
+            events.append(("exchange",))
+            return DummySidecarExchange()
+
+        with (
+            patch.object(independent_supervisor_module.os, "name", "nt"),
+            patch.object(
+                independent_supervisor_module.signal,
+                "signal",
+                side_effect=record_signal,
+            ),
+            patch.object(
+                independent_supervisor_module,
+                "BinanceRiskSidecarExchange",
+                side_effect=make_exchange,
+            ),
+            patch.object(
+                independent_supervisor_module,
+                "run_sidecar_loop",
+            ),
+        ):
+            independent_supervisor_module._risk_sidecar_process(
+                command_queue,
+                status_queue,
+                settings,
+            )
+
+        self.assertEqual(
+            events[0],
+            ("signal", signal.SIGINT, signal.SIG_IGN),
+        )
+        self.assertEqual(events[1:], [("exchange",), ("exchange",)])
+
+    def test_sidecar_process_fails_closed_if_sigint_isolation_fails(self):
+        command_queue = queue.Queue()
+        status_queue = queue.Queue()
+        settings = self.make_settings(
+            api_key="risk-key",
+            api_secret="risk-secret",
+            session_id="signal-failure-session",
+        )
+
+        with (
+            patch.object(independent_supervisor_module.os, "name", "nt"),
+            patch.object(
+                independent_supervisor_module.signal,
+                "signal",
+                side_effect=OSError("handler unavailable"),
+            ),
+            patch.object(
+                independent_supervisor_module,
+                "BinanceRiskSidecarExchange",
+            ) as exchange_type,
+        ):
+            independent_supervisor_module._risk_sidecar_process(
+                command_queue,
+                status_queue,
+                settings,
+            )
+
+        exchange_type.assert_not_called()
+        status = status_queue.get_nowait()
+        self.assertEqual(status["session_id"], "signal-failure-session")
+        self.assertFalse(status["healthy"])
+        self.assertEqual(
+            status["reason"],
+            "sidecar_init_failed:OSError:handler unavailable",
+        )
 
     def test_parent_supervisor_requires_distinct_healthy_recovery_statuses(self):
         oms = DummyOMS()

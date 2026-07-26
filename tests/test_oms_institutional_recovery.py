@@ -1,17 +1,23 @@
+import threading
 import time
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from event.type import (
     CommandOutcome,
     Event,
+    ExecutionPolicy,
     ExchangeOrderUpdate,
     GatewayCommandResult,
     LifecycleState,
     OrderIntent,
+    OrderRequest,
     OrderStatus,
     Side,
+    TIF_IOC,
     EVENT_EXCHANGE_ORDER_UPDATE,
+    EVENT_ORDER_SUBMITTED,
 )
 from oms.engine import OMS
 from oms.order import Order
@@ -147,6 +153,368 @@ class InstitutionalRecoveryTests(unittest.TestCase):
             self.assertIn(result.client_oid, oms.orders)
             self.assertTrue(oms.get_symbol_freeze_reason("BTCUSDT").startswith("order_truth:"))
         finally:
+            oms.stop()
+
+    def test_user_stream_truth_before_rest_ack_never_regresses_order(self):
+        cases = (
+            ("NEW", 0.0, OrderStatus.NEW, True),
+            ("PARTIALLY_FILLED", 0.4, OrderStatus.PARTIALLY_FILLED, True),
+            ("FILLED", 1.0, OrderStatus.FILLED, False),
+        )
+        for exchange_status, cumulative, expected, monitored in cases:
+            with self.subTest(exchange_status=exchange_status):
+                gateway = RecoveryGateway()
+                oms, _ = self.make_live_oms(gateway)
+                gateway.send_result = GatewayCommandResult(
+                    CommandOutcome.ACKNOWLEDGED,
+                    exchange_oid="ex-early",
+                )
+                oms.validator.validate_params = lambda _intent: (True, "")
+                oms.exposure.check_risk = lambda *_args, **_kwargs: (True, "")
+                oms._schedule_trade_tail_verification = (
+                    lambda *_args, **_kwargs: True
+                )
+
+                def send_with_early_truth(_request, client_oid):
+                    oms.on_exchange_update(
+                        Event(
+                            EVENT_EXCHANGE_ORDER_UPDATE,
+                            ExchangeOrderUpdate(
+                                client_oid=client_oid,
+                                exchange_oid="ex-early",
+                                symbol="BTCUSDT",
+                                status=exchange_status,
+                                filled_qty=cumulative,
+                                filled_price=100.0 if cumulative else 0.0,
+                                cum_filled_qty=cumulative,
+                                update_time=time.time(),
+                                trade_id=7 if cumulative else -1,
+                            ),
+                        )
+                    )
+                    return gateway.send_result
+
+                gateway.send_order = send_with_early_truth
+                try:
+                    result = oms.submit_order(
+                        OrderIntent(
+                            "test",
+                            "BTCUSDT",
+                            Side.BUY,
+                            100.0,
+                            1.0,
+                        )
+                    )
+
+                    order = oms.orders[result.client_oid]
+                    self.assertTrue(result.accepted)
+                    self.assertEqual(order.status, expected)
+                    self.assertEqual(order.exchange_oid, "ex-early")
+                    self.assertEqual(
+                        result.client_oid in oms.order_monitor.monitored_orders,
+                        monitored,
+                    )
+                    submitted = [
+                        event.data
+                        for event in oms.event_engine.events
+                        if event.type == EVENT_ORDER_SUBMITTED
+                    ]
+                    self.assertEqual(submitted[-1].status, expected)
+                finally:
+                    oms.stop()
+
+    def test_user_stream_new_resolves_transport_unknown_without_freeze(self):
+        gateway = RecoveryGateway()
+        oms, _ = self.make_live_oms(gateway)
+        gateway.send_result = GatewayCommandResult(
+            CommandOutcome.UNKNOWN,
+            error_message="response lost",
+        )
+        oms.validator.validate_params = lambda _intent: (True, "")
+        oms.exposure.check_risk = lambda *_args, **_kwargs: (True, "")
+        truth_checks = []
+        oms._on_order_truth_check = (
+            lambda *args, **kwargs: truth_checks.append((args, kwargs))
+        )
+
+        def send_with_early_new(_request, client_oid):
+            oms.on_exchange_update(
+                Event(
+                    EVENT_EXCHANGE_ORDER_UPDATE,
+                    ExchangeOrderUpdate(
+                        client_oid=client_oid,
+                        exchange_oid="ex-early-unknown",
+                        symbol="BTCUSDT",
+                        status="NEW",
+                        filled_qty=0.0,
+                        filled_price=0.0,
+                        cum_filled_qty=0.0,
+                        update_time=time.time(),
+                    ),
+                )
+            )
+            return gateway.send_result
+
+        gateway.send_order = send_with_early_new
+        try:
+            result = oms.submit_order(
+                OrderIntent("test", "BTCUSDT", Side.BUY, 100.0, 1.0)
+            )
+
+            self.assertTrue(result.accepted)
+            self.assertEqual(
+                result.reason,
+                "transport_unknown_resolved_by_exchange_truth",
+            )
+            self.assertEqual(
+                oms.orders[result.client_oid].status,
+                OrderStatus.NEW,
+            )
+            self.assertEqual(oms.get_symbol_freeze_reason("BTCUSDT"), "")
+            self.assertEqual(truth_checks, [])
+        finally:
+            oms.stop()
+
+    def test_shutdown_latch_allows_only_internal_emergency_reduce_send(self):
+        gateway = RecoveryGateway()
+        oms, _ = self.make_live_oms(gateway)
+        gateway.send_result = GatewayCommandResult(
+            CommandOutcome.ACKNOWLEDGED,
+            exchange_oid="ex-shutdown-flatten",
+        )
+        oms._schedule_trade_tail_verification = (
+            lambda *_args, **_kwargs: True
+        )
+
+        def send_with_early_fill(_request, client_oid):
+            oms.on_exchange_update(
+                Event(
+                    EVENT_EXCHANGE_ORDER_UPDATE,
+                    ExchangeOrderUpdate(
+                        client_oid=client_oid,
+                        exchange_oid="ex-shutdown-flatten",
+                        symbol="BTCUSDT",
+                        status="FILLED",
+                        filled_qty=1.0,
+                        filled_price=100.0,
+                        cum_filled_qty=1.0,
+                        update_time=time.time(),
+                        trade_id=8,
+                        order_type="MARKET",
+                        time_in_force=TIF_IOC,
+                    ),
+                )
+            )
+            return gateway.send_result
+
+        gateway.send_order = send_with_early_fill
+        intent = OrderIntent(
+            "system_emergency",
+            "BTCUSDT",
+            Side.SELL,
+            100.0,
+            1.0,
+            order_type="MARKET",
+            time_in_force=TIF_IOC,
+            reduce_only=True,
+            policy=ExecutionPolicy.AGGRESSIVE,
+            tag="reduce_only_flatten:test_shutdown_retry",
+        )
+        request = OrderRequest(
+            symbol="BTCUSDT",
+            price=100.0,
+            volume=1.0,
+            side="SELL",
+            order_type="MARKET",
+            time_in_force=TIF_IOC,
+            reduce_only=True,
+        )
+        try:
+            self.assertTrue(oms.begin_shutdown("test"))
+            self.assertTrue(
+                oms._submit_internal_order(
+                    intent,
+                    request,
+                    "EMG_shutdown_test",
+                    "test_shutdown_emergency",
+                    "test_shutdown_emergency",
+                )
+            )
+            order = oms.orders["EMG_shutdown_test"]
+            self.assertEqual(order.status, OrderStatus.FILLED)
+            self.assertNotIn(
+                order.client_oid,
+                oms.order_monitor.monitored_orders,
+            )
+        finally:
+            oms.stop()
+
+    def test_expired_calibration_rechecks_late_position_until_flat(self):
+        oms, gateway = self.make_live_oms()
+        oms._rpi_calibration = {
+            "enabled": True,
+            "permit_id": "permit-test",
+            "symbol": "BTCUSDT",
+        }
+        oms._rpi_calibration_expired = True
+        oms._rpi_calibration_expiry_reason = "max_order_count_exhausted"
+        oms._rpi_calibration_permit_activated = True
+        oms._rpi_calibration_terminal_cancel_sweep_completed = False
+        oms._rpi_calibration_terminal_empty_snapshots = 0
+        oms._rpi_calibration_terminal_verified = False
+        oms._rpi_calibration_terminal_pending_reason = ""
+        gateway.position_snapshots = [
+            [{"symbol": "BTCUSDT", "positionAmt": "0.1"}],
+            [{"symbol": "BTCUSDT", "positionAmt": "0"}],
+            [{"symbol": "BTCUSDT", "positionAmt": "0"}],
+        ]
+        flatten_calls = []
+        oms.emergency_reduce_only_flatten = (
+            lambda reason, symbol="": flatten_calls.append((reason, symbol))
+            or 1
+        )
+        try:
+            self.assertFalse(
+                oms._enforce_rpi_calibration_terminal_once()
+            )
+            self.assertFalse(
+                oms._enforce_rpi_calibration_terminal_once()
+            )
+            self.assertFalse(
+                oms._enforce_rpi_calibration_terminal_once()
+            )
+            self.assertTrue(
+                oms._enforce_rpi_calibration_terminal_once()
+            )
+            self.assertTrue(oms._rpi_calibration_terminal_verified)
+
+            oms.exposure.force_sync("BTCUSDT", 0.1, 100.0)
+            oms._rpi_calibration_enforcement_inflight = True
+            self.assertFalse(
+                oms._schedule_rpi_calibration_runtime_enforcement(
+                    terminal_truth_changed=True,
+                )
+            )
+            self.assertFalse(oms._rpi_calibration_terminal_verified)
+            self.assertFalse(
+                oms._enforce_rpi_calibration_terminal_once()
+            )
+            self.assertEqual(
+                flatten_calls,
+                [
+                    (
+                        "rpi_calibration_expired:"
+                        "max_order_count_exhausted",
+                        "",
+                    ),
+                    (
+                        "rpi_calibration_expired:"
+                        "max_order_count_exhausted",
+                        "",
+                    ),
+                ],
+            )
+
+            oms.exposure.force_sync("BTCUSDT", 0.0, 0.0)
+            oms._rpi_calibration_terminal_verified = True
+            gateway.get_open_orders = lambda: None
+            self.assertFalse(
+                oms._enforce_rpi_calibration_terminal_once()
+            )
+            self.assertFalse(oms._rpi_calibration_terminal_verified)
+            self.assertEqual(
+                oms._rpi_calibration_terminal_pending_reason,
+                "open_order_truth_unavailable",
+            )
+
+            gateway.get_open_orders = lambda: []
+            gateway.position_snapshots = [[{"symbol": "BTCUSDT"}]]
+            gateway.position_query_count = 0
+            self.assertFalse(
+                oms._enforce_rpi_calibration_terminal_once()
+            )
+            self.assertEqual(
+                oms._rpi_calibration_terminal_pending_reason,
+                "position_truth_invalid",
+            )
+        finally:
+            oms._rpi_calibration_enforcement_inflight = False
+            oms.stop()
+
+    def test_shutdown_waits_for_calibration_enforcer_before_main_proof_handoff(self):
+        oms, _gateway = self.make_live_oms()
+        oms._rpi_calibration = {
+            "enabled": True,
+            "permit_id": "permit-test",
+            "symbol": "BTCUSDT",
+        }
+        oms._rpi_calibration_expired = True
+        oms._rpi_calibration_permit_activated = True
+        oms._rpi_calibration_terminal_verified = False
+
+        real_thread = threading.Thread
+        enforcer_start_entered = threading.Event()
+        allow_enforcer_start = threading.Event()
+        shutdown_entered = threading.Event()
+        shutdown_returned = threading.Event()
+        created_enforcers = []
+        schedule_results = []
+        shutdown_results = []
+
+        class ControlledEnforcerThread(real_thread):
+            def start(self):
+                if self.name == "RpiCalibrationRuntimeEnforcer":
+                    created_enforcers.append(self)
+                    enforcer_start_entered.set()
+                    allow_enforcer_start.wait(timeout=2.0)
+                return super().start()
+
+        def schedule_enforcer():
+            schedule_results.append(
+                oms._schedule_rpi_calibration_runtime_enforcement()
+            )
+
+        def begin_shutdown():
+            shutdown_entered.set()
+            shutdown_results.append(oms.begin_shutdown("test_handoff"))
+            shutdown_returned.set()
+
+        scheduler = real_thread(target=schedule_enforcer)
+        shutdown = real_thread(target=begin_shutdown)
+        returned_before_enforcer_started = False
+        try:
+            oms._enforce_rpi_calibration_terminal_once = lambda: False
+            with patch("oms.engine.threading.Thread", ControlledEnforcerThread):
+                scheduler.start()
+                self.assertTrue(enforcer_start_entered.wait(timeout=1.0))
+
+                shutdown.start()
+                self.assertTrue(shutdown_entered.wait(timeout=1.0))
+                returned_before_enforcer_started = shutdown_returned.wait(
+                    timeout=0.1
+                )
+                allow_enforcer_start.set()
+
+                scheduler.join(timeout=2.0)
+                shutdown.join(timeout=2.0)
+
+            self.assertFalse(returned_before_enforcer_started)
+            self.assertFalse(scheduler.is_alive())
+            self.assertFalse(shutdown.is_alive())
+            self.assertEqual(schedule_results, [True])
+            self.assertEqual(shutdown_results, [True])
+            self.assertEqual(len(created_enforcers), 1)
+            self.assertFalse(created_enforcers[0].is_alive())
+
+            # main.py begins the final account shutdown proof only after this
+            # call returns, so no permit enforcer may remain at this handoff.
+            self.assertIsNone(oms._rpi_calibration_enforcement_thread)
+            self.assertFalse(oms._rpi_calibration_enforcement_inflight)
+        finally:
+            allow_enforcer_start.set()
+            scheduler.join(timeout=2.0)
+            if shutdown.ident is not None:
+                shutdown.join(timeout=2.0)
             oms.stop()
 
     def test_targeted_query_resolves_submit_unknown_to_new(self):

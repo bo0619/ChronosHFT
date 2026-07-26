@@ -615,6 +615,12 @@ class LocalWebDashboard:
             else {}
         )
         system = config.get("system", {}) if isinstance(config, Mapping) else {}
+        alert = config.get("alert", {}) if isinstance(config, Mapping) else {}
+        evidence_recorder = (
+            system.get("evidence_recorder", {})
+            if isinstance(system, Mapping)
+            else {}
+        )
         time_sync = (
             system.get("time_sync", {})
             if isinstance(system, Mapping)
@@ -688,6 +694,21 @@ class LocalWebDashboard:
             "simulated_execution": is_paper,
             "simulated_funds": is_paper,
             "private_api_enabled": not is_paper,
+            "external_alerts_required": bool(
+                execution_mode == "live"
+                and isinstance(alert, Mapping)
+                and alert.get("active", False)
+            ),
+            "live_evidence_required": bool(
+                execution_mode == "live"
+                and (
+                    config.get("record_data", False)
+                    or (
+                        isinstance(evidence_recorder, Mapping)
+                        and evidence_recorder.get("enabled", False)
+                    )
+                )
+            ),
             "symbols": [str(symbol).upper() for symbol in config.get("symbols", [])],
             "exchange": "BINANCE",
             "strategy": str(
@@ -2104,6 +2125,7 @@ class LocalWebDashboard:
             now=now,
             system=system,
             risk_status=risk_status,
+            runtime=self._runtime_metrics,
         )
         system["readiness"] = readiness
         account = self._account_snapshot_locked()
@@ -2232,6 +2254,7 @@ class LocalWebDashboard:
         now: float,
         system: Mapping[str, Any],
         risk_status: Mapping[str, Any],
+        runtime: Mapping[str, Any],
     ) -> dict[str, Any]:
         reasons = []
 
@@ -2413,6 +2436,37 @@ class LocalWebDashboard:
                 or venue.get("active") is not True
             ):
                 reasons.append("venue_supervisor_inactive")
+
+        # Runtime health producers are attached after the main control loop
+        # starts. Do not treat their initial absence as a failure, but once a
+        # Live producer reports an explicit unhealthy state, fail readiness
+        # directly instead of relying only on the resulting OMS restriction.
+        if self._config_view["execution_mode"] == "live":
+            for section_name, reason_field, required_field in (
+                (
+                    "external_alerts",
+                    "reason",
+                    "external_alerts_required",
+                ),
+                (
+                    "live_evidence",
+                    "failure_reason",
+                    "live_evidence_required",
+                ),
+            ):
+                section = runtime.get(section_name, {})
+                if not isinstance(section, Mapping) or not section:
+                    continue
+                observed_or_required = bool(
+                    section.get("available") is True
+                    or section.get("enabled") is True
+                    or self._config_view[required_field]
+                )
+                if observed_or_required and section.get("healthy") is False:
+                    detail = str(
+                        section.get(reason_field, "unhealthy") or "unhealthy"
+                    )
+                    reasons.append(f"{section_name}_unhealthy:{detail}")
 
         event_engine = system.get("event_engine", {})
         if (

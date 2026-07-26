@@ -20,6 +20,10 @@ from scripts.check_live_canary_readiness import (
     main,
 )
 from infrastructure.live_config_guard import (
+    LIVE_CANARY_EVIDENCE_CANONICALIZATION,
+    LIVE_CANARY_EVIDENCE_INTEGRITY_ALGORITHM,
+    LIVE_CANARY_EVIDENCE_INTEGRITY_SCHEMA,
+    sign_live_canary_evidence,
     validate_live_canary_local_evidence,
 )
 
@@ -37,13 +41,17 @@ def _check_by_id(report, check_id):
 
 
 def _example_config():
-    return json.loads(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    raw = EXAMPLE_CONFIG.read_text(encoding="utf-8").replace(
+        "EDIT-ME-rpi-canary-001",
+        "canary-2026-07-24-001",
+    )
+    return json.loads(raw)
 
 
 def _passing_evidence(config):
     symbol = config["symbols"][0]
     deployment_id = config["live_launch"]["deployment_id"]
-    return {
+    evidence = {
         "schema": EVIDENCE_SCHEMA,
         "deployment_id": deployment_id,
         "symbol": symbol,
@@ -98,6 +106,51 @@ def _passing_evidence(config):
             "totalMarginBalance": "10000.01",
             "availableBalance": "10000.01",
         },
+        "flat_start_truth": {
+            "open_orders_source": "GET /fapi/v1/openOrders",
+            "positions_source": "GET /fapi/v2/positionRisk",
+            "captured_at_utc": "2026-07-24T11:55:00Z",
+            "api_key_fingerprint_sha256": hashlib.sha256(
+                b"primary-key"
+            ).hexdigest(),
+            "open_orders": [],
+            "positions": [
+                {
+                    "symbol": symbol,
+                    "positionAmt": "0",
+                    "positionSide": "BOTH",
+                    "marginType": "isolated",
+                    "leverage": "1",
+                }
+            ],
+        },
+        "symbol_configuration_truth": {
+            "position_mode_source": "GET /fapi/v1/positionSide/dual",
+            "position_risk_source": "GET /fapi/v2/positionRisk",
+            "exchange_info_source": "GET /fapi/v1/exchangeInfo",
+            "captured_at_utc": "2026-07-24T11:55:00Z",
+            "api_key_fingerprint_sha256": hashlib.sha256(
+                b"primary-key"
+            ).hexdigest(),
+            "position_mode": {"dualSidePosition": False},
+            "symbol_position_rows": [
+                {
+                    "symbol": symbol,
+                    "positionAmt": "0",
+                    "positionSide": "BOTH",
+                    "marginType": "isolated",
+                    "leverage": "1",
+                }
+            ],
+            "exchange_symbol": {
+                "symbol": symbol,
+                "status": "TRADING",
+                "permissionSets": [["RPI"]],
+                "filters": [
+                    {"filterType": "MIN_NOTIONAL", "notional": "5"}
+                ],
+            },
+        },
         "rpi_truth": {
             "exchange_info_source": RPI_EXCHANGE_INFO_SOURCE,
             "commission_source": RPI_COMMISSION_SOURCE,
@@ -110,6 +163,22 @@ def _passing_evidence(config):
             "rpiCommissionRate": "0",
         },
     }
+    evidence["integrity"] = {
+        "schema": LIVE_CANARY_EVIDENCE_INTEGRITY_SCHEMA,
+        "algorithm": LIVE_CANARY_EVIDENCE_INTEGRITY_ALGORITHM,
+        "canonicalization": LIVE_CANARY_EVIDENCE_CANONICALIZATION,
+        "primary_hmac_sha256": "0" * 64,
+        "supervisor_hmac_sha256": "1" * 64,
+    }
+    return evidence
+
+
+def _sign_for_runtime(evidence):
+    return sign_live_canary_evidence(
+        evidence,
+        primary_api_secret="primary-secret",
+        supervisor_api_secret="risk-secret",
+    )
 
 
 def _write_case(directory, config, evidence):
@@ -150,14 +219,16 @@ class LiveCanaryReadinessTests(unittest.TestCase):
             }
         )
 
-    def test_blocked_example_passes_structural_guard_without_secrets(self):
+    def test_blocked_example_rejects_placeholder_deployment_id(self):
         report = assess_live_canary_readiness(
             EXAMPLE_CONFIG,
             now_utc=FIXED_NOW,
         )
 
         self.assertEqual(report["status"], BLOCKED)
-        self.assertEqual(_check_by_id(report, "config.live_guard")["status"], PASS)
+        guard = _check_by_id(report, "config.live_guard")
+        self.assertEqual(guard["status"], BLOCKED)
+        self.assertIn("EDIT-ME placeholder", guard["message"])
         self.assertEqual(
             _check_by_id(report, "state.deployment_binding")["status"],
             PASS,
@@ -243,8 +314,10 @@ class LiveCanaryReadinessTests(unittest.TestCase):
     def test_runtime_local_gate_binds_evidence_to_primary_api_key(self):
         config = _example_config()
         config["api_key"] = "primary-key"
+        config["api_secret"] = "primary-secret"
         config["risk"]["independent_supervisor"]["api_key"] = "risk-key"
-        evidence = _passing_evidence(config)
+        config["risk"]["independent_supervisor"]["api_secret"] = "risk-secret"
+        evidence = _sign_for_runtime(_passing_evidence(config))
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = _write_case(temp_dir, config, evidence)
             self.assertEqual(
@@ -281,15 +354,54 @@ class LiveCanaryReadinessTests(unittest.TestCase):
     def test_dual_key_account_truth_must_match_flat_start_balances(self):
         config = _example_config()
         config["api_key"] = "primary-key"
+        config["api_secret"] = "primary-secret"
         config["risk"]["independent_supervisor"]["api_key"] = "risk-key"
+        config["risk"]["independent_supervisor"]["api_secret"] = "risk-secret"
         evidence = _passing_evidence(config)
         evidence["supervisor_account_truth"]["availableBalance"] = "9999.99"
+        evidence = _sign_for_runtime(evidence)
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = _write_case(temp_dir, config, evidence)
             with self.assertRaisesRegex(
                 ValueError,
                 "same stable flat-start account snapshot",
             ):
+                validate_live_canary_local_evidence(
+                    config,
+                    config_path=config_path,
+                    now_utc=FIXED_NOW,
+                )
+
+    def test_runtime_local_gate_rejects_evidence_tampering(self):
+        config = _example_config()
+        config["api_key"] = "primary-key"
+        config["api_secret"] = "primary-secret"
+        supervisor = config["risk"]["independent_supervisor"]
+        supervisor["api_key"] = "risk-key"
+        supervisor["api_secret"] = "risk-secret"
+        evidence = _sign_for_runtime(_passing_evidence(config))
+        evidence["primary_api_restrictions"]["ipRestrict"] = False
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = _write_case(temp_dir, config, evidence)
+            with self.assertRaisesRegex(ValueError, "primary integrity"):
+                validate_live_canary_local_evidence(
+                    config,
+                    config_path=config_path,
+                    now_utc=FIXED_NOW,
+                )
+
+    def test_runtime_local_gate_rejects_outside_evidence_path(self):
+        config = _example_config()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_directory = root / "config"
+            config_directory.mkdir()
+            config_path = config_directory / "canary.json"
+            evidence_path = root / "evidence.json"
+            config["live_launch"]["offline_evidence_path"] = str(evidence_path)
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            evidence_path.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "config directory"):
                 validate_live_canary_local_evidence(
                     config,
                     config_path=config_path,

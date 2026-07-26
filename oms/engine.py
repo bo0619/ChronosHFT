@@ -1,5 +1,3 @@
-import base64
-import binascii
 import hashlib
 import json
 import math
@@ -8,26 +6,20 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal
 
 from data.cache import data_cache
 from data.ref_data import ref_data_manager
 from infrastructure.commission_truth import resolve_passive_fee_rate
 from infrastructure.logger import logger
-from infrastructure.rpi_calibration_permit import (
-    rpi_calibration_permit_sha256,
-    rpi_calibration_permit_signature_payload,
-)
 from infrastructure.single_writer_fence import SingleWriterFence
 from infrastructure.time_service import time_service
-from strategy.model_readiness import verify_ed25519_signature
 
 from event.type import (
     CancelRequest,
     CommandOutcome,
     ExecutionPolicy,
     Event,
-    ExchangeAccountUpdate,
     ExchangeOrderUpdate,
     GatewayCommandResult,
     LifecycleState,
@@ -38,13 +30,11 @@ from event.type import (
     OrderSubmitResult,
     OrderSubmitted,
     Side,
-    TradeData,
     EVENT_ORDER_SUBMITTED,
     EVENT_EXCHANGE_ORDER_UPDATE,
     EVENT_ORDER_UPDATE,
     EVENT_POSITION_UPDATE,
     EVENT_SYSTEM_HEALTH,
-    EVENT_TRADE_UPDATE,
     TIF_GTC,
     TIF_GTX,
     TIF_IOC,
@@ -52,64 +42,47 @@ from event.type import (
 )
 
 from .account_manager import AccountManager
+from .audit_logger import OMSAuditLogger
+from .background_tasks import OMSBackgroundTaskExecutor
+from .component import component_method
+from .exchange_event_processor import OMSExchangeEventProcessor
 from .exposure import ExposureManager
-from .journal import JournalCorruptionError, JournalError, OMSJournal
+from .guard_manager import OMSGuardManager
+from .journal import JournalError, OMSJournal
+from .journal_rebuilder import OMSJournalRebuilder
 from .order import Order
 from .order_manager import OrderManager
+from .order_submission import OMSOrderSubmission
+from .outbound_budget import OutboundMessageBudget
+from .reconciler import OMSReconciler
+from .rpi_calibration_manager import RpiCalibrationManager
+from .rpi_calibration_replay import RpiCalibrationReplay
+from .rpi_calibration_runtime import RpiCalibrationRuntime
 from .validator import OrderValidator
 
 
 class OMS:
-    """Deterministic OMS for a single Binance perpetual account."""
+    """Coordinate deterministic OMS components for one perpetual account.
+
+    The facade retains shared lifecycle, locks and account-level ledgers.
+    Domain workflows such as submission, replay, guards and reconciliation
+    are delegated to focused components in this package.
+    """
 
     SUPPORTED_POSITION_MODES = frozenset({"ONE_WAY"})
-    RPI_CALIBRATION_STAGE = "rpi_calibration_canary"
-    RPI_CALIBRATION_VENUE = "BINANCE_USDM"
-    RPI_CALIBRATION_MODEL = "glft"
+    RPI_CALIBRATION_STAGE = RpiCalibrationManager.RPI_CALIBRATION_STAGE
+    RPI_CALIBRATION_VENUE = RpiCalibrationManager.RPI_CALIBRATION_VENUE
+    RPI_CALIBRATION_MODEL = RpiCalibrationManager.RPI_CALIBRATION_MODEL
     RPI_CALIBRATION_STRATEGY_ID = "GLFT_MultiScale"
     RPI_CALIBRATION_JOURNAL_SCHEMA = "chronoshft.oms_rpi_calibration_quota.v1"
-    RPI_CALIBRATION_PERMIT_KEYS = frozenset(
-        {
-            "schema",
-            "permit_id",
-            "deployment_id",
-            "stage",
-            "venue",
-            "symbol",
-            "model",
-            "issued_at_utc",
-            "not_before_utc",
-            "expires_at_utc",
-            "calibration_config_sha256",
-            "target_deployment_config_sha256",
-            "strategy_policy_sha256",
-            "implementation_sha256",
-            "policy",
-            "authorized_by",
-            "signature",
-        }
+    RPI_CALIBRATION_PERMIT_KEYS = (
+        RpiCalibrationManager.RPI_CALIBRATION_PERMIT_KEYS
     )
-    RPI_CALIBRATION_POLICY_KEYS = frozenset(
-        {
-            "fixed_depths_bps",
-            "order_ttl_sec",
-            "min_order_interval_sec",
-            "max_active_orders",
-            "max_order_count",
-            "min_order_notional_usdt",
-            "max_order_notional_usdt",
-            "max_cumulative_submitted_notional_usdt",
-            "max_calibration_loss_usdt",
-        }
+    RPI_CALIBRATION_POLICY_KEYS = (
+        RpiCalibrationManager.RPI_CALIBRATION_POLICY_KEYS
     )
-    RPI_CALIBRATION_SIGNATURE_KEYS = frozenset(
-        {
-            "algorithm",
-            "key_id",
-            "signer",
-            "signed_payload_sha256",
-            "signature_base64",
-        }
+    RPI_CALIBRATION_SIGNATURE_KEYS = (
+        RpiCalibrationManager.RPI_CALIBRATION_SIGNATURE_KEYS
     )
     RPI_CALIBRATION_ACTIVATION_PAYLOAD_KEYS = frozenset(
         {
@@ -220,7 +193,7 @@ class OMS:
             "reason",
         }
     )
-    USDT_MICRO_SCALE = Decimal("1000000")
+    USDT_MICRO_SCALE = RpiCalibrationManager.USDT_MICRO_SCALE
     OUTBOUND_NEW_ORDER = "NEW_ORDER"
     OUTBOUND_REDUCE_ORDER = "REDUCE_ORDER"
     OUTBOUND_CANCEL = "CANCEL"
@@ -235,6 +208,18 @@ class OMS:
             "ASSET_TRANSFER",
         }
     )
+
+    @property
+    def rpi_calibration_runtime(self) -> RpiCalibrationRuntime:
+        runtime = self.__dict__.get("_rpi_calibration_runtime")
+        if runtime is None:
+            runtime = RpiCalibrationRuntime(self)
+            self.__dict__["_rpi_calibration_runtime"] = runtime
+        return runtime
+
+    @rpi_calibration_runtime.setter
+    def rpi_calibration_runtime(self, runtime: RpiCalibrationRuntime) -> None:
+        self.__dict__["_rpi_calibration_runtime"] = runtime
 
     def __init__(self, event_engine, gateway, config):
         self.event_engine = event_engine
@@ -354,6 +339,12 @@ class OMS:
 
         self.event_log = []
         self.orders = {}
+        # A submit remains in-flight from its first local reservation until
+        # the transport outcome has been durably settled.  Cancels received
+        # during that interval are coalesced and either fence the POST or run
+        # once settlement has established whether the order can be live.
+        self._submit_settlement_inflight_oids = set()
+        self._submit_cancel_requested_oids = set()
         self.exchange_id_map = {}
         self.symbol_guards = {}
         # A symbol can be unsafe for several independent reasons at once
@@ -375,13 +366,15 @@ class OMS:
         self._outbound_gate_epoch = 0
         self._outbound_gate_reason = "startup_bootstrap"
         self._outbound_gate_holds = set()
+        self._outbound_all_order_seal_reason = ""
         self._outbound_risk_sends_inflight = 0
         self._outbound_order_sends_inflight = 0
         self._outbound_risk_sends_inflight_by_symbol = {}
         self._shutdown_requested = False
         self._shutdown_reason = ""
         self._shutdown_cancel_verified = False
-        self._rpi_calibration = self._load_rpi_calibration_config(config)
+        self.rpi_calibration_manager = RpiCalibrationManager(config)
+        self._rpi_calibration = self.rpi_calibration_manager.runtime_config
         self._rpi_calibration_permit_activated = False
         self._rpi_calibration_expired = False
         self._rpi_calibration_expiry_reason = ""
@@ -406,6 +399,12 @@ class OMS:
         self._rpi_calibration_reservation_exchange_ns = {}
         self._rpi_calibration_ttl_cancel_oids = set()
         self._rpi_calibration_enforcement_inflight = False
+        self._rpi_calibration_terminal_cancel_sweep_completed = False
+        self._rpi_calibration_terminal_empty_snapshots = 0
+        self._rpi_calibration_terminal_verified = False
+        self._rpi_calibration_terminal_pending_reason = ""
+        self._rpi_calibration_terminal_generation = 0
+        self._rpi_calibration_enforcement_thread = None
         self._known_account_order_symbols = {
             str(symbol or "").upper()
             for symbol in config.get("symbols", [])
@@ -426,14 +425,29 @@ class OMS:
         self.mode_constraint_generations = {}
         self.mode_constraint_generation = 0
 
-        target_leverage = int(config.get("account", {}).get("leverage", 0) or 0)
+        account_config = config.get("account", {}) or {}
+        target_leverage = int(account_config.get("leverage", 0) or 0)
         if target_leverage > 0:
             self.gateway.target_leverage = target_leverage
         target_margin_type = str(
-            config.get("account", {}).get("margin_type", "CROSSED") or "CROSSED"
+            account_config.get("margin_type", "CROSSED") or "CROSSED"
         ).upper()
         self.gateway.target_margin_type = target_margin_type
         self.gateway.target_position_mode = target_position_mode
+        account_configuration_mode = str(
+            account_config.get("configuration_mode", "") or ""
+        ).strip().upper()
+        live_stage = str(
+            (config.get("live_launch", {}) or {}).get("stage", "") or ""
+        ).strip().lower()
+        if live_stage in {"canary", "rpi_calibration_canary"}:
+            if account_configuration_mode != "VERIFY_ONLY":
+                raise ValueError(
+                    "Live canary account.configuration_mode must be VERIFY_ONLY"
+                )
+        elif not account_configuration_mode:
+            account_configuration_mode = "APPLY"
+        self.gateway.account_configuration_mode = account_configuration_mode
 
         risk_limits = config.get("risk", {}).get("limits", {}) or {}
         self.max_pos_notional = risk_limits.get(
@@ -610,6 +624,7 @@ class OMS:
         )
 
         self.journal = OMSJournal(config)
+        self.audit_logger = OMSAuditLogger(self.journal)
         if self._rpi_calibration["enabled"] and not (
             self.journal.enabled
             and self.journal.replay_on_startup
@@ -637,6 +652,13 @@ class OMS:
         self.last_halt_reason = ""
         self.recovered_guard_cleanup_pending = False
         self._recovered_guard_cleanup_snapshot = None
+        self.rpi_calibration_replay = RpiCalibrationReplay(self)
+        self.rpi_calibration_runtime = RpiCalibrationRuntime(self)
+        self.guard_manager = OMSGuardManager(self)
+        self.exchange_event_processor = OMSExchangeEventProcessor(self)
+        self.journal_rebuilder = OMSJournalRebuilder(self)
+        self.reconciler = OMSReconciler(self)
+        self.order_submission = OMSOrderSubmission(self)
         self.rebuild_summary = self.rebuild_from_log()
         self._apply_rebuild_summary()
 
@@ -726,39 +748,20 @@ class OMS:
             float(oms_cfg.get("duplicate_intent_window_ms", 250.0) or 0.0) / 1000.0,
         )
         outbound_budget = oms_cfg.get("outbound_message_budget", {})
-        self.outbound_message_budget_enabled = bool(
-            outbound_budget.get("enabled", False)
+        self._outbound_budget = OutboundMessageBudget(outbound_budget)
+        # Compatibility aliases remain read-only from the OMS perspective.
+        self.outbound_message_budget_enabled = self._outbound_budget.enabled
+        self.outbound_message_window_sec = self._outbound_budget.window_sec
+        self.max_total_messages_per_window = self._outbound_budget.max_total
+        self.max_new_orders_per_window = self._outbound_budget.max_new_orders
+        self.max_reduce_orders_per_window = (
+            self._outbound_budget.max_reduce_orders
         )
-        self.outbound_message_window_sec = max(
-            0.05,
-            float(outbound_budget.get("window_sec", 1.0) or 1.0),
-        )
-        self.max_total_messages_per_window = max(
-            0,
-            int(outbound_budget.get("max_total_messages_per_window", 20) or 0),
-        )
-        self.max_new_orders_per_window = max(
-            0,
-            int(outbound_budget.get("max_new_orders_per_window", 10) or 0),
-        )
-        self.max_reduce_orders_per_window = max(
-            0,
-            int(outbound_budget.get("max_reduce_orders_per_window", 10) or 0),
-        )
-        self.max_cancel_messages_per_window = max(
-            0,
-            int(outbound_budget.get("max_cancel_messages_per_window", 20) or 0),
-        )
-        configured_reserved = max(
-            0,
-            int(outbound_budget.get("reserved_risk_messages_per_window", 5) or 0),
-        )
+        self.max_cancel_messages_per_window = self._outbound_budget.max_cancels
         self.reserved_risk_messages_per_window = (
-            min(configured_reserved, self.max_total_messages_per_window)
-            if self.max_total_messages_per_window > 0
-            else configured_reserved
+            self._outbound_budget.reserved_risk_messages
         )
-        self.outbound_message_history = deque()
+        self.outbound_message_history = self._outbound_budget.history
         self._deferred_cancel_oids = set()
         self._deferred_cancel_all_symbols = set()
         self._stopped = False
@@ -793,550 +796,65 @@ class OMS:
         self.last_reconcile_failure_ts = 0.0
         self.consecutive_reconcile_api_failures = 0
         self._reconcile_thread = None
-
-    @staticmethod
-    def _canonical_json(value: dict) -> str:
-        return json.dumps(
-            value,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
+        background_cfg = oms_cfg.get("background_tasks", {}) or {}
+        background_workers = max(
+            2,
+            int(background_cfg.get("max_workers", 8) or 8),
         )
-
-    @staticmethod
-    def _require_exact_mapping_keys(
-        value,
-        expected_keys,
-        context: str,
-    ) -> dict:
-        if not isinstance(value, dict):
-            raise ValueError(f"{context} must be an object")
-        actual_keys = set(value)
-        expected_keys = set(expected_keys)
-        if actual_keys != expected_keys:
-            missing = sorted(expected_keys - actual_keys)
-            extra = sorted(actual_keys - expected_keys)
-            raise ValueError(
-                f"{context} keys are invalid: missing={missing}, extra={extra}"
-            )
-        return value
-
-    @staticmethod
-    def _require_sha256(value, context: str) -> str:
-        digest = str(value or "").lower()
-        if len(digest) != 64 or any(
-            character not in "0123456789abcdef" for character in digest
-        ):
-            raise ValueError(f"{context} must be a lowercase SHA-256 hex digest")
-        if str(value or "") != digest:
-            raise ValueError(f"{context} must use lowercase hexadecimal")
-        return digest
-
-    @staticmethod
-    def _finite_decimal(value, context: str) -> Decimal:
-        if isinstance(value, bool):
-            raise ValueError(f"{context} must be numeric")
-        try:
-            parsed = Decimal(str(value))
-        except (InvalidOperation, TypeError, ValueError) as exc:
-            raise ValueError(f"{context} must be numeric") from exc
-        if not parsed.is_finite():
-            raise ValueError(f"{context} must be finite")
-        return parsed
-
-    @classmethod
-    def _positive_decimal(cls, value, context: str) -> Decimal:
-        parsed = cls._finite_decimal(value, context)
-        if parsed <= 0:
-            raise ValueError(f"{context} must be finite and positive")
-        return parsed
-
-    @staticmethod
-    def _decimal_text(value: Decimal) -> str:
-        return format(value.normalize(), "f")
-
-    @classmethod
-    def _usdt_to_microu(
-        cls,
-        value: Decimal,
-        *,
-        upper_bound: bool,
-    ) -> int:
-        rounding = ROUND_FLOOR if upper_bound else ROUND_CEILING
-        return int(
-            (value * cls.USDT_MICRO_SCALE).to_integral_value(
-                rounding=rounding
-            )
+        background_safety_workers = min(
+            background_workers - 1,
+            max(
+                1,
+                int(background_cfg.get("safety_workers", 2) or 2),
+            ),
         )
-
-    @staticmethod
-    def _parse_utc_exchange_ns(value, context: str) -> int:
-        text = str(value or "").strip()
-        if not text:
-            raise ValueError(f"{context} is required")
-        try:
-            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise ValueError(f"{context} must be an ISO-8601 timestamp") from exc
-        if parsed.tzinfo is None:
-            raise ValueError(f"{context} must include a UTC offset")
-        parsed = parsed.astimezone(timezone.utc)
-        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-        delta = parsed - epoch
-        return (
-            (delta.days * 86_400 + delta.seconds) * 1_000_000_000
-            + delta.microseconds * 1_000
-        )
-
-    @classmethod
-    def _verify_rpi_calibration_permit_signature(
-        cls,
-        permit: dict,
-        trusted_signers: dict,
-        *,
-        context: str,
-    ) -> None:
-        signature = cls._require_exact_mapping_keys(
-            permit.get("signature"),
-            cls.RPI_CALIBRATION_SIGNATURE_KEYS,
-            f"{context} signature",
-        )
-        if not isinstance(trusted_signers, dict) or not trusted_signers:
-            raise ValueError(f"{context} trusted signer keyring is required")
-        if signature.get("algorithm") != "ED25519":
-            raise ValueError(f"{context} signature algorithm must be ED25519")
-
-        key_id = signature.get("key_id")
-        signer = signature.get("signer")
-        authorized_by = permit.get("authorized_by")
-        if (
-            not isinstance(key_id, str)
-            or not key_id
-            or key_id != key_id.strip()
-            or not isinstance(signer, str)
-            or not signer
-            or signer != signer.strip()
-            or signer != authorized_by
-        ):
-            raise ValueError(f"{context} signer identity is invalid")
-        trusted_signer = trusted_signers.get(key_id)
-        trusted_signer = cls._require_exact_mapping_keys(
-            trusted_signer,
-            {"algorithm", "public_key_base64"},
-            f"{context} trusted signer {key_id!r}",
-        )
-        if trusted_signer.get("algorithm") != "ED25519":
-            raise ValueError(
-                f"{context} trusted signer {key_id!r} must use ED25519"
-            )
-
-        public_key_text = trusted_signer.get("public_key_base64")
-        signature_text = signature.get("signature_base64")
-        if not isinstance(public_key_text, str) or not isinstance(
-            signature_text,
-            str,
-        ):
-            raise ValueError(f"{context} key and signature must be base64 text")
-        try:
-            public_key = base64.b64decode(public_key_text, validate=True)
-            signature_bytes = base64.b64decode(
-                signature_text,
-                validate=True,
-            )
-        except (binascii.Error, ValueError) as exc:
-            raise ValueError(f"{context} contains invalid base64") from exc
-        if (
-            len(public_key) != 32
-            or len(signature_bytes) != 64
-            or base64.b64encode(public_key).decode("ascii") != public_key_text
-            or base64.b64encode(signature_bytes).decode("ascii")
-            != signature_text
-        ):
-            raise ValueError(f"{context} key or signature is not canonical")
-
-        signed_payload = rpi_calibration_permit_signature_payload(permit)
-        signed_payload_sha256 = cls._require_sha256(
-            signature.get("signed_payload_sha256"),
-            f"{context} signed-payload SHA-256",
-        )
-        if (
-            hashlib.sha256(signed_payload).hexdigest()
-            != signed_payload_sha256
-        ):
-            raise ValueError(f"{context} signed-payload SHA-256 mismatch")
-        try:
-            verified = verify_ed25519_signature(
-                public_key,
-                signed_payload,
-                signature_bytes,
-            )
-        except Exception as exc:
-            raise ValueError(
-                f"{context} Ed25519 verifier failed closed"
-            ) from exc
-        if verified is not True:
-            raise ValueError(f"{context} Ed25519 signature is invalid")
-
-    @classmethod
-    def _load_rpi_calibration_config(cls, config: dict) -> dict:
-        live_launch = config.get("live_launch", {}) or {}
-        stage = str(live_launch.get("stage", "") or "").strip()
-        wrapper = config.get("_validated_rpi_calibration_permit")
-        if stage != cls.RPI_CALIBRATION_STAGE:
-            if wrapper is not None:
-                raise ValueError(
-                    "Validated RPI calibration permit is only valid in "
-                    f"{cls.RPI_CALIBRATION_STAGE!r}"
+        self._background_task_rejection_count = 0
+        self._pending_reconcile_requests = []
+        self._max_pending_reconcile_requests = max(
+            8,
+            int(
+                background_cfg.get(
+                    "max_pending_reconcile_requests",
+                    256,
                 )
-            return {"enabled": False}
-
-        wrapper = cls._require_exact_mapping_keys(
-            wrapper,
-            {
-                "permit",
-                "permit_sha256",
-                "calibration_config_sha256",
-                "target_deployment_config_sha256",
-            },
-            "_validated_rpi_calibration_permit",
-        )
-        permit = cls._require_exact_mapping_keys(
-            wrapper["permit"],
-            cls.RPI_CALIBRATION_PERMIT_KEYS,
-            "RPI calibration permit",
-        )
-        policy = cls._require_exact_mapping_keys(
-            permit["policy"],
-            cls.RPI_CALIBRATION_POLICY_KEYS,
-            "RPI calibration permit policy",
-        )
-        cls._require_exact_mapping_keys(
-            permit["signature"],
-            cls.RPI_CALIBRATION_SIGNATURE_KEYS,
-            "RPI calibration permit signature",
-        )
-
-        permit_sha256 = cls._require_sha256(
-            wrapper["permit_sha256"],
-            "validated RPI calibration permit SHA-256",
-        )
-        calculated_permit_sha256 = hashlib.sha256(
-            cls._canonical_json(permit).encode("utf-8")
-        ).hexdigest()
-        if calculated_permit_sha256 != permit_sha256:
-            raise ValueError(
-                "Validated RPI calibration permit SHA-256 does not match "
-                "the exact signed permit"
-            )
-
-        calibration_config_sha256 = cls._require_sha256(
-            wrapper["calibration_config_sha256"],
-            "validated calibration config SHA-256",
-        )
-        target_config_sha256 = cls._require_sha256(
-            wrapper["target_deployment_config_sha256"],
-            "validated target deployment config SHA-256",
-        )
-        if (
-            cls._require_sha256(
-                permit["calibration_config_sha256"],
-                "permit calibration config SHA-256",
-            )
-            != calibration_config_sha256
-        ):
-            raise ValueError("Calibration config SHA-256 wrapper mismatch")
-        if (
-            cls._require_sha256(
-                permit["target_deployment_config_sha256"],
-                "permit target deployment config SHA-256",
-            )
-            != target_config_sha256
-        ):
-            raise ValueError("Target deployment config SHA-256 wrapper mismatch")
-
-        permit_id = str(permit["permit_id"] or "").strip()
-        deployment_id = str(permit["deployment_id"] or "").strip()
-        schema = str(permit["schema"] or "").strip()
-        symbol = str(permit["symbol"] or "").upper().strip()
-        if not schema or not permit_id or not deployment_id or not symbol:
-            raise ValueError(
-                "RPI calibration permit identity fields must be non-empty"
-            )
-        if permit["stage"] != cls.RPI_CALIBRATION_STAGE:
-            raise ValueError("RPI calibration permit stage mismatch")
-        if permit["venue"] != cls.RPI_CALIBRATION_VENUE:
-            raise ValueError("RPI calibration permit venue mismatch")
-        if permit["model"] != cls.RPI_CALIBRATION_MODEL:
-            raise ValueError("RPI calibration permit model mismatch")
-        configured_symbols = {
-            str(item or "").upper().strip()
-            for item in config.get("symbols", [])
-            if str(item or "").strip()
-        }
-        if symbol not in configured_symbols:
-            raise ValueError(
-                "RPI calibration permit symbol is not configured for this OMS"
-            )
-
-        issued_at_ns = cls._parse_utc_exchange_ns(
-            permit["issued_at_utc"],
-            "RPI calibration permit issued_at_utc",
-        )
-        not_before_ns = cls._parse_utc_exchange_ns(
-            permit["not_before_utc"],
-            "RPI calibration permit not_before_utc",
-        )
-        expires_at_ns = cls._parse_utc_exchange_ns(
-            permit["expires_at_utc"],
-            "RPI calibration permit expires_at_utc",
-        )
-        if issued_at_ns > expires_at_ns or not_before_ns >= expires_at_ns:
-            raise ValueError("RPI calibration permit time window is invalid")
-
-        raw_depths = policy["fixed_depths_bps"]
-        if not isinstance(raw_depths, list) or not raw_depths:
-            raise ValueError(
-                "RPI calibration fixed_depths_bps must be a non-empty list"
-            )
-        fixed_depths = tuple(
-            cls._positive_decimal(value, "RPI calibration depth")
-            for value in raw_depths
-        )
-        fixed_depth_texts = tuple(
-            cls._decimal_text(value) for value in fixed_depths
-        )
-        if len(set(fixed_depth_texts)) != len(fixed_depth_texts):
-            raise ValueError("RPI calibration depths must be unique")
-        if not 3 <= len(fixed_depths) <= 16:
-            raise ValueError(
-                "RPI calibration requires between 3 and 16 fixed depths"
-            )
-        if any(
-            right <= left
-            for left, right in zip(fixed_depths, fixed_depths[1:])
-        ):
-            raise ValueError(
-                "RPI calibration fixed depths must be strictly increasing"
-            )
-        if fixed_depths[-1] > Decimal("1000"):
-            raise ValueError(
-                "RPI calibration fixed depth must not exceed 1000 bps"
-            )
-        if fixed_depths[-1] - fixed_depths[0] < Decimal("0.5"):
-            raise ValueError(
-                "RPI calibration fixed-depth span must be at least 0.5 bps"
-            )
-
-        order_ttl_sec = cls._positive_decimal(
-            policy["order_ttl_sec"],
-            "RPI calibration order TTL",
-        )
-        min_order_interval_sec = cls._positive_decimal(
-            policy["min_order_interval_sec"],
-            "RPI calibration minimum order interval",
-        )
-        if order_ttl_sec > Decimal("60"):
-            raise ValueError(
-                "RPI calibration order TTL must not exceed 60 seconds"
-            )
-        if order_ttl_sec > min_order_interval_sec:
-            raise ValueError(
-                "RPI calibration order TTL must not exceed its order interval"
-            )
-        if not (
-            Decimal("5")
-            <= min_order_interval_sec
-            <= Decimal("3600")
-        ):
-            raise ValueError(
-                "RPI calibration order interval must be between 5 and "
-                "3600 seconds"
-            )
-        max_active_orders = policy["max_active_orders"]
-        max_order_count = policy["max_order_count"]
-        for value, context in (
-            (max_active_orders, "RPI calibration max active orders"),
-            (max_order_count, "RPI calibration max order count"),
-        ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value <= 0
-            ):
-                raise ValueError(f"{context} must be a positive integer")
-        if max_active_orders != 1:
-            raise ValueError("RPI calibration max_active_orders must equal 1")
-        if max_order_count > 100:
-            raise ValueError(
-                "RPI calibration max_order_count must not exceed 100"
-            )
-        permit_window_ns = expires_at_ns - not_before_ns
-        required_schedule_ns = int(
-            (
-                (
-                    Decimal(max_order_count - 1)
-                    * min_order_interval_sec
-                    + order_ttl_sec
-                )
-                * Decimal("1000000000")
-            ).to_integral_value(rounding=ROUND_CEILING)
-        )
-        if required_schedule_ns > permit_window_ns:
-            raise ValueError(
-                "RPI calibration order schedule does not fit its permit window"
-            )
-
-        min_order_notional = cls._positive_decimal(
-            policy["min_order_notional_usdt"],
-            "RPI calibration minimum order notional",
-        )
-        max_order_notional = cls._positive_decimal(
-            policy["max_order_notional_usdt"],
-            "RPI calibration maximum order notional",
-        )
-        max_cumulative_notional = cls._positive_decimal(
-            policy["max_cumulative_submitted_notional_usdt"],
-            "RPI calibration cumulative notional cap",
-        )
-        max_calibration_loss = cls._positive_decimal(
-            policy["max_calibration_loss_usdt"],
-            "RPI calibration loss cap",
-        )
-        if min_order_notional > max_order_notional:
-            raise ValueError(
-                "RPI calibration minimum notional exceeds maximum notional"
-            )
-        if max_order_notional > Decimal("8"):
-            raise ValueError(
-                "RPI calibration maximum order notional must not exceed 8 USDT"
-            )
-        configured_order_cap = cls._positive_decimal(
-            (
-                (config.get("risk", {}) or {})
-                .get("limits", {})
-                or {}
-            ).get("max_order_notional"),
-            "configured maximum order notional",
-        )
-        if max_order_notional > configured_order_cap:
-            raise ValueError(
-                "RPI calibration order cap exceeds the configured risk cap"
-            )
-        if max_cumulative_notional < min_order_notional:
-            raise ValueError(
-                "RPI calibration cumulative cap is below one legal order"
-            )
-        if (
-            max_cumulative_notional
-            > Decimal(max_order_count) * max_order_notional
-        ):
-            raise ValueError(
-                "RPI calibration cumulative cap exceeds count times "
-                "per-order cap"
-            )
-        if max_calibration_loss > Decimal("2"):
-            raise ValueError(
-                "RPI calibration loss cap must not exceed 2 USDT"
-            )
-        deployment_loss_cap = cls._positive_decimal(
-            live_launch.get("max_deployment_loss_usdt"),
-            "live launch deployment loss cap",
-        )
-        if max_calibration_loss > deployment_loss_cap:
-            raise ValueError(
-                "RPI calibration loss cap exceeds deployment loss cap"
-            )
-
-        strategy_policy_sha256 = cls._require_sha256(
-            permit["strategy_policy_sha256"],
-            "RPI calibration strategy policy SHA-256",
-        )
-        implementation_sha256 = cls._require_sha256(
-            permit["implementation_sha256"],
-            "RPI calibration implementation SHA-256",
-        )
-        freshness = (
-            (config.get("risk", {}) or {}).get(
-                "market_data_freshness",
-                {},
-            )
-            or {}
-        )
-        max_mark_age_ms = cls._positive_decimal(
-            freshness.get("max_mark_age_ms"),
-            "configured maximum mark age",
-        )
-        max_book_age_ms = cls._positive_decimal(
-            freshness.get("max_book_age_ms"),
-            "configured maximum book age",
-        )
-        trusted_signers = live_launch.get(
-            "calibration_permit_trusted_signers"
-        )
-        if not isinstance(trusted_signers, dict) or not trusted_signers:
-            raise ValueError(
-                "RPI calibration trusted signer keyring is required"
-            )
-        cls._verify_rpi_calibration_permit_signature(
-            permit,
-            trusted_signers,
-            context="RPI calibration permit",
-        )
-        return {
-            "enabled": True,
-            "signed_permit": json.loads(cls._canonical_json(permit)),
-            "trusted_signers": json.loads(
-                cls._canonical_json(trusted_signers)
+                or 256
             ),
-            "schema": schema,
-            "permit_id": permit_id,
-            "permit_sha256": permit_sha256,
-            "deployment_id": deployment_id,
-            "symbol": symbol,
-            "calibration_config_sha256": calibration_config_sha256,
-            "target_deployment_config_sha256": target_config_sha256,
-            "strategy_policy_sha256": strategy_policy_sha256,
-            "implementation_sha256": implementation_sha256,
-            "issued_at": str(permit["issued_at_utc"]),
-            "not_before": str(permit["not_before_utc"]),
-            "expires_at": str(permit["expires_at_utc"]),
-            "issued_at_ns": issued_at_ns,
-            "not_before_ns": not_before_ns,
-            "expires_at_ns": expires_at_ns,
-            "fixed_depths_bps": fixed_depth_texts,
-            "order_ttl_sec": order_ttl_sec,
-            "order_ttl_ns": int(
-                (order_ttl_sec * Decimal("1000000000")).to_integral_value(
-                    rounding=ROUND_CEILING
-                )
+        )
+        self._background_tasks = OMSBackgroundTaskExecutor(
+            max_workers=background_workers,
+            safety_workers=background_safety_workers,
+            queue_capacity=max(
+                1,
+                int(background_cfg.get("queue_capacity", 64) or 64),
             ),
-            "min_order_interval_sec": min_order_interval_sec,
-            "min_order_interval_ns": int(
-                (
-                    min_order_interval_sec * Decimal("1000000000")
-                ).to_integral_value(rounding=ROUND_CEILING)
+            safety_queue_capacity=max(
+                1,
+                int(
+                    background_cfg.get("safety_queue_capacity", 16) or 16
+                ),
             ),
-            "max_active_orders": max_active_orders,
-            "max_order_count": max_order_count,
-            "min_order_notional_microu": cls._usdt_to_microu(
-                min_order_notional,
-                upper_bound=False,
+            max_pending_tasks=max(
+                background_workers,
+                int(background_cfg.get("max_pending_tasks", 96) or 96),
             ),
-            "max_order_notional_microu": cls._usdt_to_microu(
-                max_order_notional,
-                upper_bound=True,
-            ),
-            "max_cumulative_notional_microu": cls._usdt_to_microu(
-                max_cumulative_notional,
-                upper_bound=True,
-            ),
-            "max_calibration_loss_microu": cls._usdt_to_microu(
-                max_calibration_loss,
-                upper_bound=True,
-            ),
-            "max_mark_age_ms": float(max_mark_age_ms),
-            "max_book_age_ms": float(max_book_age_ms),
-        }
+            error_handler=self._on_background_task_error,
+        )
+
+    _canonical_json = staticmethod(RpiCalibrationManager._canonical_json)
+    _require_exact_mapping_keys = staticmethod(
+        RpiCalibrationManager._require_exact_mapping_keys
+    )
+    _require_sha256 = staticmethod(RpiCalibrationManager._require_sha256)
+    _finite_decimal = staticmethod(RpiCalibrationManager._finite_decimal)
+    _positive_decimal = staticmethod(RpiCalibrationManager._positive_decimal)
+    _decimal_text = staticmethod(RpiCalibrationManager._decimal_text)
+    _usdt_to_microu = staticmethod(RpiCalibrationManager._usdt_to_microu)
+    _parse_utc_exchange_ns = staticmethod(
+        RpiCalibrationManager._parse_utc_exchange_ns
+    )
+    _verify_rpi_calibration_permit_signature = staticmethod(
+        RpiCalibrationManager._verify_rpi_calibration_permit_signature
+    )
 
     def bootstrap(self):
         logger.info("OMS: Bootstrapping state...")
@@ -1845,10 +1363,20 @@ class OMS:
         *,
         risk_increasing: bool,
         symbol: str = "",
+        allow_shutdown_emergency: bool = False,
     ) -> tuple[int | None, str]:
         symbol = str(symbol or "").upper()
         with self._outbound_gate_condition:
-            if self._shutdown_requested or getattr(self, "_stopped", False):
+            if getattr(self, "_stopped", False):
+                reason = self._shutdown_reason or "oms_stopping"
+                return None, f"shutdown_requested:{reason}"
+            if self._outbound_all_order_seal_reason:
+                return (
+                    None,
+                    "outbound_order_gate_closed:"
+                    f"{self._outbound_all_order_seal_reason}",
+                )
+            if self._shutdown_requested and not allow_shutdown_emergency:
                 reason = self._shutdown_reason or "oms_stopping"
                 return None, f"shutdown_requested:{reason}"
             if risk_increasing and not self._outbound_gate_open:
@@ -1927,6 +1455,27 @@ class OMS:
             symbol=symbol,
         )
 
+    def _submit_settlement_count_locked(
+        self,
+        *,
+        risk_increasing_only: bool = False,
+        symbol: str = "",
+    ) -> int:
+        symbol = str(symbol or "").upper()
+        count = 0
+        for client_oid in self._submit_settlement_inflight_oids:
+            order = self.orders.get(client_oid)
+            if order is None:
+                if not risk_increasing_only and not symbol:
+                    count += 1
+                continue
+            if risk_increasing_only and order.intent.reduce_only:
+                continue
+            if symbol and str(order.intent.symbol or "").upper() != symbol:
+                continue
+            count += 1
+        return count
+
     def _wait_for_outbound_risk_sends(
         self,
         context: str,
@@ -1935,8 +1484,8 @@ class OMS:
         symbol = str(symbol or "").upper()
         timeout_sec = self.outbound_gate_drain_timeout_sec
         deadline = time.perf_counter() + timeout_sec
-        with self._outbound_gate_condition:
-            while True:
+        while True:
+            with self._outbound_gate_condition:
                 inflight = (
                     self._outbound_risk_sends_inflight_by_symbol.get(
                         symbol,
@@ -1945,16 +1494,25 @@ class OMS:
                     if symbol
                     else self._outbound_risk_sends_inflight
                 )
-                if inflight <= 0:
-                    return True
-                remaining = deadline - time.perf_counter()
-                if remaining <= 0.0:
-                    break
-                self._outbound_gate_condition.wait(timeout=remaining)
+            with self.lock:
+                settling = self._submit_settlement_count_locked(
+                    risk_increasing_only=True,
+                    symbol=symbol,
+                )
+            if inflight <= 0 and settling <= 0:
+                return True
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0.0:
+                break
+            with self._outbound_gate_condition:
+                self._outbound_gate_condition.wait(
+                    timeout=min(remaining, 0.05)
+                )
 
         logger.critical(
             "[OMS] Outbound risk-send drain timed out "
             f"context={context} symbol={symbol or '*'} inflight={inflight} "
+            f"settling={settling} "
             f"timeout={timeout_sec:.3f}s"
         )
         try:
@@ -1963,6 +1521,7 @@ class OMS:
                 context=context,
                 symbol=symbol,
                 inflight=inflight,
+                settling=settling,
                 timeout_sec=timeout_sec,
             )
         except JournalError as exc:
@@ -1975,25 +1534,32 @@ class OMS:
     def _wait_for_outbound_order_sends(self, context: str) -> bool:
         timeout_sec = self.outbound_gate_drain_timeout_sec
         deadline = time.perf_counter() + timeout_sec
-        with self._outbound_gate_condition:
-            while self._outbound_order_sends_inflight > 0:
-                remaining = deadline - time.perf_counter()
-                if remaining <= 0.0:
-                    inflight = self._outbound_order_sends_inflight
-                    break
-                self._outbound_gate_condition.wait(timeout=remaining)
-            else:
+        while True:
+            with self._outbound_gate_condition:
+                inflight = self._outbound_order_sends_inflight
+            with self.lock:
+                settling = self._submit_settlement_count_locked()
+            if inflight <= 0 and settling <= 0:
                 return True
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0.0:
+                break
+            with self._outbound_gate_condition:
+                self._outbound_gate_condition.wait(
+                    timeout=min(remaining, 0.05)
+                )
 
         logger.critical(
             "[OMS] Outbound order-send drain timed out "
-            f"context={context} inflight={inflight} timeout={timeout_sec:.3f}s"
+            f"context={context} inflight={inflight} settling={settling} "
+            f"timeout={timeout_sec:.3f}s"
         )
         try:
             self._audit(
                 "outbound_order_gate_drain_timeout",
                 context=context,
                 inflight=inflight,
+                settling=settling,
                 timeout_sec=timeout_sec,
             )
         except JournalError as exc:
@@ -2040,17 +1606,41 @@ class OMS:
         sends_drained = self._wait_for_outbound_order_sends(f"shutdown:{reason}")
         with self.lock:
             reconcile_thread = self._reconcile_thread
+            calibration_enforcement_thread = (
+                self._rpi_calibration_enforcement_thread
+            )
         reconcile_stopped = True
         if (
             reconcile_thread is not None
             and reconcile_thread.is_alive()
-            and reconcile_thread is not threading.current_thread()
+            and not reconcile_thread.is_current()
         ):
             reconcile_thread.join(timeout=self.outbound_gate_drain_timeout_sec)
             reconcile_stopped = not reconcile_thread.is_alive()
             if not reconcile_stopped:
                 logger.critical("[OMS] Reconcile worker did not stop before shutdown")
-        return bool(sends_drained and reconcile_stopped)
+        calibration_enforcement_stopped = True
+        if (
+            calibration_enforcement_thread is not None
+            and calibration_enforcement_thread.is_alive()
+            and not calibration_enforcement_thread.is_current()
+        ):
+            calibration_enforcement_thread.join(
+                timeout=self.outbound_gate_drain_timeout_sec
+            )
+            calibration_enforcement_stopped = (
+                not calibration_enforcement_thread.is_alive()
+            )
+            if not calibration_enforcement_stopped:
+                logger.critical(
+                    "[OMS] RPI calibration enforcement worker did not stop "
+                    "before shutdown"
+                )
+        return bool(
+            sends_drained
+            and reconcile_stopped
+            and calibration_enforcement_stopped
+        )
 
     def verify_preconnect_shutdown_no_order_path(
         self,
@@ -2090,12 +1680,12 @@ class OMS:
                 try:
                     if failure_reason:
                         payload["reason"] = failure_reason
-                        committed_seq = self.journal.append(
+                        committed_seq = self.audit_logger.audit(
                             "preconnect_shutdown_no_order_path_rejected",
                             payload,
                         )
                     else:
-                        committed_seq = self.journal.append(
+                        committed_seq = self.audit_logger.audit(
                             "preconnect_shutdown_no_order_path_verified",
                             payload,
                         )
@@ -2124,152 +1714,14 @@ class OMS:
         return False
 
     def _rpi_calibration_active_orders_locked(self) -> list:
-        if not self._rpi_calibration["enabled"]:
-            return []
-        symbol = self._rpi_calibration["symbol"]
-        active_orders = []
-        for order in self.orders.values():
-            if not order.is_active():
-                continue
-            intent = order.intent
-            has_calibration_metadata = bool(
-                str(
-                    getattr(intent, "calibration_permit_id", "")
-                    or ""
-                ).strip()
-            )
-            is_calibration_flow = (
-                str(intent.symbol or "").upper() == symbol
-                and str(intent.strategy_id or "")
-                == self.RPI_CALIBRATION_STRATEGY_ID
-                and (
-                    has_calibration_metadata
-                    or intent.time_in_force == TIF_RPI
-                )
-            )
-            if is_calibration_flow:
-                active_orders.append(order)
-        return active_orders
+        return self.rpi_calibration_runtime._rpi_calibration_active_orders_locked()
 
     @staticmethod
     def _exchange_ns_to_iso(value: int) -> str:
-        if value <= 0:
-            return ""
-        return datetime.fromtimestamp(
-            value / 1_000_000_000,
-            tz=timezone.utc,
-        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        return RpiCalibrationRuntime._exchange_ns_to_iso(value)
 
     def _rpi_calibration_snapshot_locked(self) -> dict:
-        config = self._rpi_calibration
-        if not config["enabled"]:
-            return {
-                "enabled": False,
-                "permit_id": "",
-                "permit_sha256": "",
-                "expired": False,
-                "budget_exhausted": False,
-                "reserved_order_count": 0,
-                "cumulative_submitted_notional_usdt": 0.0,
-                "last_reserved_exchange_time": 0.0,
-                "active_order_count": 0,
-                "max_order_count": 0,
-                "max_cumulative_submitted_notional_usdt": 0.0,
-                "expires_at": "",
-            }
-        active_orders = self._rpi_calibration_active_orders_locked()
-        permit_reserved_count = max(
-            0,
-            self._rpi_calibration_reserved_order_count
-            - self._rpi_calibration_permit_start_order_count,
-        )
-        permit_cumulative_microu = max(
-            0,
-            self._rpi_calibration_cumulative_notional_microu
-            - self._rpi_calibration_permit_start_notional_microu,
-        )
-        quota_exhausted = bool(
-            self._rpi_calibration_budget_exhausted
-            or permit_reserved_count >= config["max_order_count"]
-            or (
-                permit_cumulative_microu
-                + config["min_order_notional_microu"]
-                > config["max_cumulative_notional_microu"]
-            )
-        )
-        return {
-            "enabled": True,
-            "stage": self.RPI_CALIBRATION_STAGE,
-            "permit_id": config["permit_id"],
-            "permit_sha256": config["permit_sha256"],
-            "deployment_id": config["deployment_id"],
-            "symbol": config["symbol"],
-            "expired": self._rpi_calibration_expired,
-            "expiry_reason": self._rpi_calibration_expiry_reason,
-            "restart_rearm_blocked": (
-                self._rpi_calibration_restart_rearm_blocked
-            ),
-            "budget_exhausted": quota_exhausted,
-            "permit_activated": self._rpi_calibration_permit_activated,
-            "reserved_order_count": (
-                self._rpi_calibration_reserved_order_count
-            ),
-            "permit_reserved_order_count": permit_reserved_count,
-            "cumulative_submitted_notional_usdt": (
-                self._rpi_calibration_cumulative_notional_microu / 1_000_000
-            ),
-            "permit_cumulative_submitted_notional_usdt": (
-                permit_cumulative_microu / 1_000_000
-            ),
-            "last_reserved_exchange_time": (
-                self._rpi_calibration_last_reserved_exchange_ns
-                / 1_000_000_000
-            ),
-            "last_reserved_exchange_time_utc": self._exchange_ns_to_iso(
-                self._rpi_calibration_last_reserved_exchange_ns
-            ),
-            "active_order_count": len(active_orders),
-            "active_or_unknown_client_oids": sorted(
-                order.client_oid for order in active_orders
-            ),
-            "max_active_orders": config["max_active_orders"],
-            "max_order_count": config["max_order_count"],
-            "min_order_notional_usdt": (
-                config["min_order_notional_microu"] / 1_000_000
-            ),
-            "max_order_notional_usdt": (
-                config["max_order_notional_microu"] / 1_000_000
-            ),
-            "max_cumulative_submitted_notional_usdt": (
-                config["max_cumulative_notional_microu"] / 1_000_000
-            ),
-            "max_calibration_loss_usdt": (
-                self._rpi_calibration_effective_loss_cap_microu
-                / 1_000_000
-            ),
-            "signed_max_calibration_loss_usdt": (
-                config["max_calibration_loss_microu"] / 1_000_000
-            ),
-            "peak_observed_calibration_loss_usdt": (
-                self._rpi_calibration_peak_observed_loss_microu / 1_000_000
-            ),
-            "deployment_start_equity_usdt": (
-                self._rpi_calibration_start_equity_microu / 1_000_000
-            ),
-            "fixed_depths_bps": list(config["fixed_depths_bps"]),
-            "order_ttl_sec": float(config["order_ttl_sec"]),
-            "min_order_interval_sec": float(
-                config["min_order_interval_sec"]
-            ),
-            "not_before": config["not_before"],
-            "expires_at": config["expires_at"],
-            "calibration_config_sha256": (
-                config["calibration_config_sha256"]
-            ),
-            "target_deployment_config_sha256": (
-                config["target_deployment_config_sha256"]
-            ),
-        }
+        return self.rpi_calibration_runtime._rpi_calibration_snapshot_locked()
 
     def get_outbound_gate_snapshot(self) -> dict:
         with self.lock:
@@ -2279,12 +1731,21 @@ class OMS:
                     "open": self._outbound_gate_open,
                     "epoch": self._outbound_gate_epoch,
                     "reason": self._outbound_gate_reason,
+                    "all_order_seal_reason": (
+                        self._outbound_all_order_seal_reason
+                    ),
                     "holds": sorted(self._outbound_gate_holds),
                     "risk_sends_inflight": self._outbound_risk_sends_inflight,
                     "risk_sends_inflight_by_symbol": dict(
                         self._outbound_risk_sends_inflight_by_symbol
                     ),
                     "order_sends_inflight": self._outbound_order_sends_inflight,
+                    "submit_settlements_inflight": len(
+                        self._submit_settlement_inflight_oids
+                    ),
+                    "queued_submit_cancels": len(
+                        self._submit_cancel_requested_oids
+                    ),
                     "shutdown_requested": self._shutdown_requested,
                     "shutdown_cancel_verified": (
                         self._shutdown_cancel_verified
@@ -2301,251 +1762,38 @@ class OMS:
         rounding,
         context: str,
     ) -> int:
-        parsed = cls._finite_decimal(value, context)
-        return int(
-            (parsed * cls.USDT_MICRO_SCALE).to_integral_value(
-                rounding=rounding
-            )
+        return RpiCalibrationRuntime._signed_usdt_to_microu(
+            value,
+            rounding=rounding,
+            context=context,
         )
 
     def _rpi_calibration_equity_truth_locked(self) -> tuple[str, int, int]:
-        if not self.account.exchange_balance_synced:
-            return "account_equity_not_exchange_synced", 0, 0
-        if (
-            not self.external_cash_flow_truth_enabled
-            or not self.account.cash_flow_snapshot_synced
-        ):
-            return "external_cash_flow_truth_unavailable", 0, 0
-        snapshot_monotonic = float(
-            self.account.cash_flow_snapshot_monotonic or 0.0
-        )
-        if snapshot_monotonic <= 0.0:
-            return "external_cash_flow_truth_timestamp_missing", 0, 0
-        cash_flow_age_sec = max(
-            0.0,
-            time.perf_counter() - snapshot_monotonic,
-        )
-        if (
-            self.external_cash_flow_max_age_sec > 0.0
-            and cash_flow_age_sec > self.external_cash_flow_max_age_sec
-        ):
-            return "external_cash_flow_truth_stale", 0, 0
-
-        try:
-            balance = self._finite_decimal(
-                self.account.balance,
-                "RPI calibration account balance",
-            )
-            external_cash_flow = self._finite_decimal(
-                self.account.external_cash_flow_total,
-                "RPI calibration external cash flow",
-            )
-            unrealized_pnl = Decimal("0")
-            now_monotonic = time.perf_counter()
-            for symbol, raw_position in self.exposure.net_positions.items():
-                position = self._finite_decimal(
-                    raw_position,
-                    f"RPI calibration position {symbol}",
-                )
-                if abs(position) <= Decimal("0.000000000001"):
-                    continue
-                average_price = self._positive_decimal(
-                    self.exposure.avg_prices.get(symbol, 0.0),
-                    f"RPI calibration average price {symbol}",
-                )
-                market = data_cache.get_risk_snapshot(
-                    symbol,
-                    now=now_monotonic,
-                )
-                mark_price = self._finite_decimal(
-                    market.get("mark_price", 0.0),
-                    f"RPI calibration mark price {symbol}",
-                )
-                mark_age_ms = market.get("mark_age_ms")
-                mark_is_fresh = bool(
-                    mark_price > 0
-                    and mark_age_ms is not None
-                    and float(mark_age_ms)
-                    <= self._rpi_calibration["max_mark_age_ms"]
-                )
-                if mark_is_fresh:
-                    valuation_price = mark_price
-                else:
-                    bid = self._finite_decimal(
-                        market.get("bid_price", 0.0),
-                        f"RPI calibration bid {symbol}",
-                    )
-                    ask = self._finite_decimal(
-                        market.get("ask_price", 0.0),
-                        f"RPI calibration ask {symbol}",
-                    )
-                    book_age_ms = market.get("book_age_ms")
-                    if (
-                        bid <= 0
-                        or ask <= bid
-                        or book_age_ms is None
-                        or float(book_age_ms)
-                        > self._rpi_calibration["max_book_age_ms"]
-                    ):
-                        return (
-                            f"market_valuation_truth_unavailable:{symbol}",
-                            0,
-                            0,
-                        )
-                    valuation_price = (bid + ask) / Decimal("2")
-                unrealized_pnl += (
-                    valuation_price - average_price
-                ) * position
-            equity = balance + unrealized_pnl
-            if equity <= 0:
-                return "account_equity_non_positive", 0, 0
-            equity_microu = self._signed_usdt_to_microu(
-                equity,
-                rounding=ROUND_FLOOR,
-                context="RPI calibration equity",
-            )
-            external_cash_flow_microu = self._signed_usdt_to_microu(
-                external_cash_flow,
-                rounding=ROUND_CEILING,
-                context="RPI calibration external cash flow",
-            )
-        except (TypeError, ValueError) as exc:
-            return f"calibration_loss_truth_invalid:{exc}", 0, 0
-        return "", equity_microu, external_cash_flow_microu
+        return self.rpi_calibration_runtime._rpi_calibration_equity_truth_locked()
 
     def _observe_rpi_calibration_loss_locked(
         self,
         *,
         initialize_baseline: bool,
     ) -> tuple[str, int]:
-        truth_reason, equity_microu, external_cash_flow_microu = (
-            self._rpi_calibration_equity_truth_locked()
+        return self.rpi_calibration_runtime._observe_rpi_calibration_loss_locked(
+            initialize_baseline=initialize_baseline,
         )
-        if truth_reason:
-            return truth_reason, 0
-        if self._rpi_calibration_start_equity_microu <= 0:
-            if not initialize_baseline:
-                return "calibration_loss_baseline_missing", 0
-            # Current equity is floored above. One additional micro-USDT
-            # makes the deployment baseline conservative even when the
-            # unrounded value fell exactly on a micro boundary.
-            self._rpi_calibration_start_equity_microu = equity_microu + 1
-            self._rpi_calibration_start_external_cash_flow_microu = (
-                self._signed_usdt_to_microu(
-                    self.account.external_cash_flow_total,
-                    rounding=ROUND_FLOOR,
-                    context="RPI calibration baseline external cash flow",
-                )
-            )
-        cash_flow_delta_microu = (
-            external_cash_flow_microu
-            - self._rpi_calibration_start_external_cash_flow_microu
-        )
-        adjusted_equity_microu = equity_microu - cash_flow_delta_microu
-        observed_loss_microu = max(
-            0,
-            self._rpi_calibration_start_equity_microu
-            - adjusted_equity_microu,
-        )
-        self._rpi_calibration_peak_observed_loss_microu = max(
-            self._rpi_calibration_peak_observed_loss_microu,
-            observed_loss_microu,
-        )
-        return "", observed_loss_microu
 
     def _rpi_calibration_activation_payload_locked(
         self,
         activated_at_exchange_ns: int,
     ) -> dict:
-        config = self._rpi_calibration
-        return {
-            "schema": self.RPI_CALIBRATION_JOURNAL_SCHEMA,
-            "signed_permit": config["signed_permit"],
-            "permit_id": config["permit_id"],
-            "permit_sha256": config["permit_sha256"],
-            "deployment_id": config["deployment_id"],
-            "stage": self.RPI_CALIBRATION_STAGE,
-            "venue": self.RPI_CALIBRATION_VENUE,
-            "symbol": config["symbol"],
-            "model": self.RPI_CALIBRATION_MODEL,
-            "calibration_config_sha256": (
-                config["calibration_config_sha256"]
-            ),
-            "target_deployment_config_sha256": (
-                config["target_deployment_config_sha256"]
-            ),
-            "strategy_policy_sha256": config["strategy_policy_sha256"],
-            "implementation_sha256": config["implementation_sha256"],
-            "activated_at_exchange_ns": activated_at_exchange_ns,
-            "not_before_exchange_ns": config["not_before_ns"],
-            "expires_at_exchange_ns": config["expires_at_ns"],
-            "fixed_depths_bps": list(config["fixed_depths_bps"]),
-            "order_ttl_ns": config["order_ttl_ns"],
-            "min_order_interval_ns": config["min_order_interval_ns"],
-            "max_active_orders": config["max_active_orders"],
-            "max_order_count": config["max_order_count"],
-            "min_order_notional_microu": (
-                config["min_order_notional_microu"]
-            ),
-            "max_order_notional_microu": (
-                config["max_order_notional_microu"]
-            ),
-            "max_cumulative_submitted_notional_microu": (
-                config["max_cumulative_notional_microu"]
-            ),
-            "max_calibration_loss_microu": (
-                config["max_calibration_loss_microu"]
-            ),
-            "effective_deployment_loss_cap_microu": (
-                self._rpi_calibration_effective_loss_cap_microu
-            ),
-            "deployment_start_equity_microu": (
-                self._rpi_calibration_start_equity_microu
-            ),
-            "deployment_start_external_cash_flow_microu": (
-                self._rpi_calibration_start_external_cash_flow_microu
-            ),
-            "peak_observed_loss_microu": (
-                self._rpi_calibration_peak_observed_loss_microu
-            ),
-            "starting_reserved_order_count": (
-                self._rpi_calibration_reserved_order_count
-            ),
-            "starting_cumulative_submitted_notional_microu": (
-                self._rpi_calibration_cumulative_notional_microu
-            ),
-        }
+        return self.rpi_calibration_runtime._rpi_calibration_activation_payload_locked(
+            activated_at_exchange_ns
+        )
 
     def _activate_rpi_calibration_permit_locked(
         self,
         activated_at_exchange_ns: int,
     ) -> None:
-        if self._rpi_calibration_permit_activated:
-            return
-        if self._rpi_calibration_start_equity_microu <= 0:
-            raise JournalError(
-                "RPI calibration loss baseline is not initialized"
-            )
-        committed_seq = self.journal.append(
-            "rpi_calibration_permit_activated",
-            self._rpi_calibration_activation_payload_locked(
-                activated_at_exchange_ns
-            ),
-        )
-        if not committed_seq:
-            raise JournalError(
-                "RPI calibration permit activation was not committed"
-            )
-        self._rpi_calibration_permit_activated = True
-        self._rpi_calibration_permit_start_order_count = (
-            self._rpi_calibration_reserved_order_count
-        )
-        self._rpi_calibration_permit_start_notional_microu = (
-            self._rpi_calibration_cumulative_notional_microu
-        )
-        self._rpi_calibration_effective_loss_cap_microu = min(
-            self._rpi_calibration_effective_loss_cap_microu,
-            self._rpi_calibration["max_calibration_loss_microu"],
+        self.rpi_calibration_runtime._activate_rpi_calibration_permit_locked(
+            activated_at_exchange_ns
         )
 
     def _expire_rpi_calibration_permit_locked(
@@ -2554,221 +1802,27 @@ class OMS:
         *,
         budget_exhausted: bool = False,
     ) -> bool:
-        if not self._rpi_calibration["enabled"]:
-            return False
-        reason = str(reason or "rpi_calibration_expired")
-        self._close_outbound_gate_locked(
-            f"rpi_calibration:{reason}",
-            hold="rpi_calibration_expired",
+        return self.rpi_calibration_runtime._expire_rpi_calibration_permit_locked(
+            reason,
+            budget_exhausted=budget_exhausted,
         )
-        if self._rpi_calibration_expired:
-            return False
-        now_ns = time_service.now_ns()
-        committed_seq = self.journal.append(
-            "rpi_calibration_permit_expired",
-            {
-                "schema": self.RPI_CALIBRATION_JOURNAL_SCHEMA,
-                "signed_permit": self._rpi_calibration["signed_permit"],
-                "permit_id": self._rpi_calibration["permit_id"],
-                "permit_sha256": self._rpi_calibration["permit_sha256"],
-                "deployment_id": self._rpi_calibration["deployment_id"],
-                "symbol": self._rpi_calibration["symbol"],
-                "calibration_config_sha256": (
-                    self._rpi_calibration["calibration_config_sha256"]
-                ),
-                "target_deployment_config_sha256": (
-                    self._rpi_calibration[
-                        "target_deployment_config_sha256"
-                    ]
-                ),
-                "strategy_policy_sha256": (
-                    self._rpi_calibration["strategy_policy_sha256"]
-                ),
-                "implementation_sha256": (
-                    self._rpi_calibration["implementation_sha256"]
-                ),
-                "reason": reason,
-                "budget_exhausted": bool(budget_exhausted),
-                "expired_at_exchange_ns": now_ns,
-                "reserved_order_count": (
-                    self._rpi_calibration_reserved_order_count
-                ),
-                "cumulative_submitted_notional_microu": (
-                    self._rpi_calibration_cumulative_notional_microu
-                ),
-                "deployment_start_equity_microu": (
-                    self._rpi_calibration_start_equity_microu
-                ),
-                "deployment_start_external_cash_flow_microu": (
-                    self._rpi_calibration_start_external_cash_flow_microu
-                ),
-                "peak_observed_loss_microu": (
-                    self._rpi_calibration_peak_observed_loss_microu
-                ),
-                "effective_deployment_loss_cap_microu": (
-                    self._rpi_calibration_effective_loss_cap_microu
-                ),
-            },
-        )
-        if not committed_seq:
-            raise JournalError(
-                "RPI calibration permit expiry was not committed"
-            )
-        self._rpi_calibration_expired = True
-        self._rpi_calibration_expiry_reason = reason
-        self._rpi_calibration_budget_exhausted = bool(
-            self._rpi_calibration_budget_exhausted or budget_exhausted
-        )
-        self._rpi_calibration_restart_rearm_blocked = False
-        return True
 
     def expire_rpi_calibration_permit(
         self,
         reason: str = "operator_expired",
     ) -> bool:
-        """Latch calibration closed, cancel samples, then reduce residual risk."""
-        if not self._rpi_calibration["enabled"]:
-            return False
-        journal_ok = True
-        try:
-            with self.lock:
-                config = self._rpi_calibration
-                permit_reserved_count = (
-                    self._rpi_calibration_reserved_order_count
-                    - self._rpi_calibration_permit_start_order_count
-                )
-                permit_cumulative_microu = (
-                    self._rpi_calibration_cumulative_notional_microu
-                    - self._rpi_calibration_permit_start_notional_microu
-                )
-                quota_exhausted = bool(
-                    "budget" in str(reason or "").lower()
-                    or permit_reserved_count >= config["max_order_count"]
-                    or (
-                        permit_cumulative_microu
-                        + config["min_order_notional_microu"]
-                        > config["max_cumulative_notional_microu"]
-                    )
-                )
-                self._expire_rpi_calibration_permit_locked(
-                    reason,
-                    budget_exhausted=quota_exhausted,
-                )
-        except Exception as exc:
-            journal_ok = False
-            self._fail_closed_on_journal_error(
-                exc,
-                "expire_rpi_calibration_permit",
-                self._rpi_calibration["symbol"],
-            )
-
-        self._cancel_orders_matching(
-            lambda order: order in self._rpi_calibration_active_orders_locked()
+        return self.rpi_calibration_runtime.expire_rpi_calibration_permit(
+            reason
         )
-        with self.lock:
-            calibration_symbol = self._rpi_calibration["symbol"]
-            local_position = float(
-                self.exposure.net_positions.get(calibration_symbol, 0.0)
-                or 0.0
-            )
-        if abs(local_position) > 1e-9:
-            self.emergency_reduce_only_flatten(
-                f"rpi_calibration_expired:{reason}",
-                symbol=calibration_symbol,
-            )
-        return journal_ok
 
     def _validate_rpi_calibration_sample_locked(
         self,
         intent: OrderIntent,
         request: OrderRequest,
     ) -> tuple[str, int, str, str]:
-        config = self._rpi_calibration
-        if intent.strategy_id != self.RPI_CALIBRATION_STRATEGY_ID:
-            return "rpi_calibration_strategy_mismatch", 0, "", ""
-        if str(intent.symbol or "").upper() != config["symbol"]:
-            return "rpi_calibration_symbol_mismatch", 0, "", ""
-        if str(request.symbol or "").upper() != config["symbol"]:
-            return "rpi_calibration_request_symbol_mismatch", 0, "", ""
-        if intent.order_type != "LIMIT" or request.order_type != "LIMIT":
-            return "rpi_calibration_requires_limit", 0, "", ""
-        if (
-            intent.time_in_force != TIF_RPI
-            or request.time_in_force != TIF_RPI
-        ):
-            return "rpi_calibration_requires_rpi", 0, "", ""
-        if not intent.is_post_only or not request.post_only:
-            return "rpi_calibration_requires_post_only", 0, "", ""
-        if intent.policy != ExecutionPolicy.PASSIVE:
-            return "rpi_calibration_requires_passive_policy", 0, "", ""
-        if bool(intent.reduce_only) != bool(request.reduce_only):
-            return "rpi_calibration_reduce_only_mismatch", 0, "", ""
-
-        permit_id = str(
-            getattr(intent, "calibration_permit_id", "") or ""
-        ).strip()
-        if permit_id != config["permit_id"]:
-            return "rpi_calibration_permit_id_mismatch", 0, "", ""
-        try:
-            depth = self._positive_decimal(
-                getattr(intent, "calibration_depth_bps", None),
-                "RPI calibration declared depth",
-            )
-            reference_mid = self._positive_decimal(
-                getattr(intent, "calibration_reference_mid", None),
-                "RPI calibration reference mid",
-            )
-            intent_price = self._positive_decimal(
-                intent.price,
-                "RPI calibration intent price",
-            )
-            request_price = self._positive_decimal(
-                request.price,
-                "RPI calibration request price",
-            )
-            intent_volume = self._positive_decimal(
-                intent.volume,
-                "RPI calibration intent quantity",
-            )
-            request_volume = self._positive_decimal(
-                request.volume,
-                "RPI calibration request quantity",
-            )
-        except ValueError as exc:
-            return (
-                f"rpi_calibration_invalid_numeric:{exc}",
-                0,
-                "",
-                "",
-            )
-        depth_text = self._decimal_text(depth)
-        if depth_text not in config["fixed_depths_bps"]:
-            return "rpi_calibration_depth_not_permitted", 0, "", ""
-        if intent_price != request_price or intent_volume != request_volume:
-            return "rpi_calibration_request_value_mismatch", 0, "", ""
-        if intent.side.value != request.side:
-            return "rpi_calibration_request_side_mismatch", 0, "", ""
-        if intent.side == Side.BUY and intent_price >= reference_mid:
-            return "rpi_calibration_buy_not_below_reference", 0, "", ""
-        if intent.side == Side.SELL and intent_price <= reference_mid:
-            return "rpi_calibration_sell_not_above_reference", 0, "", ""
-
-        notional_microu = int(
-            (
-                intent_price
-                * intent_volume
-                * self.USDT_MICRO_SCALE
-            ).to_integral_value(rounding=ROUND_CEILING)
-        )
-        if notional_microu < config["min_order_notional_microu"]:
-            return "rpi_calibration_below_min_notional", 0, "", ""
-        if notional_microu > config["max_order_notional_microu"]:
-            return "rpi_calibration_above_max_notional", 0, "", ""
-        return (
-            "",
-            notional_microu,
-            depth_text,
-            self._decimal_text(reference_mid),
+        return self.rpi_calibration_runtime._validate_rpi_calibration_sample_locked(
+            intent,
+            request,
         )
 
     def _reserve_rpi_calibration_sample_locked(
@@ -2777,162 +1831,11 @@ class OMS:
         request: OrderRequest,
         client_oid: str,
     ) -> tuple[str, str]:
-        if not self._rpi_calibration["enabled"]:
-            return "", ""
-        if self._rpi_calibration_expired:
-            return (
-                "rpi_calibration_permit_expired",
-                self._rpi_calibration_expiry_reason
-                or "permit_expired",
-            )
-        if self._rpi_calibration_restart_rearm_blocked:
-            terminal_reason = "unclean_restart_requires_new_permit"
-            self._expire_rpi_calibration_permit_locked(terminal_reason)
-            return (
-                "rpi_calibration_unclean_restart_blocked",
-                terminal_reason,
-            )
-
-        rejection, notional_microu, depth_text, reference_mid = (
-            self._validate_rpi_calibration_sample_locked(intent, request)
+        return self.rpi_calibration_runtime._reserve_rpi_calibration_sample_locked(
+            intent,
+            request,
+            client_oid,
         )
-        if rejection:
-            return rejection, ""
-
-        active_count = len(self._rpi_calibration_active_orders_locked())
-        if active_count >= self._rpi_calibration["max_active_orders"]:
-            return "rpi_calibration_active_order_exists", ""
-
-        now_ns = time_service.now_ns()
-        if now_ns < self._rpi_calibration["not_before_ns"]:
-            return "rpi_calibration_permit_not_yet_valid", ""
-        if now_ns >= self._rpi_calibration["expires_at_ns"]:
-            terminal_reason = "permit_expired"
-            self._expire_rpi_calibration_permit_locked(terminal_reason)
-            return "rpi_calibration_permit_expired", terminal_reason
-        last_reserved_ns = self._rpi_calibration_last_reserved_exchange_ns
-        if (
-            last_reserved_ns > 0
-            and now_ns - last_reserved_ns
-            < self._rpi_calibration["min_order_interval_ns"]
-        ):
-            return "rpi_calibration_min_order_interval", ""
-
-        next_count = self._rpi_calibration_reserved_order_count + 1
-        next_cumulative = (
-            self._rpi_calibration_cumulative_notional_microu
-            + notional_microu
-        )
-        permit_count = (
-            next_count
-            - self._rpi_calibration_permit_start_order_count
-        )
-        permit_cumulative = (
-            next_cumulative
-            - self._rpi_calibration_permit_start_notional_microu
-        )
-        if permit_count > self._rpi_calibration["max_order_count"]:
-            terminal_reason = "max_order_count_exhausted"
-            self._expire_rpi_calibration_permit_locked(
-                terminal_reason,
-                budget_exhausted=True,
-            )
-            return "rpi_calibration_order_budget_exhausted", terminal_reason
-        if (
-            permit_cumulative
-            > self._rpi_calibration["max_cumulative_notional_microu"]
-        ):
-            terminal_reason = "max_cumulative_notional_exhausted"
-            self._expire_rpi_calibration_permit_locked(
-                terminal_reason,
-                budget_exhausted=True,
-            )
-            return "rpi_calibration_notional_budget_exhausted", terminal_reason
-        loss_truth_reason, observed_loss_microu = (
-            self._observe_rpi_calibration_loss_locked(
-                initialize_baseline=True,
-            )
-        )
-        if loss_truth_reason:
-            terminal_reason = (
-                f"calibration_loss_truth_unavailable:{loss_truth_reason}"
-            )
-            self._expire_rpi_calibration_permit_locked(terminal_reason)
-            return "rpi_calibration_loss_truth_unavailable", terminal_reason
-        if (
-            self._rpi_calibration_peak_observed_loss_microu
-            >= self._rpi_calibration_effective_loss_cap_microu
-        ):
-            terminal_reason = "max_calibration_loss_exhausted"
-            self._expire_rpi_calibration_permit_locked(terminal_reason)
-            return "rpi_calibration_loss_cap_exhausted", terminal_reason
-        if client_oid in self._rpi_calibration_reservation_ids:
-            raise JournalCorruptionError(
-                f"Duplicate RPI calibration reservation ID: {client_oid}"
-            )
-
-        self._activate_rpi_calibration_permit_locked(now_ns)
-        payload = {
-            "schema": self.RPI_CALIBRATION_JOURNAL_SCHEMA,
-            "reservation_seq": next_count,
-            "permit_reservation_seq": permit_count,
-            "reservation_id": client_oid,
-            "client_oid": client_oid,
-            "permit_id": self._rpi_calibration["permit_id"],
-            "permit_sha256": self._rpi_calibration["permit_sha256"],
-            "deployment_id": self._rpi_calibration["deployment_id"],
-            "calibration_config_sha256": (
-                self._rpi_calibration["calibration_config_sha256"]
-            ),
-            "target_deployment_config_sha256": (
-                self._rpi_calibration["target_deployment_config_sha256"]
-            ),
-            "strategy_policy_sha256": (
-                self._rpi_calibration["strategy_policy_sha256"]
-            ),
-            "implementation_sha256": (
-                self._rpi_calibration["implementation_sha256"]
-            ),
-            "reserved_at_exchange_ns": now_ns,
-            "symbol": intent.symbol,
-            "strategy_id": intent.strategy_id,
-            "side": intent.side.value,
-            "price": self._decimal_text(
-                self._positive_decimal(intent.price, "calibration price")
-            ),
-            "quantity": self._decimal_text(
-                self._positive_decimal(intent.volume, "calibration quantity")
-            ),
-            "declared_depth_bps": depth_text,
-            "calibration_reference_mid": reference_mid,
-            "order_type": intent.order_type,
-            "time_in_force": intent.time_in_force,
-            "post_only": bool(intent.is_post_only),
-            "reduce_only": bool(intent.reduce_only),
-            "submitted_notional_microu": notional_microu,
-            "cumulative_submitted_notional_microu": next_cumulative,
-            "permit_cumulative_submitted_notional_microu": (
-                permit_cumulative
-            ),
-            "loss_before_send_microu": observed_loss_microu,
-            "effective_deployment_loss_cap_microu": (
-                self._rpi_calibration_effective_loss_cap_microu
-            ),
-        }
-        committed_seq = self.journal.append(
-            "rpi_calibration_send_reserved",
-            payload,
-        )
-        if not committed_seq:
-            raise JournalError(
-                "RPI calibration send reservation was not committed"
-            )
-        self._rpi_calibration_reserved_order_count = next_count
-        self._rpi_calibration_cumulative_notional_microu = next_cumulative
-        self._rpi_calibration_last_reserved_exchange_ns = now_ns
-        self._rpi_calibration_reservation_ids.add(client_oid)
-        self._rpi_calibration_reservation_exchange_ns[client_oid] = now_ns
-        return "", ""
 
     def _audit_rpi_calibration_emergency_bypass_locked(
         self,
@@ -2940,210 +1843,36 @@ class OMS:
         request: OrderRequest,
         client_oid: str,
     ) -> None:
-        if not self._rpi_calibration["enabled"]:
-            return
-        if (
-            intent.strategy_id != "system_emergency"
-            or not intent.reduce_only
-            or not request.reduce_only
-        ):
-            raise JournalError(
-                "Only system_emergency reduce-only orders may bypass "
-                "RPI calibration sampling quotas"
-            )
-        price = self._positive_decimal(
-            request.price,
-            "emergency bypass price",
+        self.rpi_calibration_runtime._audit_rpi_calibration_emergency_bypass_locked(
+            intent,
+            request,
+            client_oid,
         )
-        quantity = self._positive_decimal(
-            request.volume,
-            "emergency bypass quantity",
+
+    def _mark_rpi_calibration_terminal_pending(
+        self,
+        reason: str,
+        **details,
+    ) -> None:
+        self.rpi_calibration_runtime._mark_rpi_calibration_terminal_pending(
+            reason,
+            **details,
         )
-        notional_microu = int(
-            (
-                price * quantity * self.USDT_MICRO_SCALE
-            ).to_integral_value(rounding=ROUND_CEILING)
-        )
-        committed_seq = self.journal.append(
-            "rpi_calibration_emergency_reduce_bypass",
-            {
-                "schema": self.RPI_CALIBRATION_JOURNAL_SCHEMA,
-                "bypass_id": client_oid,
-                "client_oid": client_oid,
-                "permit_id": self._rpi_calibration["permit_id"],
-                "permit_sha256": self._rpi_calibration["permit_sha256"],
-                "deployment_id": self._rpi_calibration["deployment_id"],
-                "recorded_at_exchange_ns": time_service.now_ns(),
-                "symbol": request.symbol,
-                "side": request.side,
-                "price": self._decimal_text(price),
-                "quantity": self._decimal_text(quantity),
-                "estimated_notional_microu": notional_microu,
-                "reduce_only": True,
-                "reason": intent.tag,
-            },
-        )
-        if not committed_seq:
-            raise JournalError(
-                "RPI calibration emergency bypass audit was not committed"
-            )
+
+    def _enforce_rpi_calibration_terminal_once(self) -> bool:
+        return self.rpi_calibration_runtime._enforce_rpi_calibration_terminal_once()
 
     def enforce_rpi_calibration_runtime_limits(self) -> dict:
-        """Cancel stale samples while keeping them active until venue terminal."""
-        if not self._rpi_calibration["enabled"]:
-            return self.get_outbound_gate_snapshot()["rpi_calibration"]
+        return self.rpi_calibration_runtime.enforce_rpi_calibration_runtime_limits()
 
-        loss_terminal_reason = ""
-        try:
-            with self.lock:
-                if (
-                    self._rpi_calibration_restart_rearm_blocked
-                    and not self._rpi_calibration_expired
-                ):
-                    loss_terminal_reason = (
-                        "unclean_restart_requires_new_permit"
-                    )
-                    self._expire_rpi_calibration_permit_locked(
-                        loss_terminal_reason
-                    )
-                elif (
-                    self._rpi_calibration_permit_activated
-                    and not self._rpi_calibration_expired
-                ):
-                    truth_reason, _ = (
-                        self._observe_rpi_calibration_loss_locked(
-                            initialize_baseline=False,
-                        )
-                    )
-                    if truth_reason:
-                        loss_terminal_reason = (
-                            "calibration_loss_truth_unavailable:"
-                            f"{truth_reason}"
-                        )
-                    elif (
-                        self._rpi_calibration_peak_observed_loss_microu
-                        >= self._rpi_calibration_effective_loss_cap_microu
-                    ):
-                        loss_terminal_reason = (
-                            "max_calibration_loss_exhausted"
-                        )
-                    if loss_terminal_reason:
-                        self._expire_rpi_calibration_permit_locked(
-                            loss_terminal_reason
-                        )
-        except Exception as exc:
-            loss_terminal_reason = (
-                "calibration_loss_enforcement_journal_failure"
-            )
-            self._fail_closed_on_journal_error(
-                exc,
-                "rpi_calibration_loss_enforcement",
-                self._rpi_calibration["symbol"],
-            )
-        if loss_terminal_reason:
-            self.expire_rpi_calibration_permit(
-                loss_terminal_reason
-            )
-
-        now_ns = time_service.now_ns()
-        if now_ns >= self._rpi_calibration["expires_at_ns"]:
-            self.expire_rpi_calibration_permit("permit_expired")
-
-        ttl_ns = int(self._rpi_calibration["order_ttl_ns"])
-        ttl_sec = ttl_ns / 1_000_000_000
-        stale_oids = []
-        with self.lock:
-            active_orders = self._rpi_calibration_active_orders_locked()
-            active_ids = {order.client_oid for order in active_orders}
-            self._rpi_calibration_ttl_cancel_oids.intersection_update(
-                active_ids
-            )
-            for order in active_orders:
-                if order.status not in {
-                    OrderStatus.PENDING_ACK,
-                    OrderStatus.NEW,
-                    OrderStatus.PARTIALLY_FILLED,
-                }:
-                    continue
-                reserved_at_ns = int(
-                    self._rpi_calibration_reservation_exchange_ns.get(
-                        order.client_oid,
-                        0,
-                    )
-                    or 0
-                )
-                age_ns = (
-                    max(0, now_ns - reserved_at_ns)
-                    if reserved_at_ns > 0
-                    else ttl_ns
-                )
-                age_sec = age_ns / 1_000_000_000
-                if (
-                    age_ns >= ttl_ns
-                    and order.client_oid
-                    not in self._rpi_calibration_ttl_cancel_oids
-                ):
-                    self._rpi_calibration_ttl_cancel_oids.add(
-                        order.client_oid
-                    )
-                    stale_oids.append((order.client_oid, age_sec))
-
-        for client_oid, age_sec in stale_oids:
-            try:
-                self._audit(
-                    "rpi_calibration_order_ttl_expired",
-                    client_oid=client_oid,
-                    permit_id=self._rpi_calibration["permit_id"],
-                    deployment_id=self._rpi_calibration["deployment_id"],
-                    age_sec=age_sec,
-                    order_ttl_sec=ttl_sec,
-                )
-            except Exception as exc:
-                self._fail_closed_on_journal_error(
-                    exc,
-                    "rpi_calibration_order_ttl_expired",
-                    self._rpi_calibration["symbol"],
-                )
-            if not self.cancel_order(client_oid):
-                with self.lock:
-                    self._rpi_calibration_ttl_cancel_oids.discard(
-                        client_oid
-                    )
-        return self.get_outbound_gate_snapshot()["rpi_calibration"]
-
-    def _schedule_rpi_calibration_runtime_enforcement(self) -> bool:
-        if not self._rpi_calibration["enabled"]:
-            return False
-        with self.lock:
-            if (
-                not self._rpi_calibration_permit_activated
-                or self._rpi_calibration_expired
-                or self._rpi_calibration_enforcement_inflight
-                or self._shutdown_requested
-                or self._stopped
-            ):
-                return False
-            self._rpi_calibration_enforcement_inflight = True
-
-        def enforce():
-            try:
-                self.enforce_rpi_calibration_runtime_limits()
-            except Exception as exc:
-                self._fail_closed_on_journal_error(
-                    exc,
-                    "scheduled_rpi_calibration_enforcement",
-                    self._rpi_calibration["symbol"],
-                )
-            finally:
-                with self.lock:
-                    self._rpi_calibration_enforcement_inflight = False
-
-        threading.Thread(
-            target=enforce,
-            daemon=True,
-            name="RpiCalibrationLossEnforcer",
-        ).start()
-        return True
+    def _schedule_rpi_calibration_runtime_enforcement(
+        self,
+        *,
+        terminal_truth_changed: bool = False,
+    ) -> bool:
+        return self.rpi_calibration_runtime._schedule_rpi_calibration_runtime_enforcement(
+            terminal_truth_changed=terminal_truth_changed,
+        )
 
     def get_local_order_truth_snapshot(self) -> dict:
         """Return one locked view of active local orders and outbound sends."""
@@ -3620,28 +2349,40 @@ class OMS:
                 < self.venue_dead_man_safety_cancel_retry_sec
             ):
                 return False
-            self._venue_dead_man_safety_cancel_last_attempt = now
 
         def cancel_and_verify():
-            verified = self.cancel_all_account_orders_verified(
-                self.gateway,
-                source="venue_dead_man_switch",
-                timeout_sec=self.venue_dead_man_safety_cancel_timeout_sec,
-            )
-            self._audit(
-                "venue_dead_man_switch_safety_cancel_completed",
-                reason=reason,
-                verified=bool(verified),
-            )
+            published.wait()
+            try:
+                verified = self.cancel_all_account_orders_verified(
+                    self.gateway,
+                    source="venue_dead_man_switch",
+                    timeout_sec=self.venue_dead_man_safety_cancel_timeout_sec,
+                )
+                self._audit(
+                    "venue_dead_man_switch_safety_cancel_completed",
+                    reason=reason,
+                    verified=bool(verified),
+                )
+            finally:
+                with self.lock:
+                    handle = self._venue_dead_man_safety_cancel_thread
+                    if handle is not None and handle.is_current():
+                        self._venue_dead_man_safety_cancel_thread = None
 
-        thread = threading.Thread(
-            target=cancel_and_verify,
-            daemon=True,
+        published = threading.Event()
+        thread = self._submit_background_task(
+            "dms:safety-cancel",
+            cancel_and_verify,
             name="VenueDeadManSafetyCancel",
+            safety=True,
         )
         with self.lock:
+            if thread is None:
+                published.set()
+                return False
             self._venue_dead_man_safety_cancel_thread = thread
-        thread.start()
+            self._venue_dead_man_safety_cancel_last_attempt = now
+        published.set()
         return True
 
     def handle_venue_dead_man_switch_unhealthy(
@@ -3710,20 +2451,30 @@ class OMS:
             return healthy
 
         def renew_in_background():
+            published.wait()
             try:
                 self.renew_venue_dead_man_switch()
             finally:
                 with self.lock:
                     self.venue_dead_man_renewal_inflight = False
+                    handle = self._venue_dead_man_renewal_thread
+                    if handle is not None and handle.is_current():
+                        self._venue_dead_man_renewal_thread = None
 
-        thread = threading.Thread(
-            target=renew_in_background,
-            daemon=True,
+        published = threading.Event()
+        thread = self._submit_background_task(
+            "dms:renewal",
+            renew_in_background,
             name="VenueDeadManRenewal",
+            safety=True,
         )
         with self.lock:
+            if thread is None:
+                self.venue_dead_man_renewal_inflight = False
+                published.set()
+                return False
             self._venue_dead_man_renewal_thread = thread
-        thread.start()
+        published.set()
         return healthy
 
     def renew_venue_dead_man_switch(self, force: bool = False) -> bool:
@@ -3858,7 +2609,7 @@ class OMS:
         if (
             renewal_thread is not None
             and renewal_thread.is_alive()
-            and renewal_thread is not threading.current_thread()
+            and not renewal_thread.is_current()
         ):
             renewal_thread.join(
                 timeout=max(
@@ -3928,6 +2679,7 @@ class OMS:
             "risk_control_heartbeat": self.get_risk_control_heartbeat_snapshot(),
             "venue_dead_man_switch": self.get_venue_dead_man_switch_snapshot(),
             "outbound_message_budget": self.get_outbound_message_budget_snapshot(),
+            "background_tasks": self.get_background_task_snapshot(),
             "outbound_gate": self.get_outbound_gate_snapshot(),
             "strategy_risk_budgets": self.get_strategy_risk_budget_snapshot(),
             "single_writer_fence": (
@@ -4066,6 +2818,410 @@ class OMS:
             error_message="gateway_send_failed",
         )
 
+    def _get_final_outbound_send_rejection_locked(
+        self,
+        *,
+        permit_epoch: int | None,
+        intent: OrderIntent,
+        client_oid: str,
+        risk_increasing: bool,
+        allow_shutdown_emergency: bool,
+    ) -> tuple[str, str]:
+        """Revalidate a prepared order immediately before transport dispatch."""
+        with self._outbound_gate_condition:
+            if permit_epoch is None:
+                return "outbound_send_permit_missing", ""
+            if self._stopped:
+                reason = self._shutdown_reason or "oms_stopping"
+                return f"shutdown_requested:{reason}", ""
+            if self._outbound_all_order_seal_reason:
+                return (
+                    "outbound_order_gate_closed:"
+                    f"{self._outbound_all_order_seal_reason}",
+                    "",
+                )
+            if self._shutdown_requested and not allow_shutdown_emergency:
+                reason = self._shutdown_reason or "oms_stopping"
+                return f"shutdown_requested:{reason}", ""
+            if risk_increasing and permit_epoch != self._outbound_gate_epoch:
+                return (
+                    "outbound_gate_epoch_changed:"
+                    f"{permit_epoch}!={self._outbound_gate_epoch}",
+                    "",
+                )
+            if risk_increasing and not self._outbound_gate_open:
+                reason = self._outbound_gate_reason or "closed"
+                return f"outbound_gate_closed:{reason}", ""
+
+        if client_oid in self._submit_cancel_requested_oids:
+            return "cancel_requested_before_transport", ""
+
+        if not risk_increasing:
+            return "", ""
+
+        block_reason = self._get_order_block_reason(
+            intent.strategy_id,
+            intent.symbol,
+            reduce_only=intent.reduce_only,
+        )
+        if block_reason:
+            return block_reason, ""
+        if (
+            self.capability_mode == OMSCapabilityMode.PASSIVE_ONLY
+            and not intent.is_post_only
+        ):
+            return "oms_mode_passive_only_changed_before_dispatch", ""
+        if (
+            self.capability_mode == OMSCapabilityMode.DEGRADED
+            and self.degraded_aggressive_to_passive
+            and not intent.is_post_only
+        ):
+            return "oms_mode_degraded_changed_before_dispatch", ""
+
+        for check in (
+            self._get_clock_health_rejection_locked,
+            self._get_venue_dead_man_switch_rejection_locked,
+            self._get_risk_control_heartbeat_rejection_locked,
+            self._get_margin_health_rejection_locked,
+            self._get_self_trade_prevention_rejection_locked,
+        ):
+            rejection = check(intent)
+            if rejection:
+                return rejection, ""
+
+        if not self._rpi_calibration["enabled"]:
+            return "", ""
+        if self._rpi_calibration_expired:
+            return (
+                "rpi_calibration_permit_expired_at_dispatch",
+                self._rpi_calibration_expiry_reason or "permit_expired",
+            )
+        if self._rpi_calibration_restart_rearm_blocked:
+            return (
+                "rpi_calibration_restart_blocked_at_dispatch",
+                "unclean_restart_requires_new_permit",
+            )
+        if client_oid not in self._rpi_calibration_reservation_ids:
+            return (
+                "rpi_calibration_reservation_missing_at_dispatch",
+                "reservation_missing_at_dispatch",
+            )
+        if not self._rpi_calibration_permit_activated:
+            return (
+                "rpi_calibration_permit_inactive_at_dispatch",
+                "permit_inactive_at_dispatch",
+            )
+
+        now_ns = time_service.now_ns()
+        if now_ns < self._rpi_calibration["not_before_ns"]:
+            return (
+                "rpi_calibration_permit_not_yet_valid_at_dispatch",
+                "permit_time_regressed_before_not_before",
+            )
+        if now_ns >= self._rpi_calibration["expires_at_ns"]:
+            return (
+                "rpi_calibration_permit_expired_at_dispatch",
+                "permit_expired",
+            )
+
+        loss_truth_reason, _ = self._observe_rpi_calibration_loss_locked(
+            initialize_baseline=False,
+        )
+        if loss_truth_reason:
+            return (
+                "rpi_calibration_loss_truth_unavailable_at_dispatch",
+                f"calibration_loss_truth_unavailable:{loss_truth_reason}",
+            )
+        if (
+            self._rpi_calibration_peak_observed_loss_microu
+            >= self._rpi_calibration_effective_loss_cap_microu
+        ):
+            return (
+                "rpi_calibration_loss_cap_exhausted_at_dispatch",
+                "max_calibration_loss_exhausted",
+            )
+        return "", ""
+
+    def _dispatch_gateway_order_with_final_fence(
+        self,
+        request: OrderRequest,
+        client_oid: str,
+        intent: OrderIntent,
+        *,
+        permit_epoch: int | None,
+        risk_increasing: bool,
+        allow_shutdown_emergency: bool = False,
+    ) -> tuple[GatewayCommandResult, str]:
+        terminal_reason = ""
+        outbound_reservation = None
+        message_kind = (
+            self.OUTBOUND_REDUCE_ORDER
+            if request.reduce_only
+            else self.OUTBOUND_NEW_ORDER
+        )
+
+        def reserve_transport_message() -> str:
+            nonlocal outbound_reservation
+            if outbound_reservation is not None:
+                return ""
+            reservation, budget_rejection = (
+                self._outbound_budget.reserve_token(message_kind)
+            )
+            if not budget_rejection:
+                outbound_reservation = reservation
+            return budget_rejection
+
+        try:
+            with self.lock:
+                rejection, terminal_reason = (
+                    self._get_final_outbound_send_rejection_locked(
+                        permit_epoch=permit_epoch,
+                        intent=intent,
+                        client_oid=client_oid,
+                        risk_increasing=risk_increasing,
+                        allow_shutdown_emergency=allow_shutdown_emergency,
+                    )
+                )
+                if terminal_reason:
+                    self._close_outbound_gate_locked(
+                        f"rpi_calibration:{terminal_reason}",
+                        hold="rpi_calibration_dispatch_revoked",
+                    )
+        except Exception as exc:
+            rejection = (
+                "outbound_send_fence_unavailable:"
+                f"{type(exc).__name__}:{exc}"
+            )
+            if self._rpi_calibration["enabled"] and risk_increasing:
+                terminal_reason = "dispatch_fence_unavailable"
+            with self.lock:
+                self._close_outbound_gate_locked(
+                    rejection,
+                    hold="outbound_dispatch_fence_failure",
+                )
+
+        if rejection:
+            try:
+                self._audit(
+                    "outbound_send_fence_rejected",
+                    client_oid=client_oid,
+                    symbol=intent.symbol,
+                    strategy_id=intent.strategy_id,
+                    permit_epoch=permit_epoch,
+                    current_gate_epoch=self._outbound_gate_epoch,
+                    risk_increasing=risk_increasing,
+                    allow_shutdown_emergency=allow_shutdown_emergency,
+                    reason=rejection,
+                    calibration_terminal_reason=terminal_reason,
+                )
+            except Exception as exc:
+                logger.critical(
+                    "[OMS] Could not audit outbound send-fence rejection: "
+                    f"{type(exc).__name__}:{exc}"
+                )
+            return (
+                GatewayCommandResult(
+                    CommandOutcome.REJECTED,
+                    error_code="OUTBOUND_SEND_FENCE_REVOKED",
+                    error_message=rejection,
+                ),
+                terminal_reason,
+            )
+
+        def transport_pre_send_guard():
+            nonlocal terminal_reason
+            try:
+                with self.lock:
+                    transport_rejection, transport_terminal_reason = (
+                        self._get_final_outbound_send_rejection_locked(
+                            permit_epoch=permit_epoch,
+                            intent=intent,
+                            client_oid=client_oid,
+                            risk_increasing=risk_increasing,
+                            allow_shutdown_emergency=(
+                                allow_shutdown_emergency
+                            ),
+                        )
+                    )
+                    if transport_terminal_reason:
+                        terminal_reason = transport_terminal_reason
+                        self._close_outbound_gate_locked(
+                            f"rpi_calibration:{terminal_reason}",
+                            hold="rpi_calibration_dispatch_revoked",
+                        )
+            except Exception as exc:
+                transport_rejection = (
+                    "outbound_transport_guard_unavailable:"
+                    f"{type(exc).__name__}:{exc}"
+                )
+                if self._rpi_calibration["enabled"] and risk_increasing:
+                    terminal_reason = "transport_guard_unavailable"
+                with self.lock:
+                    self._close_outbound_gate_locked(
+                        transport_rejection,
+                        hold="outbound_transport_guard_failure",
+                    )
+            if transport_rejection:
+                return (
+                    False,
+                    "OUTBOUND_SEND_FENCE_REVOKED",
+                    transport_rejection,
+                )
+            budget_rejection = reserve_transport_message()
+            if budget_rejection:
+                return (
+                    False,
+                    "OUTBOUND_MESSAGE_BUDGET",
+                    budget_rejection,
+                )
+            return True, "", ""
+
+        supports_transport_guard = bool(
+            getattr(
+                self.gateway,
+                "supports_outbound_send_guard",
+                False,
+            )
+        )
+        if (
+            not supports_transport_guard
+            and self._rpi_calibration["enabled"]
+            and risk_increasing
+        ):
+            terminal_reason = "transport_guard_unavailable"
+            with self.lock:
+                self._close_outbound_gate_locked(
+                    "rpi_calibration:transport_guard_unavailable",
+                    hold="outbound_transport_guard_failure",
+                )
+            return (
+                GatewayCommandResult(
+                    CommandOutcome.REJECTED,
+                    error_code="OUTBOUND_SEND_FENCE_REVOKED",
+                    error_message="outbound_transport_guard_unavailable",
+                ),
+                terminal_reason,
+            )
+
+        try:
+            if supports_transport_guard:
+                raw_result = self.gateway.send_order(
+                    request,
+                    client_oid,
+                    pre_send_guard=transport_pre_send_guard,
+                )
+            else:
+                budget_rejection = reserve_transport_message()
+                if budget_rejection:
+                    return (
+                        GatewayCommandResult(
+                            CommandOutcome.REJECTED,
+                            error_code="OUTBOUND_MESSAGE_BUDGET",
+                            error_message=budget_rejection,
+                        ),
+                        terminal_reason,
+                    )
+                raw_result = self.gateway.send_order(request, client_oid)
+            command = self._normalize_submit_command(raw_result)
+        except Exception as exc:
+            command = GatewayCommandResult(
+                CommandOutcome.UNKNOWN,
+                error_message=f"gateway_send_exception:{exc}",
+            )
+        return command, terminal_reason
+
+    def _bind_submit_exchange_oid_locked(
+        self,
+        order: Order,
+        exchange_oid: str,
+        *,
+        source: str,
+    ) -> str:
+        """Bind a transport ACK without overwriting stronger exchange truth."""
+        exchange_oid = str(exchange_oid or "")
+        if not exchange_oid:
+            return ""
+        if order.exchange_oid and order.exchange_oid != exchange_oid:
+            reason = (
+                f"submit_exchange_oid_mismatch:{order.client_oid}:"
+                f"{order.exchange_oid}!={exchange_oid}"
+            )
+            self._audit(
+                "submit_exchange_oid_mismatch",
+                client_oid=order.client_oid,
+                local_exchange_oid=order.exchange_oid,
+                transport_exchange_oid=exchange_oid,
+                source=source,
+            )
+            return reason
+        mapped_order = self.exchange_id_map.get(exchange_oid)
+        if mapped_order is not None and mapped_order is not order:
+            reason = (
+                f"submit_exchange_oid_collision:{order.client_oid}:"
+                f"{exchange_oid}"
+            )
+            self._audit(
+                "submit_exchange_oid_collision",
+                client_oid=order.client_oid,
+                exchange_oid=exchange_oid,
+                mapped_client_oid=mapped_order.client_oid,
+                source=source,
+            )
+            return reason
+        order.exchange_oid = exchange_oid
+        self.exchange_id_map[exchange_oid] = order
+        return ""
+
+    def _handle_submit_transport_conflict(
+        self,
+        order: Order,
+        reason: str,
+    ) -> None:
+        if not reason:
+            return
+        context = f"submit_transport_conflict:{order.client_oid}"
+        try:
+            self.freeze_symbol(
+                order.intent.symbol,
+                f"order_truth:{reason}",
+                cancel_active_orders=False,
+            )
+            self.trigger_reconcile(
+                reason,
+                suspicious_oid=order.client_oid,
+            )
+        except JournalError as exc:
+            try:
+                self._fail_closed_on_journal_error(
+                    exc,
+                    context,
+                    order.intent.symbol,
+                )
+            except BaseException as fail_closed_exc:
+                logger.critical(
+                    "[OMS] Submit transport conflict could not complete "
+                    f"fail-closed client_oid={order.client_oid}: "
+                    f"{type(fail_closed_exc).__name__}:{fail_closed_exc}"
+                )
+        except BaseException as exc:
+            self._close_gate_after_submit_settlement_failure(
+                order,
+                context,
+                exc,
+            )
+        finally:
+            try:
+                self._on_order_truth_check(
+                    f"Submit transport conflict: {reason}",
+                    suspicious_oid=order.client_oid,
+                )
+            except BaseException as truth_exc:
+                logger.critical(
+                    "[OMS] Submit transport conflict could not start "
+                    f"truth resolution client_oid={order.client_oid}: "
+                    f"{type(truth_exc).__name__}:{truth_exc}"
+                )
+
     def _commit_gateway_submission(self, client_oid: str) -> None:
         """Release gateways which stage exchange events until the OMS ACK is durable.
 
@@ -4081,6 +3237,411 @@ class OMS:
         if committed is False:
             raise RuntimeError("gateway rejected the submit commit barrier")
 
+    def _notify_order_state_safely(self, order: Order, context: str) -> None:
+        """Notify local observers without changing the transport outcome."""
+        try:
+            self.order_monitor.on_order_update(order.client_oid, order.status)
+        except BaseException as exc:
+            logger.critical(
+                "[OMS] Order monitor notification failed after submit "
+                f"context={context} client_oid={order.client_oid}: "
+                f"{type(exc).__name__}:{exc}"
+            )
+        try:
+            self._emit_order_update(order)
+        except BaseException as exc:
+            logger.critical(
+                "[OMS] Order update publication failed after submit "
+                f"context={context} client_oid={order.client_oid}: "
+                f"{type(exc).__name__}:{exc}"
+            )
+        if context not in {"submit_ack", "internal_submit_ack"}:
+            self._finish_submit_settlement(order, context)
+
+    def _finish_submit_settlement(
+        self,
+        order: Order,
+        context: str,
+    ) -> None:
+        """Release submit coordination and honor one queued cancel."""
+        client_oid = order.client_oid
+        with self.lock:
+            if client_oid not in self._submit_settlement_inflight_oids:
+                return
+            self._submit_settlement_inflight_oids.discard(client_oid)
+            with self._outbound_gate_condition:
+                self._outbound_gate_condition.notify_all()
+            cancel_requested = (
+                client_oid in self._submit_cancel_requested_oids
+            )
+            current = self.orders.get(client_oid)
+            journal_failed = "journal_failure" in self._outbound_gate_holds
+            should_cancel = bool(
+                cancel_requested
+                and current is not None
+                and current.is_active()
+                and not self._stopped
+                and not journal_failed
+            )
+            if not should_cancel:
+                self._submit_cancel_requested_oids.discard(client_oid)
+
+        if not should_cancel:
+            return
+
+        def cancel_after_settlement():
+            with self.lock:
+                self._submit_cancel_requested_oids.discard(client_oid)
+                current_order = self.orders.get(client_oid)
+                stopped = self._stopped
+            if stopped or current_order is None or not current_order.is_active():
+                return
+            try:
+                cancel_admitted = bool(self.cancel_order(client_oid))
+            except BaseException as exc:
+                cancel_admitted = False
+                logger.critical(
+                    "[OMS] Queued post-submit cancel raised "
+                    f"client_oid={client_oid}: "
+                    f"{type(exc).__name__}:{exc}"
+                )
+            if cancel_admitted:
+                return
+            with self.lock:
+                unresolved = self.orders.get(client_oid)
+                still_active = bool(
+                    unresolved is not None and unresolved.is_active()
+                )
+            if still_active:
+                self._handle_submit_transport_conflict(
+                    unresolved,
+                    f"queued_cancel_not_admitted:{context}",
+                )
+
+        task_key = f"post-submit-cancel:{client_oid}"
+        try:
+            handle = self._submit_background_task(
+                task_key,
+                cancel_after_settlement,
+                name=f"PostSubmitCancel-{client_oid}",
+                safety=True,
+            )
+        except BaseException as exc:
+            handle = None
+            logger.critical(
+                "[OMS] Could not enqueue queued post-submit cancel "
+                f"client_oid={client_oid}: "
+                f"{type(exc).__name__}:{exc}"
+            )
+        if handle is None:
+            with self.lock:
+                self._submit_cancel_requested_oids.discard(client_oid)
+                unresolved = self.orders.get(client_oid)
+                still_active = bool(
+                    unresolved is not None and unresolved.is_active()
+                )
+            cancel_admitted = False
+            if still_active:
+                try:
+                    cancel_admitted = bool(self.cancel_order(client_oid))
+                except BaseException as exc:
+                    logger.critical(
+                        "[OMS] Synchronous queued-cancel fallback failed "
+                        f"client_oid={client_oid}: "
+                        f"{type(exc).__name__}:{exc}"
+                    )
+            if cancel_admitted:
+                return
+            if still_active:
+                self._handle_submit_transport_conflict(
+                    unresolved,
+                    f"queued_cancel_enqueue_failed:{context}",
+                )
+
+    def _publish_order_submitted_safely(
+        self,
+        request: OrderRequest,
+        order: Order,
+        submitted_status: OrderStatus,
+        context: str,
+    ) -> None:
+        """Publish a derived event without turning a durable ACK into failure."""
+        try:
+            self.event_engine.put(
+                Event(
+                    EVENT_ORDER_SUBMITTED,
+                    OrderSubmitted(
+                        request,
+                        order.client_oid,
+                        time.time(),
+                        submitted_status,
+                        monotonic_timestamp=time.perf_counter(),
+                    ),
+                )
+            )
+        except BaseException as exc:
+            logger.critical(
+                "[OMS] Order-submitted publication failed "
+                f"context={context} client_oid={order.client_oid}: "
+                f"{type(exc).__name__}:{exc}"
+            )
+
+    def _audit_post_submit_safely(
+        self,
+        kind: str,
+        order: Order,
+        **payload,
+    ) -> None:
+        """Fail closed on durable-audit loss while preserving submit truth."""
+        try:
+            self._audit(kind, **payload)
+        except JournalError as exc:
+            try:
+                self._fail_closed_on_journal_error(
+                    exc,
+                    f"post_submit_audit:{kind}",
+                    order.intent.symbol,
+                )
+            except BaseException as fail_closed_exc:
+                logger.critical(
+                    "[OMS] Post-submit audit failure could not complete "
+                    f"fail-closed context={kind} "
+                    f"client_oid={order.client_oid}: "
+                    f"{type(fail_closed_exc).__name__}:{fail_closed_exc}"
+                )
+        except BaseException as exc:
+            logger.critical(
+                "[OMS] Post-submit audit raised unexpectedly "
+                f"context={kind} client_oid={order.client_oid}: "
+                f"{type(exc).__name__}:{exc}"
+            )
+
+    def _latch_submit_ambiguity_locked(
+        self,
+        order: Order,
+        context: str,
+    ) -> str:
+        """Durably freeze one symbol without waiting on the current send lease."""
+        if not order.is_active():
+            return ""
+        symbol = str(order.intent.symbol or "").upper()
+        reason = f"order_truth:submit_exception:{order.client_oid}"
+        owner = self._symbol_guard_owner(reason)
+        records = self._ensure_symbol_guard_records_locked(symbol)
+        previous_reason = self.symbol_guards.get(symbol, "")
+        previous_owner_reason = str(
+            (records.get(owner) or {}).get("reason", "") or ""
+        )
+        epoch = max(
+            [
+                int(self.symbol_guard_epoch_counters.get(symbol, 0) or 0),
+                *(
+                    int(record.get("epoch", 0) or 0)
+                    for record in records.values()
+                ),
+            ]
+        ) + 1
+        self._audit(
+            (
+                "symbol_frozen"
+                if previous_owner_reason != reason
+                else "symbol_freeze_reasserted"
+            ),
+            symbol=symbol,
+            reason=reason,
+            previous_reason=previous_reason,
+            previous_owner_reason=previous_owner_reason,
+            owner=owner,
+            epoch=epoch,
+            source=context,
+        )
+        records[owner] = {"reason": reason, "epoch": epoch}
+        self.symbol_guard_epoch_counters[symbol] = epoch
+        self._refresh_symbol_guard_effective_locked(symbol)
+        self._refresh_outbound_gate_locked(
+            f"submit_exception:{symbol}:{order.client_oid}"
+        )
+        return reason
+
+    def _close_gate_after_submit_settlement_failure(
+        self,
+        order: Order,
+        context: str,
+        exc: BaseException,
+    ) -> None:
+        """Last-resort in-memory fence when even ambiguity settlement fails."""
+        logger.critical(
+            "[OMS] Submit exception settlement failed "
+            f"context={context} client_oid={order.client_oid}: "
+            f"{type(exc).__name__}:{exc}"
+        )
+        try:
+            with self.lock:
+                if order.status == OrderStatus.SUBMITTING:
+                    order.mark_submit_unknown(
+                        f"submit_settlement_failed:{type(exc).__name__}"
+                    )
+                self._close_outbound_gate_locked(
+                    f"submit_settlement_failed:{context}",
+                    hold="submit_exception_settlement_failure",
+                )
+                if self.state not in {
+                    LifecycleState.HALTED,
+                    LifecycleState.RECONCILING,
+                }:
+                    self.state = LifecycleState.FROZEN
+                    self._lifecycle_generation += 1
+                    self.last_freeze_reason = (
+                        f"submit_settlement_failed:{context}"
+                    )
+                    self._sync_capability_mode(self.last_freeze_reason)
+        except BaseException as fence_exc:
+            logger.critical(
+                "[OMS] Could not install submit settlement fallback fence "
+                f"client_oid={order.client_oid}: "
+                f"{type(fence_exc).__name__}:{fence_exc}"
+            )
+    def _cleanup_pre_dispatch_submit_exception(
+        self,
+        order: Order | None,
+        exc: BaseException,
+        context: str,
+        snapshot_source: str,
+        **snapshot_extra,
+    ) -> JournalError | None:
+        """Durably terminate a prepared order which never reached transport."""
+        if order is None:
+            return None
+        journal_failure = None
+        try:
+            with self.lock:
+                if order.status in {
+                    OrderStatus.CREATED,
+                    OrderStatus.SUBMITTING,
+                }:
+                    order.mark_rejected_locally(
+                        f"pre_dispatch_exception:{type(exc).__name__}"
+                    )
+                self._record_order_snapshot(
+                    order,
+                    f"{snapshot_source}_pre_dispatch_exception",
+                    exception_type=type(exc).__name__,
+                    **snapshot_extra,
+                )
+                if order.is_terminal():
+                    self._write_tombstone(order)
+                    self.orders.pop(order.client_oid, None)
+                    self.exposure.update_open_orders(self.orders)
+                    self.account.calculate()
+        except JournalError as journal_exc:
+            self._latch_journal_failure(
+                journal_exc,
+                f"{context}_cleanup",
+                order.intent.symbol,
+            )
+            journal_failure = journal_exc
+            try:
+                with self.lock:
+                    if order.status in {
+                        OrderStatus.CREATED,
+                        OrderStatus.SUBMITTING,
+                    }:
+                        order.mark_rejected_locally(
+                            "durable_journal_unavailable"
+                        )
+                    if order.is_terminal():
+                        self.orders.pop(order.client_oid, None)
+                        self.exposure.update_open_orders(self.orders)
+                        self.account.calculate()
+            except BaseException as cleanup_exc:
+                self._close_gate_after_submit_settlement_failure(
+                    order,
+                    f"{context}_journal_cleanup",
+                    cleanup_exc,
+                )
+        except BaseException as cleanup_exc:
+            self._close_gate_after_submit_settlement_failure(
+                order,
+                context,
+                cleanup_exc,
+            )
+        self._notify_order_state_safely(order, context)
+        return journal_failure
+
+    def _settle_post_dispatch_submit_exception(
+        self,
+        order: Order,
+        command_id: str,
+        exc: BaseException,
+        context: str,
+        snapshot_source: str,
+        exchange_oid: str = "",
+        **snapshot_extra,
+    ) -> JournalError | None:
+        """Persist ambiguity and quarantine the symbol before lease release."""
+        journal_failure = None
+        error_message = (
+            f"post_dispatch_exception:{type(exc).__name__}:"
+            f"{str(exc)[:512]}"
+        )
+        try:
+            self._record_command_result(
+                command_id,
+                "SUBMIT",
+                order,
+                CommandOutcome.UNKNOWN,
+                exchange_oid=exchange_oid or order.exchange_oid,
+                error_message=error_message,
+            )
+            with self.lock:
+                if order.status == OrderStatus.SUBMITTING:
+                    order.mark_submit_unknown(error_message)
+                self._record_order_snapshot(
+                    order,
+                    f"{snapshot_source}_post_dispatch_exception",
+                    exception_type=type(exc).__name__,
+                    exception_message=str(exc)[:512],
+                    **snapshot_extra,
+                )
+                self._latch_submit_ambiguity_locked(order, context)
+        except JournalError as journal_exc:
+            self._latch_journal_failure(
+                journal_exc,
+                f"{context}_settlement",
+                order.intent.symbol,
+            )
+            journal_failure = journal_exc
+            try:
+                with self.lock:
+                    if order.status == OrderStatus.SUBMITTING:
+                        order.mark_submit_unknown("result_not_durable")
+            except BaseException as cleanup_exc:
+                self._close_gate_after_submit_settlement_failure(
+                    order,
+                    f"{context}_journal_cleanup",
+                    cleanup_exc,
+                )
+        except BaseException as settlement_exc:
+            self._close_gate_after_submit_settlement_failure(
+                order,
+                context,
+                settlement_exc,
+            )
+
+        self._notify_order_state_safely(order, context)
+        try:
+            self._on_order_truth_check(
+                f"Post-dispatch submit exception: {type(exc).__name__}",
+                suspicious_oid=order.client_oid,
+            )
+        except BaseException as truth_exc:
+            logger.critical(
+                "[OMS] Could not start client-ID truth resolution after "
+                f"submit exception client_oid={order.client_oid}: "
+                f"{type(truth_exc).__name__}:{truth_exc}"
+            )
+        return journal_failure
+
     def _record_command_prepared(
         self,
         command_id: str,
@@ -4088,35 +3649,48 @@ class OMS:
         order: Order,
         request,
     ):
-        if isinstance(request, OrderRequest):
-            request_payload = {
-                "symbol": request.symbol,
-                "price": request.price,
-                "volume": request.volume,
-                "side": request.side,
-                "order_type": request.order_type,
-                "time_in_force": request.time_in_force,
-                "post_only": request.post_only,
-                "reduce_only": request.reduce_only,
-                "self_trade_prevention_mode": request.self_trade_prevention_mode,
-            }
-        else:
-            request_payload = {
-                "symbol": request.symbol,
-                "order_id": request.order_id,
-            }
-        return self.journal.append(
-            "command_prepared",
-            {
-                "command_id": command_id,
-                "command_type": command_type,
-                "idempotency_key": order.client_oid,
-                "client_oid": order.client_oid,
-                "exchange_oid": order.exchange_oid,
-                "order": order.to_record(),
-                "request": request_payload,
-            },
+        return self.audit_logger.record_command_prepared(
+            command_id,
+            command_type,
+            order,
+            request,
         )
+
+    @staticmethod
+    def _command_prepared_payload(
+        command_id: str,
+        command_type: str,
+        order: Order,
+        request,
+    ) -> dict:
+        return OMSAuditLogger.command_prepared_payload(
+            command_id,
+            command_type,
+            order,
+            request,
+        )
+
+    def _build_submit_prepared_records(
+        self,
+        command_id: str,
+        order: Order,
+        request: OrderRequest,
+        snapshot_source: str,
+        **snapshot_extra,
+    ) -> tuple[tuple[str, dict], tuple[str, dict]]:
+        return self.audit_logger.build_submit_prepared_records(
+            command_id,
+            order,
+            request,
+            snapshot_source,
+            **snapshot_extra,
+        )
+
+    def _record_submit_prepared_batch(
+        self,
+        records: tuple[tuple[str, dict], tuple[str, dict]],
+    ) -> list[int]:
+        return self.audit_logger.record_submit_prepared_batch(records)
 
     def _record_command_result(
         self,
@@ -4128,18 +3702,14 @@ class OMS:
         error_code: str = "",
         error_message: str = "",
     ):
-        return self.journal.append(
-            "command_result",
-            {
-                "command_id": command_id,
-                "command_type": command_type,
-                "idempotency_key": order.client_oid,
-                "client_oid": order.client_oid,
-                "exchange_oid": exchange_oid or order.exchange_oid,
-                "outcome": outcome.value,
-                "error_code": error_code,
-                "error_message": error_message,
-            },
+        return self.audit_logger.record_command_result(
+            command_id,
+            command_type,
+            order,
+            outcome.value,
+            exchange_oid=exchange_oid,
+            error_code=error_code,
+            error_message=error_message,
         )
 
     def record_strategy_evidence(
@@ -4151,7 +3721,7 @@ class OMS:
     ) -> int:
         """Durably commit strategy evidence or close the live send gate."""
         try:
-            committed_seq = self.journal.append(kind, payload)
+            committed_seq = self.audit_logger.audit(kind, payload)
             if not committed_seq:
                 raise JournalError(
                     f"OMS journal did not commit strategy evidence {kind}"
@@ -4187,7 +3757,7 @@ class OMS:
         if execution_id in self.execution_ids:
             return False
 
-        self.journal.append(
+        self.audit_logger.audit(
             "execution_record",
             {
                 "execution_id": execution_id,
@@ -4220,27 +3790,36 @@ class OMS:
         self.execution_ids.add(execution_id)
         return True
 
-    def _fail_closed_on_journal_error(
+    def _latch_journal_failure_locked(
         self,
         exc: Exception,
         context: str,
         symbol: str = "",
-    ):
-        """Enter cancel-only mode without depending on the failed journal."""
+    ) -> str:
+        """Atomically seal every order send before an outbound lease is released."""
         reason = f"durable_journal_unavailable:{context}:{exc}"
-        logger.critical(f"[OMS] {reason}")
-        with self.lock:
-            self.state = LifecycleState.HALTED
+        already_latched = "journal_failure" in self._outbound_gate_holds
+        if already_latched and self._outbound_all_order_seal_reason:
+            reason = self._outbound_all_order_seal_reason
+        else:
+            self._outbound_all_order_seal_reason = reason
+        self._close_outbound_gate_locked(
+            reason,
+            hold="journal_failure",
+        )
+        self.state = LifecycleState.HALTED
+        if not already_latched:
             self._lifecycle_generation += 1
-            self.manual_rearm_required = True
-            self.last_halt_reason = reason
-            self.last_freeze_reason = ""
-            self.capability_mode = OMSCapabilityMode.CANCEL_ONLY
-            self.capability_reason = reason
-            if symbol:
-                target_symbol = symbol.upper()
-                records = self._ensure_symbol_guard_records_locked(target_symbol)
-                owner = self._symbol_guard_owner(reason)
+        self.manual_rearm_required = True
+        self.last_halt_reason = reason
+        self.last_freeze_reason = ""
+        self.capability_mode = OMSCapabilityMode.CANCEL_ONLY
+        self.capability_reason = reason
+        if symbol:
+            target_symbol = symbol.upper()
+            records = self._ensure_symbol_guard_records_locked(target_symbol)
+            owner = self._symbol_guard_owner(reason)
+            if owner not in records:
                 epoch = max(
                     [
                         int(
@@ -4259,19 +3838,62 @@ class OMS:
                 records[owner] = {"reason": reason, "epoch": epoch}
                 self.symbol_guard_epoch_counters[target_symbol] = epoch
                 self._refresh_symbol_guard_effective_locked(target_symbol)
+        return reason
 
-        self.event_engine.put(Event(EVENT_SYSTEM_HEALTH, f"HALT:{reason}"))
+    def _latch_journal_failure(
+        self,
+        exc: Exception,
+        context: str,
+        symbol: str = "",
+    ) -> str:
+        with self.lock:
+            return self._latch_journal_failure_locked(
+                exc,
+                context,
+                symbol,
+            )
+
+    def _fail_closed_on_journal_error(
+        self,
+        exc: Exception,
+        context: str,
+        symbol: str = "",
+    ):
+        """Enter cancel-only mode without depending on the failed journal."""
+        reason = self._latch_journal_failure(exc, context, symbol)
+        logger.critical(f"[OMS] {reason}")
+
         try:
-            for target_symbol in self.config.get("symbols", []):
+            self.event_engine.put(
+                Event(EVENT_SYSTEM_HEALTH, f"HALT:{reason}")
+            )
+        except Exception as event_exc:
+            logger.critical(
+                "[OMS] Failed to publish journal-failure HALT event: "
+                f"{type(event_exc).__name__}:{event_exc}"
+            )
+        sends_drained = self._wait_for_outbound_order_sends(
+            f"journal_failure:{context}"
+        )
+        if not sends_drained:
+            logger.critical(
+                "[OMS] Journal failure order-send drain did not complete "
+                f"for {context}"
+            )
+        for target_symbol in self._account_cancel_symbols():
+            try:
                 self._cancel_all_orders_unchecked(
                     target_symbol,
                     source="journal_failure",
                     audit=False,
+                    bypass_message_budget=True,
                 )
-        except Exception as cancel_exc:
-            logger.critical(
-                f"[OMS] Failed to cancel orders after journal failure: {cancel_exc}"
-            )
+            except Exception as cancel_exc:
+                logger.critical(
+                    "[OMS] Failed to cancel orders after journal failure "
+                    f"for {target_symbol}: {type(cancel_exc).__name__}:"
+                    f"{cancel_exc}"
+                )
 
     def _on_order_truth_check(self, reason: str, suspicious_oid: str = None):
         if not suspicious_oid:
@@ -4281,11 +3903,18 @@ class OMS:
                 return
             self._order_truth_resolution_inflight.add(suspicious_oid)
 
-        threading.Thread(
-            target=self._resolve_order_truth,
-            args=(suspicious_oid, reason),
-            daemon=True,
-        ).start()
+        handle = self._submit_background_task(
+            f"order-truth:{suspicious_oid}",
+            self._resolve_order_truth,
+            suspicious_oid,
+            reason,
+            name=f"OrderTruth-{suspicious_oid}",
+        )
+        if handle is None:
+            with self.lock:
+                self._order_truth_resolution_inflight.discard(
+                    suspicious_oid
+                )
 
     def _resolve_order_truth(self, client_oid: str, reason: str = ""):
         try:
@@ -4470,6 +4099,9 @@ class OMS:
         self.orders[client_oid] = order
         if exchange_oid:
             self.exchange_id_map[exchange_oid] = order
+        self._schedule_rpi_calibration_runtime_enforcement(
+            terminal_truth_changed=True,
+        )
         self._audit(
             "external_order_recovered",
             client_oid=client_oid,
@@ -4494,6 +4126,9 @@ class OMS:
         if status == "EXPIRED_IN_MATCH":
             status = "EXPIRED"
         if status not in {"NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED", "REJECTED"}:
+            self._schedule_rpi_calibration_runtime_enforcement(
+                terminal_truth_changed=True,
+            )
             self._audit("unhandled_order_snapshot_status", status=status, source=source)
             return False
 
@@ -4503,6 +4138,9 @@ class OMS:
         remote_order_type = str(remote.get("type", "") or "").upper()
         remote_time_in_force = str(remote.get("timeInForce", "") or "").upper()
         if executed_qty > order.filled_volume + 1e-9:
+            self._schedule_rpi_calibration_runtime_enforcement(
+                terminal_truth_changed=True,
+            )
             truth_reason = (
                 f"execution_truth:{order.intent.symbol}:{order.client_oid}:"
                 "order_snapshot_ahead"
@@ -4553,7 +4191,7 @@ class OMS:
             current = int(self.trade_cursors.get(symbol, -1))
             if trade_id <= current:
                 return False
-            self.journal.append(
+            self.audit_logger.audit(
                 "trade_cursor_advanced",
                 {
                     "symbol": symbol,
@@ -4748,7 +4386,7 @@ class OMS:
             if page_count >= 20 and len(trades) >= limit:
                 return False
             self.trade_scan_end_ms[symbol] = end_time_ms
-            self.journal.append(
+            self.audit_logger.audit(
                 "trade_scan_completed",
                 {
                     "symbol": symbol,
@@ -4791,8 +4429,6 @@ class OMS:
         def verify_tail():
             cleaned = False
             try:
-                if self.trade_tail_verification_delay_sec > 0:
-                    time.sleep(self.trade_tail_verification_delay_sec)
                 last_ok = False
                 pending = set()
                 for attempt in range(1, self.trade_tail_verification_attempts + 1):
@@ -4847,11 +4483,16 @@ class OMS:
                         self.trade_tail_verification_inflight.discard(symbol)
                         self.trade_tail_expected_ids.pop(symbol, None)
 
-        threading.Thread(
-            target=verify_tail,
-            daemon=True,
+        handle = self._submit_background_task(
+            f"trade-tail:{symbol}",
+            verify_tail,
             name=f"TradeTruth-{symbol}",
-        ).start()
+            delay_sec=self.trade_tail_verification_delay_sec,
+        )
+        if handle is None:
+            with self.lock:
+                self.trade_tail_verification_inflight.discard(symbol)
+            return False
         return True
 
     def _prime_trade_history_baseline(self, end_time_ms: int, symbols=None) -> bool:
@@ -4882,7 +4523,7 @@ class OMS:
                     source="bootstrap_baseline",
                 )
             self.trade_scan_end_ms[symbol] = int(end_time_ms)
-            self.journal.append(
+            self.audit_logger.audit(
                 "trade_scan_completed",
                 {
                     "symbol": symbol,
@@ -4951,7 +4592,7 @@ class OMS:
                 income_id = self._external_cash_flow_income_id(income)
                 if income_id in self.external_cash_flow_ids:
                     continue
-                self.journal.append(
+                self.audit_logger.audit(
                     "external_cash_flow_record",
                     {
                         "income_id": income_id,
@@ -5038,7 +4679,7 @@ class OMS:
                 return False
 
             with self.lock:
-                self.journal.append(
+                self.audit_logger.audit(
                     "cash_flow_scan_completed",
                     {
                         "start_time_ms": start_time_ms,
@@ -5190,248 +4831,14 @@ class OMS:
         audit_kind: str,
         **audit_extra,
     ) -> bool:
-        order = Order(client_oid, intent)
-        command_id = f"SUBMIT:{client_oid}"
-        order_send_risk_increasing = not request.reduce_only
-        order_send_permit = False
-
-        with self.lock:
-            permit_epoch, permit_rejection = (
-                self._acquire_outbound_order_send_permit_locked(
-                    risk_increasing=order_send_risk_increasing,
-                    symbol=request.symbol,
-                )
-            )
-            order_send_permit = permit_epoch is not None
-            if permit_rejection:
-                budget_rejection = permit_rejection
-            else:
-                message_kind = (
-                    self.OUTBOUND_REDUCE_ORDER
-                    if request.reduce_only
-                    else self.OUTBOUND_NEW_ORDER
-                )
-                budget_rejection = self._reserve_outbound_message_locked(message_kind)
-        if budget_rejection:
-            if order_send_permit:
-                self._release_outbound_order_send_permit(
-                    risk_increasing=order_send_risk_increasing,
-                    symbol=request.symbol,
-                )
-                order_send_permit = False
-            logger.error(
-                f"[OMS] Internal order blocked by message budget: {budget_rejection}"
-            )
-            self._audit(
-                "internal_order_message_budget_rejected",
-                client_oid=client_oid,
-                symbol=intent.symbol,
-                reduce_only=request.reduce_only,
-                reason=budget_rejection,
-            )
-            return False
-
-        try:
-            with self.lock:
-                self._audit_rpi_calibration_emergency_bypass_locked(
-                    intent,
-                    request,
-                    client_oid,
-                )
-                self.orders[client_oid] = order
-                order.mark_submitting()
-                self.exposure.update_open_orders(self.orders)
-                self.account.calculate()
-                self._record_order_snapshot(order, snapshot_source, **audit_extra)
-            self._record_command_prepared(
-                command_id,
-                "SUBMIT",
-                order,
-                request,
-            )
-        except JournalError as exc:
-            if order_send_permit:
-                self._release_outbound_order_send_permit(
-                    risk_increasing=order_send_risk_increasing,
-                    symbol=request.symbol,
-                )
-                order_send_permit = False
-            with self.lock:
-                order.mark_rejected_locally("durable_journal_unavailable")
-                self.orders.pop(client_oid, None)
-                self.exposure.update_open_orders(self.orders)
-                self.account.calculate()
-                self._emit_order_update(order)
-            self._fail_closed_on_journal_error(exc, "prepare_internal_submit", intent.symbol)
-            return False
-        except BaseException:
-            if order_send_permit:
-                self._release_outbound_order_send_permit(
-                    risk_increasing=order_send_risk_increasing,
-                    symbol=request.symbol,
-                )
-            raise
-
-        try:
-            try:
-                raw_result = self.gateway.send_order(request, client_oid)
-                command = self._normalize_submit_command(raw_result)
-            except Exception as exc:
-                command = GatewayCommandResult(
-                    CommandOutcome.UNKNOWN,
-                    error_message=f"gateway_send_exception:{exc}",
-                )
-        finally:
-            if order_send_permit:
-                self._release_outbound_order_send_permit(
-                    risk_increasing=order_send_risk_increasing,
-                    symbol=request.symbol,
-                )
-                order_send_permit = False
-
-        try:
-            self._record_command_result(
-                command_id,
-                "SUBMIT",
-                order,
-                command.outcome,
-                exchange_oid=command.exchange_oid,
-                error_code=command.error_code,
-                error_message=command.error_message,
-            )
-        except JournalError as exc:
-            with self.lock:
-                if order.status == OrderStatus.SUBMITTING:
-                    order.mark_submit_unknown("result_not_durable")
-                self._emit_order_update(order)
-            self._fail_closed_on_journal_error(exc, "result_internal_submit", intent.symbol)
-            self._on_order_truth_check(
-                "Submit result could not be persisted",
-                suspicious_oid=client_oid,
-            )
-            return True
-
-        if command.outcome == CommandOutcome.ACKNOWLEDGED:
-            exchange_oid = command.exchange_oid
-            try:
-                with self.lock:
-                    order.mark_pending_ack(exchange_oid)
-                    self.exchange_id_map[exchange_oid] = order
-                    self._record_order_snapshot(order, f"{snapshot_source}_ack", **audit_extra)
-                    self._emit_order_update(order)
-            except JournalError as exc:
-                self._fail_closed_on_journal_error(exc, "snapshot_internal_submit_ack", intent.symbol)
-                return True
-
-            event_data = OrderSubmitted(
-                request,
-                client_oid,
-                time.time(),
-                monotonic_timestamp=time.perf_counter(),
-            )
-            self.event_engine.put(Event(EVENT_ORDER_SUBMITTED, event_data))
-            try:
-                self._commit_gateway_submission(client_oid)
-            except Exception as exc:
-                logger.error(
-                    f"[OMS] Gateway submit commit failed for {client_oid}: {exc}"
-                )
-                self.freeze_symbol(
-                    intent.symbol,
-                    f"order_truth:submit_commit_failed:{client_oid}",
-                    cancel_active_orders=False,
-                )
-                self._on_order_truth_check(
-                    "Gateway submit commit failed",
-                    suspicious_oid=client_oid,
-                )
-            payload = {
-                "client_oid": client_oid,
-                "exchange_oid": exchange_oid,
-                "symbol": intent.symbol,
-                "side": intent.side.value,
-                "price": intent.price,
-                "volume": intent.volume,
-            }
-            payload.update(audit_extra)
-            self._audit(audit_kind, **payload)
-            return True
-
-        if command.outcome == CommandOutcome.UNKNOWN:
-            try:
-                with self.lock:
-                    order.mark_submit_unknown(command.error_message or "submit_outcome_unknown")
-                    self._record_order_snapshot(
-                        order,
-                        f"{snapshot_source}_unknown",
-                        error_code=command.error_code,
-                        **audit_extra,
-                    )
-                    self._emit_order_update(order)
-            except JournalError as exc:
-                self._fail_closed_on_journal_error(
-                    exc,
-                    "snapshot_internal_submit_unknown",
-                    intent.symbol,
-                )
-                self._on_order_truth_check(
-                    "Submit result could not be persisted",
-                    suspicious_oid=client_oid,
-                )
-                return True
-            self.event_engine.put(
-                Event(
-                    EVENT_ORDER_SUBMITTED,
-                    OrderSubmitted(
-                        request,
-                        client_oid,
-                        time.time(),
-                        OrderStatus.SUBMIT_UNKNOWN,
-                        monotonic_timestamp=time.perf_counter(),
-                    ),
-                )
-            )
-            self.freeze_symbol(
-                intent.symbol,
-                f"order_truth:submit_unknown:{client_oid}",
-                cancel_active_orders=False,
-            )
-            self._audit(
-                f"{audit_kind}_unknown",
-                client_oid=client_oid,
-                symbol=intent.symbol,
-                error_code=command.error_code,
-                error_message=command.error_message,
-                **audit_extra,
-            )
-            self._on_order_truth_check("Order submit outcome unknown", suspicious_oid=client_oid)
-            return True
-
-        try:
-            with self.lock:
-                reject_reason = command.error_message or command.error_code or "gateway_send_rejected"
-                order.mark_rejected_locally(reject_reason)
-                self._record_order_snapshot(order, f"{snapshot_source}_failed", **audit_extra)
-                self._emit_order_update(order)
-                self.orders.pop(client_oid, None)
-                self.exposure.update_open_orders(self.orders)
-                self.account.calculate()
-        except JournalError as exc:
-            self._fail_closed_on_journal_error(
-                exc,
-                "snapshot_internal_submit_rejected",
-                intent.symbol,
-            )
-            return False
-        self._write_tombstone(order)
-        payload = {
-            "client_oid": client_oid,
-            "symbol": intent.symbol,
-            "reason": reject_reason,
-        }
-        payload.update(audit_extra)
-        self._audit(f"{audit_kind}_failed", **payload)
-        return False
+        return self.order_submission._submit_internal_order(
+            intent,
+            request,
+            client_oid,
+            snapshot_source,
+            audit_kind,
+            **audit_extra,
+        )
 
     def emergency_reduce_only_flatten(self, reason: str, symbol: str = "") -> int:
         target_symbols = {symbol.upper()} if symbol else set()
@@ -5445,16 +4852,22 @@ class OMS:
                     continue
                 if target_symbols and remote_symbol not in target_symbols:
                     continue
-                positions[remote_symbol] = float(payload.get("positionAmt", 0.0) or 0.0)
+                remote_volume = float(
+                    payload.get("positionAmt", 0.0) or 0.0
+                )
+                if abs(remote_volume) > 1e-9:
+                    positions[remote_symbol] = remote_volume
 
-        if not positions:
-            with self.lock:
-                for local_symbol, volume in self.exposure.net_positions.items():
-                    local_symbol = local_symbol.upper()
-                    if target_symbols and local_symbol not in target_symbols:
-                        continue
-                    if abs(volume) > 1e-9:
-                        positions[local_symbol] = volume
+        # A just-arrived user-stream fill can be newer than the REST position
+        # snapshot. A reduce-only order cannot increase exposure, so use local
+        # nonzero truth whenever REST has not reported that symbol as nonzero.
+        with self.lock:
+            for local_symbol, volume in self.exposure.net_positions.items():
+                local_symbol = local_symbol.upper()
+                if target_symbols and local_symbol not in target_symbols:
+                    continue
+                if local_symbol not in positions and abs(volume) > 1e-9:
+                    positions[local_symbol] = volume
 
         submitted = 0
         now_monotonic = time.perf_counter()
@@ -5523,946 +4936,145 @@ class OMS:
 
         return submitted
 
-    @staticmethod
-    def _symbol_guard_owner(reason: str) -> str:
-        reason = str(reason or "").strip()
-        parts = reason.split(":")
-        prefix = parts[0] if parts else ""
-        if prefix in {"latency", "divergence", "stale_market_data"}:
-            return prefix
-        if prefix == "truth_plane" and len(parts) > 1:
-            return ":".join(parts[:2])
-        if prefix == "system_health" and len(parts) > 2:
-            if parts[1] in {"FATAL_GAP", "ORDERBOOK_RESYNC_FAILED"}:
-                # One current order-book integrity owner per symbol. A newer
-                # recovery token replaces the older token, while its epoch and
-                # reason prevent the older worker's CLEAR from succeeding.
-                return "system_health:orderbook"
-            return ":".join(parts[:2])
-        if prefix == "order_truth" and len(parts) > 2:
-            return f"order_truth:{parts[-1]}"
-        return reason
-
-    def _ensure_symbol_guard_records_locked(self, symbol: str) -> dict:
-        if not hasattr(self, "symbol_guard_records"):
-            self.symbol_guard_records = {}
-        if not hasattr(self, "symbol_guard_epoch_counters"):
-            self.symbol_guard_epoch_counters = {}
-        records = self.symbol_guard_records.get(symbol)
-        if records is not None:
-            return records
-        records = {}
-        legacy_reason = self.symbol_guards.get(symbol, "")
-        if legacy_reason:
-            epoch = max(
-                1,
-                int(self.symbol_guard_epochs.get(symbol, 0) or 0),
-            )
-            records[self._symbol_guard_owner(legacy_reason)] = {
-                "reason": legacy_reason,
-                "epoch": epoch,
-            }
-            self.symbol_guard_epoch_counters[symbol] = max(
-                epoch,
-                int(self.symbol_guard_epoch_counters.get(symbol, 0) or 0),
-            )
-        self.symbol_guard_records[symbol] = records
-        return records
-
-    def _refresh_symbol_guard_effective_locked(self, symbol: str) -> None:
-        records = self.symbol_guard_records.get(symbol, {})
-        if not records:
-            self.symbol_guard_records.pop(symbol, None)
-            self.symbol_guards.pop(symbol, None)
-            self.symbol_guard_epochs.pop(symbol, None)
-            return
-        _, newest = max(
-            records.items(),
-            key=lambda item: int(item[1].get("epoch", 0) or 0),
-        )
-        self.symbol_guards[symbol] = str(newest.get("reason", "") or "")
-        self.symbol_guard_epochs[symbol] = int(newest.get("epoch", 0) or 0)
-
-    def freeze_symbol(self, symbol: str, reason: str, cancel_active_orders: bool = True):
-        if not symbol:
-            return None
-
-        symbol = symbol.upper()
-        reason = str(reason or "symbol_guarded")
-        owner = self._symbol_guard_owner(reason)
-        with self.lock:
-            previous_reason = self.symbol_guards.get(symbol, "")
-            records = self._ensure_symbol_guard_records_locked(symbol)
-            previous_owner_reason = str(
-                (records.get(owner) or {}).get("reason", "") or ""
-            )
-            epoch = max(
-                [
-                    int(self.symbol_guard_epoch_counters.get(symbol, 0) or 0),
-                    *(
-                        int(record.get("epoch", 0) or 0)
-                        for record in records.values()
-                    ),
-                ]
-            ) + 1
-            audit_kind = (
-                "symbol_frozen"
-                if previous_owner_reason != reason
-                else "symbol_freeze_reasserted"
-            )
-            self._audit(
-                audit_kind,
-                symbol=symbol,
-                reason=reason,
-                previous_reason=previous_reason,
-                previous_owner_reason=previous_owner_reason,
-                owner=owner,
-                epoch=epoch,
-            )
-            self.symbol_guard_epoch_counters[symbol] = epoch
-            records[owner] = {"reason": reason, "epoch": epoch}
-            self._refresh_symbol_guard_effective_locked(symbol)
-            self._refresh_outbound_gate_locked(f"symbol_frozen:{symbol}:{reason}")
-
-        if previous_owner_reason != reason:
-            logger.error(f"[OMS] Symbol frozen {symbol}: {reason}")
-
-        if cancel_active_orders:
-            self._cancel_all_orders_unchecked(
-                symbol,
-                source=f"symbol_freeze_immediate:{epoch}",
-                bypass_message_budget=True,
-            )
-        drained = self._wait_for_outbound_risk_sends(
-            f"symbol_freeze:{symbol}",
-            symbol=symbol,
-        )
-        if cancel_active_orders:
-            self._cancel_all_orders_unchecked(
-                symbol,
-                source=f"symbol_freeze_post_drain:{epoch}",
-                bypass_message_budget=True,
-            )
-        if not drained:
-            self.halt_system(
-                "Outbound symbol risk-send drain timed out during freeze: "
-                f"{symbol}"
-            )
-        with self.lock:
-            self._refresh_outbound_gate_locked(f"symbol_guarded:{symbol}")
-        return epoch
-
-    def clear_symbol_freeze(
-        self,
-        symbol: str,
-        reason: str = "",
-        expected_epoch: int | None = None,
-        expected_reason: str = "",
-        expected_owner: str = "",
-    ):
-        if not symbol:
-            return False
-
-        symbol = symbol.upper()
-        with self.lock:
-            records = self._ensure_symbol_guard_records_locked(symbol)
-            current_reason = self.symbol_guards.get(symbol, "")
-            current_epoch = int(self.symbol_guard_epochs.get(symbol, 0) or 0)
-            target_owner = str(expected_owner or "")
-            if target_owner:
-                candidates = [(target_owner, records.get(target_owner))]
-            else:
-                candidates = list(records.items())
-            candidates = [
-                (owner, record)
-                for owner, record in candidates
-                if record
-                and (
-                    not expected_reason
-                    or str(record.get("reason", "") or "") == expected_reason
-                )
-                and (
-                    expected_epoch is None
-                    or int(record.get("epoch", 0) or 0) == int(expected_epoch)
-                )
-            ]
-            if not expected_owner and not expected_reason and expected_epoch is None:
-                if len(records) == 1:
-                    candidates = list(records.items())
-                else:
-                    candidates = []
-            if len(candidates) != 1:
-                self._audit(
-                    "symbol_unfreeze_stale_ignored",
-                    symbol=symbol,
-                    reason=reason,
-                    expected_epoch=(
-                        int(expected_epoch)
-                        if expected_epoch is not None
-                        else None
-                    ),
-                    current_epoch=current_epoch,
-                    expected_reason=expected_reason,
-                    current_reason=current_reason,
-                    expected_owner=expected_owner,
-                    active_owners=sorted(records),
-                )
-                return False
-            target_owner, target_record = candidates[0]
-            previous_reason = str(target_record.get("reason", "") or "")
-            cleared_epoch = int(target_record.get("epoch", 0) or 0)
-            remaining_reasons = [
-                str(record.get("reason", "") or "")
-                for candidate_owner, record in records.items()
-                if candidate_owner != target_owner
-            ]
-            audit_kind = (
-                "symbol_guard_cleared"
-                if remaining_reasons
-                else "symbol_unfrozen"
-            )
-            self._audit(
-                audit_kind,
-                symbol=symbol,
-                reason=reason or previous_reason,
-                previous_reason=previous_reason,
-                owner=target_owner,
-                epoch=cleared_epoch,
-                remaining_reasons=remaining_reasons,
-            )
-            records.pop(target_owner, None)
-            self._refresh_symbol_guard_effective_locked(symbol)
-            self._refresh_outbound_gate_locked(
-                reason or previous_reason or f"symbol_unfrozen:{symbol}"
-            )
-        if not previous_reason:
-            return False
-
-        if remaining_reasons:
-            logger.info(
-                f"[OMS] Symbol guard owner cleared {symbol}: "
-                f"{reason or previous_reason}; remaining={remaining_reasons}"
-            )
-            audit_kind = "symbol_guard_cleared"
-        else:
-            logger.info(f"[OMS] Symbol restored {symbol}: {reason or previous_reason}")
-        return True
-
-    def get_symbol_freeze_reason(self, symbol: str) -> str:
-        if not symbol:
-            return ""
-        with self.lock:
-            return self.symbol_guards.get(symbol.upper(), "")
-
-    def get_symbol_freeze_epoch(self, symbol: str) -> int:
-        if not symbol:
-            return 0
-        with self.lock:
-            return int(self.symbol_guard_epochs.get(symbol.upper(), 0) or 0)
-
-    def get_symbol_freeze_owners(self, symbol: str) -> dict:
-        if not symbol:
-            return {}
-        symbol = symbol.upper()
-        with self.lock:
-            records = self._ensure_symbol_guard_records_locked(symbol)
-            return {
-                owner: {
-                    "reason": str(record.get("reason", "") or ""),
-                    "epoch": int(record.get("epoch", 0) or 0),
-                }
-                for owner, record in records.items()
-            }
-
-    def clear_orderbook_freeze(
-        self,
-        symbol: str,
-        recovery_token: str,
-        reason: str = "orderbook_resynced",
-    ) -> bool:
-        symbol = str(symbol or "").upper()
-        recovery_token = str(recovery_token or "").strip()
-        if not symbol or not recovery_token:
-            return False
-        expected_reasons = {
-            f"system_health:FATAL_GAP:{recovery_token}",
-            f"system_health:ORDERBOOK_RESYNC_FAILED:{recovery_token}",
-        }
-        with self.lock:
-            records = self._ensure_symbol_guard_records_locked(symbol)
-            matches = [
-                (owner, record)
-                for owner, record in records.items()
-                if str(record.get("reason", "") or "") in expected_reasons
-            ]
-            if len(matches) != 1:
-                self._audit(
-                    "orderbook_unfreeze_stale_ignored",
-                    symbol=symbol,
-                    recovery_token=recovery_token,
-                    current_reason=self.symbol_guards.get(symbol, ""),
-                    active_reasons=[
-                        str(record.get("reason", "") or "")
-                        for record in records.values()
-                    ],
-                )
-                return False
-            owner, record = matches[0]
-            current_reason = str(record.get("reason", "") or "")
-            current_epoch = int(record.get("epoch", 0) or 0)
-        return self.clear_symbol_freeze(
-            symbol,
-            reason=reason,
-            expected_epoch=current_epoch,
-            expected_reason=current_reason,
-            expected_owner=owner,
-        )
-
-    @staticmethod
-    def _venue_guard_owner(reason: str) -> str:
-        reason = str(reason or "").strip()
-        parts = reason.split(":")
-        prefix = parts[0] if parts else ""
-        if prefix == "system_health":
-            if len(parts) > 1 and parts[1] == "TRANSPORT":
-                return "system_health:transport"
-            if len(parts) > 1 and parts[1].startswith(
-                (
-                    "WS_",
-                    "USER_STREAM_",
-                    "MARKET_DATA_",
-                )
-            ):
-                return "system_health:transport"
-            return ":".join(parts[:2]) if len(parts) > 1 else reason
-        if prefix == "truth_plane" and len(parts) > 1:
-            return ":".join(parts[:2])
-        return prefix or reason
-
-    def _ensure_venue_guard_records_locked(self, venue: str) -> dict:
-        if not hasattr(self, "venue_guard_records"):
-            self.venue_guard_records = {}
-        if not hasattr(self, "venue_guard_epoch_counters"):
-            self.venue_guard_epoch_counters = {}
-        records = self.venue_guard_records.get(venue)
-        if records is not None:
-            return records
-        records = {}
-        legacy_reason = self.venue_guards.get(venue, "")
-        if legacy_reason:
-            epoch = max(1, int(self.venue_guard_epochs.get(venue, 0) or 0))
-            records[self._venue_guard_owner(legacy_reason)] = {
-                "reason": legacy_reason,
-                "epoch": epoch,
-            }
-            self.venue_guard_epoch_counters[venue] = max(
-                epoch,
-                int(self.venue_guard_epoch_counters.get(venue, 0) or 0),
-            )
-        self.venue_guard_records[venue] = records
-        return records
-
-    def _refresh_venue_guard_effective_locked(self, venue: str) -> None:
-        records = self.venue_guard_records.get(venue, {})
-        if not records:
-            self.venue_guard_records.pop(venue, None)
-            self.venue_guards.pop(venue, None)
-            self.venue_guard_epochs.pop(venue, None)
-            return
-        _, newest = max(
-            records.items(),
-            key=lambda item: int(item[1].get("epoch", 0) or 0),
-        )
-        self.venue_guards[venue] = str(newest.get("reason", "") or "")
-        self.venue_guard_epochs[venue] = int(newest.get("epoch", 0) or 0)
-
-    def freeze_venue(self, venue: str, reason: str, cancel_active_orders: bool = True):
-        venue = (venue or getattr(self.gateway, "gateway_name", "UNKNOWN")).upper()
-        reason = str(reason or "venue_guarded")
-        owner = self._venue_guard_owner(reason)
-        with self.lock:
-            previous_reason = self.venue_guards.get(venue, "")
-            records = self._ensure_venue_guard_records_locked(venue)
-            previous_owner_reason = str(
-                (records.get(owner) or {}).get("reason", "") or ""
-            )
-            epoch = max(
-                [
-                    int(self.venue_guard_epoch_counters.get(venue, 0) or 0),
-                    *(
-                        int(record.get("epoch", 0) or 0)
-                        for record in records.values()
-                    ),
-                ]
-            ) + 1
-            audit_kind = (
-                "venue_frozen"
-                if previous_owner_reason != reason
-                else "venue_freeze_reasserted"
-            )
-            self._audit(
-                audit_kind,
-                venue=venue,
-                reason=reason,
-                previous_reason=previous_reason,
-                previous_owner_reason=previous_owner_reason,
-                owner=owner,
-                epoch=epoch,
-            )
-            self.venue_guard_epoch_counters[venue] = epoch
-            records[owner] = {"reason": reason, "epoch": epoch}
-            self._refresh_venue_guard_effective_locked(venue)
-            self._refresh_outbound_gate_locked(f"venue_frozen:{venue}:{reason}")
-
-        if previous_owner_reason != reason:
-            logger.error(f"[OMS] Venue frozen {venue}: {reason}")
-
-        drained = self._wait_for_outbound_risk_sends(f"venue_freeze:{venue}")
-        if not cancel_active_orders:
-            return epoch
-
-        try:
-            for symbol in self._account_cancel_symbols():
-                self._cancel_all_orders_unchecked(
-                    symbol,
-                    source="venue_freeze",
-                )
-        except Exception:
-            pass
-        if not drained:
-            self.halt_system(
-                f"Outbound risk-send drain timed out during venue freeze: {venue}"
-            )
-        return epoch
-
-    def clear_venue_freeze(
-        self,
-        venue: str,
-        reason: str = "",
-        expected_epoch: int | None = None,
-        expected_reason: str | None = None,
-        expected_owner: str = "",
-    ):
-        venue = (venue or getattr(self.gateway, "gateway_name", "UNKNOWN")).upper()
-        with self.lock:
-            records = self._ensure_venue_guard_records_locked(venue)
-            current_epoch = int(self.venue_guard_epochs.get(venue, 0) or 0)
-            current_reason = self.venue_guards.get(venue, "")
-            target_owner = str(expected_owner or "")
-            if target_owner:
-                candidates = [(target_owner, records.get(target_owner))]
-            else:
-                candidates = list(records.items())
-            candidates = [
-                (owner, record)
-                for owner, record in candidates
-                if record
-                and (
-                    expected_reason is None
-                    or str(record.get("reason", "") or "")
-                    == str(expected_reason)
-                )
-                and (
-                    expected_epoch is None
-                    or int(record.get("epoch", 0) or 0) == int(expected_epoch)
-                )
-            ]
-            if not expected_owner and expected_reason is None and expected_epoch is None:
-                candidates = list(records.items()) if len(records) == 1 else []
-            if len(candidates) != 1:
-                self._audit(
-                    "venue_unfreeze_stale_ignored",
-                    venue=venue,
-                    reason=reason,
-                    expected_epoch=(
-                        int(expected_epoch)
-                        if expected_epoch is not None
-                        else None
-                    ),
-                    current_epoch=current_epoch,
-                    expected_reason=expected_reason,
-                    current_reason=current_reason,
-                    expected_owner=expected_owner,
-                    active_owners=sorted(records),
-                )
-                return False
-            target_owner, target_record = candidates[0]
-            previous_reason = str(target_record.get("reason", "") or "")
-            cleared_epoch = int(target_record.get("epoch", 0) or 0)
-            remaining_reasons = [
-                str(record.get("reason", "") or "")
-                for candidate_owner, record in records.items()
-                if candidate_owner != target_owner
-            ]
-            audit_kind = (
-                "venue_guard_cleared"
-                if remaining_reasons
-                else "venue_unfrozen"
-            )
-            self._audit(
-                audit_kind,
-                venue=venue,
-                reason=reason or previous_reason,
-                previous_reason=previous_reason,
-                owner=target_owner,
-                epoch=cleared_epoch,
-                remaining_reasons=remaining_reasons,
-            )
-            records.pop(target_owner, None)
-            self._refresh_venue_guard_effective_locked(venue)
-            self._refresh_outbound_gate_locked(
-                reason or previous_reason or f"venue_unfrozen:{venue}"
-            )
-        if not previous_reason:
-            return False
-
-        if remaining_reasons:
-            logger.info(
-                f"[OMS] Venue guard owner cleared {venue}: "
-                f"{reason or previous_reason}; remaining={remaining_reasons}"
-            )
-            audit_kind = "venue_guard_cleared"
-        else:
-            logger.info(f"[OMS] Venue restored {venue}: {reason or previous_reason}")
-        return True
-
-    def get_venue_freeze_reason(self, venue: str = "") -> str:
-        venue = (venue or getattr(self.gateway, "gateway_name", "UNKNOWN")).upper()
-        with self.lock:
-            return self.venue_guards.get(venue, "")
-
-    def get_venue_freeze_epoch(self, venue: str = "") -> int:
-        venue = (venue or getattr(self.gateway, "gateway_name", "UNKNOWN")).upper()
-        with self.lock:
-            return int(self.venue_guard_epochs.get(venue, 0) or 0)
-
-    def get_venue_freeze_owners(self, venue: str = "") -> dict:
-        venue = (venue or getattr(self.gateway, "gateway_name", "UNKNOWN")).upper()
-        with self.lock:
-            records = self._ensure_venue_guard_records_locked(venue)
-            return {
-                owner: {
-                    "reason": str(record.get("reason", "") or ""),
-                    "epoch": int(record.get("epoch", 0) or 0),
-                }
-                for owner, record in records.items()
-            }
-
-    def request_venue_recovery_verification(
-        self,
-        venue: str = "",
-        reason: str = "transport_recovered",
-        expected_owner: str = "",
-        expected_epoch: int | None = None,
-        expected_reason: str | None = None,
-    ) -> bool:
-        venue = (venue or getattr(self.gateway, "gateway_name", "UNKNOWN")).upper()
-        with self.lock:
-            if self._shutdown_requested or self._stopped:
-                return False
-            records = self._ensure_venue_guard_records_locked(venue)
-            owner = str(expected_owner or "")
-            candidates = (
-                [(owner, records.get(owner))]
-                if owner
-                else list(records.items())
-            )
-            candidates = [
-                (candidate_owner, record)
-                for candidate_owner, record in candidates
-                if record
-                and (
-                    expected_epoch is None
-                    or int(record.get("epoch", 0) or 0)
-                    == int(expected_epoch)
-                )
-                and (
-                    expected_reason is None
-                    or str(record.get("reason", "") or "")
-                    == str(expected_reason)
-                )
-            ]
-            if len(candidates) != 1:
-                self._audit(
-                    "venue_recovery_verification_stale_ignored",
-                    venue=venue,
-                    reason=reason,
-                    expected_owner=expected_owner,
-                    expected_epoch=expected_epoch,
-                    expected_reason=expected_reason,
-                    active_owners=sorted(records),
-                )
-                return False
-            owner, record = candidates[0]
-            guard_reason = str(record.get("reason", "") or "")
-            epoch = int(record.get("epoch", 0) or 0)
-        if not guard_reason or epoch <= 0:
-            return False
-        self._audit(
-            "venue_recovery_verification_requested",
-            venue=venue,
-            epoch=epoch,
-            owner=owner,
-            reason=reason,
-            guard_reason=guard_reason,
-        )
-        return bool(
-            self.trigger_reconcile(
-                f"Venue recovery verification: {venue}: {reason}",
-                recovery_venue=venue,
-                recovery_epoch=epoch,
-                recovery_owner=owner,
-                recovery_reason=guard_reason,
-            )
-        )
-
-    def freeze_strategy(
-        self,
-        strategy_id: str,
-        reason: str,
-        symbol: str = "",
-        cancel_active_orders: bool = True,
-    ):
-        strategy_id = (strategy_id or "").strip()
-        if not strategy_id:
-            return
-
-        symbol = symbol.upper() if symbol else ""
-        with self.lock:
-            if symbol:
-                key = (strategy_id, symbol)
-                previous_reason = self.strategy_symbol_guards.get(key, "")
-                self.strategy_symbol_guards[key] = reason
-                payload = {
-                    "strategy_id": strategy_id,
-                    "symbol": symbol,
-                    "reason": reason,
-                    "previous_reason": previous_reason,
-                }
-                log_message = f"[OMS] Strategy frozen {strategy_id}/{symbol}: {reason}"
-                audit_kind = "strategy_symbol_frozen"
-            else:
-                previous_reason = self.strategy_guards.get(strategy_id, "")
-                self.strategy_guards[strategy_id] = reason
-                payload = {
-                    "strategy_id": strategy_id,
-                    "reason": reason,
-                    "previous_reason": previous_reason,
-                }
-                log_message = f"[OMS] Strategy frozen {strategy_id}: {reason}"
-                audit_kind = "strategy_frozen"
-            self._refresh_outbound_gate_locked(
-                f"strategy_frozen:{strategy_id}:{symbol}:{reason}"
-            )
-
-        if previous_reason != reason:
-            logger.error(log_message)
-            self._audit(audit_kind, **payload)
-        else:
-            self._audit("strategy_freeze_reasserted", **payload)
-
-        self._wait_for_outbound_risk_sends(
-            f"strategy_freeze:{strategy_id}:{symbol}"
-        )
-        if cancel_active_orders:
-            self._cancel_orders_matching(
-                lambda order: order.intent.strategy_id == strategy_id
-                and (not symbol or order.intent.symbol == symbol)
-            )
-        with self.lock:
-            self._refresh_outbound_gate_locked(
-                f"strategy_guarded:{strategy_id}:{symbol}"
-            )
-
-    def clear_strategy_freeze(self, strategy_id: str, symbol: str = "", reason: str = ""):
-        strategy_id = (strategy_id or "").strip()
-        if not strategy_id:
-            return False
-
-        symbol = symbol.upper() if symbol else ""
-        with self.lock:
-            if symbol:
-                previous_reason = self.strategy_symbol_guards.pop((strategy_id, symbol), "")
-            else:
-                previous_reason = self.strategy_guards.pop(strategy_id, "")
-            self._refresh_outbound_gate_locked(
-                reason
-                or previous_reason
-                or f"strategy_unfrozen:{strategy_id}:{symbol}"
-            )
-        if not previous_reason:
-            return False
-
-        payload = {
-            "strategy_id": strategy_id,
-            "reason": reason or previous_reason,
-            "previous_reason": previous_reason,
-        }
-        if symbol:
-            payload["symbol"] = symbol
-            logger.info(f"[OMS] Strategy restored {strategy_id}/{symbol}: {reason or previous_reason}")
-        else:
-            logger.info(f"[OMS] Strategy restored {strategy_id}: {reason or previous_reason}")
-        self._audit("strategy_unfrozen", **payload)
-        return True
-
-    def get_strategy_freeze_reason(self, strategy_id: str, symbol: str = "") -> str:
-        strategy_id = (strategy_id or "").strip()
-        if not strategy_id:
-            return ""
-
-        symbol = symbol.upper() if symbol else ""
-        if symbol:
-            scoped_reason = self.strategy_symbol_guards.get((strategy_id, symbol), "")
-            if scoped_reason:
-                return scoped_reason
-        return self.strategy_guards.get(strategy_id, "")
-
-    def _capture_guard_cleanup_snapshot_locked(self, prefixes=()) -> dict:
-        prefixes = tuple(prefixes or ())
-
-        def selected(guard_reason: str) -> bool:
-            return not prefixes or any(
-                guard_reason.startswith(prefix) for prefix in prefixes
-            )
-
-        symbol_snapshots = []
-        for symbol in set(self.symbol_guards) | set(self.symbol_guard_records):
-            records = self._ensure_symbol_guard_records_locked(symbol)
-            for owner, record in records.items():
-                guard_reason = str(record.get("reason", "") or "")
-                if selected(guard_reason):
-                    symbol_snapshots.append(
-                        (
-                            symbol,
-                            owner,
-                            guard_reason,
-                            int(record.get("epoch", 0) or 0),
-                        )
-                    )
-        return {
-            "symbols": symbol_snapshots,
-            "venues": [
-                (
-                    venue,
-                    guard_reason,
-                    int(self.venue_guard_epochs.get(venue, 0) or 0),
-                )
-                for venue, guard_reason in self.venue_guards.items()
-                if selected(guard_reason)
-            ],
-            "strategies": [
-                (strategy_id, guard_reason)
-                for strategy_id, guard_reason in self.strategy_guards.items()
-                if selected(guard_reason)
-            ],
-            "strategy_symbols": [
-                (strategy_id, symbol, guard_reason)
-                for (strategy_id, symbol), guard_reason
-                in self.strategy_symbol_guards.items()
-                if selected(guard_reason)
-            ],
-        }
-
-    def _clear_guard_cleanup_snapshot(self, snapshot: dict, reason: str) -> int:
-        cleared = 0
-        # The outer RLock makes the decision and all exact-owner clears one
-        # atomic recovery commit. A new fault can only arrive afterwards and
-        # therefore cannot be mistaken for a guard proven healthy here.
-        with self.lock:
-            for symbol, owner, guard_reason, epoch in snapshot.get("symbols", []):
-                if self.clear_symbol_freeze(
-                    symbol,
-                    reason=reason,
-                    expected_epoch=epoch,
-                    expected_reason=guard_reason,
-                    expected_owner=owner,
-                ):
-                    cleared += 1
-            for venue, guard_reason, epoch in snapshot.get("venues", []):
-                if self.clear_venue_freeze(
-                    venue,
-                    reason=reason,
-                    expected_epoch=epoch,
-                    expected_reason=guard_reason,
-                ):
-                    cleared += 1
-            for strategy_id, guard_reason in snapshot.get("strategies", []):
-                if self.strategy_guards.get(strategy_id, "") != guard_reason:
-                    continue
-                if self.clear_strategy_freeze(strategy_id, reason=reason):
-                    cleared += 1
-            for strategy_id, symbol, guard_reason in snapshot.get(
-                "strategy_symbols", []
-            ):
-                if (
-                    self.strategy_symbol_guards.get((strategy_id, symbol), "")
-                    != guard_reason
-                ):
-                    continue
-                if self.clear_strategy_freeze(
-                    strategy_id,
-                    symbol=symbol,
-                    reason=reason,
-                ):
-                    cleared += 1
-        return cleared
-
-    def clear_transient_guards(
-        self,
-        prefixes=("truth_plane:",),
-        guard_snapshot: dict | None = None,
-    ):
-        prefixes = tuple(prefixes or ())
-        if not prefixes:
-            return 0
-        with self.lock:
-            snapshot = guard_snapshot or self._capture_guard_cleanup_snapshot_locked(
-                prefixes
-            )
-        return self._clear_guard_cleanup_snapshot(
-            snapshot,
-            reason="transient guard cleared after truth verification",
-        )
-
-    def _clear_recovered_guards_if_pending(self, reason: str = ""):
-        if not self.recovered_guard_cleanup_pending:
-            return 0
-
-        with self.lock:
-            snapshot = self._recovered_guard_cleanup_snapshot or {
-                "symbols": [],
-                "venues": [],
-                "strategies": [],
-                "strategy_symbols": [],
-            }
-            cleared = self._clear_guard_cleanup_snapshot(
-                snapshot,
-                reason=reason or "recovered_guard_cleared",
-            )
-            self.recovered_guard_cleanup_pending = False
-            self._recovered_guard_cleanup_snapshot = None
-        if cleared:
-            self._audit("recovered_guards_cleared", reason=reason or "recovered_guard_cleared", count=cleared)
-        return cleared
-
-    def is_symbol_tradeable(self, symbol: str) -> bool:
-        return self.can_open_new_risk() and not self.get_symbol_freeze_reason(symbol)
-
-    def can_submit_for_strategy(self, strategy_id: str, symbol: str = "") -> bool:
-        return self._get_order_block_reason(strategy_id, symbol) == ""
-
-    def get_order_block_reason(self, strategy_id: str = "", symbol: str = "") -> str:
-        return self._get_order_block_reason(strategy_id, symbol)
-
-    def _cancel_orders_matching(self, predicate):
-        with self.lock:
-            client_oids = [
-                order.client_oid
-                for order in self.orders.values()
-                if order.is_active() and predicate(order)
-            ]
-        for client_oid in client_oids:
-            self.cancel_order(client_oid)
+    _symbol_guard_owner = staticmethod(OMSGuardManager._symbol_guard_owner)
+    _ensure_symbol_guard_records_locked = component_method("guard_manager")
+    _refresh_symbol_guard_effective_locked = component_method("guard_manager")
+    _install_symbol_guard_locked = component_method("guard_manager")
+    _enforce_symbol_guard = component_method("guard_manager")
+    freeze_symbol = component_method("guard_manager")
+    clear_symbol_freeze = component_method("guard_manager")
+    get_symbol_freeze_reason = component_method("guard_manager")
+    get_symbol_freeze_epoch = component_method("guard_manager")
+    get_symbol_freeze_owners = component_method("guard_manager")
+    _venue_guard_owner = staticmethod(OMSGuardManager._venue_guard_owner)
+    clear_orderbook_freeze = component_method("guard_manager")
+    _ensure_venue_guard_records_locked = component_method("guard_manager")
+    _refresh_venue_guard_effective_locked = component_method("guard_manager")
+    freeze_venue = component_method("guard_manager")
+    clear_venue_freeze = component_method("guard_manager")
+    get_venue_freeze_reason = component_method("guard_manager")
+    get_venue_freeze_epoch = component_method("guard_manager")
+    get_venue_freeze_owners = component_method("guard_manager")
+    request_venue_recovery_verification = component_method("guard_manager")
+    freeze_strategy = component_method("guard_manager")
+    clear_strategy_freeze = component_method("guard_manager")
+    get_strategy_freeze_reason = component_method("guard_manager")
+    _capture_guard_cleanup_snapshot_locked = component_method("guard_manager")
+    _clear_guard_cleanup_snapshot = component_method("guard_manager")
+    clear_transient_guards = component_method("guard_manager")
+    _clear_recovered_guards_if_pending = component_method("guard_manager")
+    is_symbol_tradeable = component_method("guard_manager")
+    can_submit_for_strategy = component_method("guard_manager")
+    get_order_block_reason = component_method("guard_manager")
+    _cancel_orders_matching = component_method("guard_manager")
 
     def _prune_outbound_message_history_locked(self, now: float = None) -> float:
-        now = time.perf_counter() if now is None else float(now)
-        cutoff = now - self.outbound_message_window_sec
-        while (
-            self.outbound_message_history
-            and self.outbound_message_history[0][0] <= cutoff
-        ):
-            self.outbound_message_history.popleft()
-        return now
+        observed_at = time.perf_counter() if now is None else float(now)
+        self._outbound_budget.snapshot(observed_at)
+        return observed_at
 
     def _outbound_message_counts_locked(self) -> dict:
-        counts = {
-            self.OUTBOUND_NEW_ORDER: 0,
-            self.OUTBOUND_REDUCE_ORDER: 0,
-            self.OUTBOUND_CANCEL: 0,
-        }
-        for _timestamp, message_kind in self.outbound_message_history:
-            if message_kind in counts:
-                counts[message_kind] += 1
-        counts["TOTAL"] = len(self.outbound_message_history)
-        return counts
+        return dict(self._outbound_budget.snapshot()["counts"])
 
     def _reserve_outbound_message_locked(
         self,
         message_kind: str,
         now: float = None,
     ) -> str:
-        if not self.outbound_message_budget_enabled:
-            return ""
-        if message_kind not in {
-            self.OUTBOUND_NEW_ORDER,
-            self.OUTBOUND_REDUCE_ORDER,
-            self.OUTBOUND_CANCEL,
-        }:
-            raise ValueError(f"unsupported_outbound_message_kind:{message_kind}")
-
-        now = self._prune_outbound_message_history_locked(now)
-        counts = self._outbound_message_counts_locked()
-        class_limits = {
-            self.OUTBOUND_NEW_ORDER: self.max_new_orders_per_window,
-            self.OUTBOUND_REDUCE_ORDER: self.max_reduce_orders_per_window,
-            self.OUTBOUND_CANCEL: self.max_cancel_messages_per_window,
-        }
-        class_limit = class_limits[message_kind]
-        if class_limit > 0 and counts[message_kind] >= class_limit:
-            return (
-                f"outbound_message_budget:{message_kind.lower()}_limit:"
-                f"{counts[message_kind]}>={class_limit}"
-            )
-
-        total_count = counts["TOTAL"]
-        if self.max_total_messages_per_window > 0:
-            if message_kind == self.OUTBOUND_NEW_ORDER:
-                opening_risk_ceiling = max(
-                    0,
-                    self.max_total_messages_per_window
-                    - self.reserved_risk_messages_per_window,
-                )
-                if total_count >= opening_risk_ceiling:
-                    return (
-                        "outbound_message_budget:risk_capacity_reserved:"
-                        f"{total_count}>={opening_risk_ceiling}"
-                    )
-            elif total_count >= self.max_total_messages_per_window:
-                return (
-                    "outbound_message_budget:total_limit:"
-                    f"{total_count}>={self.max_total_messages_per_window}"
-                )
-
-        self.outbound_message_history.append((now, message_kind))
-        return ""
+        return self._outbound_budget.reserve(message_kind, now)
 
     def get_outbound_message_budget_snapshot(self) -> dict:
+        return self._outbound_budget.snapshot()
+
+    def _latch_background_task_failure(
+        self,
+        key: str,
+        reason: str,
+    ) -> None:
+        failure_reason = (
+            f"background_task_unavailable:{str(key or 'unknown')}:"
+            f"{str(reason or 'rejected')}"
+        )
         with self.lock:
-            self._prune_outbound_message_history_locked()
-            counts = self._outbound_message_counts_locked()
-            opening_risk_ceiling = (
-                max(
-                    0,
-                    self.max_total_messages_per_window
-                    - self.reserved_risk_messages_per_window,
-                )
-                if self.max_total_messages_per_window > 0
-                else None
+            self._background_task_rejection_count += 1
+            self._close_outbound_gate_locked(
+                failure_reason,
+                hold="background_task_failure",
             )
-            return {
-                "enabled": self.outbound_message_budget_enabled,
-                "window_sec": self.outbound_message_window_sec,
-                "counts": counts,
-                "limits": {
-                    "total": self.max_total_messages_per_window,
-                    "new_orders": self.max_new_orders_per_window,
-                    "reduce_orders": self.max_reduce_orders_per_window,
-                    "cancels": self.max_cancel_messages_per_window,
-                    "reserved_risk_messages": self.reserved_risk_messages_per_window,
-                    "opening_risk_ceiling": opening_risk_ceiling,
-                },
-            }
+            if self.state != LifecycleState.HALTED:
+                self._lifecycle_generation += 1
+            self.state = LifecycleState.HALTED
+            self.manual_rearm_required = True
+            self.last_halt_reason = failure_reason
+            self.last_freeze_reason = ""
+            self._sync_capability_mode(failure_reason)
+        logger.critical(f"[OMS] {failure_reason}")
+        try:
+            self._audit(
+                "background_task_failure",
+                task_key=key,
+                reason=reason,
+                rejection_count=self._background_task_rejection_count,
+            )
+        except Exception as exc:
+            logger.critical(
+                "[OMS] Could not persist background task failure: "
+                f"{type(exc).__name__}:{exc}"
+            )
+
+    def _on_background_task_error(
+        self,
+        key: str,
+        name: str,
+        exc: BaseException,
+    ) -> None:
+        self._latch_background_task_failure(
+            key,
+            f"{name}:{type(exc).__name__}:{exc}",
+        )
+
+    def _submit_background_task(
+        self,
+        key: str,
+        callback,
+        *args,
+        name: str = "",
+        safety: bool = False,
+        delay_sec: float = 0.0,
+        resubmit_after_current: bool = False,
+        fail_closed: bool = True,
+        **kwargs,
+    ):
+        lane = (
+            OMSBackgroundTaskExecutor.SAFETY_LANE
+            if safety
+            else OMSBackgroundTaskExecutor.DEFAULT_LANE
+        )
+        submission = self._background_tasks.submit(
+            key,
+            callback,
+            *args,
+            name=name,
+            lane=lane,
+            delay_sec=delay_sec,
+            resubmit_after_current=resubmit_after_current,
+            **kwargs,
+        )
+        if submission.accepted:
+            return submission.handle
+        if fail_closed:
+            self._latch_background_task_failure(key, submission.reason)
+        else:
+            logger.error(
+                f"[OMS] Background task rejected key={key}: "
+                f"{submission.reason}"
+            )
+        return None
+
+    def get_background_task_snapshot(self) -> dict:
+        snapshot = self._background_tasks.snapshot()
+        snapshot["rejection_count"] = self._background_task_rejection_count
+        return snapshot
 
     def _schedule_cancel_order_retry(self, client_oid: str) -> bool:
         with self.lock:
@@ -6477,12 +5089,17 @@ class OMS:
             if not stopped:
                 self.cancel_order(client_oid)
 
-        timer = threading.Timer(
-            self.outbound_message_window_sec + 0.01,
+        handle = self._submit_background_task(
+            f"cancel-retry:{client_oid}",
             retry,
+            name=f"CancelRetry-{client_oid}",
+            safety=True,
+            delay_sec=self.outbound_message_window_sec + 0.01,
         )
-        timer.daemon = True
-        timer.start()
+        if handle is None:
+            with self.lock:
+                self._deferred_cancel_oids.discard(client_oid)
+            return False
         return True
 
     def _schedule_cancel_all_retry(self, symbol: str, source: str) -> bool:
@@ -6508,12 +5125,17 @@ class OMS:
                 source=retry_source,
             )
 
-        timer = threading.Timer(
-            self.outbound_message_window_sec + 0.01,
+        handle = self._submit_background_task(
+            f"cancel-all-retry:{symbol}",
             retry,
+            name=f"CancelAllRetry-{symbol}",
+            safety=True,
+            delay_sec=self.outbound_message_window_sec + 0.01,
         )
-        timer.daemon = True
-        timer.start()
+        if handle is None:
+            with self.lock:
+                self._deferred_cancel_all_symbols.discard(symbol)
+            return False
         return True
 
     def _get_order_block_reason(
@@ -6857,7 +5479,15 @@ class OMS:
                 )
                 emit_halt_event = True
         if emit_halt_event:
-            self.event_engine.put(Event(EVENT_SYSTEM_HEALTH, f"HALT:{reason}"))
+            try:
+                self.event_engine.put(
+                    Event(EVENT_SYSTEM_HEALTH, f"HALT:{reason}")
+                )
+            except Exception as event_exc:
+                logger.critical(
+                    "[OMS] Failed to publish HALT event: "
+                    f"{type(event_exc).__name__}:{event_exc}"
+                )
         self._wait_for_outbound_risk_sends(f"system_halt:{reason}")
         try:
             for symbol in self._account_cancel_symbols():
@@ -6905,11 +5535,29 @@ class OMS:
 
     def stop(self, clean_shutdown: bool = False, reason: str = ""):
         with self.lock:
+            self._stopped = True
+            self._outbound_all_order_seal_reason = reason or "oms_stop"
             self._close_outbound_gate_locked("oms_stop", hold="stopped")
         drained = self._wait_for_outbound_order_sends("oms_stop")
+        background_tasks_stopped = self._background_tasks.shutdown(
+            timeout=self.outbound_gate_drain_timeout_sec
+        )
+        if not background_tasks_stopped:
+            logger.critical(
+                "[OMS] Bounded background executor did not stop cleanly"
+            )
+        with self.lock:
+            self.reconcile_retry_scheduled = False
+            self._submit_settlement_inflight_oids.clear()
+            self._submit_cancel_requested_oids.clear()
+            self._deferred_cancel_oids.clear()
+            self._deferred_cancel_all_symbols.clear()
+            self.trade_tail_verification_inflight.clear()
+            self._order_truth_resolution_inflight.clear()
         clean_shutdown = bool(
             clean_shutdown
             and drained
+            and background_tasks_stopped
             and self._shutdown_requested
             and self._shutdown_cancel_verified
         )
@@ -6943,7 +5591,6 @@ class OMS:
             )
 
         with self.lock:
-            self._stopped = True
             self._refresh_outbound_gate_locked("oms_stopped")
 
         order_monitor_stopped = True
@@ -6972,1145 +5619,31 @@ class OMS:
                     f"{type(exc).__name__}:{exc}"
                 )
 
-        stopped = bool(order_monitor_stopped and fence_released)
+        stopped = bool(
+            background_tasks_stopped
+            and order_monitor_stopped
+            and fence_released
+        )
         return {
             "stopped": stopped,
             "drained": bool(drained),
+            "background_tasks_stopped": bool(background_tasks_stopped),
             "clean": bool(clean_shutdown and audit_ok and stopped),
         }
 
-    def trigger_reconcile(
-        self,
-        reason: str,
-        suspicious_oid: str = None,
-        recovery_venue: str = "",
-        recovery_epoch: int | None = None,
-        recovery_owner: str = "",
-        recovery_reason: str = "",
-    ):
-        with self.lock:
-            if self._shutdown_requested or self._stopped:
-                return False
-            if self.state in [LifecycleState.RECONCILING, LifecycleState.HALTED]:
-                return False
-
-        self.freeze_system(
-            f"Awaiting reconcile: {reason}",
-            cancel_active_orders=True,
-        )
-
-        suppression = ""
-        with self.lock:
-            # freeze_system performs network cancellation outside its state
-            # transition. Revalidate after that work so a concurrent HALT or
-            # shutdown cannot be overwritten by a late reconcile start.
-            if (
-                self._shutdown_requested
-                or self._stopped
-                or self.state in {LifecycleState.RECONCILING, LifecycleState.HALTED}
-            ):
-                return False
-            if self.state != LifecycleState.FROZEN:
-                return False
-
-            now = time.perf_counter()
-            if (
-                self.last_reconcile_failure_ts
-                and now - self.last_reconcile_failure_ts
-                < self.reconcile_api_cooldown_sec
-            ):
-                suppression = "api_failure"
-            elif (
-                now - self.last_reconcile_request_ts
-                < self.reconcile_min_interval_sec
-            ):
-                suppression = "min_interval"
-
-            if suppression:
-                self._audit(
-                    "reconcile_suppressed",
-                    reason=reason,
-                    suspicious_oid=suspicious_oid,
-                    cooldown=suppression,
-                )
-            else:
-                self.last_reconcile_request_ts = now
-                logger.warning(f"OMS dirty: {reason}. State -> RECONCILING")
-                self.state = LifecycleState.RECONCILING
-                self._lifecycle_generation += 1
-                reconcile_generation = self._lifecycle_generation
-                self._sync_capability_mode(reason)
-                self._audit(
-                    "reconcile_requested",
-                    state=self.state.value,
-                    reason=reason,
-                    suspicious_oid=suspicious_oid,
-                )
-                reconcile_thread = threading.Thread(
-                    target=self._execute_reconcile,
-                    args=(
-                        suspicious_oid,
-                        recovery_venue,
-                        recovery_epoch,
-                        reconcile_generation,
-                        recovery_owner,
-                        recovery_reason,
-                    ),
-                    daemon=True,
-                    name="OMSReconcile",
-                )
-                self._reconcile_thread = reconcile_thread
-                try:
-                    # Register and start while holding the same lock observed
-                    # by begin_shutdown; shutdown can never miss this worker.
-                    reconcile_thread.start()
-                except Exception:
-                    self._reconcile_thread = None
-                    self.state = LifecycleState.FROZEN
-                    self._lifecycle_generation += 1
-                    self._sync_capability_mode("reconcile_thread_start_failed")
-                    raise
-
-        if suppression:
-            logger.warning(
-                f"[OMS] Reconcile suppressed by {suppression}: {reason}"
-            )
-            self._schedule_reconcile_retry(reason, suspicious_oid=suspicious_oid)
-            return False
-        return True
-
-    def _schedule_reconcile_retry(
-        self,
-        reason: str,
-        suspicious_oid: str = None,
-        delay_sec: float = None,
-    ):
-        with self.lock:
-            if (
-                self._shutdown_requested
-                or self._stopped
-                or self.reconcile_retry_scheduled
-                or self.state == LifecycleState.HALTED
-            ):
-                return
-
-        if delay_sec is None:
-            now = time.perf_counter()
-            cooldown_remaining = 0.0
-            if self.last_reconcile_failure_ts:
-                cooldown_remaining = max(
-                    0.0,
-                    self.reconcile_api_cooldown_sec - (now - self.last_reconcile_failure_ts),
-                )
-            interval_remaining = max(
-                0.0,
-                self.reconcile_min_interval_sec - (now - self.last_reconcile_request_ts),
-            )
-            delay_sec = max(cooldown_remaining, interval_remaining, 0.05)
-
-        delay_sec = max(delay_sec, 0.05)
-        self.reconcile_retry_scheduled = True
-        self._audit(
-            "reconcile_retry_scheduled",
-            reason=reason,
-            suspicious_oid=suspicious_oid,
-            delay_sec=delay_sec,
-        )
-
-        def _retry():
-            time.sleep(delay_sec)
-            self.reconcile_retry_scheduled = False
-            if self._shutdown_requested or self._stopped:
-                return
-            if self.state != LifecycleState.FROZEN:
-                return
-            self.trigger_reconcile(reason, suspicious_oid=suspicious_oid)
-
-        threading.Thread(target=_retry, daemon=True).start()
-
-    def _execute_reconcile(
-        self,
-        suspicious_oid: str,
-        recovery_venue: str = "",
-        recovery_epoch: int | None = None,
-        reconcile_generation: int | None = None,
-        recovery_owner: str = "",
-        recovery_reason: str = "",
-    ):
-        with self.lock:
-            if reconcile_generation is None:
-                reconcile_generation = self._lifecycle_generation
-        self._audit("reconcile_started", suspicious_oid=suspicious_oid)
-        try:
-            remote_positions = self.query_positions()
-            remote_orders = self.query_open_orders()
-            remote_account = self.query_account_info()
-
-            recovery_symbols = set(self.config.get("symbols", []))
-            if remote_positions is not None:
-                recovery_symbols.update(
-                    str(position.get("symbol", "") or "").upper()
-                    for position in remote_positions
-                    if isinstance(position, dict)
-                    and str(position.get("symbol", "") or "").strip()
-                )
-            if remote_orders is not None:
-                recovery_symbols.update(
-                    item["symbol"]
-                    for item in self._normalize_remote_open_orders(remote_orders)
-                )
-            trade_backfill_ok = self._backfill_trade_history(
-                symbols=recovery_symbols,
-                end_time_ms=time_service.now(),
-            )
-
-            if (
-                not trade_backfill_ok
-                or remote_positions is None
-                or remote_orders is None
-                or not remote_account
-                or not self._refresh_missing_local_order_terminals(remote_orders)
-            ):
-                self.consecutive_reconcile_api_failures += 1
-                self.last_reconcile_failure_ts = time.perf_counter()
-                attempt = self.consecutive_reconcile_api_failures
-                self._audit(
-                    "reconcile_api_unreachable",
-                    failures=attempt,
-                    suspicious_oid=suspicious_oid,
-                )
-                if attempt >= self.reconcile_api_failure_threshold:
-                    self.halt_system("Reconcile API unreachable")
-                else:
-                    logger.error(
-                        f"[Reconcile] API unreachable ({attempt}/{self.reconcile_api_failure_threshold}); "
-                        "keeping FROZEN and backing off."
-                    )
-                    self.freeze_system("Reconcile API unreachable")
-                    self._schedule_reconcile_retry(
-                        "Reconcile API retry",
-                        suspicious_oid=suspicious_oid,
-                    )
-                return
-
-            self.consecutive_reconcile_api_failures = 0
-            self.last_reconcile_failure_ts = 0.0
-
-            with self.lock:
-                remote_map = {
-                    pos["symbol"]: float(pos["positionAmt"])
-                    for pos in remote_positions
-                    if float(pos["positionAmt"]) != 0
-                }
-                local_map = {
-                    symbol: volume
-                    for symbol, volume in self.exposure.net_positions.items()
-                    if volume != 0
-                }
-                local_active_orders = self._collect_local_active_orders_locked()
-                local_balance = float(self.account.balance or 0.0)
-                local_balance_synced = bool(self.account.exchange_balance_synced)
-
-            configured_symbols = {
-                str(symbol or "").upper()
-                for symbol in self.config.get("symbols", [])
-                if str(symbol or "").strip()
-            }
-            off_config_positions = {
-                symbol: amount
-                for symbol, amount in remote_map.items()
-                if symbol not in configured_symbols and abs(amount) > 1e-9
-            }
-            if off_config_positions:
-                self._audit(
-                    "reconcile_reset",
-                    case="off_config_nonzero_positions",
-                    remote_positions=off_config_positions,
-                )
-                self._perform_full_reset()
-                return
-
-            remote_balance = float(
-                remote_account.get("totalWalletBalance", 0.0) or 0.0
-            )
-            truth_config = self.config.get("oms", {}).get("truth_monitor", {}) or {}
-            balance_tolerance = max(
-                0.0,
-                float(truth_config.get("account_balance_tolerance", 1.0) or 1.0),
-            )
-            if (
-                not local_balance_synced
-                or abs(local_balance - remote_balance) > balance_tolerance
-            ):
-                self._audit(
-                    "reconcile_reset",
-                    case="account_balance_mismatch",
-                    local_balance=local_balance,
-                    remote_balance=remote_balance,
-                    tolerance=balance_tolerance,
-                    local_balance_synced=local_balance_synced,
-                )
-                self._perform_full_reset()
-                return
-
-            for symbol in set(remote_map) | set(local_map):
-                if abs(local_map.get(symbol, 0.0) - remote_map.get(symbol, 0.0)) > 1e-6:
-                    logger.error(
-                        f"[Reconcile] Position mismatch {symbol}: "
-                        f"Local={local_map.get(symbol, 0.0)}, Exch={remote_map.get(symbol, 0.0)}"
-                    )
-                    self._audit("reconcile_reset", case="position_mismatch", symbol=symbol)
-                    self._perform_full_reset()
-                    return
-
-            remote_active_orders = self._normalize_remote_open_orders(remote_orders)
-            off_config_orders = [
-                item
-                for item in remote_active_orders
-                if item["symbol"] not in configured_symbols
-            ]
-            if off_config_orders:
-                self._audit(
-                    "reconcile_reset",
-                    case="off_config_open_orders",
-                    remote_active_orders=off_config_orders,
-                )
-                self._perform_full_reset()
-                return
-            if local_active_orders != remote_active_orders:
-                self._audit(
-                    "reconcile_reset",
-                    case="open_order_mismatch",
-                    local_active_orders=local_active_orders,
-                    remote_active_orders=remote_active_orders,
-                    suspicious_oid=suspicious_oid,
-                )
-                self._perform_full_reset()
-                return
-
-            remote_has_suspicious = False
-            local_has_suspicious = False
-            if suspicious_oid:
-                remote_has_suspicious = any(
-                    suspicious_oid in order["identifiers"]
-                    for order in remote_active_orders
-                )
-                local_has_suspicious = any(
-                    suspicious_oid in order["identifiers"]
-                    for order in local_active_orders
-                )
-
-            if remote_has_suspicious and not local_has_suspicious:
-                self._audit(
-                    "reconcile_reset",
-                    case="missing_local_order",
-                    suspicious_oid=suspicious_oid,
-                )
-                self._perform_full_reset()
-            else:
-                with self.lock:
-                    if self._shutdown_requested or self._stopped:
-                        self._audit(
-                            "reconcile_resume_suppressed",
-                            reason="shutdown_requested",
-                        )
-                        return
-                    if (
-                        self.state != LifecycleState.RECONCILING
-                        or self._lifecycle_generation != reconcile_generation
-                    ):
-                        self._audit(
-                            "reconcile_resume_suppressed",
-                            reason="lifecycle_superseded",
-                            current_state=self.state.value,
-                            expected_generation=reconcile_generation,
-                            current_generation=self._lifecycle_generation,
-                        )
-                        return
-                    self.state = LifecycleState.LIVE
-                    self._lifecycle_generation += 1
-                    self._sync_capability_mode("reconcile_cleared")
-                    self.last_freeze_reason = ""
-                    self._clear_recovered_guards_if_pending("reconcile_cleared")
-                    self._audit("reconcile_cleared", state=self.state.value)
-                logger.info("[Reconcile] False alarm. Resuming LIVE.")
-
-        except Exception as exc:
-            self.halt_system(f"Reconcile critical error: {exc}")
-        finally:
-            if recovery_venue:
-                try:
-                    self._complete_venue_recovery_verification(
-                        recovery_venue,
-                        recovery_epoch,
-                        recovery_owner,
-                        recovery_reason,
-                    )
-                except Exception as exc:
-                    self.halt_system(
-                        "Venue recovery verification failed: "
-                        f"{type(exc).__name__}:{exc}"
-                    )
-            with self.lock:
-                if self._reconcile_thread is threading.current_thread():
-                    self._reconcile_thread = None
-
-    def _complete_venue_recovery_verification(
-        self,
-        venue: str,
-        expected_epoch: int | None,
-        expected_owner: str = "",
-        expected_reason: str = "",
-    ) -> bool:
-        venue = str(venue or "").upper()
-        with self.lock:
-            if self.state != LifecycleState.LIVE:
-                return False
-            records = self._ensure_venue_guard_records_locked(venue)
-            record = records.get(str(expected_owner or ""))
-            current_epoch = (
-                int(record.get("epoch", 0) or 0)
-                if record is not None
-                else 0
-            )
-            current_reason = (
-                str(record.get("reason", "") or "")
-                if record is not None
-                else ""
-            )
-            if (
-                not expected_owner
-                or expected_epoch is None
-                or current_epoch != int(expected_epoch)
-                or current_reason != str(expected_reason or "")
-            ):
-                self.state = LifecycleState.FROZEN
-                self._lifecycle_generation += 1
-                self.last_freeze_reason = (
-                    f"Venue recovery owner changed for {venue}: "
-                    f"owner={expected_owner} expected_epoch={expected_epoch} "
-                    f"current_epoch={current_epoch}"
-                )
-                self._sync_capability_mode("venue_recovery_epoch_changed")
-                self._audit(
-                    "venue_recovery_verification_stale",
-                    venue=venue,
-                    expected_owner=expected_owner,
-                    expected_epoch=expected_epoch,
-                    current_epoch=current_epoch,
-                    expected_reason=expected_reason,
-                    current_reason=current_reason,
-                )
-                return False
-
-        cleared = self.clear_venue_freeze(
-            venue,
-            reason="truth_verified_after_transport_recovery",
-            expected_epoch=expected_epoch,
-            expected_reason=expected_reason,
-            expected_owner=expected_owner,
-        )
-        if cleared:
-            self._audit(
-                "venue_recovery_verified",
-                venue=venue,
-                epoch=int(expected_epoch),
-                owner=expected_owner,
-            )
-        return cleared
-
-    def _exchange_snapshot_signature(self, account, positions, open_orders):
-        normalized_positions = tuple(
-            sorted(
-                (
-                    str(pos.get("symbol", "") or ""),
-                    float(pos.get("positionAmt", 0.0) or 0.0),
-                    float(pos.get("entryPrice", 0.0) or 0.0),
-                )
-                for pos in positions
-                if pos.get("symbol")
-            )
-        )
-        normalized_orders = tuple(
-            (
-                item["symbol"],
-                item["identifiers"],
-                item["side"],
-            )
-            for item in self._normalize_remote_open_orders(open_orders)
-        )
-        # Exclude mark-to-market fields such as initial margin and available
-        # balance: they legitimately move while prices change. The barrier is
-        # for structural order/position state plus settled wallet balance.
-        account_signature = float(account.get("totalWalletBalance", 0.0) or 0.0)
-        return normalized_positions, normalized_orders, account_signature
-
-    def _capture_stable_exchange_snapshot(self, require_no_open_orders=False):
-        previous_signature = None
-        stable_count = 0
-        last_payload = None
-
-        for attempt in range(1, self.snapshot_max_attempts + 1):
-            account_floor = time_service.now() / 1000.0
-            open_orders = self.query_open_orders()
-            account = self.query_account_info()
-            positions_floor = time_service.now() / 1000.0
-            positions = self.query_positions()
-            snapshot_end_ms = time_service.now()
-            if open_orders is None or not account or positions is None:
-                raise RuntimeError("API failed while acquiring stable exchange snapshot")
-
-            signature = self._exchange_snapshot_signature(account, positions, open_orders)
-            if signature == previous_signature:
-                stable_count += 1
-            else:
-                stable_count = 1
-                previous_signature = signature
-
-            normalized_orders = self._normalize_remote_open_orders(open_orders)
-            last_payload = {
-                "open_orders": open_orders,
-                "account": account,
-                "positions": positions,
-                "account_floor": account_floor,
-                "positions_floor": positions_floor,
-                "end_time_ms": snapshot_end_ms,
-                "attempt": attempt,
-            }
-            if (
-                stable_count >= self.snapshot_stability_required
-                and (not require_no_open_orders or not normalized_orders)
-            ):
-                self._audit(
-                    "stable_snapshot_acquired",
-                    attempts=attempt,
-                    stable_count=stable_count,
-                    end_time_ms=snapshot_end_ms,
-                )
-                return last_payload
-
-            time.sleep(self.snapshot_settle_interval_sec)
-
-        residual = (
-            self._normalize_remote_open_orders(last_payload["open_orders"])
-            if last_payload
-            else []
-        )
-        raise RuntimeError(
-            "exchange snapshot did not stabilize"
-            + (f"; residual open orders={residual}" if residual else "")
-        )
-
-    def _perform_full_reset(self):
-        with self.lock:
-            reset_entry_state = self.state
-            reset_entry_generation = self._lifecycle_generation
-            transient_guard_snapshot = self._capture_guard_cleanup_snapshot_locked(
-                prefixes=("truth_plane:",)
-            )
-        logger.info("[OMS] Performing full state reset...")
-        self._audit("full_reset_started", symbols=self.config.get("symbols", []))
-        try:
-            if not self._ensure_venue_dead_man_switch_armed("full_reset"):
-                return
-            command_fence_started = time.perf_counter()
-            discovered_orders = self.query_open_orders()
-            if discovered_orders is None:
-                raise RuntimeError(
-                    "account open-order discovery failed before reset cancel"
-                )
-            for symbol in self._account_cancel_symbols(discovered_orders):
-                if not self._cancel_all_orders_unchecked(
-                    symbol,
-                    source="full_reset_initial",
-                    bypass_message_budget=True,
-                ):
-                    raise RuntimeError(
-                        f"initial mass cancel not admitted for {symbol}"
-                    )
-
-            initial_snapshot = self._capture_stable_exchange_snapshot(
-                require_no_open_orders=True,
-            )
-            recovery_symbols = set(self._account_cancel_symbols())
-            recovery_symbols.update(
-                str(position.get("symbol", "") or "").upper()
-                for position in initial_snapshot["positions"]
-                if str(position.get("symbol", "") or "").strip()
-            )
-            with self.lock:
-                establish_trade_baseline = bool(
-                    self.state == LifecycleState.BOOTSTRAP
-                    and not self.orders
-                    and not self.trade_cursors
-                )
-            if establish_trade_baseline and not self._prime_trade_history_baseline(
-                initial_snapshot["end_time_ms"],
-                symbols=recovery_symbols,
-            ):
-                raise RuntimeError("trade history baseline failed during bootstrap")
-            if self.external_cash_flow_truth_enabled and not self.backfill_external_cash_flow_history(
-                end_time_ms=initial_snapshot["end_time_ms"],
-                source="bootstrap_income_history",
-            ):
-                raise RuntimeError("external cash-flow history failed during bootstrap")
-            if not self._backfill_trade_history(
-                symbols=recovery_symbols,
-                end_time_ms=initial_snapshot["end_time_ms"],
-            ):
-                raise RuntimeError("trade history backfill failed during reset")
-
-            fence_remaining = max(
-                0.0,
-                self.command_fence_timeout_sec
-                - (time.perf_counter() - command_fence_started),
-            )
-            if fence_remaining > 0:
-                self._audit(
-                    "command_fence_wait",
-                    remaining_sec=fence_remaining,
-                )
-                time.sleep(fence_remaining)
-
-            # A pre-freeze submit may arrive after the first mass cancel but
-            # cannot arrive after its signed recvWindow expires. Cancel again
-            # beyond that fence, then establish the committed snapshot.
-            for symbol in self._account_cancel_symbols():
-                if not self._cancel_all_orders_unchecked(
-                    symbol,
-                    source="full_reset_fenced",
-                    bypass_message_budget=True,
-                ):
-                    raise RuntimeError(
-                        f"fenced mass cancel not admitted for {symbol}"
-                    )
-
-            snapshot = self._capture_stable_exchange_snapshot(
-                require_no_open_orders=True,
-            )
-            if self.external_cash_flow_truth_enabled and not self.backfill_external_cash_flow_history(
-                end_time_ms=snapshot["end_time_ms"],
-                source="reset_income_history",
-            ):
-                raise RuntimeError("external cash-flow history failed during reset")
-            recovery_symbols.update(
-                str(position.get("symbol", "") or "").upper()
-                for position in snapshot["positions"]
-                if str(position.get("symbol", "") or "").strip()
-            )
-            if not self._backfill_trade_history(
-                symbols=recovery_symbols,
-                end_time_ms=snapshot["end_time_ms"],
-            ):
-                raise RuntimeError("final trade history backfill failed during reset")
-
-            remote_orders = snapshot["open_orders"]
-            account = snapshot["account"]
-            positions = snapshot["positions"]
-            configured_symbols = {
-                str(symbol or "").upper()
-                for symbol in self.config.get("symbols", [])
-                if str(symbol or "").strip()
-            }
-            off_config_positions = {
-                str(pos.get("symbol", "") or "").upper(): float(
-                    pos.get("positionAmt", 0.0) or 0.0
-                )
-                for pos in positions
-                if str(pos.get("symbol", "") or "").strip()
-                and str(pos.get("symbol", "") or "").upper()
-                not in configured_symbols
-                and abs(float(pos.get("positionAmt", 0.0) or 0.0)) > 1e-9
-            }
-            account_snapshot_floor = snapshot["account_floor"]
-            positions_snapshot_floor = snapshot["positions_floor"]
-
-            residual_orders = self._normalize_remote_open_orders(remote_orders)
-            if residual_orders:
-                raise RuntimeError(
-                    f"remote open orders still present after cancel-all: {residual_orders}"
-                )
-
-            with self.lock:
-                previously_tracked_symbols = set(self.exposure.net_positions.keys())
-                self.orders.clear()
-                self.exchange_id_map.clear()
-                self.exposure.net_positions.clear()
-                self.exposure.avg_prices.clear()
-                self.exposure.open_buy_qty.clear()
-                self.exposure.open_sell_qty.clear()
-                self.exposure.update_open_orders(self.orders)
-
-                for pos in positions:
-                    amount = float(pos["positionAmt"])
-                    if amount == 0:
-                        continue
-                    symbol = pos["symbol"]
-                    self.exposure.force_sync(symbol, amount, float(pos["entryPrice"]))
-
-                snapshot_symbols = previously_tracked_symbols | configured_symbols
-                snapshot_symbols.update(
-                    str(pos.get("symbol", "") or "").upper()
-                    for pos in positions
-                    if pos.get("symbol")
-                )
-                for symbol in snapshot_symbols:
-                    self.exposure.reconcile_strategy_position(
-                        symbol,
-                        self.exposure.net_positions[symbol],
-                        self.exposure.avg_prices[symbol],
-                    )
-                    self._position_state_event_time[symbol] = max(
-                        float(self._position_state_event_time.get(symbol, 0.0) or 0.0),
-                        positions_snapshot_floor,
-                    )
-                    self._exchange_position_event_time[symbol] = max(
-                        float(self._exchange_position_event_time.get(symbol, 0.0) or 0.0),
-                        positions_snapshot_floor,
-                    )
-
-                available_balance = account.get("availableBalance")
-                self.account.force_sync(
-                    float(account["totalWalletBalance"]),
-                    float(account["totalInitialMargin"]),
-                    float(available_balance) if available_balance is not None else None,
-                    maintenance_margin=account.get("totalMaintMargin"),
-                    margin_balance=account.get("totalMarginBalance"),
-                    margin_snapshot_time=time.time(),
-                    margin_snapshot_monotonic=time.perf_counter(),
-                )
-                self._account_state_event_time = max(
-                    float(self._account_state_event_time or 0.0),
-                    account_snapshot_floor,
-                )
-                self._exchange_account_event_time = max(
-                    float(self._exchange_account_event_time or 0.0),
-                    account_snapshot_floor,
-                )
-                self.order_monitor.monitored_orders.clear()
-
-            for symbol in snapshot_symbols:
-                self._emit_position_update(symbol)
-
-            if off_config_positions:
-                self._audit(
-                    "full_reset_manual_halt",
-                    case="off_config_nonzero_positions",
-                    remote_positions=off_config_positions,
-                )
-                symbols = ",".join(sorted(off_config_positions))
-                self.halt_system(
-                    "Off-config nonzero positions require manual handling: "
-                    f"{symbols}"
-                )
-                return
-
-            with self.lock:
-                if self._shutdown_requested or self._stopped:
-                    if self.state != LifecycleState.HALTED:
-                        self.state = LifecycleState.FROZEN
-                        self._lifecycle_generation += 1
-                    self._sync_capability_mode("shutdown_requested")
-                    self._audit(
-                        "full_reset_resume_suppressed",
-                        reason="shutdown_requested",
-                    )
-                    return
-                if (
-                    reset_entry_state
-                    not in {LifecycleState.BOOTSTRAP, LifecycleState.RECONCILING}
-                    or self.state != reset_entry_state
-                    or self._lifecycle_generation != reset_entry_generation
-                ):
-                    self._audit(
-                        "full_reset_resume_suppressed",
-                        reason="lifecycle_superseded",
-                        entry_state=reset_entry_state.value,
-                        current_state=self.state.value,
-                        expected_generation=reset_entry_generation,
-                        current_generation=self._lifecycle_generation,
-                    )
-                    return
-                self.state = LifecycleState.LIVE
-                self._lifecycle_generation += 1
-                self._sync_capability_mode("full_reset_completed")
-                self.manual_rearm_required = False
-                self.last_freeze_reason = ""
-                self.last_halt_reason = ""
-                self.reconcile_retry_scheduled = False
-                self.clear_transient_guards(
-                    prefixes=("truth_plane:",),
-                    guard_snapshot=transient_guard_snapshot,
-                )
-                self._clear_recovered_guards_if_pending("full_reset_completed")
-                self._audit(
-                    "full_reset_completed",
-                    state=self.state.value,
-                    balance=self.account.balance,
-                    equity=self.account.equity,
-                    positions=dict(self.exposure.net_positions),
-                )
-            logger.info("OMS: Reset complete. System is CLEAN and LIVE.")
-
-        except Exception as exc:
-            self.halt_system(f"Reset failed: {exc}")
+    _schedule_pending_reconcile_requests = component_method("reconciler")
+    _queue_reconcile_request_locked = component_method("reconciler")
+    _drain_pending_reconcile_requests = component_method("reconciler")
+    trigger_reconcile = component_method("reconciler")
+    _schedule_reconcile_retry = component_method("reconciler")
+    _execute_reconcile = component_method("reconciler")
+    _complete_venue_recovery_verification = component_method("reconciler")
+    _exchange_snapshot_signature = component_method("reconciler")
+    _capture_stable_exchange_snapshot = component_method("reconciler")
+    _perform_full_reset = component_method("reconciler")
 
     def submit_order(self, intent: OrderIntent) -> OrderSubmitResult:
-        client_oid = str(uuid.uuid4())
-        original_intent = intent
-        order = None
-        request = None
-        rejection_reason = ""
-        rejection_extra = {}
-        rejection_intent = intent
-        command_id = f"SUBMIT:{client_oid}"
-        order_send_permit = False
-        order_send_risk_increasing = not intent.reduce_only
-        calibration_terminal_reason = ""
-
-        # Risk evaluation and exposure reservation are one critical section.
-        # Every concurrent submit sees earlier accepted-but-not-yet-ACKed orders.
-        try:
-            with self.lock:
-                rejection_reason = self._get_order_block_reason(
-                    intent.strategy_id,
-                    intent.symbol,
-                    reduce_only=intent.reduce_only,
-                )
-                if not rejection_reason:
-                    intent, rejection_reason = self.adapt_intent_for_trading_mode(intent)
-                    rejection_intent = original_intent if rejection_reason else intent
-
-                if not rejection_reason:
-                    valid, rejection_reason = self.validator.validate_params(intent)
-                    rejection_intent = intent
-                    if valid:
-                        rejection_reason = ""
-
-                if not rejection_reason:
-                    rejection_reason = self._get_submission_safety_reason_locked(intent)
-
-                notional = intent.price * intent.volume if not rejection_reason else 0.0
-                if not rejection_reason and intent.reduce_only:
-                    ok, risk_reason = self.exposure.check_reduce_only(
-                        intent.symbol,
-                        intent.side,
-                        intent.volume,
-                    )
-                    if not ok:
-                        rejection_reason = risk_reason
-                elif not rejection_reason:
-                    if not self.account.check_margin(notional):
-                        rejection_reason = "insufficient_margin"
-                        rejection_extra = {
-                            "notional": notional,
-                            "available": self.account.available,
-                        }
-                    else:
-                        ok, risk_reason = self.exposure.check_risk(
-                            intent.symbol,
-                            intent.side,
-                            intent.volume,
-                            self.max_pos_notional,
-                            self.max_account_gross_notional,
-                            intent.price,
-                            self.max_concurrent_symbols,
-                        )
-                        if not ok:
-                            logger.warning(f"[OMS] Risk rejected: {risk_reason}")
-                            rejection_reason = f"exposure_limit:{risk_reason}"
-
-                if not rejection_reason:
-                    rejection_reason = (
-                        self._get_strategy_budget_rejection_locked(intent)
-                    )
-
-                if not rejection_reason:
-                    order_send_risk_increasing = not intent.reduce_only
-                    permit_epoch, rejection_reason = (
-                        self._acquire_outbound_order_send_permit_locked(
-                            risk_increasing=order_send_risk_increasing,
-                            symbol=intent.symbol,
-                        )
-                    )
-                    order_send_permit = permit_epoch is not None
-
-                if not rejection_reason:
-                    message_kind = (
-                        self.OUTBOUND_REDUCE_ORDER
-                        if intent.reduce_only
-                        else self.OUTBOUND_NEW_ORDER
-                    )
-                    rejection_reason = self._reserve_outbound_message_locked(
-                        message_kind
-                    )
-
-                if not rejection_reason:
-                    request = OrderRequest(
-                        symbol=intent.symbol,
-                        price=intent.price,
-                        volume=intent.volume,
-                        side=intent.side.value,
-                        order_type=intent.order_type,
-                        time_in_force=intent.time_in_force,
-                        post_only=intent.is_post_only,
-                        reduce_only=intent.reduce_only,
-                        self_trade_prevention_mode=(
-                            self.exchange_self_trade_prevention_mode
-                        ),
-                    )
-                    (
-                        rejection_reason,
-                        calibration_terminal_reason,
-                    ) = self._reserve_rpi_calibration_sample_locked(
-                        intent,
-                        request,
-                        client_oid,
-                    )
-
-                if not rejection_reason:
-                    order = Order(client_oid, intent)
-                    self.orders[client_oid] = order
-                    order.mark_submitting()
-                    self.exposure.update_open_orders(self.orders)
-                    self.account.calculate()
-                    self._record_order_snapshot(order, "accepted")
-
-            if rejection_reason:
-                if order_send_permit:
-                    self._release_outbound_order_send_permit(
-                        risk_increasing=order_send_risk_increasing,
-                        symbol=intent.symbol,
-                    )
-                    order_send_permit = False
-                if calibration_terminal_reason:
-                    self.expire_rpi_calibration_permit(
-                        calibration_terminal_reason
-                    )
-                return self._reject_intent_locally(
-                    rejection_intent,
-                    client_oid,
-                    rejection_reason,
-                    **rejection_extra,
-                )
-
-            # The durable command intent is committed before the first byte is
-            # sent to the venue. Recovery queries by client_oid and never
-            # blindly resends an ambiguous command.
-            self._record_command_prepared(command_id, "SUBMIT", order, request)
-        except JournalError as exc:
-            if order_send_permit:
-                self._release_outbound_order_send_permit(
-                    risk_increasing=order_send_risk_increasing,
-                    symbol=intent.symbol,
-                )
-                order_send_permit = False
-            with self.lock:
-                if order is not None and order.status == OrderStatus.SUBMITTING:
-                    order.mark_rejected_locally("durable_journal_unavailable")
-                self.orders.pop(client_oid, None)
-                self.exposure.update_open_orders(self.orders)
-                self.account.calculate()
-                if order is not None:
-                    self._emit_order_update(order)
-            self._fail_closed_on_journal_error(exc, "prepare_submit", intent.symbol)
-            return OrderSubmitResult(
-                accepted=False,
-                client_oid=client_oid,
-                reason="durable_journal_unavailable",
-                state=self.state.value,
-            )
-        except BaseException:
-            if order_send_permit:
-                self._release_outbound_order_send_permit(
-                    risk_increasing=order_send_risk_increasing,
-                    symbol=intent.symbol,
-                )
-            raise
-
-        try:
-            try:
-                raw_result = self.gateway.send_order(request, client_oid)
-                command = self._normalize_submit_command(raw_result)
-            except Exception as exc:
-                command = GatewayCommandResult(
-                    CommandOutcome.UNKNOWN,
-                    error_message=f"gateway_send_exception:{exc}",
-                )
-        finally:
-            if order_send_permit:
-                self._release_outbound_order_send_permit(
-                    risk_increasing=order_send_risk_increasing,
-                    symbol=intent.symbol,
-                )
-                order_send_permit = False
-
-        try:
-            self._record_command_result(
-                command_id,
-                "SUBMIT",
-                order,
-                command.outcome,
-                exchange_oid=command.exchange_oid,
-                error_code=command.error_code,
-                error_message=command.error_message,
-            )
-        except JournalError as exc:
-            with self.lock:
-                if order.status == OrderStatus.SUBMITTING:
-                    order.mark_submit_unknown("result_not_durable")
-                self._emit_order_update(order)
-            self._fail_closed_on_journal_error(exc, "result_submit", intent.symbol)
-            self._on_order_truth_check(
-                "Submit result could not be persisted",
-                suspicious_oid=client_oid,
-            )
-            return OrderSubmitResult(
-                accepted=True,
-                client_oid=client_oid,
-                reason="submit_outcome_unknown",
-                state=self.state.value,
-            )
-
-        if command.outcome == CommandOutcome.ACKNOWLEDGED:
-            exchange_oid = command.exchange_oid
-            try:
-                with self.lock:
-                    order.mark_pending_ack(exchange_oid)
-                    self.exchange_id_map[exchange_oid] = order
-                    self._record_order_snapshot(order, "rest_ack")
-                    self._emit_order_update(order)
-            except JournalError as exc:
-                self._fail_closed_on_journal_error(exc, "snapshot_submit_ack", intent.symbol)
-                return OrderSubmitResult(
-                    accepted=True,
-                    client_oid=client_oid,
-                    reason="accepted_but_local_snapshot_failed",
-                    state=self.state.value,
-                )
-
-            event_data = OrderSubmitted(
-                request,
-                client_oid,
-                time.time(),
-                monotonic_timestamp=time.perf_counter(),
-            )
-            self.event_engine.put(Event(EVENT_ORDER_SUBMITTED, event_data))
-            try:
-                self._commit_gateway_submission(client_oid)
-            except Exception as exc:
-                logger.error(
-                    f"[OMS] Gateway submit commit failed for {client_oid}: {exc}"
-                )
-                self.freeze_symbol(
-                    intent.symbol,
-                    f"order_truth:submit_commit_failed:{client_oid}",
-                    cancel_active_orders=False,
-                )
-                self._on_order_truth_check(
-                    "Gateway submit commit failed",
-                    suspicious_oid=client_oid,
-                )
-            self._audit(
-                "order_submitted",
-                client_oid=client_oid,
-                exchange_oid=exchange_oid,
-                symbol=intent.symbol,
-                side=intent.side.value,
-                price=intent.price,
-                volume=intent.volume,
-            )
-            return OrderSubmitResult(
-                accepted=True,
-                client_oid=client_oid,
-                state=self.state.value,
-            )
-
-        if command.outcome == CommandOutcome.UNKNOWN:
-            try:
-                with self.lock:
-                    order.mark_submit_unknown(command.error_message or "submit_outcome_unknown")
-                    self._record_order_snapshot(
-                        order,
-                        "send_unknown",
-                        error_code=command.error_code,
-                        error_message=command.error_message,
-                    )
-                    self._emit_order_update(order)
-            except JournalError as exc:
-                self._fail_closed_on_journal_error(exc, "snapshot_submit_unknown", intent.symbol)
-                self._on_order_truth_check(
-                    "Submit result could not be persisted",
-                    suspicious_oid=client_oid,
-                )
-                return OrderSubmitResult(
-                    accepted=True,
-                    client_oid=client_oid,
-                    reason="submit_outcome_unknown",
-                    state=self.state.value,
-                )
-            self.event_engine.put(
-                Event(
-                    EVENT_ORDER_SUBMITTED,
-                    OrderSubmitted(
-                        request,
-                        client_oid,
-                        time.time(),
-                        OrderStatus.SUBMIT_UNKNOWN,
-                        monotonic_timestamp=time.perf_counter(),
-                    ),
-                )
-            )
-            self.freeze_symbol(
-                intent.symbol,
-                f"order_truth:submit_unknown:{client_oid}",
-                cancel_active_orders=False,
-            )
-            self._audit(
-                "order_submit_unknown",
-                client_oid=client_oid,
-                symbol=intent.symbol,
-                error_code=command.error_code,
-                error_message=command.error_message,
-            )
-            self._on_order_truth_check("Order submit outcome unknown", suspicious_oid=client_oid)
-            return OrderSubmitResult(
-                accepted=True,
-                client_oid=client_oid,
-                reason="submit_outcome_unknown",
-                state=self.state.value,
-            )
-
-        try:
-            with self.lock:
-                reject_reason = command.error_message or command.error_code or "gateway_send_rejected"
-                order.mark_rejected_locally(reject_reason)
-                self._record_order_snapshot(order, "send_failed")
-                self._emit_order_update(order)
-                self.orders.pop(client_oid, None)
-                self.exposure.update_open_orders(self.orders)
-                self.account.calculate()
-        except JournalError as exc:
-            self._fail_closed_on_journal_error(exc, "snapshot_submit_rejected", intent.symbol)
-            return OrderSubmitResult(
-                accepted=False,
-                client_oid=client_oid,
-                reason="durable_journal_unavailable",
-                state=self.state.value,
-            )
-        self._write_tombstone(order)
-        self._audit(
-            "order_rejected_locally",
-            client_oid=client_oid,
-            symbol=intent.symbol,
-            reason=reject_reason,
-        )
-        return OrderSubmitResult(
-            accepted=False,
-            client_oid=client_oid,
-            reason=reject_reason,
-            state=self.state.value,
-        )
+        return self.order_submission.submit_order(intent)
 
     def _reject_intent_locally(self, intent: OrderIntent, client_oid: str, reason: str, **extra):
         order = Order(client_oid, intent)
@@ -8143,13 +5676,31 @@ class OMS:
             return False
 
         command_id = f"CANCEL:{client_oid}:{uuid.uuid4().hex}"
+        message_reservation = None
         try:
             with self.lock:
                 order = self.orders.get(client_oid)
                 if not order or not order.is_active():
                     return False
-                budget_rejection = self._reserve_outbound_message_locked(
-                    self.OUTBOUND_CANCEL
+                if client_oid in self._submit_settlement_inflight_oids:
+                    if client_oid in self._submit_cancel_requested_oids:
+                        return True
+                    self._submit_cancel_requested_oids.add(client_oid)
+                    self._audit(
+                        "cancel_queued_until_submit_settled",
+                        client_oid=client_oid,
+                        symbol=order.intent.symbol,
+                    )
+                    return True
+                if client_oid in self._submit_cancel_requested_oids:
+                    return True
+                if order.status == OrderStatus.CANCELLING:
+                    return True
+                (
+                    message_reservation,
+                    budget_rejection,
+                ) = self._outbound_budget.reserve_token(
+                    self.OUTBOUND_CANCEL,
                 )
                 if budget_rejection:
                     scheduled = self._schedule_cancel_order_retry(client_oid)
@@ -8165,13 +5716,15 @@ class OMS:
                 target_id = order.exchange_oid if order.exchange_oid else client_oid
                 try:
                     order.mark_cancelling()
-                    self._record_order_snapshot(order, "cancel_requested")
-                    self._emit_order_update(order)
                 except ValueError:
-                    pass
+                    self._outbound_budget.rollback(message_reservation)
+                    return order.status == OrderStatus.CANCELLING
+                self._record_order_snapshot(order, "cancel_requested")
+                self._emit_order_update(order)
                 request = CancelRequest(order.intent.symbol, target_id)
             self._record_command_prepared(command_id, "CANCEL", order, request)
         except JournalError as exc:
+            self._outbound_budget.rollback(message_reservation)
             self._fail_closed_on_journal_error(
                 exc,
                 "prepare_cancel",
@@ -8212,6 +5765,11 @@ class OMS:
                 error_message=error_message,
             )
         except JournalError as exc:
+            self._latch_journal_failure(
+                exc,
+                "result_cancel",
+                request.symbol,
+            )
             with self.lock:
                 current = self.orders.get(client_oid)
                 if current and current.is_active():
@@ -8219,12 +5777,34 @@ class OMS:
                         current.mark_cancel_unknown("result_not_durable")
                     except ValueError:
                         pass
-                    self._emit_order_update(current)
-            self._fail_closed_on_journal_error(exc, "result_cancel", request.symbol)
-            self._on_order_truth_check(
-                "Cancel result could not be persisted",
-                suspicious_oid=client_oid,
-            )
+            if current is not None:
+                self._notify_order_state_safely(
+                    current,
+                    "cancel_result_journal_failure",
+                )
+            try:
+                self._fail_closed_on_journal_error(
+                    exc,
+                    "result_cancel",
+                    request.symbol,
+                )
+            except BaseException as fail_closed_exc:
+                logger.critical(
+                    "[OMS] Cancel result failure could not complete "
+                    f"fail-closed: {type(fail_closed_exc).__name__}:"
+                    f"{fail_closed_exc}"
+                )
+            try:
+                self._on_order_truth_check(
+                    "Cancel result could not be persisted",
+                    suspicious_oid=client_oid,
+                )
+            except BaseException as truth_exc:
+                logger.critical(
+                    "[OMS] Cancel result failure could not start truth "
+                    f"resolution: {type(truth_exc).__name__}:"
+                    f"{truth_exc}"
+                )
             return True
 
         if response is not None and getattr(response, "status_code", 0) == 200:
@@ -8309,11 +5889,14 @@ class OMS:
         bypass_message_budget: bool = False,
     ) -> bool:
         budget_rejection = ""
+        message_reservation = None
         if not bypass_message_budget:
-            with self.lock:
-                budget_rejection = self._reserve_outbound_message_locked(
-                    self.OUTBOUND_CANCEL
-                )
+            (
+                message_reservation,
+                budget_rejection,
+            ) = self._outbound_budget.reserve_token(
+                self.OUTBOUND_CANCEL,
+            )
         if budget_rejection:
             logger.error(
                 f"[OMS] Mass cancel blocked for {symbol}: {budget_rejection}"
@@ -8334,7 +5917,15 @@ class OMS:
             return deferred
 
         if audit:
-            self._audit("cancel_all_submitted", symbol=symbol, source=source)
+            try:
+                self._audit(
+                    "cancel_all_submitted",
+                    symbol=symbol,
+                    source=source,
+                )
+            except Exception:
+                self._outbound_budget.rollback(message_reservation)
+                raise
         try:
             response = self.gateway.cancel_all_orders(symbol)
         except Exception as exc:
@@ -8543,673 +6134,22 @@ class OMS:
             source="public_cancel_all",
         )
 
-    def on_exchange_update(self, event):
-        try:
-            self._append_and_process(event)
-        except JournalError as exc:
-            symbol = str(getattr(event.data, "symbol", "") or "")
-            self._fail_closed_on_journal_error(exc, "exchange_update", symbol)
+    on_exchange_update = component_method("exchange_event_processor")
+    on_exchange_account_update = component_method("exchange_event_processor")
+    _append_and_process = component_method("exchange_event_processor")
+    _quarantine_execution_gap_locked = component_method("exchange_event_processor")
+    _apply_event = component_method("exchange_event_processor")
+    _apply_recovered_execution = component_method("exchange_event_processor")
+    _apply_recovered_command_result = component_method("exchange_event_processor")
 
-    def on_exchange_account_update(self, event):
-        update: ExchangeAccountUpdate = event.data
-        if str(update.reason or "").upper() in self.CASH_FLOW_DIRTY_REASONS:
-            self.mark_external_cash_flow_truth_unavailable(
-                f"account_update:{str(update.reason).upper()}"
-            )
-        tracked_symbols = set(self.config.get("symbols", []))
-        tracked_positions = {
-            symbol: payload
-            for symbol, payload in update.positions.items()
-            if not tracked_symbols or symbol in tracked_symbols
-        }
+    _journal_int = staticmethod(RpiCalibrationReplay._journal_int)
 
-        event_time = float(update.event_time or 0.0)
-        has_balance_update = bool(update.asset or update.balances)
-        corrected_positions = {}
-        corrected_with_active_order = {}
+    def _journal_decimal(self, payload: dict, field: str) -> Decimal:
+        return self.rpi_calibration_replay._journal_decimal(payload, field)
 
-        with self.lock:
-            # ACCOUNT_UPDATE.P is a partial delta: only symbols changed by this
-            # account event are present. Absence must never be interpreted as a
-            # flat position.
-            for symbol, payload in tracked_positions.items():
-                state_time = float(self._position_state_event_time.get(symbol, 0.0) or 0.0)
-                if event_time and state_time and event_time + 1e-6 < state_time:
-                    self._audit(
-                        "stale_exchange_position_update_ignored",
-                        symbol=symbol,
-                        event_time=event_time,
-                        state_time=state_time,
-                    )
-                    continue
-
-                remote_volume = float(payload.get("volume", 0.0) or 0.0)
-                remote_entry_price = float(payload.get("entry_price", 0.0) or 0.0)
-                local_volume = float(self.exposure.net_positions.get(symbol, 0.0) or 0.0)
-                if abs(local_volume - remote_volume) > 1e-9:
-                    corrected_positions[symbol] = {
-                        "local": local_volume,
-                        "exchange": remote_volume,
-                        "entry_price": remote_entry_price,
-                    }
-                    corrected_with_active_order[symbol] = self._has_active_orders_locked({symbol})
-                    self.exposure.force_sync(symbol, remote_volume, remote_entry_price)
-                    self.exposure.reconcile_strategy_position(
-                        symbol,
-                        remote_volume,
-                        remote_entry_price,
-                    )
-
-                if event_time:
-                    self._position_state_event_time[symbol] = max(state_time, event_time)
-                    self._exchange_position_event_time[symbol] = max(
-                        float(self._exchange_position_event_time.get(symbol, 0.0) or 0.0),
-                        event_time,
-                    )
-
-            account_state_time = float(self._account_state_event_time or 0.0)
-            account_update_is_stale = bool(
-                event_time
-                and account_state_time
-                and event_time + 1e-6 < account_state_time
-            )
-            if account_update_is_stale:
-                self._audit(
-                    "stale_exchange_account_update_ignored",
-                    event_time=event_time,
-                    state_time=account_state_time,
-                )
-                if corrected_positions:
-                    self.account.calculate()
-            elif has_balance_update:
-                self.account.sync_exchange_balance(
-                    update.wallet_balance,
-                    available=update.available_balance,
-                    asset=update.asset,
-                    balances=update.balances,
-                )
-                if event_time:
-                    self._account_state_event_time = max(account_state_time, event_time)
-                    self._exchange_account_event_time = max(
-                        float(self._exchange_account_event_time or 0.0),
-                        event_time,
-                    )
-
-        if has_balance_update:
-            self._schedule_rpi_calibration_runtime_enforcement()
-        if not corrected_positions:
-            return
-
-        self._audit(
-            "exchange_account_positions_synced",
-            reason=update.reason,
-            event_time=event_time,
-            positions=corrected_positions,
-        )
-
-        for symbol in corrected_positions:
-            self._emit_position_update(symbol)
-            self._schedule_trade_tail_verification(
-                symbol,
-                reason="exchange_account_position_correction",
-            )
-
-        if self.state in {LifecycleState.HALTED, LifecycleState.RECONCILING}:
-            return
-
-        unexpected_positions = {
-            symbol: payload
-            for symbol, payload in corrected_positions.items()
-            if not corrected_with_active_order.get(symbol, False)
-        }
-        if unexpected_positions:
-            logger.error(
-                "[OMS] Exchange position correction without an active local order: "
-                f"{unexpected_positions}"
-            )
-            self.trigger_reconcile("Unexpected exchange account position correction")
-
-    def _append_and_process(self, event):
-        self.event_log.append(event)
-        self._apply_event(event)
-
-    def _quarantine_execution_gap_locked(
-        self,
-        order: Order,
-        update: ExchangeOrderUpdate,
-        delta: float,
-        detail: str,
-    ) -> None:
-        reason = (
-            f"execution_truth:{order.intent.symbol}:{order.client_oid}:"
-            f"{detail}"
-        )
-        self._audit(
-            "execution_truth_gap",
-            reason=reason,
-            client_oid=order.client_oid,
-            exchange_oid=update.exchange_oid or order.exchange_oid,
-            symbol=order.intent.symbol,
-            status=update.status,
-            local_filled=order.filled_volume,
-            incoming_cumulative=update.cum_filled_qty,
-            incoming_last_fill=update.filled_qty,
-            missing_delta=delta,
-            trade_id=update.trade_id,
-        )
-        if self.state not in {
-            LifecycleState.HALTED,
-            LifecycleState.RECONCILING,
-        }:
-            previous_state = self.state
-            self.state = LifecycleState.FROZEN
-            self._lifecycle_generation += 1
-            self.last_freeze_reason = reason
-            self._sync_capability_mode(reason)
-            self._audit(
-                "lifecycle",
-                state=self.state.value,
-                reason=reason,
-                previous_state=previous_state.value,
-            )
-        threading.Thread(
-            target=self.trigger_reconcile,
-            args=(
-                f"Unverified execution gap {order.client_oid}",
-                order.client_oid,
-            ),
-            daemon=True,
-            name=f"ExecutionTruth-{order.client_oid}",
-        ).start()
-
-    def _apply_event(self, event):
-        if event.type != "eExchangeOrderUpdate":
-            return
-
-        update: ExchangeOrderUpdate = event.data
-        update.status = str(update.status or "").upper()
-        if update.status == "EXPIRED_IN_MATCH":
-            update.status = "EXPIRED"
-        with self.lock:
-            order = self.orders.get(update.client_oid)
-            if not order and update.exchange_oid:
-                order = self.exchange_id_map.get(update.exchange_oid)
-
-            if not order:
-                suspicious = update.client_oid or update.exchange_oid
-                if suspicious in self.terminated_oids:
-                    self._audit(
-                        "late_duplicate_ignored",
-                        suspicious_oid=suspicious,
-                        exchange_status=update.status,
-                    )
-                    return
-                self._audit(
-                    "unknown_order_update",
-                    client_oid=update.client_oid,
-                    exchange_oid=update.exchange_oid,
-                    status=update.status,
-                )
-                threading.Thread(
-                    target=self.trigger_reconcile,
-                    args=(f"Unknown Order {suspicious}", suspicious),
-                    daemon=True,
-                ).start()
-                return
-
-            if update.exchange_oid and order.exchange_oid and order.exchange_oid != update.exchange_oid:
-                self._audit(
-                    "exchange_oid_mismatch",
-                    client_oid=order.client_oid,
-                    local_exchange_oid=order.exchange_oid,
-                    incoming_exchange_oid=update.exchange_oid,
-                )
-                threading.Thread(
-                    target=self.trigger_reconcile,
-                    args=(f"Exchange OID mismatch {order.client_oid}", order.client_oid),
-                    daemon=True,
-                ).start()
-                return
-
-            semantic_mismatches = {}
-            if (
-                update.order_type
-                and update.order_type != order.intent.order_type
-            ):
-                semantic_mismatches["order_type"] = {
-                    "expected": order.intent.order_type,
-                    "actual": update.order_type,
-                }
-            if (
-                update.time_in_force
-                and order.intent.order_type == "LIMIT"
-                and update.time_in_force != order.intent.time_in_force
-            ):
-                semantic_mismatches["time_in_force"] = {
-                    "expected": order.intent.time_in_force,
-                    "actual": update.time_in_force,
-                }
-            if semantic_mismatches:
-                reason = f"exchange_order_semantics_mismatch:{order.client_oid}"
-                self._audit(
-                    "exchange_order_semantics_mismatch",
-                    client_oid=order.client_oid,
-                    symbol=order.intent.symbol,
-                    mismatches=semantic_mismatches,
-                )
-                threading.Thread(
-                    target=self.freeze_symbol,
-                    args=(order.intent.symbol, reason),
-                    daemon=True,
-                ).start()
-
-            if update.seq and update.seq <= order.last_update_seq:
-                self._audit(
-                    "stale_update_ignored",
-                    client_oid=order.client_oid,
-                    seq=update.seq,
-                    last_seq=order.last_update_seq,
-                )
-                return
-
-            if (
-                not update.seq
-                and update.update_time
-                and order.last_exchange_update_time
-                and update.update_time + 1e-6 < order.last_exchange_update_time
-                and update.cum_filled_qty <= order.filled_volume + 1e-9
-            ):
-                self._audit(
-                    "stale_exchange_time_update_ignored",
-                    client_oid=order.client_oid,
-                    update_time=update.update_time,
-                    last_exchange_update_time=order.last_exchange_update_time,
-                )
-                return
-
-            if update.cum_filled_qty + 1e-9 < order.filled_volume:
-                self._audit(
-                    "cum_fill_regression",
-                    client_oid=order.client_oid,
-                    incoming_cum=update.cum_filled_qty,
-                    local_cum=order.filled_volume,
-                )
-                threading.Thread(
-                    target=self.trigger_reconcile,
-                    args=(f"Cum fill regression {order.client_oid}", order.client_oid),
-                    daemon=True,
-                ).start()
-                return
-
-            incoming_delta = update.cum_filled_qty - order.filled_volume
-            if incoming_delta > 1e-9:
-                tolerance = max(1e-9, abs(incoming_delta) * 1e-9)
-                gap_detail = ""
-                if update.status not in {"FILLED", "PARTIALLY_FILLED"}:
-                    gap_detail = "terminal_snapshot_ahead_of_trade_history"
-                elif update.trade_id < 0:
-                    gap_detail = "missing_trade_id"
-                elif update.filled_qty <= 0.0:
-                    gap_detail = "missing_last_fill_quantity"
-                elif update.filled_price <= 0.0:
-                    gap_detail = "missing_last_fill_price"
-                elif abs(incoming_delta - update.filled_qty) > tolerance:
-                    gap_detail = (
-                        "cumulative_delta_exceeds_last_fill:"
-                        f"{incoming_delta:.12g}!={update.filled_qty:.12g}"
-                    )
-                if gap_detail:
-                    self._quarantine_execution_gap_locked(
-                        order,
-                        update,
-                        incoming_delta,
-                        gap_detail,
-                    )
-                    return
-
-                execution_id = self._execution_id(order, update)
-                if execution_id in self.execution_ids:
-                    self._audit(
-                        "duplicate_execution_ignored",
-                        execution_id=execution_id,
-                        client_oid=order.client_oid,
-                        trade_id=update.trade_id,
-                    )
-                    return
-
-            previous_status = order.status
-            had_fill = False
-
-            try:
-                if update.status == "NEW":
-                    order.mark_new(
-                        exchange_oid=update.exchange_oid,
-                        update_time=update.update_time,
-                        seq=update.seq,
-                    )
-                    if update.exchange_oid:
-                        self.exchange_id_map[update.exchange_oid] = order
-
-                elif update.status == "CANCELED":
-                    order.mark_cancelled(
-                        update_time=update.update_time,
-                        seq=update.seq,
-                        exchange_status=update.status,
-                    )
-                    self._write_tombstone(order)
-
-                elif update.status == "EXPIRED":
-                    order.mark_expired(update_time=update.update_time, seq=update.seq)
-                    self._write_tombstone(order)
-
-                elif update.status == "REJECTED":
-                    order.mark_rejected(
-                        reason="exchange_rejected",
-                        update_time=update.update_time,
-                        seq=update.seq,
-                        exchange_status=update.status,
-                    )
-                    self._write_tombstone(order)
-
-                elif update.status in ["FILLED", "PARTIALLY_FILLED"]:
-                    delta = update.cum_filled_qty - order.filled_volume
-                    if delta > 1e-9:
-                        fill_notional = delta * update.filled_price
-                        fee = self._get_fill_commission(update, order, fill_notional)
-                        # Execution truth is committed before mutating order,
-                        # exposure, or account projections. If the process dies
-                        # after this point, replay can finish applying the fill.
-                        if not self._record_execution(
-                            order,
-                            update,
-                            delta,
-                            fee,
-                        ):
-                            self._audit(
-                                "duplicate_execution_ignored",
-                                execution_id=self._execution_id(order, update),
-                                client_oid=order.client_oid,
-                                trade_id=update.trade_id,
-                            )
-                            return
-                        had_fill = order.add_fill(
-                            delta,
-                            update.filled_price,
-                            update_time=update.update_time,
-                            seq=update.seq,
-                            exchange_status=update.status,
-                        )
-                        symbol = order.intent.symbol
-                        if had_fill:
-                            self.exposure.on_strategy_fill(
-                                order.intent.strategy_id,
-                                symbol,
-                                order.intent.side,
-                                delta,
-                                update.filled_price,
-                            )
-                        exchange_position_time = float(
-                            self._exchange_position_event_time.get(symbol, 0.0) or 0.0
-                        )
-                        position_already_synced = bool(
-                            update.update_time
-                            and exchange_position_time + 1e-6 >= update.update_time
-                        )
-                        if position_already_synced:
-                            local_realized_pnl = 0.0
-                            self._audit(
-                                "fill_position_already_covered",
-                                client_oid=order.client_oid,
-                                symbol=symbol,
-                                fill_time=update.update_time,
-                                exchange_position_time=exchange_position_time,
-                            )
-                        else:
-                            local_realized_pnl = self.exposure.on_fill(
-                                symbol,
-                                order.intent.side,
-                                delta,
-                                update.filled_price,
-                            )
-                            if update.update_time:
-                                self._position_state_event_time[symbol] = max(
-                                    float(self._position_state_event_time.get(symbol, 0.0) or 0.0),
-                                    update.update_time,
-                                )
-                        self.exposure.reconcile_strategy_position(
-                            symbol,
-                            self.exposure.net_positions[symbol],
-                            self.exposure.avg_prices[symbol],
-                        )
-                        realized_pnl = (
-                            update.realized_pnl
-                            if update.realized_pnl is not None
-                            else local_realized_pnl
-                        )
-                        account_already_synced = bool(
-                            update.update_time
-                            and float(self._exchange_account_event_time or 0.0) + 1e-6
-                            >= update.update_time
-                        )
-                        if account_already_synced:
-                            self._audit(
-                                "fill_account_already_covered",
-                                client_oid=order.client_oid,
-                                fill_time=update.update_time,
-                                exchange_account_time=self._exchange_account_event_time,
-                            )
-                        else:
-                            self.account.update_balance(realized_pnl, fee)
-                            if update.update_time:
-                                self._account_state_event_time = max(
-                                    float(self._account_state_event_time or 0.0),
-                                    update.update_time,
-                                )
-
-                        trade_data = TradeData(
-                            symbol=order.intent.symbol,
-                            order_id=order.client_oid,
-                            trade_id=(
-                                str(update.trade_id)
-                                if update.trade_id >= 0
-                                else f"T{int(update.update_time * 1000)}"
-                            ),
-                            side=order.intent.side.value,
-                            price=update.filled_price,
-                            volume=delta,
-                            datetime=datetime.now(),
-                        )
-                        self.event_engine.put(Event(EVENT_TRADE_UPDATE, trade_data))
-                    else:
-                        order.note_exchange_update(
-                            exchange_status=update.status,
-                            update_time=update.update_time,
-                            seq=update.seq,
-                            exchange_oid=update.exchange_oid,
-                        )
-
-                    if update.status == "FILLED":
-                        order.mark_filled(update_time=update.update_time, seq=update.seq)
-                        self._write_tombstone(order)
-
-                else:
-                    self._audit(
-                        "unhandled_exchange_status",
-                        client_oid=order.client_oid,
-                        status=update.status,
-                    )
-                    order.note_exchange_update(
-                        exchange_status=update.status,
-                        update_time=update.update_time,
-                        seq=update.seq,
-                        exchange_oid=update.exchange_oid,
-                    )
-                    return
-
-            except ValueError as exc:
-                self._audit(
-                    "invalid_transition",
-                    client_oid=order.client_oid,
-                    current_status=order.status.value,
-                    incoming_status=update.status,
-                    error=str(exc),
-                )
-                threading.Thread(
-                    target=self.trigger_reconcile,
-                    args=(f"Invalid transition {order.client_oid}", order.client_oid),
-                    daemon=True,
-                ).start()
-                return
-
-            self.order_monitor.on_order_update(order.client_oid, order.status)
-            self.exposure.update_open_orders(self.orders)
-            self.account.calculate()
-
-            if order.status != previous_status or had_fill:
-                self._record_order_snapshot(
-                    order,
-                    "exchange_update",
-                    exchange_status=update.status,
-                    seq=update.seq,
-                    cum_filled_qty=update.cum_filled_qty,
-                )
-                self._emit_order_update(order)
-                if had_fill:
-                    self._emit_position_update(order.intent.symbol)
-                    self._schedule_rpi_calibration_runtime_enforcement()
-                    self._schedule_trade_tail_verification(
-                        order.intent.symbol,
-                        trade_id=update.trade_id,
-                        reason="user_stream_fill",
-                    )
-
-    def _apply_recovered_execution(self, order: Order, payload: dict):
-        execution_id = str(payload.get("execution_id", "") or "")
-        if not execution_id:
-            raise JournalCorruptionError(
-                f"Execution record without execution_id for {order.client_oid}"
-            )
-        self.execution_ids.add(execution_id)
-
-        exchange_oid = str(payload.get("exchange_oid", "") or "")
-        if exchange_oid:
-            order.exchange_oid = exchange_oid
-
-        try:
-            cumulative_qty = float(payload.get("cum_filled_qty", 0.0) or 0.0)
-            fill_price = float(payload.get("fill_price", 0.0) or 0.0)
-            exchange_time = float(payload.get("exchange_time", 0.0) or 0.0)
-        except (TypeError, ValueError) as exc:
-            raise JournalCorruptionError(
-                f"Malformed execution record {execution_id}: {exc}"
-            ) from exc
-
-        delta = cumulative_qty - order.filled_volume
-        if delta <= 1e-9:
-            return
-
-        pre_status = order.status
-        order.add_fill(
-            delta,
-            fill_price,
-            update_time=exchange_time,
-            exchange_status=str(payload.get("exchange_status", "") or "PARTIALLY_FILLED"),
-        )
-        if order.status == OrderStatus.FILLED:
-            return
-        if pre_status == OrderStatus.CANCELLED:
-            order.mark_cancelled(update_time=exchange_time)
-        elif pre_status == OrderStatus.EXPIRED:
-            order.mark_expired(update_time=exchange_time)
-
-    def _apply_recovered_command_result(self, order: Order, payload: dict):
-        command_type = str(payload.get("command_type", "") or "").upper()
-        try:
-            outcome = CommandOutcome(str(payload.get("outcome", "") or ""))
-        except ValueError as exc:
-            raise JournalCorruptionError(
-                f"Invalid command outcome for {order.client_oid}: {payload.get('outcome')}"
-            ) from exc
-
-        error_message = str(
-            payload.get("error_message", "")
-            or payload.get("error_code", "")
-            or "recovered_command_result"
-        )
-        exchange_oid = str(payload.get("exchange_oid", "") or "")
-
-        if command_type == "SUBMIT":
-            if order.status == OrderStatus.CREATED:
-                order.mark_submitting()
-            if order.status != OrderStatus.SUBMITTING:
-                return
-            if outcome == CommandOutcome.ACKNOWLEDGED:
-                order.mark_pending_ack(exchange_oid)
-            elif outcome == CommandOutcome.UNKNOWN:
-                order.mark_submit_unknown(error_message)
-            else:
-                order.mark_rejected_locally(error_message)
-            return
-
-        if command_type == "CANCEL" and order.is_active():
-            if order.status != OrderStatus.CANCELLING:
-                try:
-                    order.mark_cancelling()
-                except ValueError:
-                    pass
-            if order.status == OrderStatus.CANCELLING:
-                order.mark_cancel_unknown(
-                    "recovered_cancel_ack_requires_truth"
-                    if outcome == CommandOutcome.ACKNOWLEDGED
-                    else error_message
-                )
-
-    @staticmethod
-    def _journal_int(
-        payload: dict,
-        field: str,
-        *,
-        minimum: int | None = 0,
-    ) -> int:
-        value = payload.get(field)
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise JournalCorruptionError(
-                f"RPI calibration journal field {field} must be an integer"
-            )
-        if minimum is not None and value < minimum:
-            raise JournalCorruptionError(
-                f"RPI calibration journal field {field} must be >= {minimum}"
-            )
-        return value
-
-    @classmethod
-    def _journal_decimal(
-        cls,
-        payload: dict,
-        field: str,
-    ) -> Decimal:
-        try:
-            value = cls._positive_decimal(
-                payload.get(field),
-                f"RPI calibration journal {field}",
-            )
-        except ValueError as exc:
-            raise JournalCorruptionError(str(exc)) from exc
-        return value
-
-    @staticmethod
-    def _new_rpi_calibration_replay_state() -> dict:
-        return {
-            "deployments": {},
-            "activations": {},
-            "reservation_ids": set(),
-            "reservation_exchange_ns": {},
-            "expired_permits": {},
-            "bypass_ids": set(),
-            "send_ids": set(),
-            "permit_identities": {},
-            "last_bypass_exchange_ns": {},
-        }
+    _new_rpi_calibration_replay_state = staticmethod(
+        RpiCalibrationReplay._new_rpi_calibration_replay_state
+    )
 
     def _verify_replayed_rpi_calibration_permit(
         self,
@@ -9217,116 +6157,11 @@ class OMS:
         expected_sha256: str,
         record_index: int,
     ) -> dict:
-        try:
-            permit = self._require_exact_mapping_keys(
-                signed_permit,
-                self.RPI_CALIBRATION_PERMIT_KEYS,
-                "replayed RPI calibration signed permit",
-            )
-            self._require_exact_mapping_keys(
-                permit.get("policy"),
-                self.RPI_CALIBRATION_POLICY_KEYS,
-                "replayed RPI calibration signed policy",
-            )
-            signature = self._require_exact_mapping_keys(
-                permit.get("signature"),
-                self.RPI_CALIBRATION_SIGNATURE_KEYS,
-                "replayed RPI calibration signature",
-            )
-            calculated_sha256 = rpi_calibration_permit_sha256(permit)
-            if calculated_sha256 != expected_sha256:
-                raise ValueError(
-                    "complete signed permit SHA-256 mismatch"
-                )
-            if signature.get("algorithm") != "ED25519":
-                raise ValueError(
-                    "replayed permit signature algorithm is not ED25519"
-                )
-            key_id = str(signature.get("key_id", "") or "")
-            signer = str(signature.get("signer", "") or "")
-            if not key_id or not signer or signer != permit.get("authorized_by"):
-                raise ValueError(
-                    "replayed permit signer identity is invalid"
-                )
-            trusted_signers = self._rpi_calibration.get(
-                "trusted_signers",
-                {},
-            )
-            trusted_signer = (
-                trusted_signers.get(key_id)
-                if isinstance(trusted_signers, dict)
-                else None
-            )
-            if (
-                not isinstance(trusted_signer, dict)
-                or set(trusted_signer)
-                != {"algorithm", "public_key_base64"}
-                or trusted_signer.get("algorithm") != "ED25519"
-            ):
-                raise ValueError(
-                    f"replayed permit signer key {key_id!r} is not trusted"
-                )
-            public_key_text = str(
-                trusted_signer.get("public_key_base64", "") or ""
-            )
-            signature_text = str(
-                signature.get("signature_base64", "") or ""
-            )
-            try:
-                public_key = base64.b64decode(
-                    public_key_text,
-                    validate=True,
-                )
-                signature_bytes = base64.b64decode(
-                    signature_text,
-                    validate=True,
-                )
-            except (binascii.Error, ValueError) as exc:
-                raise ValueError(
-                    "replayed permit contains invalid base64"
-                ) from exc
-            if (
-                len(public_key) != 32
-                or len(signature_bytes) != 64
-                or base64.b64encode(public_key).decode("ascii")
-                != public_key_text
-                or base64.b64encode(signature_bytes).decode("ascii")
-                != signature_text
-            ):
-                raise ValueError(
-                    "replayed permit key or signature is not canonical"
-                )
-            signed_payload = rpi_calibration_permit_signature_payload(
-                permit
-            )
-            signed_payload_sha256 = self._require_sha256(
-                signature.get("signed_payload_sha256"),
-                "replayed permit signed-payload SHA-256",
-            )
-            if (
-                hashlib.sha256(signed_payload).hexdigest()
-                != signed_payload_sha256
-            ):
-                raise ValueError(
-                    "replayed permit signed-payload digest mismatch"
-                )
-            if (
-                verify_ed25519_signature(
-                    public_key,
-                    signed_payload,
-                    signature_bytes,
-                )
-                is not True
-            ):
-                raise ValueError(
-                    "replayed permit Ed25519 signature is invalid"
-                )
-        except Exception as exc:
-            raise JournalCorruptionError(
-                "Cannot independently verify signed RPI calibration permit "
-                f"at journal record {record_index}: {exc}"
-            ) from exc
-        return permit
+        return self.rpi_calibration_replay._verify_replayed_rpi_calibration_permit(
+            signed_permit,
+            expected_sha256,
+            record_index,
+        )
 
     def _replay_rpi_calibration_activation(
         self,
@@ -9334,498 +6169,11 @@ class OMS:
         state: dict,
         record_index: int,
     ) -> None:
-        if payload.get("schema") != self.RPI_CALIBRATION_JOURNAL_SCHEMA:
-            raise JournalCorruptionError(
-                "Invalid RPI calibration activation schema at journal "
-                f"record {record_index}"
-            )
-        permit_id = str(payload.get("permit_id", "") or "")
-        permit_sha256 = self._require_sha256(
-            payload.get("permit_sha256"),
-            "RPI calibration activation permit SHA-256",
-        )
-        signed_permit = self._verify_replayed_rpi_calibration_permit(
-            payload.get("signed_permit"),
-            permit_sha256,
+        self.rpi_calibration_replay._replay_rpi_calibration_activation(
+            payload,
+            state,
             record_index,
         )
-        deployment_id = str(payload.get("deployment_id", "") or "")
-        symbol = str(payload.get("symbol", "") or "").upper()
-        if not permit_id or not deployment_id or not symbol:
-            raise JournalCorruptionError(
-                "Incomplete RPI calibration activation identity at journal "
-                f"record {record_index}"
-            )
-        if permit_id in state["activations"]:
-            raise JournalCorruptionError(
-                "Duplicate RPI calibration permit activation at journal "
-                f"record {record_index}: {permit_id}"
-            )
-        permit_identity = (permit_sha256, deployment_id)
-        existing_permit_identity = state["permit_identities"].get(permit_id)
-        if (
-            existing_permit_identity is not None
-            and existing_permit_identity != permit_identity
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration permit identity changed at journal "
-                f"record {record_index}"
-            )
-        state["permit_identities"][permit_id] = permit_identity
-        if (
-            payload.get("stage") != self.RPI_CALIBRATION_STAGE
-            or payload.get("venue") != self.RPI_CALIBRATION_VENUE
-            or payload.get("model") != self.RPI_CALIBRATION_MODEL
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration activation environment mismatch at journal "
-                f"record {record_index}"
-            )
-        signed_identity = {
-            "permit_id": permit_id,
-            "deployment_id": deployment_id,
-            "stage": self.RPI_CALIBRATION_STAGE,
-            "venue": self.RPI_CALIBRATION_VENUE,
-            "symbol": symbol,
-            "model": self.RPI_CALIBRATION_MODEL,
-            "calibration_config_sha256": str(
-                payload.get("calibration_config_sha256", "") or ""
-            ),
-            "target_deployment_config_sha256": str(
-                payload.get(
-                    "target_deployment_config_sha256",
-                    "",
-                )
-                or ""
-            ),
-            "strategy_policy_sha256": str(
-                payload.get("strategy_policy_sha256", "") or ""
-            ),
-            "implementation_sha256": str(
-                payload.get("implementation_sha256", "") or ""
-            ),
-        }
-        if any(
-            signed_permit.get(field) != value
-            for field, value in signed_identity.items()
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration activation derived identity differs from "
-                f"its signed permit at journal record {record_index}"
-            )
-
-        calibration_config_sha256 = self._require_sha256(
-            payload.get("calibration_config_sha256"),
-            "RPI calibration activation config SHA-256",
-        )
-        target_config_sha256 = self._require_sha256(
-            payload.get("target_deployment_config_sha256"),
-            "RPI calibration activation target config SHA-256",
-        )
-        strategy_policy_sha256 = self._require_sha256(
-            payload.get("strategy_policy_sha256"),
-            "RPI calibration activation strategy policy SHA-256",
-        )
-        implementation_sha256 = self._require_sha256(
-            payload.get("implementation_sha256"),
-            "RPI calibration activation implementation SHA-256",
-        )
-        activated_at_ns = self._journal_int(
-            payload,
-            "activated_at_exchange_ns",
-            minimum=1,
-        )
-        not_before_ns = self._journal_int(
-            payload,
-            "not_before_exchange_ns",
-            minimum=1,
-        )
-        expires_at_ns = self._journal_int(
-            payload,
-            "expires_at_exchange_ns",
-            minimum=1,
-        )
-        if not (
-            not_before_ns <= activated_at_ns < expires_at_ns
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration activation is outside its permit window at "
-                f"journal record {record_index}"
-            )
-        if (
-            self._parse_utc_exchange_ns(
-                signed_permit.get("not_before_utc"),
-                "signed permit not_before_utc",
-            )
-            != not_before_ns
-            or self._parse_utc_exchange_ns(
-                signed_permit.get("expires_at_utc"),
-                "signed permit expires_at_utc",
-            )
-            != expires_at_ns
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration activation timestamps differ from its "
-                f"signed permit at journal record {record_index}"
-            )
-
-        raw_depths = payload.get("fixed_depths_bps")
-        if not isinstance(raw_depths, list) or not raw_depths:
-            raise JournalCorruptionError(
-                "RPI calibration activation has no fixed depths at journal "
-                f"record {record_index}"
-            )
-        try:
-            depth_texts = tuple(
-                self._decimal_text(
-                    self._positive_decimal(
-                        value,
-                        "RPI calibration activation depth",
-                    )
-                )
-                for value in raw_depths
-            )
-        except ValueError as exc:
-            raise JournalCorruptionError(str(exc)) from exc
-        if len(set(depth_texts)) != len(depth_texts):
-            raise JournalCorruptionError(
-                "RPI calibration activation contains duplicate depths at "
-                f"journal record {record_index}"
-            )
-        parsed_depths = tuple(Decimal(value) for value in depth_texts)
-        if (
-            not 3 <= len(parsed_depths) <= 16
-            or any(
-                right <= left
-                for left, right in zip(
-                    parsed_depths,
-                    parsed_depths[1:],
-                )
-            )
-            or parsed_depths[-1] > Decimal("1000")
-            or parsed_depths[-1] - parsed_depths[0] < Decimal("0.5")
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration activation depth schedule is unsafe at "
-                f"journal record {record_index}"
-            )
-
-        limits = {
-            "order_ttl_ns": self._journal_int(
-                payload,
-                "order_ttl_ns",
-                minimum=1,
-            ),
-            "min_order_interval_ns": self._journal_int(
-                payload,
-                "min_order_interval_ns",
-                minimum=1,
-            ),
-            "max_active_orders": self._journal_int(
-                payload,
-                "max_active_orders",
-                minimum=1,
-            ),
-            "max_order_count": self._journal_int(
-                payload,
-                "max_order_count",
-                minimum=1,
-            ),
-            "min_order_notional_microu": self._journal_int(
-                payload,
-                "min_order_notional_microu",
-                minimum=1,
-            ),
-            "max_order_notional_microu": self._journal_int(
-                payload,
-                "max_order_notional_microu",
-                minimum=1,
-            ),
-            "max_cumulative_submitted_notional_microu": (
-                self._journal_int(
-                    payload,
-                    "max_cumulative_submitted_notional_microu",
-                    minimum=1,
-                )
-            ),
-            "max_calibration_loss_microu": self._journal_int(
-                payload,
-                "max_calibration_loss_microu",
-                minimum=1,
-            ),
-        }
-        if limits["max_active_orders"] != 1:
-            raise JournalCorruptionError(
-                "RPI calibration activation max_active_orders must equal 1"
-            )
-        if (
-            limits["order_ttl_ns"] > 60_000_000_000
-            or limits["order_ttl_ns"]
-            > limits["min_order_interval_ns"]
-            or not (
-                5_000_000_000
-                <= limits["min_order_interval_ns"]
-                <= 3_600_000_000_000
-            )
-            or limits["max_order_count"] > 100
-            or limits["min_order_notional_microu"]
-            > limits["max_order_notional_microu"]
-            or limits["max_order_notional_microu"] > 8_000_000
-            or limits[
-                "max_cumulative_submitted_notional_microu"
-            ]
-            < limits["min_order_notional_microu"]
-            or limits[
-                "max_cumulative_submitted_notional_microu"
-            ]
-            > (
-                limits["max_order_count"]
-                * limits["max_order_notional_microu"]
-            )
-            or limits["max_calibration_loss_microu"] > 2_000_000
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration activation limits are unsafe at journal "
-                f"record {record_index}"
-            )
-        required_duration_ns = (
-            (limits["max_order_count"] - 1)
-            * limits["min_order_interval_ns"]
-            + limits["order_ttl_ns"]
-        )
-        if required_duration_ns > expires_at_ns - not_before_ns:
-            raise JournalCorruptionError(
-                "RPI calibration activation schedule exceeds its window at "
-                f"journal record {record_index}"
-            )
-        signed_policy = signed_permit["policy"]
-        signed_depths = tuple(
-            self._decimal_text(
-                self._positive_decimal(
-                    value,
-                    "signed RPI calibration depth",
-                )
-            )
-            for value in signed_policy["fixed_depths_bps"]
-        )
-        signed_policy_fields = {
-            "fixed_depths_bps": signed_depths,
-            "order_ttl_ns": int(
-                (
-                    self._positive_decimal(
-                        signed_policy["order_ttl_sec"],
-                        "signed RPI calibration order TTL",
-                    )
-                    * Decimal("1000000000")
-                ).to_integral_value(rounding=ROUND_CEILING)
-            ),
-            "min_order_interval_ns": int(
-                (
-                    self._positive_decimal(
-                        signed_policy["min_order_interval_sec"],
-                        "signed RPI calibration interval",
-                    )
-                    * Decimal("1000000000")
-                ).to_integral_value(rounding=ROUND_CEILING)
-            ),
-            "max_active_orders": signed_policy["max_active_orders"],
-            "max_order_count": signed_policy["max_order_count"],
-            "min_order_notional_microu": self._usdt_to_microu(
-                self._positive_decimal(
-                    signed_policy["min_order_notional_usdt"],
-                    "signed minimum order notional",
-                ),
-                upper_bound=False,
-            ),
-            "max_order_notional_microu": self._usdt_to_microu(
-                self._positive_decimal(
-                    signed_policy["max_order_notional_usdt"],
-                    "signed maximum order notional",
-                ),
-                upper_bound=True,
-            ),
-            "max_cumulative_submitted_notional_microu": (
-                self._usdt_to_microu(
-                    self._positive_decimal(
-                        signed_policy[
-                            "max_cumulative_submitted_notional_usdt"
-                        ],
-                        "signed cumulative notional cap",
-                    ),
-                    upper_bound=True,
-                )
-            ),
-            "max_calibration_loss_microu": self._usdt_to_microu(
-                self._positive_decimal(
-                    signed_policy["max_calibration_loss_usdt"],
-                    "signed calibration loss cap",
-                ),
-                upper_bound=True,
-            ),
-        }
-        if signed_policy_fields["fixed_depths_bps"] != depth_texts or any(
-            signed_policy_fields[field] != limits[field]
-            for field in limits
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration activation derived policy differs from its "
-                f"signed policy at journal record {record_index}"
-            )
-
-        starting_count = self._journal_int(
-            payload,
-            "starting_reserved_order_count",
-        )
-        starting_cumulative = self._journal_int(
-            payload,
-            "starting_cumulative_submitted_notional_microu",
-        )
-        deployment = state["deployments"].setdefault(
-            deployment_id,
-            {
-                "reserved_order_count": 0,
-                "cumulative_notional_microu": 0,
-                "last_reserved_exchange_ns": 0,
-                "identity": None,
-                "start_equity_microu": 0,
-                "start_external_cash_flow_microu": 0,
-                "peak_observed_loss_microu": 0,
-                "effective_loss_cap_microu": 0,
-                "open_permit_id": "",
-                "last_expired_at_ns": 0,
-                "latest_permit_id": "",
-                "last_signed_permit_expires_at_ns": 0,
-            },
-        )
-        if (
-            starting_count != deployment["reserved_order_count"]
-            or starting_cumulative
-            != deployment["cumulative_notional_microu"]
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration permit activation attempted to reset "
-                f"deployment history at journal record {record_index}"
-            )
-        previous_permit_id = str(deployment["latest_permit_id"] or "")
-        previous_permit_expires_at_ns = int(
-            deployment["last_signed_permit_expires_at_ns"] or 0
-        )
-        if (
-            previous_permit_id
-            and previous_permit_id != permit_id
-            and not_before_ns < previous_permit_expires_at_ns
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration permit validity window overlaps the "
-                "previous signed permit at journal "
-                f"record {record_index}"
-            )
-        if deployment["open_permit_id"]:
-            raise JournalCorruptionError(
-                "RPI calibration permit activation overlaps an unexpired "
-                f"permit at journal record {record_index}"
-            )
-        if activated_at_ns < deployment["last_expired_at_ns"]:
-            raise JournalCorruptionError(
-                "RPI calibration permit activation predates the previous "
-                "permit expiry at "
-                f"journal record {record_index}"
-            )
-        start_equity_microu = self._journal_int(
-            payload,
-            "deployment_start_equity_microu",
-            minimum=1,
-        )
-        start_external_cash_flow_microu = self._journal_int(
-            payload,
-            "deployment_start_external_cash_flow_microu",
-            minimum=None,
-        )
-        peak_observed_loss_microu = self._journal_int(
-            payload,
-            "peak_observed_loss_microu",
-        )
-        effective_loss_cap_microu = self._journal_int(
-            payload,
-            "effective_deployment_loss_cap_microu",
-            minimum=1,
-        )
-        expected_effective_loss_cap = min(
-            (
-                deployment["effective_loss_cap_microu"]
-                or limits["max_calibration_loss_microu"]
-            ),
-            limits["max_calibration_loss_microu"],
-        )
-        if effective_loss_cap_microu != expected_effective_loss_cap:
-            raise JournalCorruptionError(
-                "RPI calibration activation widened or changed the effective "
-                f"loss cap at journal record {record_index}"
-            )
-        if deployment["start_equity_microu"] > 0 and (
-            deployment["start_equity_microu"] != start_equity_microu
-            or deployment["start_external_cash_flow_microu"]
-            != start_external_cash_flow_microu
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration activation reset the deployment loss "
-                f"baseline at journal record {record_index}"
-            )
-        if (
-            peak_observed_loss_microu
-            < deployment["peak_observed_loss_microu"]
-            or peak_observed_loss_microu >= effective_loss_cap_microu
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration activation loss evidence is non-monotonic "
-                f"or already breached at journal record {record_index}"
-            )
-        deployment["start_equity_microu"] = start_equity_microu
-        deployment["start_external_cash_flow_microu"] = (
-            start_external_cash_flow_microu
-        )
-        deployment["peak_observed_loss_microu"] = (
-            peak_observed_loss_microu
-        )
-        deployment["effective_loss_cap_microu"] = (
-            effective_loss_cap_microu
-        )
-        deployment["open_permit_id"] = permit_id
-        deployment["latest_permit_id"] = permit_id
-        deployment["last_signed_permit_expires_at_ns"] = expires_at_ns
-        deployment_identity = {
-            "symbol": symbol,
-            "target_deployment_config_sha256": target_config_sha256,
-            "strategy_policy_sha256": strategy_policy_sha256,
-            "implementation_sha256": implementation_sha256,
-        }
-        if (
-            deployment["identity"] is not None
-            and deployment["identity"] != deployment_identity
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration deployment identity changed at journal "
-                f"record {record_index}"
-            )
-        deployment["identity"] = deployment_identity
-        state["activations"][permit_id] = {
-            "permit_id": permit_id,
-            "permit_sha256": permit_sha256,
-            "deployment_id": deployment_id,
-            "symbol": symbol,
-            "calibration_config_sha256": calibration_config_sha256,
-            "target_deployment_config_sha256": target_config_sha256,
-            "strategy_policy_sha256": strategy_policy_sha256,
-            "implementation_sha256": implementation_sha256,
-            "not_before_exchange_ns": not_before_ns,
-            "expires_at_exchange_ns": expires_at_ns,
-            "fixed_depths_bps": depth_texts,
-            "starting_reserved_order_count": starting_count,
-            "starting_cumulative_submitted_notional_microu": (
-                starting_cumulative
-            ),
-            **limits,
-        }
 
     def _replay_rpi_calibration_reservation(
         self,
@@ -9833,240 +6181,11 @@ class OMS:
         state: dict,
         record_index: int,
     ) -> None:
-        if payload.get("schema") != self.RPI_CALIBRATION_JOURNAL_SCHEMA:
-            raise JournalCorruptionError(
-                "Invalid RPI calibration reservation schema at journal "
-                f"record {record_index}"
-            )
-        permit_id = str(payload.get("permit_id", "") or "")
-        activation = state["activations"].get(permit_id)
-        if activation is None:
-            raise JournalCorruptionError(
-                "RPI calibration reservation precedes permit activation at "
-                f"journal record {record_index}"
-            )
-        if permit_id in state["expired_permits"]:
-            raise JournalCorruptionError(
-                "RPI calibration reservation follows permit expiry at "
-                f"journal record {record_index}"
-            )
-        reservation_id = str(payload.get("reservation_id", "") or "")
-        client_oid = str(payload.get("client_oid", "") or "")
-        if not reservation_id or reservation_id != client_oid:
-            raise JournalCorruptionError(
-                "Invalid RPI calibration reservation identity at journal "
-                f"record {record_index}"
-            )
-        if reservation_id in state["send_ids"]:
-            raise JournalCorruptionError(
-                "Duplicate RPI calibration reservation at journal "
-                f"record {record_index}: {reservation_id}"
-            )
-        identity_fields = (
-            "permit_sha256",
-            "deployment_id",
-            "calibration_config_sha256",
-            "target_deployment_config_sha256",
-            "strategy_policy_sha256",
-            "implementation_sha256",
-        )
-        if any(
-            str(payload.get(field, "") or "") != activation[field]
-            for field in identity_fields
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration reservation identity mismatch at journal "
-                f"record {record_index}"
-            )
-        if (
-            str(payload.get("symbol", "") or "").upper()
-            != activation["symbol"]
-            or payload.get("strategy_id")
-            != self.RPI_CALIBRATION_STRATEGY_ID
-            or payload.get("order_type") != "LIMIT"
-            or payload.get("time_in_force") != TIF_RPI
-            or payload.get("post_only") is not True
-            or not isinstance(payload.get("reduce_only"), bool)
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration reservation order contract mismatch at "
-                f"journal record {record_index}"
-            )
-
-        deployment = state["deployments"][activation["deployment_id"]]
-        reservation_seq = self._journal_int(
+        self.rpi_calibration_replay._replay_rpi_calibration_reservation(
             payload,
-            "reservation_seq",
-            minimum=1,
+            state,
+            record_index,
         )
-        expected_seq = deployment["reserved_order_count"] + 1
-        if reservation_seq != expected_seq:
-            raise JournalCorruptionError(
-                "Non-monotonic RPI calibration reservation sequence at "
-                f"journal record {record_index}: expected {expected_seq}, "
-                f"got {reservation_seq}"
-            )
-        permit_reservation_seq = self._journal_int(
-            payload,
-            "permit_reservation_seq",
-            minimum=1,
-        )
-        expected_permit_seq = (
-            reservation_seq
-            - activation["starting_reserved_order_count"]
-        )
-        if permit_reservation_seq != expected_permit_seq:
-            raise JournalCorruptionError(
-                "RPI calibration per-permit reservation sequence is "
-                f"inconsistent at journal record {record_index}"
-            )
-        reserved_at_ns = self._journal_int(
-            payload,
-            "reserved_at_exchange_ns",
-            minimum=1,
-        )
-        if not (
-            activation["not_before_exchange_ns"]
-            <= reserved_at_ns
-            < activation["expires_at_exchange_ns"]
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration reservation is outside its permit window at "
-                f"journal record {record_index}"
-            )
-        last_reserved_ns = deployment["last_reserved_exchange_ns"]
-        if reserved_at_ns < last_reserved_ns:
-            raise JournalCorruptionError(
-                "Non-monotonic RPI calibration reservation timestamp at "
-                f"journal record {record_index}"
-            )
-        if (
-            last_reserved_ns > 0
-            and reserved_at_ns - last_reserved_ns
-            < activation["min_order_interval_ns"]
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration reservation violated its minimum interval "
-                f"at journal record {record_index}"
-            )
-
-        depth = self._journal_decimal(payload, "declared_depth_bps")
-        depth_text = self._decimal_text(depth)
-        if depth_text not in activation["fixed_depths_bps"]:
-            raise JournalCorruptionError(
-                "RPI calibration reservation depth is not permitted at "
-                f"journal record {record_index}"
-            )
-        price = self._journal_decimal(payload, "price")
-        quantity = self._journal_decimal(payload, "quantity")
-        reference_mid = self._journal_decimal(
-            payload,
-            "calibration_reference_mid",
-        )
-        side = str(payload.get("side", "") or "")
-        if (
-            side not in {Side.BUY.value, Side.SELL.value}
-            or (side == Side.BUY.value and price >= reference_mid)
-            or (side == Side.SELL.value and price <= reference_mid)
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration reservation reference direction is invalid "
-                f"at journal record {record_index}"
-            )
-        calculated_notional_microu = int(
-            (
-                price * quantity * self.USDT_MICRO_SCALE
-            ).to_integral_value(rounding=ROUND_CEILING)
-        )
-        submitted_notional_microu = self._journal_int(
-            payload,
-            "submitted_notional_microu",
-            minimum=1,
-        )
-        if calculated_notional_microu != submitted_notional_microu:
-            raise JournalCorruptionError(
-                "RPI calibration reservation notional mismatch at journal "
-                f"record {record_index}"
-            )
-        if not (
-            activation["min_order_notional_microu"]
-            <= submitted_notional_microu
-            <= activation["max_order_notional_microu"]
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration reservation notional is outside permit "
-                f"bounds at journal record {record_index}"
-            )
-        cumulative = self._journal_int(
-            payload,
-            "cumulative_submitted_notional_microu",
-            minimum=1,
-        )
-        expected_cumulative = (
-            deployment["cumulative_notional_microu"]
-            + submitted_notional_microu
-        )
-        if cumulative != expected_cumulative:
-            raise JournalCorruptionError(
-                "Non-monotonic RPI calibration cumulative notional at "
-                f"journal record {record_index}"
-            )
-        permit_cumulative = self._journal_int(
-            payload,
-            "permit_cumulative_submitted_notional_microu",
-            minimum=1,
-        )
-        expected_permit_cumulative = (
-            cumulative
-            - activation[
-                "starting_cumulative_submitted_notional_microu"
-            ]
-        )
-        if permit_cumulative != expected_permit_cumulative:
-            raise JournalCorruptionError(
-                "RPI calibration per-permit cumulative notional is "
-                f"inconsistent at journal record {record_index}"
-            )
-        if (
-            permit_reservation_seq > activation["max_order_count"]
-            or permit_cumulative
-            > activation[
-                "max_cumulative_submitted_notional_microu"
-            ]
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration reservation exceeded signed quota at "
-                f"journal record {record_index}"
-            )
-        loss_before_send_microu = self._journal_int(
-            payload,
-            "loss_before_send_microu",
-        )
-        effective_loss_cap_microu = self._journal_int(
-            payload,
-            "effective_deployment_loss_cap_microu",
-            minimum=1,
-        )
-        if (
-            effective_loss_cap_microu
-            != deployment["effective_loss_cap_microu"]
-            or loss_before_send_microu >= effective_loss_cap_microu
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration reservation loss envelope is invalid at "
-                f"journal record {record_index}"
-            )
-
-        deployment["reserved_order_count"] = reservation_seq
-        deployment["cumulative_notional_microu"] = cumulative
-        deployment["last_reserved_exchange_ns"] = reserved_at_ns
-        deployment["peak_observed_loss_microu"] = max(
-            deployment["peak_observed_loss_microu"],
-            loss_before_send_microu,
-        )
-        state["reservation_ids"].add(reservation_id)
-        state["reservation_exchange_ns"][reservation_id] = reserved_at_ns
-        state["send_ids"].add(reservation_id)
 
     def _replay_rpi_calibration_expiry(
         self,
@@ -10074,284 +6193,11 @@ class OMS:
         state: dict,
         record_index: int,
     ) -> None:
-        if payload.get("schema") != self.RPI_CALIBRATION_JOURNAL_SCHEMA:
-            raise JournalCorruptionError(
-                "Invalid RPI calibration expiry schema at journal "
-                f"record {record_index}"
-            )
-        permit_id = str(payload.get("permit_id", "") or "")
-        if not permit_id or permit_id in state["expired_permits"]:
-            raise JournalCorruptionError(
-                "Duplicate or missing RPI calibration expiry permit at "
-                f"journal record {record_index}"
-            )
-        permit_sha256 = self._require_sha256(
-            payload.get("permit_sha256"),
-            "RPI calibration expiry permit SHA-256",
-        )
-        signed_permit = self._verify_replayed_rpi_calibration_permit(
-            payload.get("signed_permit"),
-            permit_sha256,
+        self.rpi_calibration_replay._replay_rpi_calibration_expiry(
+            payload,
+            state,
             record_index,
         )
-        deployment_id = str(payload.get("deployment_id", "") or "")
-        if not deployment_id:
-            raise JournalCorruptionError(
-                "RPI calibration expiry deployment is missing at journal "
-                f"record {record_index}"
-            )
-        permit_identity = (permit_sha256, deployment_id)
-        existing_permit_identity = state["permit_identities"].get(permit_id)
-        if (
-            existing_permit_identity is not None
-            and existing_permit_identity != permit_identity
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration expiry permit identity changed at journal "
-                f"record {record_index}"
-            )
-        state["permit_identities"][permit_id] = permit_identity
-        signed_identity = {
-            "permit_id": permit_id,
-            "deployment_id": deployment_id,
-            "symbol": str(payload.get("symbol", "") or "").upper(),
-            "calibration_config_sha256": str(
-                payload.get("calibration_config_sha256", "") or ""
-            ),
-            "target_deployment_config_sha256": str(
-                payload.get(
-                    "target_deployment_config_sha256",
-                    "",
-                )
-                or ""
-            ),
-            "strategy_policy_sha256": str(
-                payload.get("strategy_policy_sha256", "") or ""
-            ),
-            "implementation_sha256": str(
-                payload.get("implementation_sha256", "") or ""
-            ),
-        }
-        if any(
-            signed_permit.get(field) != value
-            for field, value in signed_identity.items()
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration expiry derived identity differs from its "
-                f"signed permit at journal record {record_index}"
-            )
-        if (
-            signed_permit.get("stage") != self.RPI_CALIBRATION_STAGE
-            or signed_permit.get("venue") != self.RPI_CALIBRATION_VENUE
-            or signed_permit.get("model") != self.RPI_CALIBRATION_MODEL
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration expiry signed environment is invalid at "
-                f"journal record {record_index}"
-            )
-        signed_not_before_ns = self._parse_utc_exchange_ns(
-            signed_permit.get("not_before_utc"),
-            "expired signed permit not_before_utc",
-        )
-        signed_expires_at_ns = self._parse_utc_exchange_ns(
-            signed_permit.get("expires_at_utc"),
-            "expired signed permit expires_at_utc",
-        )
-        if signed_not_before_ns >= signed_expires_at_ns:
-            raise JournalCorruptionError(
-                "RPI calibration expiry signed time window is invalid at "
-                f"journal record {record_index}"
-            )
-        activation = state["activations"].get(permit_id)
-        if activation is not None and (
-            activation["permit_sha256"] != permit_sha256
-            or activation["deployment_id"] != deployment_id
-            or activation["not_before_exchange_ns"]
-            != signed_not_before_ns
-            or activation["expires_at_exchange_ns"]
-            != signed_expires_at_ns
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration expiry identity mismatch at journal "
-                f"record {record_index}"
-            )
-        deployment = state["deployments"].setdefault(
-            deployment_id,
-            {
-                "reserved_order_count": 0,
-                "cumulative_notional_microu": 0,
-                "last_reserved_exchange_ns": 0,
-                "identity": None,
-                "start_equity_microu": 0,
-                "start_external_cash_flow_microu": 0,
-                "peak_observed_loss_microu": 0,
-                "effective_loss_cap_microu": 0,
-                "open_permit_id": "",
-                "last_expired_at_ns": 0,
-                "latest_permit_id": "",
-                "last_signed_permit_expires_at_ns": 0,
-            },
-        )
-        previous_permit_id = str(deployment["latest_permit_id"] or "")
-        previous_permit_expires_at_ns = int(
-            deployment["last_signed_permit_expires_at_ns"] or 0
-        )
-        if (
-            activation is None
-            and previous_permit_id
-            and previous_permit_id != permit_id
-            and signed_not_before_ns < previous_permit_expires_at_ns
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration expired permit validity window overlaps the "
-                "previous signed permit at journal "
-                f"record {record_index}"
-            )
-        deployment_identity = {
-            "symbol": signed_identity["symbol"],
-            "target_deployment_config_sha256": (
-                signed_identity["target_deployment_config_sha256"]
-            ),
-            "strategy_policy_sha256": (
-                signed_identity["strategy_policy_sha256"]
-            ),
-            "implementation_sha256": (
-                signed_identity["implementation_sha256"]
-            ),
-        }
-        if (
-            deployment["identity"] is not None
-            and deployment["identity"] != deployment_identity
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration expiry deployment identity changed at "
-                f"journal record {record_index}"
-            )
-        deployment["identity"] = deployment_identity
-        recorded_count = self._journal_int(
-            payload,
-            "reserved_order_count",
-        )
-        recorded_cumulative = self._journal_int(
-            payload,
-            "cumulative_submitted_notional_microu",
-        )
-        if (
-            recorded_count != deployment["reserved_order_count"]
-            or recorded_cumulative
-            != deployment["cumulative_notional_microu"]
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration expiry counters are inconsistent at journal "
-                f"record {record_index}"
-            )
-        expired_at_ns = self._journal_int(
-            payload,
-            "expired_at_exchange_ns",
-            minimum=1,
-        )
-        if expired_at_ns < deployment["last_reserved_exchange_ns"]:
-            raise JournalCorruptionError(
-                "RPI calibration expiry timestamp moved backwards at journal "
-                f"record {record_index}"
-            )
-        if (
-            deployment["open_permit_id"]
-            and deployment["open_permit_id"] != permit_id
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration expiry does not match the deployment's "
-                f"open permit at journal record {record_index}"
-            )
-        budget_exhausted = payload.get("budget_exhausted")
-        if not isinstance(budget_exhausted, bool):
-            raise JournalCorruptionError(
-                "RPI calibration expiry budget flag is invalid at journal "
-                f"record {record_index}"
-            )
-        start_equity_microu = self._journal_int(
-            payload,
-            "deployment_start_equity_microu",
-        )
-        start_external_cash_flow_microu = self._journal_int(
-            payload,
-            "deployment_start_external_cash_flow_microu",
-            minimum=None,
-        )
-        peak_observed_loss_microu = self._journal_int(
-            payload,
-            "peak_observed_loss_microu",
-        )
-        effective_loss_cap_microu = self._journal_int(
-            payload,
-            "effective_deployment_loss_cap_microu",
-            minimum=1,
-        )
-        signed_loss_cap_microu = self._usdt_to_microu(
-            self._positive_decimal(
-                signed_permit["policy"]["max_calibration_loss_usdt"],
-                "signed calibration loss cap",
-            ),
-            upper_bound=True,
-        )
-        expected_effective_loss_cap = min(
-            (
-                deployment["effective_loss_cap_microu"]
-                or signed_loss_cap_microu
-            ),
-            signed_loss_cap_microu,
-        )
-        if effective_loss_cap_microu != expected_effective_loss_cap:
-            raise JournalCorruptionError(
-                "RPI calibration expiry widened the deployment loss cap at "
-                f"journal record {record_index}"
-            )
-        if deployment["start_equity_microu"] > 0 and (
-            deployment["start_equity_microu"] != start_equity_microu
-            or deployment["start_external_cash_flow_microu"]
-            != start_external_cash_flow_microu
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration expiry reset the deployment loss baseline "
-                f"at journal record {record_index}"
-            )
-        if (
-            peak_observed_loss_microu
-            < deployment["peak_observed_loss_microu"]
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration expiry loss evidence moved backwards at "
-                f"journal record {record_index}"
-            )
-        if start_equity_microu > 0:
-            deployment["start_equity_microu"] = start_equity_microu
-            deployment["start_external_cash_flow_microu"] = (
-                start_external_cash_flow_microu
-            )
-        deployment["peak_observed_loss_microu"] = (
-            peak_observed_loss_microu
-        )
-        deployment["effective_loss_cap_microu"] = (
-            effective_loss_cap_microu
-        )
-        if deployment["open_permit_id"] == permit_id:
-            deployment["open_permit_id"] = ""
-        deployment["last_expired_at_ns"] = max(
-            deployment["last_expired_at_ns"],
-            expired_at_ns,
-        )
-        deployment["latest_permit_id"] = permit_id
-        deployment["last_signed_permit_expires_at_ns"] = max(
-            deployment["last_signed_permit_expires_at_ns"],
-            signed_expires_at_ns,
-        )
-        state["expired_permits"][permit_id] = {
-            "permit_sha256": permit_sha256,
-            "deployment_id": deployment_id,
-            "reason": str(payload.get("reason", "") or ""),
-            "budget_exhausted": budget_exhausted,
-            "expired_at_exchange_ns": expired_at_ns,
-        }
 
     def _replay_rpi_calibration_bypass(
         self,
@@ -10359,89 +6205,11 @@ class OMS:
         state: dict,
         record_index: int,
     ) -> None:
-        if payload.get("schema") != self.RPI_CALIBRATION_JOURNAL_SCHEMA:
-            raise JournalCorruptionError(
-                "Invalid RPI calibration bypass schema at journal "
-                f"record {record_index}"
-            )
-        bypass_id = str(payload.get("bypass_id", "") or "")
-        client_oid = str(payload.get("client_oid", "") or "")
-        deployment_id = str(payload.get("deployment_id", "") or "")
-        if (
-            not bypass_id
-            or bypass_id != client_oid
-            or bypass_id in state["send_ids"]
-            or not deployment_id
-            or payload.get("reduce_only") is not True
-        ):
-            raise JournalCorruptionError(
-                "Invalid or duplicate RPI calibration emergency bypass at "
-                f"journal record {record_index}"
-            )
-        recorded_at_ns = self._journal_int(
+        self.rpi_calibration_replay._replay_rpi_calibration_bypass(
             payload,
-            "recorded_at_exchange_ns",
-            minimum=1,
+            state,
+            record_index,
         )
-        previous_ns = state["last_bypass_exchange_ns"].get(
-            deployment_id,
-            0,
-        )
-        if recorded_at_ns <= previous_ns:
-            raise JournalCorruptionError(
-                "Non-monotonic RPI calibration bypass timestamp at journal "
-                f"record {record_index}"
-            )
-        permit_sha256 = self._require_sha256(
-            payload.get("permit_sha256"),
-            "RPI calibration bypass permit SHA-256",
-        )
-        permit_id = str(payload.get("permit_id", "") or "")
-        if not permit_id:
-            raise JournalCorruptionError(
-                "RPI calibration bypass permit is missing at journal "
-                f"record {record_index}"
-            )
-        permit_identity = (permit_sha256, deployment_id)
-        existing_permit_identity = state["permit_identities"].get(permit_id)
-        if (
-            existing_permit_identity is not None
-            and existing_permit_identity != permit_identity
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration bypass permit identity changed at journal "
-                f"record {record_index}"
-            )
-        state["permit_identities"][permit_id] = permit_identity
-        activation = state["activations"].get(permit_id)
-        if activation is not None and (
-            activation["permit_sha256"] != permit_sha256
-            or activation["deployment_id"] != deployment_id
-        ):
-            raise JournalCorruptionError(
-                "RPI calibration bypass identity mismatch at journal "
-                f"record {record_index}"
-            )
-        price = self._journal_decimal(payload, "price")
-        quantity = self._journal_decimal(payload, "quantity")
-        estimated_notional_microu = self._journal_int(
-            payload,
-            "estimated_notional_microu",
-            minimum=1,
-        )
-        calculated_notional_microu = int(
-            (
-                price * quantity * self.USDT_MICRO_SCALE
-            ).to_integral_value(rounding=ROUND_CEILING)
-        )
-        if calculated_notional_microu != estimated_notional_microu:
-            raise JournalCorruptionError(
-                "RPI calibration bypass notional mismatch at journal "
-                f"record {record_index}"
-            )
-        state["bypass_ids"].add(bypass_id)
-        state["send_ids"].add(bypass_id)
-        state["last_bypass_exchange_ns"][deployment_id] = recorded_at_ns
 
     def _replay_rpi_calibration_record(
         self,
@@ -10450,69 +6218,12 @@ class OMS:
         state: dict,
         record_index: int,
     ) -> bool:
-        calibration_kinds = {
-            "rpi_calibration_permit_activated",
-            "rpi_calibration_send_reserved",
-            "rpi_calibration_permit_expired",
-            "rpi_calibration_emergency_reduce_bypass",
-        }
-        if kind not in calibration_kinds:
-            return False
-        if not isinstance(payload, dict):
-            raise JournalCorruptionError(
-                "RPI calibration journal payload must be an object at "
-                f"record {record_index}"
-            )
-        try:
-            payload_keys = {
-                "rpi_calibration_permit_activated": (
-                    self.RPI_CALIBRATION_ACTIVATION_PAYLOAD_KEYS
-                ),
-                "rpi_calibration_send_reserved": (
-                    self.RPI_CALIBRATION_RESERVATION_PAYLOAD_KEYS
-                ),
-                "rpi_calibration_permit_expired": (
-                    self.RPI_CALIBRATION_EXPIRY_PAYLOAD_KEYS
-                ),
-                "rpi_calibration_emergency_reduce_bypass": (
-                    self.RPI_CALIBRATION_BYPASS_PAYLOAD_KEYS
-                ),
-            }
-            self._require_exact_mapping_keys(
-                payload,
-                payload_keys[kind],
-                f"{kind} journal payload",
-            )
-            if kind == "rpi_calibration_permit_activated":
-                self._replay_rpi_calibration_activation(
-                    payload,
-                    state,
-                    record_index,
-                )
-            elif kind == "rpi_calibration_send_reserved":
-                self._replay_rpi_calibration_reservation(
-                    payload,
-                    state,
-                    record_index,
-                )
-            elif kind == "rpi_calibration_permit_expired":
-                self._replay_rpi_calibration_expiry(
-                    payload,
-                    state,
-                    record_index,
-                )
-            elif kind == "rpi_calibration_emergency_reduce_bypass":
-                self._replay_rpi_calibration_bypass(
-                    payload,
-                    state,
-                    record_index,
-                )
-        except ValueError as exc:
-            raise JournalCorruptionError(
-                "Malformed RPI calibration record at journal "
-                f"record {record_index}: {exc}"
-            ) from exc
-        return True
+        return self.rpi_calibration_replay._replay_rpi_calibration_record(
+            kind,
+            payload,
+            state,
+            record_index,
+        )
 
     def _finalize_rpi_calibration_replay(
         self,
@@ -10520,841 +6231,13 @@ class OMS:
         *,
         dirty_shutdown: bool = False,
     ) -> dict:
-        config = self._rpi_calibration
-        if not config["enabled"]:
-            return {
-                "permit_activated": False,
-                "expired": False,
-                "expiry_reason": "",
-                "budget_exhausted": False,
-                "reserved_order_count": 0,
-                "cumulative_submitted_notional_microu": 0,
-                "last_reserved_exchange_ns": 0,
-                "reservation_ids": [],
-                "reservation_exchange_ns": {},
-                "permit_start_order_count": 0,
-                "permit_start_notional_microu": 0,
-                "deployment_start_equity_microu": 0,
-                "deployment_start_external_cash_flow_microu": 0,
-                "peak_observed_loss_microu": 0,
-                "effective_loss_cap_microu": 0,
-                "restart_rearm_blocked": False,
-            }
-        deployment = state["deployments"].get(
-            config["deployment_id"],
-            {
-                "reserved_order_count": 0,
-                "cumulative_notional_microu": 0,
-                "last_reserved_exchange_ns": 0,
-                "identity": None,
-                "start_equity_microu": 0,
-                "start_external_cash_flow_microu": 0,
-                "peak_observed_loss_microu": 0,
-                "effective_loss_cap_microu": 0,
-                "open_permit_id": "",
-                "last_expired_at_ns": 0,
-                "latest_permit_id": "",
-                "last_signed_permit_expires_at_ns": 0,
-            },
+        return self.rpi_calibration_replay._finalize_rpi_calibration_replay(
+            state,
+            dirty_shutdown=dirty_shutdown,
         )
-        expected_deployment_identity = {
-            "symbol": config["symbol"],
-            "target_deployment_config_sha256": (
-                config["target_deployment_config_sha256"]
-            ),
-            "strategy_policy_sha256": config["strategy_policy_sha256"],
-            "implementation_sha256": config["implementation_sha256"],
-        }
-        if (
-            deployment["identity"] is not None
-            and deployment["identity"] != expected_deployment_identity
-        ):
-            raise JournalCorruptionError(
-                "Configured RPI calibration permit does not match the "
-                "persisted deployment identity"
-            )
-
-        activation = state["activations"].get(config["permit_id"])
-        latest_permit_id = str(deployment["latest_permit_id"] or "")
-        if (
-            activation is None
-            and latest_permit_id
-            and latest_permit_id != config["permit_id"]
-            and config["not_before_ns"]
-            < deployment["last_signed_permit_expires_at_ns"]
-        ):
-            raise JournalCorruptionError(
-                "Configured RPI calibration permit validity window overlaps "
-                "the previous signed permit"
-            )
-        persisted_permit_identity = state["permit_identities"].get(
-            config["permit_id"]
-        )
-        if (
-            persisted_permit_identity is not None
-            and persisted_permit_identity
-            != (
-                config["permit_sha256"],
-                config["deployment_id"],
-            )
-        ):
-            raise JournalCorruptionError(
-                "Configured RPI calibration permit identity differs from "
-                "persisted audit records"
-            )
-        if activation is not None:
-            expected_activation = {
-                "permit_sha256": config["permit_sha256"],
-                "deployment_id": config["deployment_id"],
-                "symbol": config["symbol"],
-                "calibration_config_sha256": (
-                    config["calibration_config_sha256"]
-                ),
-                "target_deployment_config_sha256": (
-                    config["target_deployment_config_sha256"]
-                ),
-                "strategy_policy_sha256": (
-                    config["strategy_policy_sha256"]
-                ),
-                "implementation_sha256": (
-                    config["implementation_sha256"]
-                ),
-                "not_before_exchange_ns": config["not_before_ns"],
-                "expires_at_exchange_ns": config["expires_at_ns"],
-                "fixed_depths_bps": config["fixed_depths_bps"],
-                "order_ttl_ns": config["order_ttl_ns"],
-                "min_order_interval_ns": config["min_order_interval_ns"],
-                "max_active_orders": config["max_active_orders"],
-                "max_order_count": config["max_order_count"],
-                "min_order_notional_microu": (
-                    config["min_order_notional_microu"]
-                ),
-                "max_order_notional_microu": (
-                    config["max_order_notional_microu"]
-                ),
-                "max_cumulative_submitted_notional_microu": (
-                    config["max_cumulative_notional_microu"]
-                ),
-                "max_calibration_loss_microu": (
-                    config["max_calibration_loss_microu"]
-                ),
-            }
-            if any(
-                activation.get(field) != value
-                for field, value in expected_activation.items()
-            ):
-                raise JournalCorruptionError(
-                    "Configured RPI calibration permit differs from its "
-                    "persisted activation"
-                )
-
-        expiry = state["expired_permits"].get(config["permit_id"], {})
-        open_permit_id = str(deployment["open_permit_id"] or "")
-        if (
-            open_permit_id
-            and open_permit_id != config["permit_id"]
-        ):
-            raise JournalCorruptionError(
-                "A renewed RPI calibration permit cannot activate before "
-                "the previous permit has a durable expiry record"
-            )
-        if activation is not None and not expiry and (
-            open_permit_id != config["permit_id"]
-        ):
-            raise JournalCorruptionError(
-                "Persisted RPI calibration activation is not the deployment's "
-                "open permit"
-            )
-        permit_start_order_count = (
-            activation["starting_reserved_order_count"]
-            if activation is not None
-            else deployment["reserved_order_count"]
-        )
-        permit_start_notional_microu = (
-            activation[
-                "starting_cumulative_submitted_notional_microu"
-            ]
-            if activation is not None
-            else deployment["cumulative_notional_microu"]
-        )
-        restart_rearm_blocked = bool(
-            dirty_shutdown
-            and activation is not None
-            and not expiry
-        )
-        return {
-            "permit_activated": activation is not None,
-            "expired": bool(expiry),
-            "expiry_reason": str(expiry.get("reason", "") or ""),
-            "budget_exhausted": bool(
-                expiry.get("budget_exhausted", False)
-            ),
-            "reserved_order_count": deployment["reserved_order_count"],
-            "cumulative_submitted_notional_microu": (
-                deployment["cumulative_notional_microu"]
-            ),
-            "last_reserved_exchange_ns": (
-                deployment["last_reserved_exchange_ns"]
-            ),
-            "reservation_ids": sorted(state["reservation_ids"]),
-            "reservation_exchange_ns": dict(
-                state["reservation_exchange_ns"]
-            ),
-            "permit_start_order_count": permit_start_order_count,
-            "permit_start_notional_microu": (
-                permit_start_notional_microu
-            ),
-            "deployment_start_equity_microu": (
-                deployment["start_equity_microu"]
-            ),
-            "deployment_start_external_cash_flow_microu": (
-                deployment["start_external_cash_flow_microu"]
-            ),
-            "peak_observed_loss_microu": (
-                deployment["peak_observed_loss_microu"]
-            ),
-            "effective_loss_cap_microu": (
-                deployment["effective_loss_cap_microu"]
-                or config["max_calibration_loss_microu"]
-            ),
-            "restart_rearm_blocked": restart_rearm_blocked,
-        }
 
     def rebuild_from_log(self):
-        records = self.journal.load()
-        if not records:
-            calibration_replay = (
-                self._new_rpi_calibration_replay_state()
-            )
-            return {
-                "records": 0,
-                "recovered_orders": 0,
-                "recovered_active_orders": 0,
-                "recovered_terminal_ids": 0,
-                "pending_commands": 0,
-                "last_lifecycle": None,
-                "last_freeze_reason": "",
-                "last_halt_reason": "",
-                "manual_rearm_required": False,
-                "symbol_guards": {},
-                "symbol_guard_records": {},
-                "venue_guards": {},
-                "venue_guard_records": {},
-                "strategy_guards": {},
-                "strategy_symbol_guards": {},
-                "mode_override": "",
-                "mode_override_reason": "",
-                "mode_constraint_generation": 0,
-                "mode_constraints": {},
-                "clean_shutdown": True,
-                "dirty_shutdown": False,
-                "trade_cursors": {},
-                "trade_scan_end_ms": {},
-                "untrusted_trade_cursor_symbols": [],
-                "unverified_execution_symbols": [],
-                "external_cash_flow_total": 0.0,
-                "external_cash_flow_ids": [],
-                "external_cash_flow_scan_end_ms": 0,
-                "rpi_calibration": (
-                    self._finalize_rpi_calibration_replay(
-                        calibration_replay
-                    )
-                ),
-            }
-
-        latest_order_records = {}
-        latest_order_record_indexes = {}
-        commands = {}
-        executions_by_client_oid = {}
-        execution_records = []
-        last_lifecycle = None
-        last_freeze_reason = ""
-        last_halt_reason = ""
-        manual_rearm_required = False
-        symbol_guards = {}
-        symbol_guard_records = {}
-        symbol_guard_epoch_counters = {}
-        venue_guards = {}
-        venue_guard_records = {}
-        venue_guard_epoch_counters = {}
-        strategy_guards = {}
-        strategy_symbol_guards = {}
-        mode_override = ""
-        mode_override_reason = ""
-        mode_constraint_generation = 0
-        mode_constraints = {}
-        trade_cursors = {}
-        trade_scan_end_ms = {}
-        untrusted_trade_cursor_symbols = set()
-        unverified_execution_symbols = set()
-        external_cash_flow_total = 0.0
-        external_cash_flow_ids = set()
-        external_cash_flow_scan_end_ms = 0
-        calibration_replay = self._new_rpi_calibration_replay_state()
-        clean_shutdown = records[-1].get("kind") == "oms_stopped"
-        for record_index, record in enumerate(records):
-            payload = record.get("payload", {})
-            kind = record.get("kind")
-            if self._replay_rpi_calibration_record(
-                kind,
-                payload,
-                calibration_replay,
-                record_index,
-            ):
-                continue
-            if kind == "order_snapshot":
-                client_oid = payload.get("client_oid")
-                if client_oid:
-                    latest_order_records[client_oid] = payload
-                    latest_order_record_indexes[client_oid] = record_index
-            elif kind in {"command_prepared", "command_result"}:
-                command_id = str(payload.get("command_id", "") or "")
-                if command_id:
-                    entry = commands.setdefault(command_id, {})
-                    entry[kind] = {
-                        "index": record_index,
-                        "payload": payload,
-                    }
-            elif kind == "execution_record":
-                client_oid = str(payload.get("client_oid", "") or "")
-                try:
-                    recorded_trade_id = int(payload.get("trade_id", -1))
-                except (TypeError, ValueError):
-                    recorded_trade_id = -1
-                if (
-                    recorded_trade_id < 0
-                    and float(payload.get("fill_qty", 0.0) or 0.0) > 0.0
-                ):
-                    symbol = str(payload.get("symbol", "") or "").upper()
-                    if symbol:
-                        unverified_execution_symbols.add(symbol)
-                execution_records.append(
-                    {"index": record_index, "payload": payload}
-                )
-                if client_oid:
-                    executions_by_client_oid.setdefault(client_oid, []).append(
-                        {"index": record_index, "payload": payload}
-                    )
-            elif kind == "lifecycle":
-                last_lifecycle = payload.get("state")
-                reason = str(payload.get("reason", "") or "")
-                if last_lifecycle == LifecycleState.FROZEN.value and reason:
-                    last_freeze_reason = reason
-                elif last_lifecycle == LifecycleState.HALTED.value:
-                    if reason:
-                        last_halt_reason = reason
-                    manual_rearm_required = bool(payload.get("manual_rearm_required", True))
-                elif last_lifecycle == LifecycleState.LIVE.value:
-                    manual_rearm_required = False
-                    last_halt_reason = ""
-                    last_freeze_reason = ""
-            elif kind in {"full_reset_completed", "reconcile_cleared", "rearm_completed"}:
-                last_lifecycle = payload.get("state") or LifecycleState.LIVE.value
-                if last_lifecycle == LifecycleState.LIVE.value:
-                    manual_rearm_required = False
-                    last_freeze_reason = ""
-                    if kind == "rearm_completed":
-                        last_halt_reason = ""
-            elif kind in {"reconcile_requested", "reconcile_started", "full_reset_started"}:
-                last_lifecycle = LifecycleState.RECONCILING.value
-            elif kind in {"bootstrap_guarded", "freeze_reasserted"}:
-                reason = str(payload.get("reason", "") or "")
-                if reason:
-                    last_freeze_reason = reason
-                if last_lifecycle != LifecycleState.HALTED.value:
-                    last_lifecycle = LifecycleState.FROZEN.value
-            elif kind == "halt_reasserted":
-                last_lifecycle = LifecycleState.HALTED.value
-                reason = str(payload.get("reason", "") or "")
-                if reason:
-                    last_halt_reason = reason
-                manual_rearm_required = True
-            elif kind in {"symbol_frozen", "symbol_freeze_reasserted"}:
-                symbol = str(payload.get("symbol", "") or "").upper()
-                reason = str(payload.get("reason", "") or "")
-                if symbol and reason:
-                    owner = str(
-                        payload.get("owner", "")
-                        or self._symbol_guard_owner(reason)
-                    )
-                    epoch = int(payload.get("epoch", 0) or 0)
-                    if epoch <= 0:
-                        epoch = int(symbol_guard_epoch_counters.get(symbol, 0)) + 1
-                    symbol_guard_epoch_counters[symbol] = max(
-                        epoch,
-                        int(symbol_guard_epoch_counters.get(symbol, 0)),
-                    )
-                    records_for_symbol = symbol_guard_records.setdefault(symbol, {})
-                    existing_epoch = int(
-                        (records_for_symbol.get(owner) or {}).get("epoch", 0)
-                        or 0
-                    )
-                    if epoch >= existing_epoch:
-                        records_for_symbol[owner] = {
-                            "reason": reason,
-                            "epoch": epoch,
-                        }
-                    newest = max(
-                        records_for_symbol.values(),
-                        key=lambda record: int(record.get("epoch", 0) or 0),
-                    )
-                    symbol_guards[symbol] = str(newest.get("reason", "") or "")
-            elif kind in {"symbol_unfrozen", "symbol_guard_cleared"}:
-                symbol = str(payload.get("symbol", "") or "").upper()
-                if symbol:
-                    records_for_symbol = symbol_guard_records.get(symbol, {})
-                    owner = str(payload.get("owner", "") or "")
-                    previous_reason = str(
-                        payload.get("previous_reason", "") or ""
-                    )
-                    epoch = int(payload.get("epoch", 0) or 0)
-                    if owner:
-                        owner_record = records_for_symbol.get(owner)
-                        if owner_record and (
-                            epoch <= 0
-                            or int(owner_record.get("epoch", 0) or 0) == epoch
-                        ) and (
-                            not previous_reason
-                            or str(owner_record.get("reason", "") or "")
-                            == previous_reason
-                        ):
-                            records_for_symbol.pop(owner, None)
-                    elif previous_reason:
-                        matching_owners = [
-                            candidate_owner
-                            for candidate_owner, record in records_for_symbol.items()
-                            if str(record.get("reason", "") or "") == previous_reason
-                            and (
-                                epoch <= 0
-                                or int(record.get("epoch", 0) or 0) == epoch
-                            )
-                        ]
-                        for candidate_owner in matching_owners:
-                            records_for_symbol.pop(candidate_owner, None)
-                    else:
-                        # Backward compatibility for journals written before
-                        # owner-aware guards existed.
-                        records_for_symbol.clear()
-                    if records_for_symbol:
-                        newest = max(
-                            records_for_symbol.values(),
-                            key=lambda record: int(record.get("epoch", 0) or 0),
-                        )
-                        symbol_guards[symbol] = str(
-                            newest.get("reason", "") or ""
-                        )
-                    else:
-                        symbol_guard_records.pop(symbol, None)
-                        symbol_guards.pop(symbol, None)
-            elif kind in {"venue_frozen", "venue_freeze_reasserted"}:
-                venue = str(payload.get("venue", "") or "").upper()
-                reason = str(payload.get("reason", "") or "")
-                if venue and reason:
-                    owner = str(
-                        payload.get("owner", "")
-                        or self._venue_guard_owner(reason)
-                    )
-                    epoch = int(payload.get("epoch", 0) or 0)
-                    if epoch <= 0:
-                        epoch = int(venue_guard_epoch_counters.get(venue, 0)) + 1
-                    venue_guard_epoch_counters[venue] = max(
-                        epoch,
-                        int(venue_guard_epoch_counters.get(venue, 0)),
-                    )
-                    records_for_venue = venue_guard_records.setdefault(venue, {})
-                    existing_epoch = int(
-                        (records_for_venue.get(owner) or {}).get("epoch", 0)
-                        or 0
-                    )
-                    if epoch >= existing_epoch:
-                        records_for_venue[owner] = {
-                            "reason": reason,
-                            "epoch": epoch,
-                        }
-                    newest = max(
-                        records_for_venue.values(),
-                        key=lambda record: int(record.get("epoch", 0) or 0),
-                    )
-                    venue_guards[venue] = str(newest.get("reason", "") or "")
-            elif kind in {"venue_unfrozen", "venue_guard_cleared"}:
-                venue = str(payload.get("venue", "") or "").upper()
-                if venue:
-                    records_for_venue = venue_guard_records.get(venue, {})
-                    owner = str(payload.get("owner", "") or "")
-                    previous_reason = str(
-                        payload.get("previous_reason", "") or ""
-                    )
-                    epoch = int(payload.get("epoch", 0) or 0)
-                    if owner:
-                        owner_record = records_for_venue.get(owner)
-                        if owner_record and (
-                            epoch <= 0
-                            or int(owner_record.get("epoch", 0) or 0) == epoch
-                        ) and (
-                            not previous_reason
-                            or str(owner_record.get("reason", "") or "")
-                            == previous_reason
-                        ):
-                            records_for_venue.pop(owner, None)
-                    elif previous_reason:
-                        matching_owners = [
-                            candidate_owner
-                            for candidate_owner, record in records_for_venue.items()
-                            if str(record.get("reason", "") or "")
-                            == previous_reason
-                            and (
-                                epoch <= 0
-                                or int(record.get("epoch", 0) or 0) == epoch
-                            )
-                        ]
-                        for candidate_owner in matching_owners:
-                            records_for_venue.pop(candidate_owner, None)
-                    else:
-                        records_for_venue.clear()
-                    if records_for_venue:
-                        newest = max(
-                            records_for_venue.values(),
-                            key=lambda record: int(record.get("epoch", 0) or 0),
-                        )
-                        venue_guards[venue] = str(
-                            newest.get("reason", "") or ""
-                        )
-                    else:
-                        venue_guard_records.pop(venue, None)
-                        venue_guards.pop(venue, None)
-            elif kind in {"strategy_frozen", "strategy_freeze_reasserted"}:
-                strategy_id = str(payload.get("strategy_id", "") or "").strip()
-                symbol = str(payload.get("symbol", "") or "").upper()
-                reason = str(payload.get("reason", "") or "")
-                if strategy_id and reason:
-                    if symbol:
-                        strategy_symbol_guards[f"{strategy_id}|{symbol}"] = reason
-                    else:
-                        strategy_guards[strategy_id] = reason
-            elif kind == "strategy_symbol_frozen":
-                strategy_id = str(payload.get("strategy_id", "") or "").strip()
-                symbol = str(payload.get("symbol", "") or "").upper()
-                reason = str(payload.get("reason", "") or "")
-                if strategy_id and symbol and reason:
-                    strategy_symbol_guards[f"{strategy_id}|{symbol}"] = reason
-            elif kind == "strategy_unfrozen":
-                strategy_id = str(payload.get("strategy_id", "") or "").strip()
-                symbol = str(payload.get("symbol", "") or "").upper()
-                if strategy_id and symbol:
-                    strategy_symbol_guards.pop(f"{strategy_id}|{symbol}", None)
-                elif strategy_id:
-                    strategy_guards.pop(strategy_id, None)
-            elif kind == "trading_mode_override_set":
-                mode_override = str(payload.get("mode", "") or "")
-                mode_override_reason = str(payload.get("reason", "") or "")
-                constraint_key = str(
-                    payload.get("constraint_key", "")
-                    or self._mode_constraint_key(mode_override_reason)
-                )
-                if mode_override and mode_override_reason:
-                    if "constraint_generation" in payload:
-                        try:
-                            constraint_generation = int(
-                                payload["constraint_generation"]
-                            )
-                        except (TypeError, ValueError) as exc:
-                            raise JournalCorruptionError(
-                                "Invalid explicit mode constraint "
-                                "generation at journal record "
-                                f"{record_index}"
-                            ) from exc
-                        if (
-                            constraint_generation
-                            <= mode_constraint_generation
-                        ):
-                            raise JournalCorruptionError(
-                                "Non-monotonic mode constraint generation "
-                                f"at journal record {record_index}: "
-                                f"{constraint_generation}<="
-                                f"{mode_constraint_generation}"
-                            )
-                    else:
-                        constraint_generation = (
-                            mode_constraint_generation + 1
-                        )
-                    mode_constraint_generation = constraint_generation
-                    mode_constraints[constraint_key] = {
-                        "mode": mode_override,
-                        "reason": mode_override_reason,
-                        "generation": constraint_generation,
-                    }
-            elif kind == "trading_mode_override_cleared":
-                cleared_keys = payload.get("cleared_constraint_keys", []) or []
-                cleared_generations = payload.get(
-                    "cleared_constraint_generations",
-                    {},
-                )
-                if not isinstance(cleared_generations, dict):
-                    cleared_generations = {}
-                if cleared_keys:
-                    for constraint_key in cleared_keys:
-                        constraint_key = str(constraint_key)
-                        current = mode_constraints.get(constraint_key)
-                        expected_generation = cleared_generations.get(
-                            constraint_key
-                        )
-                        if (
-                            expected_generation is not None
-                            and current is not None
-                            and int(current.get("generation", 0) or 0)
-                            != int(expected_generation)
-                        ):
-                            continue
-                        mode_constraints.pop(constraint_key, None)
-                else:
-                    previous_reason = str(payload.get("previous_reason", "") or "")
-                    if previous_reason:
-                        mode_constraints.pop(
-                            self._mode_constraint_key(previous_reason),
-                            None,
-                        )
-                    else:
-                        mode_constraints.clear()
-                if mode_constraints:
-                    _selected_key, selected = max(
-                        mode_constraints.items(),
-                        key=lambda item: (
-                            self._mode_rank(OMSCapabilityMode(item[1]["mode"])),
-                            item[0],
-                        ),
-                    )
-                    mode_override = selected["mode"]
-                    mode_override_reason = selected["reason"]
-                else:
-                    mode_override = ""
-                    mode_override_reason = ""
-            elif kind == "oms_stopped":
-                state = payload.get("state")
-                if state:
-                    last_lifecycle = state
-                if payload.get("manual_rearm_required") is True:
-                    manual_rearm_required = True
-            elif kind == "trade_cursor_advanced":
-                symbol = str(payload.get("symbol", "") or "").upper()
-                trade_id = int(payload.get("trade_id", -1))
-                source = str(payload.get("source", "") or "")
-                if symbol and source == "user_stream":
-                    untrusted_trade_cursor_symbols.add(symbol)
-                elif symbol:
-                    trade_cursors[symbol] = max(trade_cursors.get(symbol, -1), trade_id)
-            elif kind == "trade_scan_completed":
-                symbol = str(payload.get("symbol", "") or "").upper()
-                end_time_ms = int(payload.get("end_time_ms", 0))
-                if symbol:
-                    trade_scan_end_ms[symbol] = max(
-                        trade_scan_end_ms.get(symbol, 0),
-                        end_time_ms,
-                    )
-            elif kind == "external_cash_flow_record":
-                income_id = str(payload.get("income_id", "") or "")
-                if income_id in external_cash_flow_ids:
-                    continue
-                external_cash_flow_ids.add(income_id)
-                external_cash_flow_total += float(payload.get("amount", 0.0) or 0.0)
-            elif kind == "cash_flow_scan_completed":
-                external_cash_flow_scan_end_ms = max(
-                    external_cash_flow_scan_end_ms,
-                    int(payload.get("end_time_ms", 0) or 0),
-                )
-
-        latest_command_results = {}
-        pending_commands = 0
-        for entry in commands.values():
-            prepared = entry.get("command_prepared")
-            result = entry.get("command_result")
-            if prepared and not result:
-                prepared_payload = prepared["payload"]
-                client_oid = str(prepared_payload.get("client_oid", "") or "")
-                snapshot = latest_order_records.get(client_oid, {})
-                snapshot_index = latest_order_record_indexes.get(client_oid, -1)
-                snapshot_status = str(snapshot.get("status", "") or "")
-                ambiguous_statuses = {
-                    OrderStatus.SUBMITTING.value,
-                    OrderStatus.SUBMIT_UNKNOWN.value,
-                    OrderStatus.CANCELLING.value,
-                    OrderStatus.CANCEL_UNKNOWN.value,
-                }
-                if (
-                    not snapshot
-                    or snapshot_index <= prepared["index"]
-                    or snapshot_status in ambiguous_statuses
-                ):
-                    pending_commands += 1
-            if not result:
-                continue
-            result_payload = result["payload"]
-            client_oid = str(result_payload.get("client_oid", "") or "")
-            if not client_oid:
-                continue
-            current = latest_command_results.get(client_oid)
-            if current is None or result["index"] > current["index"]:
-                latest_command_results[client_oid] = result
-
-        with self.lock:
-            self.orders.clear()
-            self.exchange_id_map.clear()
-            self.execution_ids.clear()
-            self.terminated_oids.clear()
-            self.terminated_oid_queue.clear()
-            self.exposure.strategy_net_positions.clear()
-            self.exposure.strategy_avg_prices.clear()
-            self.exposure.strategy_open_buy_qty.clear()
-            self.exposure.strategy_open_sell_qty.clear()
-            replayed_strategy_executions = set()
-            for execution in execution_records:
-                payload = execution["payload"]
-                execution_id = str(payload.get("execution_id", "") or "")
-                if not execution_id:
-                    raise JournalCorruptionError(
-                        "Execution record without execution_id during strategy replay"
-                    )
-                if execution_id in replayed_strategy_executions:
-                    continue
-                client_oid = str(payload.get("client_oid", "") or "")
-                order_payload = latest_order_records.get(client_oid, {})
-                intent_payload = order_payload.get("intent", {})
-                strategy_id = str(
-                    payload.get("strategy_id", "")
-                    or intent_payload.get("strategy_id", "")
-                    or "exchange_recovery"
-                )
-                symbol = str(
-                    payload.get("symbol", "")
-                    or intent_payload.get("symbol", "")
-                ).upper()
-                side_value = str(
-                    payload.get("side", "")
-                    or intent_payload.get("side", "")
-                )
-                try:
-                    side = Side(side_value)
-                    fill_qty = float(payload.get("fill_qty", 0.0) or 0.0)
-                    fill_price = float(payload.get("fill_price", 0.0) or 0.0)
-                except (TypeError, ValueError) as exc:
-                    raise JournalCorruptionError(
-                        f"Malformed strategy execution {execution_id}: {exc}"
-                    ) from exc
-                if (
-                    not symbol
-                    or fill_qty <= 0.0
-                    or fill_price <= 0.0
-                    or not math.isfinite(fill_qty)
-                    or not math.isfinite(fill_price)
-                ):
-                    raise JournalCorruptionError(
-                        f"Invalid strategy execution values for {execution_id}"
-                    )
-                self.exposure.on_strategy_fill(
-                    strategy_id,
-                    symbol,
-                    side,
-                    fill_qty,
-                    fill_price,
-                )
-                replayed_strategy_executions.add(execution_id)
-                self.execution_ids.add(execution_id)
-            recovered_terminal_ids = 0
-            recovered_active_orders = 0
-            for client_oid, payload in latest_order_records.items():
-                try:
-                    order = Order.from_record(payload)
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise JournalCorruptionError(
-                        f"Invalid order snapshot for {client_oid}: {exc}"
-                    ) from exc
-
-                trailing_result = latest_command_results.get(client_oid)
-                if (
-                    trailing_result
-                    and trailing_result["index"] > latest_order_record_indexes[client_oid]
-                ):
-                    self._apply_recovered_command_result(
-                        order,
-                        trailing_result["payload"],
-                    )
-
-                for execution in executions_by_client_oid.get(client_oid, []):
-                    self.execution_ids.add(
-                        str(execution["payload"].get("execution_id", "") or "")
-                    )
-                    if execution["index"] > latest_order_record_indexes[client_oid]:
-                        self._apply_recovered_execution(order, execution["payload"])
-
-                # PREPARED/SUBMITTING and PREPARED/CANCELLING are deliberately
-                # ambiguous after a process crash. They must be queried by the
-                # durable idempotency key and never blindly resent.
-                if order.status == OrderStatus.SUBMITTING:
-                    order.mark_submit_unknown("recovered_inflight_submit")
-                elif order.status == OrderStatus.CANCELLING:
-                    order.mark_cancel_unknown("recovered_inflight_cancel")
-
-                if order.is_active():
-                    self.orders[order.client_oid] = order
-                    if order.exchange_oid:
-                        self.exchange_id_map[order.exchange_oid] = order
-                    self.order_monitor.recover_order(order)
-                    recovered_active_orders += 1
-                    continue
-
-                if order.is_terminal():
-                    if order.client_oid:
-                        self._remember_terminated_oid(order.client_oid)
-                        recovered_terminal_ids += 1
-                    if order.exchange_oid:
-                        self._remember_terminated_oid(order.exchange_oid)
-                        recovered_terminal_ids += 1
-
-            self.exposure.update_open_orders(self.orders)
-            self.account.calculate()
-
-        summary = {
-            "records": len(records),
-            "recovered_orders": len(latest_order_records),
-            "recovered_active_orders": recovered_active_orders,
-            "recovered_terminal_ids": recovered_terminal_ids,
-            "pending_commands": pending_commands,
-            "last_lifecycle": last_lifecycle,
-            "last_freeze_reason": last_freeze_reason,
-            "last_halt_reason": last_halt_reason,
-            "manual_rearm_required": manual_rearm_required,
-            "symbol_guards": symbol_guards,
-            "symbol_guard_records": symbol_guard_records,
-            "venue_guards": venue_guards,
-            "venue_guard_records": venue_guard_records,
-            "strategy_guards": strategy_guards,
-            "strategy_symbol_guards": strategy_symbol_guards,
-            "mode_override": mode_override,
-            "mode_override_reason": mode_override_reason,
-            "mode_constraint_generation": mode_constraint_generation,
-            "mode_constraints": mode_constraints,
-            "clean_shutdown": clean_shutdown,
-            "dirty_shutdown": not clean_shutdown,
-            "trade_cursors": trade_cursors,
-            "trade_scan_end_ms": trade_scan_end_ms,
-            "untrusted_trade_cursor_symbols": sorted(
-                untrusted_trade_cursor_symbols
-            ),
-            "unverified_execution_symbols": sorted(
-                unverified_execution_symbols
-            ),
-            "external_cash_flow_total": external_cash_flow_total,
-            "external_cash_flow_ids": sorted(external_cash_flow_ids),
-            "external_cash_flow_scan_end_ms": external_cash_flow_scan_end_ms,
-            "rpi_calibration": self._finalize_rpi_calibration_replay(
-                calibration_replay,
-                dirty_shutdown=not clean_shutdown,
-            ),
-        }
-        if recovered_terminal_ids:
-            logger.info(
-                f"[OMS] Recovered {recovered_terminal_ids} terminal IDs from journal"
-            )
-        return summary
+        return self.journal_rebuilder.rebuild_from_log()
 
     def _normalize_remote_open_orders(self, remote_orders):
         if not isinstance(remote_orders, (list, tuple)):
@@ -11521,7 +6404,7 @@ class OMS:
         payload.setdefault("capability_reason", self.capability_reason)
         payload.setdefault("mode_override", self.mode_override.value if self.mode_override else "")
         payload.setdefault("mode_override_reason", self.mode_override_reason)
-        self.journal.append(kind, payload)
+        self.audit_logger.audit(kind, payload)
 
     def record_rpi_commission_truth(
         self,
@@ -11553,11 +6436,11 @@ class OMS:
         return True
 
     def _record_order_snapshot(self, order: Order, source: str, **extra):
-        payload = order.to_record()
-        payload["source"] = source
-        if extra:
-            payload["extra"] = extra
-        self.journal.append("order_snapshot", payload)
+        self.audit_logger.record_order_snapshot(
+            order,
+            source,
+            **extra,
+        )
 
     def _emit_order_update(self, order: Order):
         self.event_engine.put(Event(EVENT_ORDER_UPDATE, order.to_snapshot()))

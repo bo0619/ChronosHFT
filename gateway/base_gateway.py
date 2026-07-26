@@ -30,7 +30,13 @@ class BaseGateway(ABC):
         pass
 
     @abstractmethod
-    def send_order(self, req, client_oid: str = None):
+    def send_order(
+        self,
+        req,
+        client_oid: str = None,
+        *,
+        pre_send_guard=None,
+    ):
         pass
 
     @abstractmethod

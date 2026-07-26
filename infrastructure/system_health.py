@@ -1,8 +1,95 @@
-def handle_system_health_event(event, risk_controller, oms=None):
+from infrastructure.logger import logger
+
+
+def handle_system_health_event(
+    event,
+    risk_controller,
+    oms=None,
+    risk_supervisor=None,
+):
     message = event.data
     if not isinstance(message, str):
         message = str(message)
     if message.startswith("HALT:"):
+        halt_reason = message[5:] or "unspecified"
+        suspend_parent_heartbeat = getattr(
+            risk_supervisor,
+            "suspend_parent_heartbeat",
+            None,
+        )
+        resume_shutdown_guard = getattr(
+            risk_supervisor,
+            "resume_shutdown_guard",
+            None,
+        )
+        if callable(resume_shutdown_guard):
+            try:
+                supervisor_result = resume_shutdown_guard(
+                    reason=f"oms_halt:{halt_reason}"
+                )
+            except Exception as exc:
+                logger.critical(
+                    "Independent risk supervisor HALT handoff raised: "
+                    f"{type(exc).__name__}:{exc}"
+                )
+                if callable(suspend_parent_heartbeat):
+                    try:
+                        suspend_parent_heartbeat(
+                            "oms_halt_handoff_exception"
+                        )
+                    except Exception as suspend_exc:
+                        logger.critical(
+                            "Could not suspend parent heartbeat after HALT "
+                            f"handoff exception: {type(suspend_exc).__name__}:"
+                            f"{suspend_exc}"
+                        )
+            else:
+                if not (
+                    isinstance(supervisor_result, dict)
+                    and supervisor_result.get("accepted") is True
+                    and supervisor_result.get("kill_latched") is True
+                    and supervisor_result.get("persisted") is True
+                ):
+                    logger.critical(
+                        "Independent risk supervisor did not durably accept "
+                        f"OMS HALT handoff: {supervisor_result!r}"
+                    )
+                    if callable(suspend_parent_heartbeat):
+                        try:
+                            suspend_parent_heartbeat(
+                                "oms_halt_handoff_unconfirmed"
+                            )
+                        except Exception as suspend_exc:
+                            logger.critical(
+                                "Could not suspend parent heartbeat after "
+                                "unconfirmed HALT handoff: "
+                                f"{type(suspend_exc).__name__}:{suspend_exc}"
+                            )
+        else:
+            logger.critical(
+                "Independent risk supervisor HALT handoff is unavailable"
+            )
+            if callable(suspend_parent_heartbeat):
+                try:
+                    suspend_parent_heartbeat(
+                        "oms_halt_handoff_unavailable"
+                    )
+                except Exception as suspend_exc:
+                    logger.critical(
+                        "Could not suspend parent heartbeat after missing "
+                        f"HALT handoff: {type(suspend_exc).__name__}:"
+                        f"{suspend_exc}"
+                    )
+        if risk_controller is not None:
+            try:
+                risk_controller.trigger_kill_switch(
+                    f"SystemHealth: {message}"
+                )
+            except Exception as exc:
+                logger.critical(
+                    "Parent risk kill failed after OMS HALT: "
+                    f"{type(exc).__name__}:{exc}"
+                )
         return
 
     if message.startswith("FREEZE_SYMBOL:") and oms is not None:

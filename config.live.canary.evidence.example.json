@@ -1,6 +1,6 @@
 {
   "_warning": "BLOCKED EXAMPLE ONLY. Every false value must be verified by the operator in the actual deployment environment; do not change a value merely to satisfy the checker.",
-  "schema": "chronoshft.live_canary_evidence.v2",
+  "schema": "chronoshft.live_canary_evidence.v4",
   "deployment_id": "EDIT-ME-rpi-canary-001",
   "symbol": "XAUUSDT",
   "operator_attestations": {
@@ -69,6 +69,26 @@
     "totalMarginBalance": null,
     "availableBalance": null
   },
+  "flat_start_truth": {
+    "_comment": "Raw account-wide responses collected with the primary key. Both arrays are validated; do not replace them with operator booleans.",
+    "open_orders_source": "GET /fapi/v1/openOrders",
+    "positions_source": "GET /fapi/v2/positionRisk",
+    "captured_at_utc": "",
+    "api_key_fingerprint_sha256": "",
+    "open_orders": null,
+    "positions": null
+  },
+  "symbol_configuration_truth": {
+    "_comment": "Raw target-symbol exchange and account configuration responses. ONE_WAY, ISOLATED, 1x, RPI permission, and minimum notional are validated from these fields.",
+    "position_mode_source": "GET /fapi/v1/positionSide/dual",
+    "position_risk_source": "GET /fapi/v2/positionRisk",
+    "exchange_info_source": "GET /fapi/v1/exchangeInfo",
+    "captured_at_utc": "",
+    "api_key_fingerprint_sha256": "",
+    "position_mode": null,
+    "symbol_position_rows": null,
+    "exchange_symbol": null
+  },
   "rpi_truth": {
     "_comment": "Export recent exchangeInfo support and account-specific commissionRate truth from an allowed deployment environment. Never infer zero fee from marketing or public symbol metadata.",
     "exchange_info_source": "GET /fapi/v1/exchangeInfo",
@@ -80,5 +100,13 @@
     "makerCommissionRate": null,
     "takerCommissionRate": null,
     "rpiCommissionRate": null
+  },
+  "_integrity_comment": "Generated only by scripts/collect_live_canary_evidence.py from canonical strict JSON. Never enter API secrets or hand-edit these tags.",
+  "integrity": {
+    "schema": "chronoshft.live_canary_evidence_integrity.v1",
+    "algorithm": "HMAC-SHA256",
+    "canonicalization": "SORTED-COMPACT-ASCII-JSON-V1",
+    "primary_hmac_sha256": "",
+    "supervisor_hmac_sha256": ""
   }
 }

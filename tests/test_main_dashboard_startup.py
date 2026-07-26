@@ -2,6 +2,9 @@ import ast
 import copy
 import io
 import inspect
+import json
+import os
+import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
@@ -13,6 +16,7 @@ import main as main_module
 class FakeLogger:
     def __init__(self):
         self.callback = None
+        self.alert_callback = None
         self.messages = []
 
     def init_logging(self, _config):
@@ -20,6 +24,9 @@ class FakeLogger:
 
     def set_ui_callback(self, callback):
         self.callback = callback
+
+    def set_alert_callback(self, callback):
+        self.alert_callback = callback
 
     def _record(self, level, message):
         self.messages.append((level, message))
@@ -127,6 +134,11 @@ class MainDashboardStartupTests(unittest.TestCase):
             patch.object(main_module, "load_config", return_value=self.config()),
             patch.object(main_module, "time_service", clock),
             patch.object(main_module, "logger", fake_logger),
+            patch.object(
+                main_module,
+                "start_external_alert_service",
+                return_value=None,
+            ),
             patch.object(main_module, "LocalWebDashboard", return_value=dashboard),
             patch.object(main_module.webbrowser, "open", browser_open),
             patch.object(main_module.time, "sleep", side_effect=KeyboardInterrupt),
@@ -157,6 +169,10 @@ class MainDashboardStartupTests(unittest.TestCase):
         calls = []
 
         class FakeOms:
+            def close_outbound_gate(self, reason, wait=False):
+                calls.append(("outbound_gate_close", reason, wait))
+                return True
+
             def begin_shutdown(self, reason):
                 calls.append(("oms_begin", reason))
                 return True
@@ -167,6 +183,7 @@ class MainDashboardStartupTests(unittest.TestCase):
 
             def stop(self, clean_shutdown=False, reason=""):
                 calls.append(("oms_stop", clean_shutdown, reason))
+                return {"stopped": True, "clean": clean_shutdown}
 
         class Component:
             def __init__(self, name):
@@ -186,12 +203,25 @@ class MainDashboardStartupTests(unittest.TestCase):
             def get_queue_snapshot(self):
                 return {}
 
+        class FakeGateway(Component):
+            def begin_shutdown(self):
+                calls.append(("gateway_begin_shutdown",))
+                return True
+
+        class FakeRiskController:
+            kill_switch_triggered = True
+            kill_state = "FLAT_VERIFIED"
+
+        class FakeTruthProvider(Component):
+            def get_all_positions(self):
+                return []
+
         strategy = Component("strategy")
         venue = Component("venue")
         truth_monitor = Component("truth_monitor")
         risk = Component("risk")
-        gateway = Component("gateway")
-        truth_provider = Component("truth_provider")
+        gateway = FakeGateway("gateway")
+        truth_provider = FakeTruthProvider("truth_provider")
         recorder = Component("recorder")
         engine = FakeEngine("engine")
         clock = Component("clock")
@@ -203,6 +233,7 @@ class MainDashboardStartupTests(unittest.TestCase):
             "truth_provider": truth_provider,
             "strategy_runtime": strategy,
             "risk_supervisor": risk,
+            "risk_controller": FakeRiskController(),
             "truth_monitor": truth_monitor,
             "venue_supervisor": venue,
             "recorder": recorder,
@@ -286,6 +317,397 @@ class MainDashboardStartupTests(unittest.TestCase):
             )
         release.set()
 
+    def test_required_live_dashboard_bind_failure_is_fatal(self):
+        class FailedDashboard:
+            def start(self):
+                raise OSError("address already in use")
+
+        fake_logger = FakeLogger()
+        with patch.object(main_module, "logger", fake_logger):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Local dashboard failed to start",
+            ):
+                main_module.start_local_dashboard(
+                    FailedDashboard(),
+                    {"open_browser": False},
+                    required=True,
+                )
+
+    def test_live_dashboard_bind_precedes_gateway_connection_statically(self):
+        source = inspect.getsource(main_module._run_main)
+
+        self.assertLess(
+            source.index("start_local_dashboard("),
+            source.index("connect_gateway_with_risk_heartbeat("),
+        )
+
+
+class MainShutdownLatchOrderStaticTests(unittest.TestCase):
+    @staticmethod
+    def shutdown_source_tree():
+        source = inspect.getsource(main_module.shutdown_runtime)
+        return source, ast.parse(source)
+
+    @staticmethod
+    def run_step_line(tree, step_name):
+        lines = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Name) or node.func.id != "run_step":
+                continue
+            if not node.args or not isinstance(node.args[0], ast.Constant):
+                continue
+            if node.args[0].value == step_name:
+                lines.append(node.lineno)
+        if not lines:
+            raise AssertionError(f"run_step {step_name!r} was not found")
+        return min(lines)
+
+    @staticmethod
+    def call_lines(tree, function_name):
+        lines = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name):
+                called_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                called_name = node.func.attr
+            else:
+                continue
+            if called_name == function_name:
+                lines.append(node.lineno)
+        return sorted(lines)
+
+    @staticmethod
+    def runtime_key_assignment_lines(tree, key):
+        lines = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if not isinstance(target, ast.Subscript):
+                    continue
+                if not isinstance(target.value, ast.Name):
+                    continue
+                if target.value.id != "runtime":
+                    continue
+                if (
+                    isinstance(target.slice, ast.Constant)
+                    and target.slice.value == key
+                ):
+                    lines.append(node.lineno)
+        return sorted(lines)
+
+    def test_flat_verification_precedes_latches_and_final_truth_statically(self):
+        _, tree = self.shutdown_source_tree()
+
+        close_gate = self.run_step_line(tree, "oms_close_outbound_gate")
+        stop_strategy = self.run_step_line(tree, "strategy_stop")
+        oms_latch = self.run_step_line(tree, "oms_begin_shutdown")
+        wait_for_flat = next(
+            line
+            for line in self.call_lines(
+                tree,
+                "wait_for_kill_flatten_verification",
+            )
+            if stop_strategy < line < oms_latch
+        )
+        flat_verified = min(
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Compare)
+            and any(
+                isinstance(comparator, ast.Constant)
+                and comparator.value == "FLAT_VERIFIED"
+                for comparator in node.comparators
+            )
+        )
+        gateway_latch = self.run_step_line(tree, "gateway_begin_shutdown")
+        final_order_truth = self.call_lines(tree, "verify_account_orders")[0]
+        final_position_truth = self.call_lines(
+            tree,
+            "verify_account_positions",
+        )[0]
+        sidecar_quiesce = self.run_step_line(
+            tree,
+            "risk_supervisor_quiesce",
+        )
+        sidecar_stop = self.run_step_line(tree, "risk_supervisor_stop")
+
+        self.assertLess(close_gate, stop_strategy)
+        self.assertLess(stop_strategy, wait_for_flat)
+        self.assertLess(wait_for_flat, flat_verified)
+        self.assertLess(flat_verified, oms_latch)
+        self.assertLess(oms_latch, gateway_latch)
+        self.assertLess(gateway_latch, final_order_truth)
+        self.assertLess(final_order_truth, final_position_truth)
+        self.assertLess(final_position_truth, sidecar_quiesce)
+        self.assertLess(sidecar_quiesce, sidecar_stop)
+
+    def test_failed_flat_verification_returns_before_latches_statically(self):
+        source, tree = self.shutdown_source_tree()
+        oms_latch = self.run_step_line(tree, "oms_begin_shutdown")
+        gateway_latch = self.run_step_line(tree, "gateway_begin_shutdown")
+        guard = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and "account_shutdown_proof_required" in ast.dump(node.test)
+            and "kill_flatten_verified" in ast.dump(node.test)
+        )
+        publisher = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "publish_shutdown_blocked"
+        )
+        guard_source = ast.get_source_segment(source, guard) or ""
+        publisher_source = ast.get_source_segment(source, publisher) or ""
+        guard_returns = [
+            node
+            for node in ast.walk(ast.Module(body=guard.body, type_ignores=[]))
+            if isinstance(node, ast.Return)
+            and isinstance(node.value, ast.Constant)
+            and node.value.value is False
+        ]
+
+        self.assertIn("publish_shutdown_blocked", guard_source)
+        self.assertIn('runtime["_shutdown_retryable"] = True', publisher_source)
+        self.assertTrue(guard_returns)
+        self.assertLess(guard.lineno, oms_latch)
+        self.assertLess(guard.lineno, gateway_latch)
+        self.assertGreater(
+            self.runtime_key_assignment_lines(tree, "_shutdown_complete")[0],
+            guard.lineno,
+        )
+        self.assertGreater(
+            self.runtime_key_assignment_lines(tree, "_shutdown_in_progress")[-1],
+            guard.lineno,
+        )
+
+    def test_preconnect_and_paper_truth_boundaries_remain_statically(self):
+        source, tree = self.shutdown_source_tree()
+        live_boundary_source = inspect.getsource(
+            main_module.requires_live_canary_shutdown_truth
+        )
+        verify_orders = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "verify_account_orders"
+        )
+        verify_positions = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "verify_account_positions"
+        )
+        order_source = ast.get_source_segment(source, verify_orders) or ""
+        position_source = ast.get_source_segment(source, verify_positions) or ""
+
+        self.assertIn("if not account_shutdown_proof_required", order_source)
+        self.assertIn(
+            "verify_preconnect_shutdown_no_order_path",
+            order_source,
+        )
+        self.assertIn("shutdown_latched", order_source)
+        self.assertIn("if not live_canary_truth_required", position_source)
+        self.assertIn("return bool(kill_flatten_verified)", position_source)
+        self.assertIn(
+            'not runtime.get("paper_trade", False)',
+            live_boundary_source,
+        )
+        self.assertIn(
+            'stage in {"canary", "rpi_calibration_canary"}',
+            live_boundary_source,
+        )
+        self.assertLess(
+            self.run_step_line(tree, "gateway_begin_shutdown"),
+            self.call_lines(tree, "verify_account_orders")[0],
+        )
+
+    def test_parent_flatten_retry_does_not_depend_on_sidecar_resume(self):
+        source, tree = self.shutdown_source_tree()
+        resumed_branch = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "resumed"
+        )
+        restart_helper = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "restart_parent_kill_after_truth_drift"
+        )
+        helper_source = ast.get_source_segment(source, restart_helper) or ""
+        helper_calls = self.call_lines(
+            tree,
+            "restart_parent_kill_after_truth_drift",
+        )
+        sidecar_quiesce = self.run_step_line(tree, "risk_supervisor_quiesce")
+
+        self.assertEqual(len(helper_calls), 2)
+        self.assertIn("restart_kill_switch_after_truth_drift", helper_source)
+        self.assertIn("wait_for_kill_flatten_verification", helper_source)
+        self.assertLess(helper_calls[0], sidecar_quiesce)
+        self.assertGreater(helper_calls[1], resumed_branch.end_lineno)
+
+
+class AdminControlStartupTests(unittest.TestCase):
+    def test_admin_cli_bypasses_full_live_config_loader(self):
+        minimal_config = {
+            "live_launch": {"deployment_id": "canary-test-001"},
+            "system": {
+                "admin_control": {
+                    "path": os.path.abspath("storage/admin"),
+                    "command_ttl_sec": 10.0,
+                    "session_max_age_sec": 2.0,
+                }
+            },
+        }
+        submit = Mock(
+            return_value={
+                "accepted": True,
+                "status": "ok",
+                "message": "OMS status snapshot.",
+            }
+        )
+        with (
+            patch.object(
+                main_module,
+                "load_admin_control_config",
+                return_value=minimal_config,
+            ) as minimal_loader,
+            patch.object(
+                main_module,
+                "load_config",
+                side_effect=AssertionError("full loader must not run"),
+            ) as full_loader,
+            patch.object(main_module, "submit_admin_command", submit),
+        ):
+            main_module._run_main(
+                ["--config", "live.json", "--admin-command", "status"]
+            )
+
+        minimal_loader.assert_called_once_with("live.json")
+        full_loader.assert_not_called()
+        submit.assert_called_once()
+
+    def test_minimal_loader_ignores_live_secrets_and_approvals(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            admin_dir = os.path.join(tmpdir, "admin")
+            config_path = os.path.join(tmpdir, "live.json")
+            payload = {
+                "execution": {"mode": "live"},
+                "api_key_env": "",
+                "api_secret_env": "",
+                "live_launch": {"permit_path": "missing.json"},
+                "system": {
+                    "admin_control": {"path": admin_dir},
+                    "external_alerts": {"webhook_env": "MISSING_WEBHOOK"},
+                },
+            }
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+
+            loaded = main_module.load_admin_control_config(config_path)
+
+        self.assertEqual(
+            loaded,
+            {
+                "live_launch": {"deployment_id": ""},
+                "system": {
+                    "admin_control": {
+                        "path": os.path.abspath(admin_dir),
+                        "command_ttl_sec": 10.0,
+                        "session_max_age_sec": 2.0,
+                    }
+                }
+            },
+        )
+
+    def test_minimal_loader_resolves_relative_admin_path_from_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            deploy_dir = os.path.join(tmpdir, "deploy")
+            caller_dir = os.path.join(tmpdir, "caller")
+            os.makedirs(deploy_dir)
+            os.makedirs(caller_dir)
+            config_path = os.path.join(deploy_dir, "live.json")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "system": {
+                            "admin_control": {"path": "state/admin"}
+                        }
+                    },
+                    handle,
+                )
+            previous = os.getcwd()
+            try:
+                os.chdir(caller_dir)
+                loaded = main_module.load_admin_control_config(config_path)
+            finally:
+                os.chdir(previous)
+
+        self.assertEqual(
+            loaded["system"]["admin_control"]["path"],
+            os.path.abspath(os.path.join(deploy_dir, "state", "admin")),
+        )
+
+    def test_minimal_loader_rejects_malformed_and_non_object_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for name, payload, expected in (
+                ("malformed", "{", "malformed"),
+                ("array", "[]", "JSON object"),
+                ("bad-system", '{"system": 1}', "system must be a JSON object"),
+                (
+                    "bad-admin",
+                    '{"system":{"admin_control":1}}',
+                    "admin_control must be a JSON object",
+                ),
+                (
+                    "duplicate",
+                    '{"system":{},"system":{}}',
+                    "duplicate JSON object key",
+                ),
+            ):
+                with self.subTest(name=name):
+                    config_path = os.path.join(tmpdir, f"{name}.json")
+                    with open(config_path, "w", encoding="utf-8") as handle:
+                        handle.write(payload)
+                    with self.assertRaisesRegex((ValueError, OSError), expected):
+                        main_module.load_admin_control_config(config_path)
+
+    def test_minimal_loader_rejects_dangerous_or_ambiguous_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "live.json")
+            cases = {
+                "": "non-empty",
+                ".": "working directory",
+                "..\\admin": "parent traversal",
+                "C:admin": "drive-relative",
+                "\\\\server\\share\\admin": "UNC or device",
+                "~/admin": "user or environment expansion",
+            }
+            for admin_path, expected in cases.items():
+                with self.subTest(admin_path=admin_path):
+                    with open(config_path, "w", encoding="utf-8") as handle:
+                        json.dump(
+                            {
+                                "system": {
+                                    "admin_control": {"path": admin_path}
+                                }
+                            },
+                            handle,
+                        )
+                    with self.assertRaisesRegex(ValueError, expected):
+                        main_module.load_admin_control_config(config_path)
+
 
 class CommissionConfigStartupTests(unittest.TestCase):
     class Gateway:
@@ -331,7 +753,7 @@ class CommissionConfigStartupTests(unittest.TestCase):
         )
         self.assertEqual(config["backtest"]["maker_fee"], 0.0003)
         self.assertEqual(config["backtest"]["taker_fee"], 0.0006)
-        self.assertEqual(config["backtest"]["rpi_commission_rate"], 0.0)
+        self.assertEqual(config["backtest"]["rpi_commission_rate"], 0.00002)
         self.assertEqual(
             config["backtest"]["rpi_commission_rates"],
             {"BTCUSDT": 0.00001, "ETHUSDT": 0.00002},
@@ -399,6 +821,34 @@ class CommissionConfigStartupTests(unittest.TestCase):
             call_lines["synchronize_commission_config"],
             call_lines["bootstrap_or_rearm"],
         )
+
+    def test_strategy_runtime_starts_only_after_bootstrap_and_monitors(self):
+        source = ast.parse(inspect.getsource(main_module._run_main))
+        call_lines = {}
+        for node in ast.walk(source):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id == "bootstrap_or_rearm":
+                call_lines["bootstrap"] = node.lineno
+                continue
+            if not isinstance(node.func, ast.Attribute) or node.func.attr != "start":
+                continue
+            owner = node.func.value
+            if isinstance(owner, ast.Name) and owner.id in {
+                "strategy_runtime",
+                "truth_monitor",
+                "venue_supervisor",
+            }:
+                call_lines[owner.id] = node.lineno
+
+        self.assertEqual(
+            set(call_lines),
+            {"bootstrap", "strategy_runtime", "truth_monitor", "venue_supervisor"},
+        )
+        self.assertLess(call_lines["bootstrap"], call_lines["truth_monitor"])
+        self.assertLess(call_lines["bootstrap"], call_lines["venue_supervisor"])
+        self.assertLess(call_lines["truth_monitor"], call_lines["strategy_runtime"])
+        self.assertLess(call_lines["venue_supervisor"], call_lines["strategy_runtime"])
 
 
 if __name__ == "__main__":

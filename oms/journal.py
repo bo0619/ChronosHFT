@@ -85,43 +85,66 @@ class OMSJournal:
         self._next_seq = len(records) + 1
 
     def append(self, kind: str, payload: dict):
+        committed = self.append_batch(((kind, payload),))
+        return committed[0] if committed else 0
+
+    def append_batch(self, records) -> list[int]:
+        """Append related records under one hash-chain lock and one fsync."""
         if not self.enabled:
-            return 0
+            return [0 for _item in records]
+
+        records = list(records)
+        if not records:
+            return []
 
         with self.lock:
+            next_seq = self._next_seq
+            last_hash = self._last_hash
+            lines = []
+            committed_sequences = []
             try:
-                unsigned_record = {
-                    "version": self.RECORD_VERSION,
-                    "seq": self._next_seq,
-                    "ts": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
-                    "kind": str(kind),
-                    "payload": _normalize(payload),
-                    "prev_hash": self._last_hash,
-                }
-                record_hash = self._calculate_hash(unsigned_record)
-                record = dict(unsigned_record)
-                record["hash"] = record_hash
-                line = self._canonical_json(record)
+                for kind, payload in records:
+                    unsigned_record = {
+                        "version": self.RECORD_VERSION,
+                        "seq": next_seq,
+                        "ts": (
+                            datetime.utcnow().isoformat(
+                                timespec="milliseconds"
+                            )
+                            + "Z"
+                        ),
+                        "kind": str(kind),
+                        "payload": _normalize(payload),
+                        "prev_hash": last_hash,
+                    }
+                    record_hash = self._calculate_hash(unsigned_record)
+                    record = dict(unsigned_record)
+                    record["hash"] = record_hash
+                    lines.append(self._canonical_json(record))
+                    committed_sequences.append(next_seq)
+                    next_seq += 1
+                    last_hash = record_hash
             except (TypeError, ValueError) as exc:
                 raise JournalWriteError(
-                    f"OMS journal payload is not serializable for kind={kind}: {exc}"
+                    "OMS journal batch payload is not serializable: "
+                    f"{exc}"
                 ) from exc
 
             try:
                 with open(self.path, "a", encoding="utf-8", newline="\n") as f:
-                    f.write(line + "\n")
+                    f.write("\n".join(lines) + "\n")
                     f.flush()
                     if self.fsync_enabled:
                         os.fsync(f.fileno())
             except OSError as exc:
                 raise JournalWriteError(
-                    f"Failed to persist OMS journal seq={self._next_seq}: {exc}"
+                    "Failed to persist OMS journal batch "
+                    f"seq={self._next_seq}..{next_seq - 1}: {exc}"
                 ) from exc
 
-            committed_seq = self._next_seq
-            self._next_seq += 1
-            self._last_hash = record_hash
-            return committed_seq
+            self._next_seq = next_seq
+            self._last_hash = last_hash
+            return committed_sequences
 
     def load(self):
         if not self.enabled or not self.replay_on_startup or not os.path.exists(self.path):

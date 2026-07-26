@@ -6,6 +6,12 @@ __pycache__/
 
 # 2. [绝对禁止上传] 配置文件 (含 API Key)
 config.json
+config.live.canary.json
+config.live.rpi-calibration.json
+config.live.rpi-calibration.permit.json
+config.live.canary.evidence.json
+*.pem
+*.key
 
 # 3. 忽略回测产生的庞大某些数据
 storage/
@@ -32,6 +38,7 @@ tests/*
 !tests/test_live_config_guard.py
 !tests/test_rpi_policy.py
 !tests/test_rpi_calibration_permit.py
+!tests/test_rpi_calibration_permit_authoring.py
 !tests/test_commission_truth.py
 !tests/test_runtime_commission_truth.py
 !tests/test_deployment_loss.py
@@ -46,3 +53,6 @@ tests/*
 !tests/test_live_evidence.py
 !tests/test_oos_reconstruction.py
 !tests/test_external_alerts.py
+!tests/test_binance_account_configuration_verify_only.py
+!tests/test_live_canary_evidence_collector.py
+!tests/test_rpi_terminal_truth_static.py

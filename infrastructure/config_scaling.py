@@ -121,6 +121,7 @@ OUTBOUND_MESSAGE_BUDGET_DEFAULTS = {
     "max_reduce_orders_per_window": 10,
     "max_cancel_messages_per_window": 20,
     "reserved_risk_messages_per_window": 5,
+    "reserved_cancel_messages_per_window": 5,
 }
 SELF_TRADE_PREVENTION_DEFAULTS = {
     "enabled": True,
@@ -525,10 +526,7 @@ def resolve_runtime_secrets(config: dict) -> dict:
         env_name = str(resolved.get(env_field, default_env_name) or "").strip()
         resolved[env_field] = env_name
         env_value = os.environ.get(env_name, "") if env_name else ""
-        if env_value:
-            resolved[field] = env_value
-        else:
-            resolved[field] = str(resolved.get(field, "") or "")
+        resolved[field] = env_value
 
     risk = resolved.get("risk", {})
     if isinstance(risk, dict):
@@ -544,9 +542,43 @@ def resolve_runtime_secrets(config: dict) -> dict:
                 ).strip()
                 supervisor[env_field] = env_name
                 env_value = os.environ.get(env_name, "") if env_name else ""
-                if env_value:
-                    supervisor[field] = env_value
+                supervisor[field] = env_value
     return resolved
+
+
+def _reject_live_inline_secrets(raw: dict) -> None:
+    if is_paper_trade(raw):
+        return
+    locations = (
+        (raw, "api_key", "api_key"),
+        (raw, "api_secret", "api_secret"),
+    )
+    risk = raw.get("risk", {})
+    risk = risk if isinstance(risk, dict) else {}
+    supervisor = risk.get("independent_supervisor", {})
+    supervisor = supervisor if isinstance(supervisor, dict) else {}
+    locations += (
+        (
+            supervisor,
+            "api_key",
+            "risk.independent_supervisor.api_key",
+        ),
+        (
+            supervisor,
+            "api_secret",
+            "risk.independent_supervisor.api_secret",
+        ),
+    )
+    populated = [
+        label
+        for container, field, label in locations
+        if str(container.get(field, "") or "").strip()
+    ]
+    if populated:
+        raise ValueError(
+            "Live API credentials must not be stored inline; remove: "
+            + ", ".join(populated)
+        )
 
 
 def normalize_strategy_registration(config: dict) -> dict:
@@ -682,11 +714,32 @@ def normalize_root_config_preapproval(raw: dict) -> dict:
 
 
 def load_root_config(path: str = "config.json") -> dict:
+    config_path = os.path.abspath(os.fspath(path))
     try:
-        with open(path, "r", encoding="utf-8") as handle:
+        with open(config_path, "r", encoding="utf-8") as handle:
             raw = json.load(handle)
-    except Exception:
-        return {}
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"root config file not found: {config_path}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "root config JSON is malformed at "
+            f"{config_path}:{exc.lineno}:{exc.colno}: {exc.msg}"
+        ) from exc
+    except (OSError, UnicodeError) as exc:
+        raise OSError(
+            f"root config file is not readable: {config_path}: {exc}"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"root config must be a JSON object: {config_path}"
+        )
+    if not raw:
+        raise ValueError(
+            f"root config must not be an empty JSON object: {config_path}"
+        )
+    _reject_live_inline_secrets(raw)
     configured = normalize_root_config_preapproval(raw)
     if not is_paper_trade(configured):
         stage = live_launch_stage(configured)
@@ -694,13 +747,13 @@ def load_root_config(path: str = "config.json") -> dict:
             configured["_validated_rpi_calibration_permit"] = (
                 load_and_validate_rpi_calibration_permit(
                     configured,
-                    config_path=path,
+                    config_path=config_path,
                 )
             )
         elif stage == CANARY_STAGE:
             approval = validate_live_calibration_approval(
                 configured,
-                config_path=path,
+                config_path=config_path,
             )
             runtime_calibration = approval.get("_runtime_calibration")
             if runtime_calibration is not None:
@@ -717,6 +770,6 @@ def load_root_config(path: str = "config.json") -> dict:
         configured = apply_paper_trade_mode(configured)
     return validate_live_runtime_config(
         configured,
-        config_path=path,
+        config_path=config_path,
         require_local_evidence=not is_paper_trade(configured),
     )

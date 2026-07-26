@@ -77,7 +77,29 @@ def _configs():
             "target_deployment_config_path": "target.json",
             "calibration_permit_trusted_signers": trusted_signers,
         },
-        "system": {},
+        "system": {
+            "admin_control": {
+                "path": f"storage/live/{deployment_id}/calibration/admin",
+            },
+            "evidence_recorder": {
+                "path": (
+                    f"storage/live/{deployment_id}/calibration/"
+                    "market_evidence.jsonl"
+                ),
+                "single_writer_fence": {
+                    "path": (
+                        f"storage/live/{deployment_id}/calibration/"
+                        "market_evidence.jsonl.lock"
+                    ),
+                },
+            },
+        },
+        "alert": {
+            "failure_spool_path": (
+                f"storage/live/{deployment_id}/calibration/"
+                "external_alert_failures.jsonl"
+            ),
+        },
         "account": {},
         "oms": {
             "journal_path": (
@@ -116,6 +138,18 @@ def _configs():
     )
     target["risk"]["independent_supervisor"]["state_path"] = (
         f"storage/live/{deployment_id}/target/risk_supervisor_state.json"
+    )
+    target["system"]["admin_control"]["path"] = (
+        f"storage/live/{deployment_id}/target/admin"
+    )
+    target["system"]["evidence_recorder"]["path"] = (
+        f"storage/live/{deployment_id}/target/market_evidence.jsonl"
+    )
+    target["system"]["evidence_recorder"]["single_writer_fence"][
+        "path"
+    ] = f"storage/live/{deployment_id}/target/market_evidence.jsonl.lock"
+    target["alert"]["failure_spool_path"] = (
+        f"storage/live/{deployment_id}/target/external_alert_failures.jsonl"
     )
     return calibration, target, trusted_signers
 

@@ -5,6 +5,7 @@ import threading
 import types
 import unittest
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -1427,6 +1428,144 @@ class LocalWebDashboardTests(unittest.TestCase):
         symbol = dashboard.get_snapshot()["symbols"][0]
         self.assertAlmostEqual(symbol["position"]["unrealized_pnl"], 4.0)
         self.assertEqual(symbol["position"]["unrealized_pnl_source"], "derived_mark_to_market")
+
+
+class LiveAcceptanceDashboardTests(unittest.TestCase):
+    @staticmethod
+    def make_live_config():
+        return {
+            "testnet": False,
+            "execution": {"mode": "live"},
+            "record_data": True,
+            "symbols": ["XAUUSDT"],
+            "alert": {"active": True},
+            "system": {
+                "evidence_recorder": {"enabled": True},
+                "web_dashboard": {"host": "127.0.0.1", "port": 0},
+            },
+            "strategy": {"primary_model": "glft", "use_rpi": True},
+            "risk": {"limits": {}},
+        }
+
+    @staticmethod
+    def make_calibration_oms():
+        oms = object.__new__(OMS)
+        oms.orders = {}
+        oms._rpi_calibration = {
+            "enabled": True,
+            "permit_id": "permit-live-001",
+            "permit_sha256": "1" * 64,
+            "deployment_id": "deployment-live-001",
+            "symbol": "XAUUSDT",
+            "max_active_orders": 1,
+            "max_order_count": 10,
+            "min_order_notional_microu": 5_000_000,
+            "max_order_notional_microu": 8_000_000,
+            "max_cumulative_notional_microu": 80_000_000,
+            "max_calibration_loss_microu": 2_000_000,
+            "fixed_depths_bps": (1.0, 1.25, 1.5),
+            "order_ttl_sec": 30.0,
+            "min_order_interval_sec": 30.0,
+            "not_before": "2026-07-24T12:00:00Z",
+            "expires_at": "2026-07-24T12:10:00Z",
+            "calibration_config_sha256": "2" * 64,
+            "target_deployment_config_sha256": "3" * 64,
+            "strategy_policy_sha256": "4" * 64,
+            "implementation_sha256": "5" * 64,
+        }
+        oms._rpi_calibration_expired = False
+        oms._rpi_calibration_expiry_reason = ""
+        oms._rpi_calibration_restart_rearm_blocked = False
+        oms._rpi_calibration_budget_exhausted = False
+        oms._rpi_calibration_permit_activated = True
+        oms._rpi_calibration_reserved_order_count = 2
+        oms._rpi_calibration_permit_start_order_count = 0
+        oms._rpi_calibration_cumulative_notional_microu = 16_000_000
+        oms._rpi_calibration_permit_start_notional_microu = 0
+        oms._rpi_calibration_last_reserved_exchange_ns = 1_753_358_430_000_000_000
+        oms._rpi_calibration_effective_loss_cap_microu = 2_000_000
+        oms._rpi_calibration_peak_observed_loss_microu = 100_000
+        oms._rpi_calibration_start_equity_microu = 10_000_000_000
+        return oms
+
+    def test_oms_calibration_snapshot_carries_all_binding_digests(self):
+        snapshot = self.make_calibration_oms()._rpi_calibration_snapshot_locked()
+
+        self.assertEqual(snapshot["stage"], "rpi_calibration_canary")
+        self.assertTrue(snapshot["permit_activated"])
+        self.assertEqual(snapshot["permit_sha256"], "1" * 64)
+        self.assertEqual(snapshot["calibration_config_sha256"], "2" * 64)
+        self.assertEqual(snapshot["target_deployment_config_sha256"], "3" * 64)
+        self.assertEqual(snapshot["strategy_policy_sha256"], "4" * 64)
+        self.assertEqual(snapshot["implementation_sha256"], "5" * 64)
+
+    def test_live_runtime_health_blocks_only_after_explicit_report(self):
+        dashboard = LocalWebDashboard(config=self.make_live_config())
+        initial_reasons = dashboard.get_snapshot()["readiness"]["reasons"]
+        self.assertFalse(
+            any(reason.startswith("external_alerts_unhealthy") for reason in initial_reasons)
+        )
+        self.assertFalse(
+            any(reason.startswith("live_evidence_unhealthy") for reason in initial_reasons)
+        )
+
+        dashboard.publish_snapshot(
+            {
+                "external_alerts": {
+                    "available": True,
+                    "enabled": True,
+                    "healthy": False,
+                    "reason": "delivery_failed",
+                },
+                "live_evidence": {
+                    "available": True,
+                    "enabled": True,
+                    "healthy": False,
+                    "failure_reason": "fsync_failed",
+                },
+            },
+            force=True,
+        )
+        reasons = dashboard.get_snapshot()["readiness"]["reasons"]
+        self.assertIn("external_alerts_unhealthy:delivery_failed", reasons)
+        self.assertIn("live_evidence_unhealthy:fsync_failed", reasons)
+
+    def test_paper_runtime_health_does_not_block_readiness(self):
+        config = self.make_live_config()
+        config["execution"] = {"mode": "paper"}
+        config["paper_trade"] = {"enabled": True}
+        dashboard = LocalWebDashboard(config=config)
+        dashboard.publish_snapshot(
+            {
+                "external_alerts": {"available": True, "healthy": False},
+                "live_evidence": {"available": True, "healthy": False},
+            },
+            force=True,
+        )
+
+        reasons = dashboard.get_snapshot()["readiness"]["reasons"]
+        self.assertFalse(any("external_alerts_unhealthy" in reason for reason in reasons))
+        self.assertFalse(any("live_evidence_unhealthy" in reason for reason in reasons))
+
+    def test_dashboard_html_renders_live_acceptance_sources(self):
+        html = (
+            Path(__file__).resolve().parents[1] / "web" / "dashboard.html"
+        ).read_text(encoding="utf-8")
+
+        for marker in (
+            'id="acceptanceMetrics"',
+            'id="acceptancePermit"',
+            'id="acceptanceAlerts"',
+            'id="acceptanceEvidence"',
+            'id="acceptanceDigests"',
+            "system.oms.capability.outbound_gate.rpi_calibration",
+            "terminal_convergence_verified",
+            "runtime.external_alerts",
+            "runtime.live_evidence",
+            "strategy_policy_sha256",
+            "implementation_sha256",
+        ):
+            self.assertIn(marker, html)
 
 
 class StrategyRegistryTests(unittest.TestCase):

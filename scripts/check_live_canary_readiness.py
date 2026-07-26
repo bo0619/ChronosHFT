@@ -28,12 +28,17 @@ from infrastructure.config_scaling import (  # noqa: E402
 from infrastructure.live_config_guard import (  # noqa: E402
     CANARY_STAGE,
     LIVE_CANARY_ACCOUNT_SOURCE,
+    LIVE_CANARY_EVIDENCE_SCHEMA,
     RPI_CALIBRATION_CANARY_STAGE,
     live_launch_stage,
+    resolve_live_canary_evidence_path,
     validate_live_api_restrictions_evidence,
+    validate_live_canary_evidence_integrity,
     validate_live_dual_key_account_evidence,
+    validate_live_flat_start_evidence,
     validate_live_runtime_config,
     validate_live_state_path_bindings,
+    validate_live_symbol_configuration_evidence,
 )
 from infrastructure.rpi_calibration_permit import (  # noqa: E402
     load_and_validate_rpi_calibration_permit,
@@ -45,7 +50,7 @@ from strategy.model_readiness import (  # noqa: E402
 
 
 REPORT_SCHEMA = "chronoshft.live_canary_readiness.v1"
-EVIDENCE_SCHEMA = "chronoshft.live_canary_evidence.v2"
+EVIDENCE_SCHEMA = LIVE_CANARY_EVIDENCE_SCHEMA
 PASS = "PASS"
 BLOCKED = "BLOCKED"
 DEFAULT_CONFIG_PATH = "config.live.canary.example.json"
@@ -145,10 +150,23 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-standard JSON number {value!r} is not allowed")
 
 
+def _reject_duplicate_json_keys(pairs):
+    payload = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError("duplicate JSON object keys are not allowed")
+        payload[key] = value
+    return payload
+
+
 def _read_json_object(path: Path, label: str) -> dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as handle:
-            value = json.load(handle, parse_constant=_reject_json_constant)
+            value = json.load(
+                handle,
+                parse_constant=_reject_json_constant,
+                object_pairs_hook=_reject_duplicate_json_keys,
+            )
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"cannot read {label} at {path}: {exc}") from exc
     if not isinstance(value, dict):
@@ -258,19 +276,10 @@ def _evidence_path(config: Mapping[str, Any], config_path: Path) -> Path | None:
     raw_path = str(live_launch.get("offline_evidence_path", "") or "").strip()
     if not raw_path:
         return None
-    normalized_parts = tuple(
-        part
-        for part in raw_path.replace("\\", "/").split("/")
-        if part not in {"", "."}
+    return resolve_live_canary_evidence_path(
+        config,
+        config_path=config_path,
     )
-    if ".." in normalized_parts:
-        raise ValueError(
-            "live_launch.offline_evidence_path must not contain '..' components"
-        )
-    candidate = Path(raw_path)
-    if not candidate.is_absolute():
-        candidate = config_path.parent / candidate
-    return candidate.resolve()
 
 
 def _operator_attestation_check(
@@ -488,6 +497,68 @@ def _api_permission_evidence_check(
     )
 
 
+def _integrity_evidence_check(evidence: Mapping[str, Any]) -> dict[str, str]:
+    try:
+        validate_live_canary_evidence_integrity(
+            evidence,
+            require_secret_binding=False,
+        )
+    except (TypeError, ValueError) as exc:
+        return _check("evidence.integrity", BLOCKED, str(exc))
+    return _check(
+        "evidence.integrity",
+        PASS,
+        "v4 evidence contains two role-separated HMAC-SHA256 tags; offline "
+        "readiness validates format only",
+    )
+
+
+def _flat_start_evidence_check(
+    config: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    *,
+    now_utc: datetime,
+) -> dict[str, str]:
+    try:
+        validate_live_flat_start_evidence(
+            config,
+            evidence,
+            now_utc=now_utc,
+            require_api_key_binding=False,
+        )
+    except (TypeError, ValueError) as exc:
+        return _check("evidence.flat_start_truth", BLOCKED, str(exc))
+    return _check(
+        "evidence.flat_start_truth",
+        PASS,
+        "fresh account-wide GET truth shows no open orders and exact zero "
+        "positions",
+    )
+
+
+def _symbol_configuration_evidence_check(
+    config: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    *,
+    now_utc: datetime,
+) -> dict[str, str]:
+    try:
+        validate_live_symbol_configuration_evidence(
+            config,
+            evidence,
+            now_utc=now_utc,
+            require_api_key_binding=False,
+        )
+    except (TypeError, ValueError) as exc:
+        return _check("evidence.symbol_configuration_truth", BLOCKED, str(exc))
+    return _check(
+        "evidence.symbol_configuration_truth",
+        PASS,
+        "fresh raw GET truth confirms ONE_WAY, ISOLATED, 1x, RPI permission, "
+        "and exchange minimum notional",
+    )
+
+
 def _evidence_checks(
     config: Mapping[str, Any],
     config_path: Path,
@@ -622,6 +693,7 @@ def _evidence_checks(
             "local evidence schema, deployment_id, and symbol match",
         ),
         _operator_attestation_check(evidence),
+        _integrity_evidence_check(evidence),
         _rpi_evidence_check(config, evidence, now_utc=now_utc),
         _api_permission_evidence_check(
             config,
@@ -629,6 +701,16 @@ def _evidence_checks(
             now_utc=now_utc,
         ),
         _account_equity_evidence_check(
+            config,
+            evidence,
+            now_utc=now_utc,
+        ),
+        _flat_start_evidence_check(
+            config,
+            evidence,
+            now_utc=now_utc,
+        ),
+        _symbol_configuration_evidence_check(
             config,
             evidence,
             now_utc=now_utc,

@@ -213,7 +213,8 @@
             "max_new_orders_per_window": 10,
             "max_reduce_orders_per_window": 10,
             "max_cancel_messages_per_window": 20,
-            "reserved_risk_messages_per_window": 5
+            "reserved_risk_messages_per_window": 5,
+            "reserved_cancel_messages_per_window": 5
         },
         "self_trade_prevention": {
             "enabled": true,

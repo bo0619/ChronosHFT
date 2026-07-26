@@ -56,6 +56,11 @@
     "strategy_runtime": {
       "shutdown_timeout_sec": 5.0
     },
+    "admin_control": {
+      "path": "storage/live/EDIT-ME-rpi-canary-001/admin",
+      "command_ttl_sec": 10.0,
+      "session_max_age_sec": 2.0
+    },
     "web_dashboard": {
       "enabled": true,
       "host": "127.0.0.1",
@@ -84,6 +89,7 @@
     "failure_spool_fsync": true
   },
   "account": {
+    "configuration_mode": "VERIFY_ONLY",
     "leverage": 1,
     "margin_type": "ISOLATED",
     "position_mode": "ONE_WAY",

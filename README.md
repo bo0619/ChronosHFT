@@ -291,10 +291,26 @@ public-flow calibration all fail closed.
 
 `live_launch.stage="rpi_calibration_canary"` is a separate, real-order
 bootstrap stage for collecting the first genuine Binance RPI
-ACK-to-terminal exposure. It does not reuse or bypass the ordinary canary's
-model approval. A normal `stage="canary"` still requires the complete signed
-model manifest, source evidence, OOS evidence, approved formula version, and
-runtime calibration artifact.
+ACK-to-terminal exposure. Its risk-limited permit neither grants, weakens, nor
+replaces the ordinary canary's model approval. A normal `stage="canary"` still
+requires the complete signed model manifest, source evidence, OOS evidence,
+approved formula version, and runtime calibration artifact.
+
+The calibration permit is an operational risk budget, not a statistical
+sample budget. A framework-validation run may stop after 6-10 attempts and a
+clean verified shutdown; it does not require a fill, 30 training orders, 100
+OOS fills, or profitability. Partial fills remain executions on the original
+order and are never counted as independent order samples. None of these
+framework-validation observations promote the strategy to the normal
+profitability-gated `canary` stage.
+
+The operator procedure is documented in
+[`docs/live-rpi-framework-validation-runbook.md`](docs/live-rpi-framework-validation-runbook.md).
+Use `scripts/create_rpi_calibration_permit.py` to generate an encrypted
+offline Ed25519 key and create a deployment-bound permit. The tool imports no
+Gateway or OMS, performs no network operation, refuses to keep the private key
+inside this repository, refuses output overwrite, and independently verifies
+the signed permit before writing it.
 
 The calibration stage is allowed only by a dedicated Ed25519 permit loaded
 from `live_launch.calibration_permit_path`. The permit is bound to both the
@@ -319,7 +335,10 @@ For an approximately 10,000 USDT personal account, the calibration guard
 enforces all of the following:
 
 - Exactly one symbol, GLFT only, RPI only, no GTX fallback, isolated margin,
-  1x leverage, and fresh account-specific zero `rpiCommissionRate` truth.
+  1x leverage, `account.configuration_mode="VERIFY_ONLY"`, and fresh
+  account-specific zero `rpiCommissionRate` truth. ONE_WAY, ISOLATED, and 1x
+  must be configured manually before launch; ChronosHFT refuses to modify
+  them during Live startup.
 - At most 50 USDT deployed, 8 USDT per order, 8 USDT position and gross
   notional, 1 USDT daily loss, and 2 USDT deployment loss.
 - All four OMS active-order caps and the independent supervisor open-order

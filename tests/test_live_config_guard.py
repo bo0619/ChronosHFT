@@ -68,6 +68,16 @@ def safe_live_config():
                 "startup_required": True,
                 "require_healthy_for_trading": True,
             },
+            "admin_control": {
+                "path": "storage/live/canary-2026-07-23-001/admin",
+                "command_ttl_sec": 10.0,
+                "session_max_age_sec": 2.0,
+            },
+            "web_dashboard": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "port": 8765,
+            },
             "evidence_recorder": {
                 "enabled": True,
                 "path": (
@@ -88,6 +98,7 @@ def safe_live_config():
             },
         },
         "account": {
+            "configuration_mode": "VERIFY_ONLY",
             "leverage": 1,
             "margin_type": "ISOLATED",
             "trading_budget_total": 100.0,
@@ -350,6 +361,51 @@ class LiveConfigGuardTests(unittest.TestCase):
 
         self.assertIs(validate_live_runtime_config(config), config)
         self.assertEqual(config, before)
+
+    def test_live_dashboard_and_admin_control_are_fail_closed(self):
+        cases = (
+            (
+                ("system", "web_dashboard", "enabled"),
+                False,
+                "web_dashboard.enabled",
+            ),
+            (
+                ("system", "web_dashboard", "host"),
+                "0.0.0.0",
+                "explicit loopback",
+            ),
+            (
+                ("system", "web_dashboard", "port"),
+                0,
+                "port must be an integer",
+            ),
+            (
+                ("system", "admin_control", "command_ttl_sec"),
+                31.0,
+                "command_ttl_sec",
+            ),
+            (
+                ("system", "admin_control", "session_max_age_sec"),
+                10.0,
+                "session_max_age_sec",
+            ),
+        )
+        for path, value, expected in cases:
+            with self.subTest(path=path):
+                config = safe_live_config()
+                target = config
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                with self.assertRaisesRegex(ValueError, expected):
+                    validate_live_runtime_config(config)
+
+        config = safe_live_config()
+        config["system"]["admin_control"]["path"] = (
+            "storage/live/shared/admin"
+        )
+        with self.assertRaisesRegex(ValueError, "contain deployment_id"):
+            validate_live_runtime_config(config)
 
     def test_live_external_alert_channel_is_fail_closed_and_env_only(self):
         cases = (
@@ -765,7 +821,9 @@ class LiveConfigGuardTests(unittest.TestCase):
 
     def test_mainnet_clock_and_risk_planes_are_mandatory(self):
         cases = (
-            (("testnet",), True, "testnet must be false"),
+            (("testnet",), True, "JSON boolean false"),
+            (("testnet",), 0, "JSON boolean false"),
+            (("testnet",), "false", "JSON boolean false"),
             (
                 ("system", "market_data", "environment"),
                 "testnet",
@@ -774,7 +832,12 @@ class LiveConfigGuardTests(unittest.TestCase):
             (
                 ("system", "market_data", "testnet"),
                 True,
-                "market_data.testnet",
+                "JSON boolean false",
+            ),
+            (
+                ("system", "market_data", "testnet"),
+                "false",
+                "JSON boolean false",
             ),
             (("risk", "active"), False, "risk.active"),
             (
@@ -949,6 +1012,11 @@ class LiveConfigGuardTests(unittest.TestCase):
         cases = (
             (("live_launch", "stage"), "production", "stage"),
             (("symbols",), ["BTCUSDT", "ETHUSDT"], "exactly one"),
+            (
+                ("account", "configuration_mode"),
+                "APPLY",
+                "VERIFY_ONLY",
+            ),
             (("account", "margin_type"), "CROSSED", "ISOLATED"),
             (("account", "leverage"), 3, "leverage"),
             (("account", "leverage"), 1.5, "leverage"),
@@ -970,6 +1038,11 @@ class LiveConfigGuardTests(unittest.TestCase):
                 ("live_launch", "deployment_id"),
                 "",
                 "deployment_id",
+            ),
+            (
+                ("live_launch", "deployment_id"),
+                "EDIT-ME-rpi-canary-001",
+                "EDIT-ME placeholder",
             ),
             (
                 (
@@ -1310,8 +1383,18 @@ class LiveConfigGuardTests(unittest.TestCase):
 
     def test_root_loader_applies_guard_to_explicit_live_mode(self):
         payload = safe_live_config()
+        payload.pop("api_key")
+        payload.pop("api_secret")
+        payload["risk"]["independent_supervisor"].pop("api_key")
+        payload["risk"]["independent_supervisor"].pop("api_secret")
+        credential_environment = {
+            "BINANCE_API_KEY": "primary-key",
+            "BINANCE_API_SECRET": "primary-secret",
+            "BINANCE_RISK_API_KEY": "risk-key",
+            "BINANCE_RISK_API_SECRET": "risk-secret",
+        }
 
-        with patch(
+        with patch.dict(os.environ, credential_environment), patch(
             "infrastructure.config_scaling.validate_live_calibration_approval"
         ), patch(
             "infrastructure.live_config_guard."
@@ -1322,7 +1405,7 @@ class LiveConfigGuardTests(unittest.TestCase):
         self.assertEqual(loaded["symbols"], ["BTCUSDT"])
 
         payload["risk"]["independent_supervisor"]["enabled"] = False
-        with patch(
+        with patch.dict(os.environ, credential_environment), patch(
             "infrastructure.config_scaling.validate_live_calibration_approval"
         ), patch(
             "infrastructure.live_config_guard."
@@ -1331,9 +1414,67 @@ class LiveConfigGuardTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "independent_supervisor.enabled"):
                 load_root_config("config.json")
 
+    def test_root_live_loader_rejects_inline_credentials_without_echoing(self):
+        payload = safe_live_config()
+        secret_values = (
+            payload["api_key"],
+            payload["api_secret"],
+            payload["risk"]["independent_supervisor"]["api_key"],
+            payload["risk"]["independent_supervisor"]["api_secret"],
+        )
+        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+            with self.assertRaisesRegex(ValueError, "must not be stored inline") as caught:
+                load_root_config("config.json")
+        for value in secret_values:
+            self.assertNotIn(value, str(caught.exception))
+
+    def test_root_loader_reports_missing_and_unreadable_file_with_path(self):
+        expected_path = os.path.abspath("missing-config.json")
+        with patch("builtins.open", side_effect=FileNotFoundError("missing")):
+            with self.assertRaisesRegex(
+                FileNotFoundError,
+                "root config file not found",
+            ) as missing:
+                load_root_config("missing-config.json")
+        self.assertIn(expected_path, str(missing.exception))
+
+        with patch("builtins.open", side_effect=PermissionError("denied")):
+            with self.assertRaisesRegex(
+                OSError,
+                "root config file is not readable",
+            ) as unreadable:
+                load_root_config("missing-config.json")
+        self.assertIn(expected_path, str(unreadable.exception))
+
+    def test_root_loader_rejects_malformed_non_object_and_empty_json(self):
+        cases = {
+            "malformed": ("{", "JSON is malformed"),
+            "array": ("[]", "must be a JSON object"),
+            "empty": ("{}", "must not be an empty JSON object"),
+        }
+        for name, (payload, expected) in cases.items():
+            with self.subTest(name=name):
+                with patch("builtins.open", mock_open(read_data=payload)):
+                    with self.assertRaisesRegex(ValueError, expected) as raised:
+                        load_root_config("invalid-config.json")
+                self.assertIn(
+                    os.path.abspath("invalid-config.json"),
+                    str(raised.exception),
+                )
+
     def test_root_live_loader_requires_local_evidence(self):
         payload = safe_live_config()
-        with patch(
+        payload.pop("api_key")
+        payload.pop("api_secret")
+        payload["risk"]["independent_supervisor"].pop("api_key")
+        payload["risk"]["independent_supervisor"].pop("api_secret")
+        credential_environment = {
+            "BINANCE_API_KEY": "primary-key",
+            "BINANCE_API_SECRET": "primary-secret",
+            "BINANCE_RISK_API_KEY": "risk-key",
+            "BINANCE_RISK_API_SECRET": "risk-secret",
+        }
+        with patch.dict(os.environ, credential_environment), patch(
             "infrastructure.config_scaling.validate_live_calibration_approval"
         ), patch("builtins.open", mock_open(read_data=json.dumps(payload))):
             with self.assertRaisesRegex(ValueError, "offline_evidence_path"):
