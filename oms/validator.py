@@ -1,5 +1,6 @@
 ﻿import threading
 import time
+import math
 from collections import deque
 
 from data.cache import data_cache
@@ -58,10 +59,21 @@ class OrderValidator:
             if not info.supports_rpi:
                 return False, f"rpi_unsupported_symbol:{intent.symbol}"
 
-        if intent.price <= 0 or intent.volume <= 0:
+        try:
+            price = float(intent.price)
+            volume = float(intent.volume)
+        except (TypeError, ValueError):
+            return False, "non_numeric_price_or_volume"
+        if not math.isfinite(price) or not math.isfinite(volume):
+            return False, "non_finite_price_or_volume"
+        if price <= 0 or volume <= 0:
             return False, "non_positive_price_or_volume"
+        intent.price = price
+        intent.volume = volume
 
-        notional = intent.price * intent.volume
+        notional = price * volume
+        if not math.isfinite(notional):
+            return False, "non_finite_order_notional"
 
         if info and notional < max(info.min_notional, 5.0):
             return False, f"notional_below_min:{notional:.8f}"
@@ -78,9 +90,11 @@ class OrderValidator:
             if freshness_error:
                 return False, freshness_error
 
-        mark_price = snapshot["mark_price"]
+        mark_price = self._finite_or_zero(snapshot["mark_price"])
         if mark_price <= 0 and not self.freshness_enabled:
-            mark_price = data_cache.get_mark_price(intent.symbol)
+            mark_price = self._finite_or_zero(
+                data_cache.get_mark_price(intent.symbol)
+            )
         if mark_price > 0 and not intent.reduce_only:
             deviation = abs(intent.price - mark_price) / mark_price
             if deviation > self.max_deviation_pct:
@@ -90,10 +104,12 @@ class OrderValidator:
                     f"(order={intent.price},mark={mark_price})",
                 )
 
-        bid_price = snapshot["bid_price"]
-        ask_price = snapshot["ask_price"]
+        bid_price = self._finite_or_zero(snapshot["bid_price"])
+        ask_price = self._finite_or_zero(snapshot["ask_price"])
         if not self.freshness_enabled and (bid_price <= 0 or ask_price <= 0):
             bid_price, ask_price = data_cache.get_best_quote(intent.symbol)
+            bid_price = self._finite_or_zero(bid_price)
+            ask_price = self._finite_or_zero(ask_price)
         if (
             not intent.reduce_only
             and bid_price > 0
@@ -118,39 +134,67 @@ class OrderValidator:
         return True, ""
 
     def _validate_market_data_freshness(self, snapshot: dict) -> str:
-        mark_price = float(snapshot.get("mark_price", 0.0) or 0.0)
+        mark_price = self._finite_or_zero(
+            snapshot.get("mark_price", 0.0)
+        )
         mark_age_ms = snapshot.get("mark_age_ms")
         if self.require_mark_price and mark_price <= 0:
             return "market_data_unavailable:mark_price"
         if mark_price > 0 and mark_age_ms is None:
             return "market_data_timestamp_missing:mark_price"
+        if mark_age_ms is not None:
+            try:
+                mark_age_ms = float(mark_age_ms)
+            except (TypeError, ValueError):
+                return "market_data_timestamp_invalid:mark_price"
+            if not math.isfinite(mark_age_ms) or mark_age_ms < 0.0:
+                return "market_data_timestamp_invalid:mark_price"
         if (
             mark_price > 0
             and self.max_mark_age_ms > 0
-            and float(mark_age_ms) > self.max_mark_age_ms
+            and mark_age_ms > self.max_mark_age_ms
         ):
             return (
-                f"market_data_stale:mark_price:{float(mark_age_ms):.1f}ms"
+                f"market_data_stale:mark_price:{mark_age_ms:.1f}ms"
                 f">{self.max_mark_age_ms:.1f}ms"
             )
 
-        bid_price = float(snapshot.get("bid_price", 0.0) or 0.0)
-        ask_price = float(snapshot.get("ask_price", 0.0) or 0.0)
+        bid_price = self._finite_or_zero(
+            snapshot.get("bid_price", 0.0)
+        )
+        ask_price = self._finite_or_zero(
+            snapshot.get("ask_price", 0.0)
+        )
         book_age_ms = snapshot.get("book_age_ms")
         if self.require_book and (bid_price <= 0 or ask_price <= 0):
             return "market_data_unavailable:book"
         if (bid_price > 0 or ask_price > 0) and book_age_ms is None:
             return "market_data_timestamp_missing:book"
+        if book_age_ms is not None:
+            try:
+                book_age_ms = float(book_age_ms)
+            except (TypeError, ValueError):
+                return "market_data_timestamp_invalid:book"
+            if not math.isfinite(book_age_ms) or book_age_ms < 0.0:
+                return "market_data_timestamp_invalid:book"
         if (
             (bid_price > 0 or ask_price > 0)
             and self.max_book_age_ms > 0
-            and float(book_age_ms) > self.max_book_age_ms
+            and book_age_ms > self.max_book_age_ms
         ):
             return (
-                f"market_data_stale:book:{float(book_age_ms):.1f}ms"
+                f"market_data_stale:book:{book_age_ms:.1f}ms"
                 f">{self.max_book_age_ms:.1f}ms"
             )
         return ""
+
+    @staticmethod
+    def _finite_or_zero(value) -> float:
+        try:
+            normalized = float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return normalized if math.isfinite(normalized) else 0.0
 
     def _check_rate_limit(
         self,

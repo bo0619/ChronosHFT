@@ -2,7 +2,10 @@
 
 # Production
 REST_URL_MAIN = "https://fapi.binance.com"
-WS_URL_MAIN = "wss://fstream.binance.com/ws"
+WS_URL_MAIN = "wss://fstream.binance.com"
+WS_PUBLIC_URL_MAIN = f"{WS_URL_MAIN}/public"
+WS_MARKET_URL_MAIN = f"{WS_URL_MAIN}/market"
+WS_PRIVATE_URL_MAIN = f"{WS_URL_MAIN}/private"
 
 # Testnet
 REST_URL_TEST = "https://testnet.binancefuture.com"
@@ -10,6 +13,7 @@ WS_URL_TEST = "wss://stream.binancefuture.com/ws"
 
 # Endpoints
 EP_DEPTH_SNAPSHOT = "/fapi/v1/depth"
+EP_PREMIUM_INDEX = "/fapi/v1/premiumIndex"
 EP_RPI_DEPTH = "/fapi/v1/rpiDepth"
 EP_ORDER = "/fapi/v1/order"
 EP_LISTEN_KEY = "/fapi/v1/listenKey"

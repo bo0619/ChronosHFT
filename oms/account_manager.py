@@ -61,6 +61,14 @@ class AccountManager:
         margin_snapshot_time: float = None,
         margin_snapshot_monotonic: float = None,
     ):
+        balance = self._require_finite(balance, "balance")
+        used_margin = self._require_finite(
+            used_margin,
+            "used_margin",
+            nonnegative=True,
+        )
+        available = self._optional_finite(available, "available")
+        balances = self._normalize_balance_payload(balances)
         self.balance = balance
         self.exchange_balance_synced = True
         self._sync_balance_maps(asset=asset, balance=balance, available=available, balances=balances)
@@ -79,6 +87,9 @@ class AccountManager:
         asset: str = "",
         balances: dict = None,
     ):
+        balance = self._require_finite(balance, "balance")
+        available = self._optional_finite(available, "available")
+        balances = self._normalize_balance_payload(balances)
         self.balance = balance
         self.exchange_balance_synced = True
         self._sync_balance_maps(asset=asset, balance=balance, available=available, balances=balances)
@@ -132,10 +143,38 @@ class AccountManager:
         self.calculate()
 
     def update_balance(self, realized_pnl, commission):
-        self.balance += (realized_pnl - commission)
+        realized_pnl = self._require_finite(
+            realized_pnl,
+            "realized_pnl",
+        )
+        commission = self._require_finite(
+            commission,
+            "commission",
+        )
+        next_balance = self.balance + realized_pnl - commission
+        if not math.isfinite(next_balance):
+            raise ValueError("Account balance update overflowed")
+        self.balance = next_balance
         self.calculate()
 
     def calculate(self, used_margin_override: float = None, available_override: float = None):
+        if (
+            not math.isfinite(float(self.balance))
+            or not math.isfinite(float(self.leverage))
+            or float(self.leverage) <= 0.0
+        ):
+            raise ValueError("Account state is not finite")
+        if used_margin_override is not None:
+            used_margin_override = self._require_finite(
+                used_margin_override,
+                "used_margin_override",
+                nonnegative=True,
+            )
+        if available_override is not None:
+            available_override = self._require_finite(
+                available_override,
+                "available_override",
+            )
         unrealized_pnl = 0.0
         pos_margin = 0.0
         order_margin = 0.0
@@ -143,24 +182,40 @@ class AccountManager:
         for symbol, pos_vol in self.exposure.net_positions.items():
             if pos_vol == 0:
                 continue
+            if not math.isfinite(float(pos_vol)):
+                raise ValueError(
+                    f"Non-finite position volume for {symbol}"
+                )
 
             mark_price = data_cache.get_mark_price(symbol)
-            if mark_price <= 0:
+            if not math.isfinite(mark_price) or mark_price <= 0:
                 mark_price, _ = data_cache.get_best_quote(symbol)
-            if mark_price <= 0:
+            if not math.isfinite(mark_price) or mark_price <= 0:
                 mark_price = self.exposure.avg_prices[symbol]
 
-            if mark_price > 0:
-                avg_price = self.exposure.avg_prices[symbol]
+            avg_price = float(self.exposure.avg_prices[symbol])
+            if not math.isfinite(avg_price):
+                raise ValueError(
+                    f"Non-finite average price for {symbol}"
+                )
+            if math.isfinite(mark_price) and mark_price > 0:
                 unrealized_pnl += (mark_price - avg_price) * pos_vol
                 pos_margin += (abs(pos_vol) * mark_price) / self.leverage
 
         for symbol, qty in self.exposure.open_buy_qty.items():
+            if not math.isfinite(float(qty)) or qty < 0.0:
+                raise ValueError(
+                    f"Non-finite open buy quantity for {symbol}"
+                )
             mark_price = self._get_price_safely(symbol)
             if mark_price > 0:
                 order_margin += (qty * mark_price) / self.leverage
 
         for symbol, qty in self.exposure.open_sell_qty.items():
+            if not math.isfinite(float(qty)) or qty < 0.0:
+                raise ValueError(
+                    f"Non-finite open sell quantity for {symbol}"
+                )
             mark_price = self._get_price_safely(symbol)
             if mark_price > 0:
                 order_margin += (qty * mark_price) / self.leverage
@@ -278,6 +333,53 @@ class AccountManager:
             if available is not None:
                 self.available_balances[asset] = float(available)
 
+    @classmethod
+    def _normalize_balance_payload(cls, balances):
+        if balances is None:
+            return None
+        if not isinstance(balances, dict):
+            raise ValueError("balances must be a mapping")
+        normalized = {}
+        for raw_asset, raw_payload in balances.items():
+            asset = str(raw_asset or "").upper().strip()
+            if not asset or not isinstance(raw_payload, dict):
+                raise ValueError("balances contains an invalid asset entry")
+            payload = dict(raw_payload)
+            payload["wallet_balance"] = cls._require_finite(
+                payload.get("wallet_balance", 0.0),
+                f"balances.{asset}.wallet_balance",
+            )
+            if payload.get("available_balance") is not None:
+                payload["available_balance"] = cls._require_finite(
+                    payload["available_balance"],
+                    f"balances.{asset}.available_balance",
+                )
+            normalized[asset] = payload
+        return normalized
+
+    @staticmethod
+    def _require_finite(
+        value,
+        field: str,
+        *,
+        nonnegative: bool = False,
+    ) -> float:
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be numeric") from exc
+        if not math.isfinite(normalized):
+            raise ValueError(f"{field} must be finite")
+        if nonnegative and normalized < 0.0:
+            raise ValueError(f"{field} must be nonnegative")
+        return normalized
+
+    @classmethod
+    def _optional_finite(cls, value, field: str):
+        if value is None:
+            return None
+        return cls._require_finite(value, field)
+
     def _budget_equity_value(self):
         if self.trading_budget_total > 0.0:
             return min(self.equity, self.trading_budget_total)
@@ -285,9 +387,9 @@ class AccountManager:
 
     def _get_price_safely(self, symbol):
         price = data_cache.get_mark_price(symbol)
-        if price <= 0:
+        if not math.isfinite(price) or price <= 0:
             price, _ = data_cache.get_best_quote(symbol)
-        return price
+        return price if math.isfinite(price) and price > 0.0 else 0.0
 
     def check_margin(self, notional_value):
         required = notional_value / self.leverage

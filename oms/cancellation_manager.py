@@ -41,7 +41,14 @@ class OMSCancellationManager(OMSComponent):
             return False
         return True
 
-    def _schedule_cancel_all_retry(self, symbol: str, source: str) -> bool:
+    def _schedule_cancel_all_retry(
+        self,
+        symbol: str,
+        source: str,
+        *,
+        audit: bool = True,
+        bypass_message_budget: bool = False,
+    ) -> bool:
         symbol = str(symbol or "").upper()
         with self.lock:
             if self._stopped or symbol in self._deferred_cancel_all_symbols:
@@ -62,6 +69,8 @@ class OMSCancellationManager(OMSComponent):
             self._cancel_all_orders_unchecked(
                 symbol,
                 source=retry_source,
+                audit=audit,
+                bypass_message_budget=bypass_message_budget,
             )
 
         handle = self._submit_background_task(
@@ -318,7 +327,16 @@ class OMSCancellationManager(OMSComponent):
             logger.error(
                 f"[OMS] Mass cancel blocked for {symbol}: {budget_rejection}"
             )
-            scheduled = self._schedule_cancel_all_retry(symbol, source)
+            scheduled = (
+                self._schedule_cancel_all_retry(symbol, source)
+                if audit and not bypass_message_budget
+                else self._schedule_cancel_all_retry(
+                    symbol,
+                    source,
+                    audit=audit,
+                    bypass_message_budget=bypass_message_budget,
+                )
+            )
             with self.lock:
                 deferred = (
                     scheduled or symbol.upper() in self._deferred_cancel_all_symbols
@@ -347,19 +365,29 @@ class OMSCancellationManager(OMSComponent):
             response = self.gateway.cancel_all_orders(symbol)
         except Exception as exc:
             logger.error(f"[OMS] Mass cancel failed for {symbol}: {exc}")
-            self._audit(
-                "cancel_all_outcome_unknown",
-                symbol=symbol,
-                source=source,
-                error=f"{type(exc).__name__}:{exc}",
-            )
-            self.freeze_symbol(
-                symbol,
-                f"order_truth:cancel_all_unknown:{source}",
-                cancel_active_orders=False,
-            )
-            self._schedule_cancel_all_retry(symbol, source)
-            self._on_order_truth_check("Mass cancel outcome unknown")
+            if audit:
+                self._audit(
+                    "cancel_all_outcome_unknown",
+                    symbol=symbol,
+                    source=source,
+                    error=f"{type(exc).__name__}:{exc}",
+                )
+                self.freeze_symbol(
+                    symbol,
+                    f"order_truth:cancel_all_unknown:{source}",
+                    cancel_active_orders=False,
+                )
+            if audit and not bypass_message_budget:
+                self._schedule_cancel_all_retry(symbol, source)
+            else:
+                self._schedule_cancel_all_retry(
+                    symbol,
+                    source,
+                    audit=audit,
+                    bypass_message_budget=bypass_message_budget,
+                )
+            if audit:
+                self._on_order_truth_check("Mass cancel outcome unknown")
             return False
 
         status_code = getattr(response, "status_code", None)
@@ -385,21 +413,31 @@ class OMSCancellationManager(OMSComponent):
             f"[OMS] Mass cancel outcome unknown for {symbol}: "
             f"status={status_code} code={error_code} msg={error_message}"
         )
-        self._audit(
-            "cancel_all_outcome_unknown",
-            symbol=symbol,
-            source=source,
-            status_code=status_code,
-            error_code=error_code,
-            error_message=error_message,
-        )
-        self.freeze_symbol(
-            symbol,
-            f"order_truth:cancel_all_unknown:{source}",
-            cancel_active_orders=False,
-        )
-        self._schedule_cancel_all_retry(symbol, source)
-        self._on_order_truth_check("Mass cancel outcome unknown")
+        if audit:
+            self._audit(
+                "cancel_all_outcome_unknown",
+                symbol=symbol,
+                source=source,
+                status_code=status_code,
+                error_code=error_code,
+                error_message=error_message,
+            )
+            self.freeze_symbol(
+                symbol,
+                f"order_truth:cancel_all_unknown:{source}",
+                cancel_active_orders=False,
+            )
+        if audit and not bypass_message_budget:
+            self._schedule_cancel_all_retry(symbol, source)
+        else:
+            self._schedule_cancel_all_retry(
+                symbol,
+                source,
+                audit=audit,
+                bypass_message_budget=bypass_message_budget,
+            )
+        if audit:
+            self._on_order_truth_check("Mass cancel outcome unknown")
         return False
 
     def _account_cancel_symbols(self, remote_orders=None) -> list[str]:
@@ -485,7 +523,17 @@ class OMSCancellationManager(OMSComponent):
         else:
             while time.perf_counter() < deadline:
                 try:
-                    remote_orders = query()
+                    remote_orders = (
+                        query(emergency=True)
+                        if bool(
+                            getattr(
+                                provider,
+                                "supports_emergency_query_priority",
+                                False,
+                            )
+                        )
+                        else query()
+                    )
                     normalized_remote = self._normalize_remote_open_orders(
                         remote_orders
                     )

@@ -6,12 +6,28 @@ import time
 import websocket
 
 from infrastructure.logger import logger
-from .constants import WS_URL_MAIN, WS_URL_TEST
+from .constants import (
+    WS_MARKET_URL_MAIN,
+    WS_PRIVATE_URL_MAIN,
+    WS_PUBLIC_URL_MAIN,
+    WS_URL_TEST,
+)
 
 
 class BinanceWsApi:
     def __init__(self, callback, error_callback, testnet=False):
-        self.base_url = WS_URL_TEST if testnet else WS_URL_MAIN
+        self.testnet = bool(testnet)
+        if self.testnet:
+            # Binance Futures testnet still documents the legacy combined
+            # stream layout. Keep it isolated from production URL routing so a
+            # testnet compatibility change cannot regress the live endpoints.
+            self.public_base_url = WS_URL_TEST
+            self.market_base_url = WS_URL_TEST
+            self.private_base_url = WS_URL_TEST
+        else:
+            self.public_base_url = WS_PUBLIC_URL_MAIN
+            self.market_base_url = WS_MARKET_URL_MAIN
+            self.private_base_url = WS_PRIVATE_URL_MAIN
         self.callback = callback
         self.error_callback = error_callback
         self.active = False
@@ -20,22 +36,49 @@ class BinanceWsApi:
         self.stream_apps = {}
         self.close_requested = False
         self.connected_events = {
+            "PublicWS": threading.Event(),
             "MarketWS": threading.Event(),
             "UserWS": threading.Event(),
         }
 
     def start_market_stream(self, symbols):
-        streams = []
+        public_streams = []
+        market_streams = []
         for s in symbols:
             sl = s.lower()
-            streams += [f"{sl}@depth@100ms", f"{sl}@aggTrade", f"{sl}@markPrice@1s"]
+            public_streams.append(f"{sl}@depth@100ms")
+            market_streams.extend(
+                [f"{sl}@aggTrade", f"{sl}@markPrice@1s"]
+            )
 
-        url = self.base_url.replace("/ws", "") + "/stream?streams=" + "/".join(streams)
-        self._start_thread(url, "MarketWS")
+        self._start_thread(
+            self._combined_stream_url(
+                self.public_base_url,
+                public_streams,
+            ),
+            "PublicWS",
+        )
+        self._start_thread(
+            self._combined_stream_url(
+                self.market_base_url,
+                market_streams,
+            ),
+            "MarketWS",
+        )
 
     def start_user_stream(self, listen_key):
-        url = f"{self.base_url}/{listen_key}"
+        if self.testnet:
+            url = f"{self.private_base_url}/{listen_key}"
+        else:
+            url = f"{self.private_base_url}/ws/{listen_key}"
         self._start_thread(url, "UserWS")
+
+    def _combined_stream_url(self, base_url, streams):
+        if self.testnet:
+            root = str(base_url).removesuffix("/ws")
+        else:
+            root = str(base_url).rstrip("/")
+        return root + "/stream?streams=" + "/".join(streams)
 
     def _start_thread(self, url, name):
         with self.lock:
@@ -44,7 +87,11 @@ class BinanceWsApi:
             self.connected_events.setdefault(name, threading.Event()).clear()
         threading.Thread(target=self._run, args=(url, name), daemon=True).start()
 
-    def wait_until_connected(self, names=("MarketWS", "UserWS"), timeout_sec=10.0):
+    def wait_until_connected(
+        self,
+        names=("PublicWS", "MarketWS", "UserWS"),
+        timeout_sec=10.0,
+    ):
         deadline = time.perf_counter() + max(0.0, float(timeout_sec))
         for name in names:
             with self.lock:
@@ -77,9 +124,16 @@ class BinanceWsApi:
                     on_error=lambda ws, err: self._handle_transport_fault(name, err, fault_reported),
                     on_close=lambda ws, code, msg: self._handle_close(name, ws, code, msg, fault_reported),
                 )
+                start_aborted = False
                 with self.lock:
-                    self.stream_apps[name] = ws_app
-                    self.ws = ws_app
+                    if not self.active or self.close_requested:
+                        start_aborted = True
+                    else:
+                        self.stream_apps[name] = ws_app
+                        self.ws = ws_app
+                if start_aborted:
+                    ws_app.close()
+                    return
                 ws_app.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
                 self._handle_transport_fault(name, e, fault_reported)
@@ -119,10 +173,17 @@ class BinanceWsApi:
             return bool(self.active)
 
     def _handle_open(self, name, ws):
+        reject_open = False
         with self.lock:
-            self.stream_apps[name] = ws
-            self.ws = ws
-            self.connected_events.setdefault(name, threading.Event()).set()
+            if not self.active or self.close_requested:
+                reject_open = True
+            else:
+                self.stream_apps[name] = ws
+                self.ws = ws
+                self.connected_events.setdefault(name, threading.Event()).set()
+        if reject_open:
+            ws.close()
+            return
         logger.info(f"[{name}] Connected.")
 
     def _handle_transport_fault(self, name, err, fault_reported):

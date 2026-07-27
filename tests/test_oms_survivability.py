@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import tempfile
@@ -17,6 +18,7 @@ if "requests" not in sys.modules:
 
 from event.type import (
     Event,
+    ExchangeAccountUpdate,
     ExchangeOrderUpdate,
     ExecutionPolicy,
     EVENT_EXCHANGE_ORDER_UPDATE,
@@ -34,7 +36,11 @@ from infrastructure.single_writer_fence import (
 )
 from infrastructure.truth_monitor import TruthMonitor
 from oms.engine import OMS
-from oms.journal import OMSJournal
+from oms.journal import (
+    JournalCorruptionError,
+    JournalWriteError,
+    OMSJournal,
+)
 from oms.order import Order
 
 
@@ -264,6 +270,351 @@ class OMSSurvivabilityTests(unittest.TestCase):
         finally:
             oms.stop()
 
+    def test_nonfinite_exchange_fill_is_quarantined_before_state_mutation(self):
+        gateway = DummyGateway()
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            oms.state = LifecycleState.LIVE
+            oms._sync_capability_mode("test_live")
+            order = Order(
+                "oid-nan-fill",
+                OrderIntent(
+                    "alpha",
+                    "BTCUSDT",
+                    Side.BUY,
+                    100.0,
+                    1.0,
+                ),
+            )
+            order.mark_submitting()
+            order.mark_pending_ack("ex-nan-fill")
+            order.mark_new("ex-nan-fill", update_time=1.0, seq=1)
+            oms.orders[order.client_oid] = order
+            oms.exchange_id_map[order.exchange_oid] = order
+            oms.exposure.update_open_orders(oms.orders)
+            queued = []
+            oms._queue_reconcile_request_locked = (
+                lambda reason, suspicious_oid="": queued.append(
+                    (reason, suspicious_oid)
+                )
+            )
+
+            oms._apply_event(
+                Event(
+                    EVENT_EXCHANGE_ORDER_UPDATE,
+                    ExchangeOrderUpdate(
+                        client_oid=order.client_oid,
+                        exchange_oid=order.exchange_oid,
+                        symbol="BTCUSDT",
+                        status="PARTIALLY_FILLED",
+                        filled_qty=1.0,
+                        filled_price=float("nan"),
+                        cum_filled_qty=1.0,
+                        update_time=2.0,
+                        seq=2,
+                        trade_id=17,
+                    ),
+                )
+            )
+
+            self.assertEqual(order.status, OrderStatus.NEW)
+            self.assertEqual(order.filled_volume, 0.0)
+            self.assertEqual(order.cumulative_cost, 0.0)
+            self.assertTrue(math.isfinite(order.avg_price))
+            self.assertEqual(oms.exposure.net_positions["BTCUSDT"], 0.0)
+            self.assertEqual(oms.execution_ids, set())
+            self.assertEqual(oms.state, LifecycleState.FROZEN)
+            self.assertIn("filled_price:not_finite", oms.last_freeze_reason)
+            self.assertEqual(queued[-1][1], order.client_oid)
+        finally:
+            oms.stop()
+
+    def test_unsupported_exchange_status_is_quarantined(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            oms.state = LifecycleState.LIVE
+            oms._sync_capability_mode("test_live")
+            order = Order(
+                "oid-unknown-status",
+                OrderIntent(
+                    "alpha",
+                    "BTCUSDT",
+                    Side.BUY,
+                    100.0,
+                    1.0,
+                ),
+            )
+            order.mark_submitting()
+            order.mark_pending_ack("ex-unknown-status")
+            order.mark_new("ex-unknown-status", update_time=1.0, seq=1)
+            oms.orders[order.client_oid] = order
+            oms.exchange_id_map[order.exchange_oid] = order
+            queued = []
+            oms._queue_reconcile_request_locked = (
+                lambda reason, suspicious_oid="": queued.append(
+                    (reason, suspicious_oid)
+                )
+            )
+
+            oms._apply_event(
+                Event(
+                    EVENT_EXCHANGE_ORDER_UPDATE,
+                    ExchangeOrderUpdate(
+                        client_oid=order.client_oid,
+                        exchange_oid=order.exchange_oid,
+                        symbol="BTCUSDT",
+                        status="PENDING_MAGIC",
+                        filled_qty=0.0,
+                        filled_price=0.0,
+                        cum_filled_qty=0.0,
+                        update_time=2.0,
+                        seq=2,
+                    ),
+                )
+            )
+
+            self.assertEqual(order.status, OrderStatus.NEW)
+            self.assertEqual(oms.state, LifecycleState.FROZEN)
+            self.assertIn(
+                "status:unsupported:PENDING_MAGIC",
+                oms.last_freeze_reason,
+            )
+            self.assertEqual(queued[-1][1], order.client_oid)
+        finally:
+            oms.stop()
+
+    def test_order_rejects_nonfinite_direct_fill(self):
+        order = Order(
+            "oid-direct-nan",
+            OrderIntent(
+                "alpha",
+                "BTCUSDT",
+                Side.BUY,
+                100.0,
+                1.0,
+            ),
+        )
+        order.mark_submitting()
+        order.mark_pending_ack("ex-direct-nan")
+        order.mark_new("ex-direct-nan")
+
+        for quantity, price in (
+            (float("nan"), 100.0),
+            (1.0, float("nan")),
+            (1.0, float("inf")),
+        ):
+            with self.subTest(quantity=quantity, price=price):
+                with self.assertRaises(ValueError):
+                    order.add_fill(quantity, price)
+                self.assertEqual(order.filled_volume, 0.0)
+                self.assertEqual(order.cumulative_cost, 0.0)
+
+    def test_internal_account_and_exposure_ledgers_reject_nonfinite_truth(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            original_balance = oms.account.balance
+            with self.assertRaises(ValueError):
+                oms.account.force_sync(float("nan"), 0.0)
+            self.assertEqual(oms.account.balance, original_balance)
+            self.assertFalse(oms.account.exchange_balance_synced)
+
+            with self.assertRaises(ValueError):
+                oms.exposure.force_sync(
+                    "BTCUSDT",
+                    float("nan"),
+                    100.0,
+                )
+            self.assertEqual(oms.exposure.net_positions["BTCUSDT"], 0.0)
+        finally:
+            oms.stop()
+
+    def test_nonfinite_exchange_account_update_is_quarantined(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            oms.state = LifecycleState.LIVE
+            oms._sync_capability_mode("test_live")
+            oms.account.force_sync(
+                1000.0,
+                0.0,
+                available=900.0,
+                asset="USDT",
+            )
+            oms.exposure.force_sync("BTCUSDT", 0.5, 100.0)
+            queued = []
+            oms._queue_reconcile_request_locked = (
+                lambda reason, suspicious_oid="": queued.append(
+                    (reason, suspicious_oid)
+                )
+            )
+
+            oms.on_exchange_account_update(
+                Event(
+                    EVENT_ACCOUNT_UPDATE,
+                    ExchangeAccountUpdate(
+                        asset="USDT",
+                        wallet_balance=float("nan"),
+                        available_balance=800.0,
+                        balances={
+                            "USDT": {
+                                "wallet_balance": float("nan"),
+                                "available_balance": 800.0,
+                            }
+                        },
+                        positions={
+                            "BTCUSDT": {
+                                "volume": 1.0,
+                                "entry_price": 101.0,
+                            }
+                        },
+                        reason="ORDER",
+                        event_time=2.0,
+                    ),
+                )
+            )
+
+            self.assertEqual(oms.account.balance, 1000.0)
+            self.assertEqual(
+                oms.exposure.net_positions["BTCUSDT"],
+                0.5,
+            )
+            self.assertEqual(oms.state, LifecycleState.FROZEN)
+            self.assertIn("wallet_balance:not_finite", oms.last_freeze_reason)
+            self.assertTrue(queued)
+        finally:
+            oms.stop()
+
+    def test_order_validator_rejects_nonfinite_price_and_volume(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            for price, volume in (
+                (float("nan"), 1.0),
+                (100.0, float("nan")),
+                (float("inf"), 1.0),
+                (100.0, float("inf")),
+            ):
+                with self.subTest(price=price, volume=volume):
+                    accepted, reason = oms.validator.validate_params(
+                        OrderIntent(
+                            "alpha",
+                            "BTCUSDT",
+                            Side.BUY,
+                            price,
+                            volume,
+                        )
+                    )
+                    self.assertFalse(accepted)
+                    self.assertEqual(
+                        reason,
+                        "non_finite_price_or_volume",
+                    )
+        finally:
+            oms.stop()
+
+    def test_rest_truth_rejects_nonfinite_order_and_trade_rows(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            self.assertFalse(
+                oms._apply_exchange_order_snapshot(
+                    {
+                        "symbol": "BTCUSDT",
+                        "orderId": "ex-rest-nan",
+                        "clientOrderId": "oid-rest-nan",
+                        "side": "BUY",
+                        "status": "NEW",
+                        "origQty": "1",
+                        "executedQty": float("nan"),
+                        "price": "100",
+                        "avgPrice": "0",
+                        "updateTime": 2000,
+                    }
+                )
+            )
+            self.assertNotIn("oid-rest-nan", oms.orders)
+
+            self.assertFalse(
+                oms._apply_exchange_trade(
+                    {
+                        "symbol": "BTCUSDT",
+                        "id": 71,
+                        "orderId": "ex-rest-nan",
+                        "qty": float("nan"),
+                        "price": "100",
+                        "commission": "0",
+                        "realizedPnl": "0",
+                        "time": 2000,
+                    }
+                )
+            )
+            self.assertEqual(oms.execution_ids, set())
+        finally:
+            oms.stop()
+
+    def test_trade_history_baseline_rejects_non_list_response(self):
+        gateway = DummyGateway()
+        gateway.get_user_trades = lambda *_args, **_kwargs: {
+            "code": -1000
+        }
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            self.assertFalse(
+                oms._prime_trade_history_baseline(
+                    2000,
+                    symbols={"BTCUSDT"},
+                )
+            )
+            self.assertEqual(oms.trade_cursors, {})
+        finally:
+            oms.stop()
+
+    def test_journal_rejects_nonfinite_json_on_write_and_read(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            journal_path = os.path.join(temp_dir, "oms_journal.jsonl")
+            config = self.make_journaled_config(journal_path)
+            journal = OMSJournal(config)
+
+            with self.assertRaises(JournalWriteError):
+                journal.append("invalid", {"fill_price": float("nan")})
+            self.assertFalse(os.path.exists(journal_path))
+
+            with open(journal_path, "w", encoding="utf-8") as journal_file:
+                journal_file.write('{"kind":"invalid","fill_price":NaN}\n')
+
+            with self.assertRaises(JournalCorruptionError):
+                OMSJournal(config)
+
+    def test_journal_replay_rejects_string_encoded_nonfinite_amount(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            journal_path = os.path.join(temp_dir, "oms_journal.jsonl")
+            config = self.make_journaled_config(journal_path)
+            journal = OMSJournal(config)
+            journal.append(
+                "external_cash_flow_record",
+                {
+                    "income_id": "TRANSFER:bad",
+                    "amount": "NaN",
+                },
+            )
+
+            with self.assertRaises(JournalCorruptionError):
+                OMS(DummyEngine(), DummyGateway(), config)
+
+    def test_order_recovery_rejects_string_encoded_nonfinite_state(self):
+        order = Order(
+            "oid-record-nan",
+            OrderIntent(
+                "alpha",
+                "BTCUSDT",
+                Side.BUY,
+                100.0,
+                1.0,
+            ),
+        )
+        record = order.to_record()
+        record["filled_volume"] = "NaN"
+
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            Order.from_record(record)
+
     def test_full_reset_halts_if_remote_open_orders_survive_cancel_all(self):
         gateway = DummyGateway()
         gateway.open_orders = [
@@ -300,6 +651,33 @@ class OMSSurvivabilityTests(unittest.TestCase):
             oms._perform_full_reset = lambda: called.append("reset")
             oms._execute_reconcile(None)
             self.assertEqual(called, ["reset"])
+        finally:
+            oms.stop()
+
+    def test_stable_snapshot_rejects_nonfinite_account_truth(self):
+        gateway = DummyGateway()
+        gateway.account["totalWalletBalance"] = float("nan")
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            with self.assertRaisesRegex(ValueError, "not finite"):
+                oms._capture_stable_exchange_snapshot()
+        finally:
+            oms.stop()
+
+    def test_stable_snapshot_rejects_nonfinite_position_truth(self):
+        gateway = DummyGateway()
+        gateway.positions = [
+            {
+                "symbol": "BTCUSDT",
+                "positionAmt": float("nan"),
+                "entryPrice": 100.0,
+                "positionSide": "BOTH",
+            }
+        ]
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            with self.assertRaisesRegex(ValueError, "not finite"):
+                oms._capture_stable_exchange_snapshot()
         finally:
             oms.stop()
 
@@ -1276,6 +1654,95 @@ class OMSSurvivabilityTests(unittest.TestCase):
         finally:
             oms.stop()
 
+    def test_journal_failure_mass_cancel_retry_stays_audit_free(self):
+        gateway = DummyGateway()
+        gateway.cancel_all_status_code = 500
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        retries = []
+        oms._audit = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("journal must not be touched")
+        )
+        oms._schedule_cancel_all_retry = (
+            lambda symbol, source, **kwargs: retries.append(
+                (symbol, source, kwargs)
+            )
+            or True
+        )
+        try:
+            acknowledged = oms._cancel_all_orders_unchecked(
+                "BTCUSDT",
+                source="journal_failure",
+                audit=False,
+                bypass_message_budget=True,
+            )
+
+            self.assertFalse(acknowledged)
+            self.assertNotIn("BTCUSDT", oms.symbol_guards)
+            self.assertEqual(
+                retries,
+                [
+                    (
+                        "BTCUSDT",
+                        "journal_failure",
+                        {
+                            "audit": False,
+                            "bypass_message_budget": True,
+                        },
+                    )
+                ],
+            )
+        finally:
+            oms._audit = lambda *_args, **_kwargs: None
+            oms.stop()
+
+    def test_halt_audit_failure_still_enters_cancel_only_and_cancels(self):
+        gateway = DummyGateway()
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            oms.state = LifecycleState.LIVE
+            oms._sync_capability_mode("test_live")
+            original_audit = oms._audit
+            oms._audit = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                JournalWriteError("disk unavailable")
+            )
+
+            oms.halt_system("operator:test")
+
+            self.assertEqual(oms.state, LifecycleState.HALTED)
+            self.assertTrue(oms.manual_rearm_required)
+            self.assertFalse(oms.can_open_new_risk())
+            self.assertIn("BTCUSDT", gateway.cancelled_symbols)
+            self.assertIn(
+                "durable_journal_unavailable:halt_system",
+                oms.last_halt_reason,
+            )
+            oms._audit = original_audit
+        finally:
+            oms.stop()
+
+    def test_rearm_audit_failure_remains_halted_and_returns_false(self):
+        gateway = DummyGateway()
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            oms.state = LifecycleState.HALTED
+            oms.manual_rearm_required = True
+            oms._sync_capability_mode("test_halted")
+            original_audit = oms._audit
+            oms._audit = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                JournalWriteError("disk unavailable")
+            )
+
+            rearmed = oms.rearm_system("operator:test")
+
+            self.assertFalse(rearmed)
+            self.assertEqual(oms.state, LifecycleState.HALTED)
+            self.assertTrue(oms.manual_rearm_required)
+            self.assertFalse(oms.can_open_new_risk())
+            self.assertIn("BTCUSDT", gateway.cancelled_symbols)
+            oms._audit = original_audit
+        finally:
+            oms.stop()
+
     def test_freeze_waits_for_inflight_risk_send_before_mass_cancel(self):
         gateway = DummyGateway()
         send_started = threading.Event()
@@ -1470,6 +1937,8 @@ class OMSSurvivabilityTests(unittest.TestCase):
 
     def test_shutdown_verified_cancel_discovers_off_config_orders(self):
         gateway = DummyGateway()
+        gateway.supports_emergency_query_priority = True
+        emergency_queries = []
         gateway.open_orders = [
             {
                 "symbol": "OLDUSDT",
@@ -1489,6 +1958,13 @@ class OMSSurvivabilityTests(unittest.TestCase):
             return DummyResponse(200, {})
 
         gateway.cancel_all_orders = cancel_and_remove
+        original_get_open_orders = gateway.get_open_orders
+
+        def get_open_orders(*, emergency=False):
+            emergency_queries.append(bool(emergency))
+            return original_get_open_orders()
+
+        gateway.get_open_orders = get_open_orders
         oms = OMS(DummyEngine(), gateway, self.make_config())
         try:
             oms.state = LifecycleState.LIVE
@@ -1508,6 +1984,8 @@ class OMSSurvivabilityTests(unittest.TestCase):
                 oms.get_outbound_gate_snapshot()["shutdown_cancel_verified"]
             )
             self.assertEqual(gateway.open_orders, [])
+            self.assertTrue(emergency_queries)
+            self.assertTrue(all(emergency_queries))
         finally:
             oms.stop(clean_shutdown=True, reason="test_shutdown")
 

@@ -72,32 +72,67 @@ class OMSLifecycleController(OMSComponent):
         if not isinstance(account, dict) or not account:
             return False
 
-        balances = {}
-        for entry in account.get("assets", []) or []:
-            asset = str(entry.get("asset", "") or "").upper()
-            if not asset:
-                continue
-            available_balance = entry.get("availableBalance")
-            balances[asset] = {
-                "wallet_balance": float(entry.get("walletBalance", 0.0) or 0.0),
-                "available_balance": (
-                    float(available_balance or 0.0)
-                    if available_balance is not None
-                    else None
-                ),
-            }
+        try:
+            account = self.reconciler._normalize_remote_account(
+                account,
+                require_initial_margin=True,
+            )
+            raw_assets = account.get("assets", []) or []
+            if not isinstance(raw_assets, (list, tuple)):
+                raise ValueError(
+                    "remote account assets snapshot must be a list"
+                )
+            balances = {}
+            for index, entry in enumerate(raw_assets):
+                if not isinstance(entry, dict):
+                    raise ValueError(
+                        f"remote account asset {index} must be an object"
+                    )
+                asset = str(entry.get("asset", "") or "").upper()
+                if not asset:
+                    raise ValueError(
+                        f"remote account asset {index} is missing asset"
+                    )
+                wallet_balance = (
+                    self.reconciler._finite_snapshot_float(
+                        entry.get("walletBalance", 0.0),
+                        f"assets.{asset}.walletBalance",
+                    )
+                )
+                available_balance = entry.get("availableBalance")
+                if available_balance is not None:
+                    available_balance = (
+                        self.reconciler._finite_snapshot_float(
+                            available_balance,
+                            f"assets.{asset}.availableBalance",
+                        )
+                    )
+                balances[asset] = {
+                    "wallet_balance": wallet_balance,
+                    "available_balance": available_balance,
+                }
 
-        available_balance = account.get("availableBalance")
-        self.account.force_sync(
-            float(account.get("totalWalletBalance", self.account.balance) or self.account.balance),
-            float(account.get("totalInitialMargin", self.account.used_margin) or 0.0),
-            float(available_balance) if available_balance is not None else None,
-            balances=balances or None,
-            maintenance_margin=account.get("totalMaintMargin"),
-            margin_balance=account.get("totalMarginBalance"),
-            margin_snapshot_time=time.time(),
-            margin_snapshot_monotonic=time.perf_counter(),
-        )
+            available_balance = account.get("availableBalance")
+            self.account.force_sync(
+                account["totalWalletBalance"],
+                account["totalInitialMargin"],
+                available_balance,
+                balances=balances or None,
+                maintenance_margin=account.get("totalMaintMargin"),
+                margin_balance=account.get("totalMarginBalance"),
+                margin_snapshot_time=time.time(),
+                margin_snapshot_monotonic=time.perf_counter(),
+            )
+        except (TypeError, ValueError) as exc:
+            logger.error(
+                "[OMS] Invalid read-only account snapshot: "
+                f"{type(exc).__name__}:{exc}"
+            )
+            self._audit(
+                "read_only_account_sync_rejected",
+                reason=f"{type(exc).__name__}:{exc}",
+            )
+            return False
         self._audit(
             "read_only_account_sync",
             balance=self.account.balance,
@@ -744,6 +779,7 @@ class OMSLifecycleController(OMSComponent):
         """Latch shutdown and wait until every order-send call has returned."""
         reason = str(reason or "operator_shutdown")
         first_request = False
+        audit_error = None
         with self.lock:
             if not self._shutdown_requested:
                 first_request = True
@@ -755,15 +791,29 @@ class OMSLifecycleController(OMSComponent):
             if self.state != LifecycleState.HALTED:
                 self.state = LifecycleState.FROZEN
                 self.last_freeze_reason = f"Shutdown: {reason}"
-                self._sync_capability_mode(f"shutdown:{reason}")
+                try:
+                    self._sync_capability_mode(f"shutdown:{reason}")
+                except Exception as exc:
+                    audit_error = exc
+
+        if audit_error is not None:
+            self._fail_closed_on_journal_error(
+                audit_error,
+                "begin_shutdown_capability_transition",
+            )
+            return False
 
         if first_request:
             try:
                 self._audit("shutdown_started", reason=reason)
-            except JournalError as exc:
+            except Exception as exc:
                 logger.critical(
                     "[OMS] Could not persist shutdown latch: "
                     f"{type(exc).__name__}:{exc}"
+                )
+                self._fail_closed_on_journal_error(
+                    exc,
+                    "begin_shutdown",
                 )
                 return False
         sends_drained = self._wait_for_outbound_order_sends(f"shutdown:{reason}")
@@ -908,6 +958,7 @@ class OMSLifecycleController(OMSComponent):
                 }
 
     def freeze_system(self, reason: str, cancel_active_orders: bool = False):
+        audit_error = None
         with self.lock:
             if self.state == LifecycleState.HALTED:
                 self._close_outbound_gate_locked(reason)
@@ -916,20 +967,43 @@ class OMSLifecycleController(OMSComponent):
             previous_state = self.state
             self._lifecycle_generation += 1
             self.state = LifecycleState.FROZEN
-            self._sync_capability_mode(reason)
+            try:
+                self._sync_capability_mode(reason)
+            except Exception as exc:
+                audit_error = exc
             self.last_freeze_reason = reason
 
+        if audit_error is not None:
+            self._fail_closed_on_journal_error(
+                audit_error,
+                "freeze_capability_transition",
+            )
+            return
         if previous_state != LifecycleState.FROZEN:
             logger.error(f"OMS FROZEN: {reason}")
-            self._audit(
-                "lifecycle",
-                state=self.state.value,
-                reason=reason,
-                previous_state=previous_state.value,
-            )
+            try:
+                self._audit(
+                    "lifecycle",
+                    state=self.state.value,
+                    reason=reason,
+                    previous_state=previous_state.value,
+                )
+            except Exception as exc:
+                self._fail_closed_on_journal_error(
+                    exc,
+                    "freeze_system",
+                )
+                return
         else:
             logger.error(f"OMS still FROZEN: {reason}")
-            self._audit("freeze_reasserted", reason=reason)
+            try:
+                self._audit("freeze_reasserted", reason=reason)
+            except Exception as exc:
+                self._fail_closed_on_journal_error(
+                    exc,
+                    "freeze_system_reasserted",
+                )
+                return
 
         self._wait_for_outbound_risk_sends(f"system_freeze:{reason}")
         if not cancel_active_orders:
@@ -951,27 +1025,40 @@ class OMSLifecycleController(OMSComponent):
 
     def halt_system(self, reason: str):
         emit_halt_event = False
+        audit_error = None
         with self.lock:
             self._lifecycle_generation += 1
             if self.state == LifecycleState.HALTED:
                 self.last_halt_reason = reason
                 self.manual_rearm_required = True
-                self._sync_capability_mode(reason)
-                self._audit("halt_reasserted", reason=reason)
+                try:
+                    self._sync_capability_mode(reason)
+                    self._audit("halt_reasserted", reason=reason)
+                except Exception as exc:
+                    audit_error = exc
             else:
                 self.state = LifecycleState.HALTED
-                self._sync_capability_mode(reason)
                 self.manual_rearm_required = True
                 self.last_halt_reason = reason
                 self.last_freeze_reason = ""
                 logger.critical(f"OMS HALTED: {reason}")
-                self._audit(
-                    "lifecycle",
-                    state=self.state.value,
-                    reason=reason,
-                    manual_rearm_required=True,
-                )
+                try:
+                    self._sync_capability_mode(reason)
+                    self._audit(
+                        "lifecycle",
+                        state=self.state.value,
+                        reason=reason,
+                        manual_rearm_required=True,
+                    )
+                except Exception as exc:
+                    audit_error = exc
                 emit_halt_event = True
+        if audit_error is not None:
+            self._fail_closed_on_journal_error(
+                audit_error,
+                "halt_system",
+            )
+            return
         if emit_halt_event:
             try:
                 self.event_engine.put(
@@ -993,39 +1080,70 @@ class OMSLifecycleController(OMSComponent):
             pass
 
     def rearm_system(self, reason: str = "manual"):
+        audit_error = None
+        ignored = False
         with self.lock:
             if self.state != LifecycleState.HALTED or not self.manual_rearm_required:
-                self._audit("rearm_ignored", reason=reason)
-                return False
-
-            logger.warning(f"OMS manual rearm requested: {reason}")
-            self._audit(
-                "rearm_requested",
-                reason=reason,
-                halted_reason=self.last_halt_reason,
+                ignored = True
+                try:
+                    self._audit("rearm_ignored", reason=reason)
+                except Exception as exc:
+                    audit_error = exc
+            else:
+                logger.warning(f"OMS manual rearm requested: {reason}")
+                try:
+                    self._audit(
+                        "rearm_requested",
+                        reason=reason,
+                        halted_reason=self.last_halt_reason,
+                    )
+                except Exception as exc:
+                    audit_error = exc
+                if audit_error is None:
+                    self.state = LifecycleState.RECONCILING
+                    self._lifecycle_generation += 1
+                    try:
+                        self._sync_capability_mode(
+                            f"manual_rearm:{reason}"
+                        )
+                        self._audit(
+                            "lifecycle",
+                            state=self.state.value,
+                            reason=f"manual_rearm:{reason}",
+                        )
+                    except Exception as exc:
+                        audit_error = exc
+        if audit_error is not None:
+            self._fail_closed_on_journal_error(
+                audit_error,
+                "rearm_ignored" if ignored else "rearm_transition",
             )
-            self.state = LifecycleState.RECONCILING
-            self._lifecycle_generation += 1
-            self._sync_capability_mode(f"manual_rearm:{reason}")
-            self._audit(
-                "lifecycle",
-                state=self.state.value,
-                reason=f"manual_rearm:{reason}",
-            )
+            return False
+        if ignored:
+            return False
         self._perform_full_reset()
         with self.lock:
             if self.state == LifecycleState.LIVE:
                 self.manual_rearm_required = False
                 self.last_halt_reason = ""
-                self._audit(
-                    "rearm_completed",
-                    state=self.state.value,
-                    reason=reason,
-                )
-                return True
+                try:
+                    self._audit(
+                        "rearm_completed",
+                        state=self.state.value,
+                        reason=reason,
+                    )
+                except Exception as exc:
+                    audit_error = exc
+                if audit_error is None:
+                    return True
 
             self.manual_rearm_required = True
-            return False
+        if audit_error is not None:
+            self._fail_closed_on_journal_error(
+                audit_error,
+                "rearm_completed",
+            )
+        return False
 
     def stop(self, clean_shutdown: bool = False, reason: str = ""):
         with self.lock:

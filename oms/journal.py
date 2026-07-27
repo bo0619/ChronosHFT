@@ -18,6 +18,10 @@ class JournalWriteError(JournalError):
     """Raised when a journal record cannot be made durable."""
 
 
+def _reject_nonstandard_json_constant(value: str):
+    raise ValueError(f"non-standard numeric constant {value}")
+
+
 def _normalize(value):
     if isinstance(value, Enum):
         return value.value
@@ -60,6 +64,7 @@ class OMSJournal:
     def _canonical_json(value: dict) -> str:
         return json.dumps(
             value,
+            allow_nan=False,
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
@@ -166,8 +171,11 @@ class OMSJournal:
                     if not stripped:
                         continue
                     try:
-                        record = json.loads(stripped)
-                    except json.JSONDecodeError as exc:
+                        record = json.loads(
+                            stripped,
+                            parse_constant=_reject_nonstandard_json_constant,
+                        )
+                    except (json.JSONDecodeError, ValueError) as exc:
                         raise JournalCorruptionError(
                             f"Invalid JSON in OMS journal at line {line_number}: {exc}"
                         ) from exc

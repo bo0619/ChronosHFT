@@ -28,6 +28,7 @@ from event.type import (
     OMSCapabilityMode,
 )
 from gateway.binance.gateway import BinanceGateway
+from gateway.binance.rate_limit_budget import BinanceRateLimitBudget
 from gateway.binance.truth_provider import BinanceTruthSnapshotProvider
 from infrastructure.admin_control import (
     AdminControlServer,
@@ -150,6 +151,42 @@ def run_live_risk_checks(risk_controller, independent_supervisor=None):
     funding_healthy = bool(risk_controller.check_funding_guard())
     risk_healthy = bool(risk_controller.check_market_data_freshness())
     return supervisor_healthy and funding_healthy and risk_healthy
+
+
+def wait_for_initial_market_data_readiness(
+    risk_controller,
+    independent_supervisor=None,
+    *,
+    timeout_sec: float = 5.0,
+    poll_interval_sec: float = 0.1,
+) -> bool:
+    """Keep safety leases alive while waiting for fresh mark and book truth."""
+    readiness = getattr(
+        risk_controller,
+        "market_data_readiness_failures",
+        None,
+    )
+    if not callable(readiness):
+        return False
+    deadline = time.perf_counter() + max(0.0, float(timeout_sec or 0.0))
+    while True:
+        run_live_risk_checks(risk_controller, independent_supervisor)
+        failures = readiness()
+        if not failures:
+            return True
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0.0:
+            logger.error(
+                "Initial market-data readiness timed out: "
+                f"{failures}"
+            )
+            return False
+        time.sleep(
+            min(
+                max(0.01, float(poll_interval_sec or 0.0)),
+                remaining,
+            )
+        )
 
 
 def connect_gateway_with_risk_heartbeat(
@@ -398,7 +435,17 @@ def verify_account_flat(
     required = max(2, int(required_flat_snapshots or 2))
     settle = max(0.01, float(settle_interval_sec or 0.25))
     for snapshot_index in range(required):
-        positions = query()
+        positions = (
+            query(emergency=True)
+            if bool(
+                getattr(
+                    snapshot_provider,
+                    "supports_emergency_query_priority",
+                    False,
+                )
+            )
+            else query()
+        )
         if not isinstance(positions, (list, tuple)):
             return False
         for position in positions:
@@ -487,17 +534,39 @@ def build_gateway_bundle(engine, config, market_data_config):
         )
         return gateway, PaperTruthSnapshotProvider(gateway)
 
+    rate_limit_config = dict(
+        config.get("system", {}).get("binance_rest_rate_limit", {}) or {}
+    )
+    if rate_limit_config.get("enabled", True) is not True:
+        raise RuntimeError(
+            "Live Binance REST rate-limit coordination cannot be disabled"
+        )
+    rate_limit_budget = BinanceRateLimitBudget.from_config(rate_limit_config)
+    full_open_orders_audit_interval_sec = float(
+        rate_limit_config.get(
+            "full_open_orders_audit_interval_sec",
+            60.0,
+        )
+        or 60.0
+    )
+
     gateway = BinanceGateway(
         engine,
         config["api_key"],
         config["api_secret"],
         testnet=config["testnet"],
         market_data_config=market_data_config,
+        rate_limit_budget=rate_limit_budget,
     )
     truth_provider = BinanceTruthSnapshotProvider(
         config["api_key"],
         config["api_secret"],
         testnet=config["testnet"],
+        rate_limit_budget=rate_limit_budget,
+        symbols=config.get("symbols", ()),
+        full_open_orders_audit_interval_sec=(
+            full_open_orders_audit_interval_sec
+        ),
     )
     return gateway, truth_provider
 
@@ -1368,6 +1437,14 @@ def _run_main(argv=None, runtime=None):
         raise RuntimeError(
             "Exchange clock health gate failed immediately before OMS bootstrap"
         )
+    if not wait_for_initial_market_data_readiness(
+        risk_controller,
+        risk_supervisor,
+    ):
+        oms_system.halt_system("initial_market_data_unready")
+        raise RuntimeError(
+            "Initial market-data readiness gate failed before OMS bootstrap"
+        )
     risk_controller.resume_kill_switch_supervision()
     bootstrap_ready = bootstrap_or_rearm(
         oms_system,
@@ -1493,6 +1570,7 @@ def shutdown_runtime(runtime, reason: str = "main_exit") -> bool:
     truth_monitor = runtime.get("truth_monitor")
     venue_supervisor = runtime.get("venue_supervisor")
     recorder = runtime.get("recorder")
+    admin_control = runtime.get("admin_control")
     web_dashboard = runtime.get("web_dashboard")
     clock_service = runtime.get("time_service")
     event_engine_config = runtime.get("event_engine_config", {}) or {}
@@ -1570,6 +1648,12 @@ def shutdown_runtime(runtime, reason: str = "main_exit") -> bool:
     )
     recorder_closed = bool(
         shutdown_phase.get("recorder_closed", recorder is None)
+    )
+    admin_control_closed = bool(
+        shutdown_phase.get(
+            "admin_control_closed",
+            admin_control is None,
+        )
     )
     oms_stopped = bool(
         shutdown_phase.get("oms_stopped", oms_system is None)
@@ -2090,6 +2174,24 @@ def shutdown_runtime(runtime, reason: str = "main_exit") -> bool:
             )
             return False
 
+        if not admin_control_closed:
+            _ok, close_result = run_step(
+                "admin_control_close",
+                admin_control.close,
+            )
+            admin_control_closed = step_acknowledged(
+                _ok,
+                close_result,
+            )
+            shutdown_phase["admin_control_closed"] = (
+                admin_control_closed
+            )
+        if not admin_control_closed:
+            publish_shutdown_blocked(
+                "admin control session withdrawal failed"
+            )
+            return False
+
         if not venue_supervisor_stopped:
             _ok, stop_result = run_step(
                 "venue_supervisor_stop",
@@ -2259,6 +2361,7 @@ def shutdown_runtime(runtime, reason: str = "main_exit") -> bool:
             and event_drained
             and truth_provider_closed
             and recorder_closed
+            and admin_control_closed
             and oms_stopped
             and oms_clean
             and engine_stopped
@@ -2380,6 +2483,7 @@ def main(argv=None):
         shutdown_reason,
     )
     external_alerts_stopped = stop_external_alert_service(runtime)
+    logger.flush(timeout_sec=2.0)
     if pending_exception is not None:
         raise pending_exception.with_traceback(pending_traceback)
     if runtime and (not shutdown_verified or not external_alerts_stopped):

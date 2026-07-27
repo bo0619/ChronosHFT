@@ -1,4 +1,5 @@
 import json
+import math
 import socket
 import threading
 import time
@@ -53,8 +54,17 @@ class HFTAdapter(HTTPAdapter):
 
 class BinanceGateway(BaseGateway):
     supports_outbound_send_guard = True
+    supports_emergency_query_priority = True
 
-    def __init__(self, event_engine, api_key, api_secret, testnet=True, market_data_config=None):
+    def __init__(
+        self,
+        event_engine,
+        api_key,
+        api_secret,
+        testnet=True,
+        market_data_config=None,
+        rate_limit_budget=None,
+    ):
         super().__init__(event_engine, "BINANCE")
         self.api_key = api_key
         self.api_secret = api_secret
@@ -66,7 +76,13 @@ class BinanceGateway(BaseGateway):
         self.session.mount("https://", adapter)
         self.session.headers.update({"Content-Type": "application/json"})
 
-        self.rest = BinanceRestApi(api_key, api_secret, self.session, testnet)
+        self.rest = BinanceRestApi(
+            api_key,
+            api_secret,
+            self.session,
+            testnet,
+            rate_limit_budget=rate_limit_budget,
+        )
         self.require_healthy_clock = True
         self.rest.order_clock_guard = self._clock_health_guard
         # A websocket is bound to the book lifecycle generation at connect
@@ -105,6 +121,21 @@ class BinanceGateway(BaseGateway):
         )
         self.emit_full_orderbook_events = bool(
             market_data_config.get("emit_full_orderbook_events", False)
+        )
+        try:
+            ingress_age_ms = float(
+                market_data_config.get(
+                    "max_market_event_ingress_age_ms",
+                    1000.0,
+                )
+                or 1000.0
+            )
+        except (TypeError, ValueError, OverflowError):
+            ingress_age_ms = 1000.0
+        self.max_market_event_ingress_age_ms = (
+            ingress_age_ms
+            if math.isfinite(ingress_age_ms) and ingress_age_ms >= 100.0
+            else 1000.0
         )
         self.active = False
         self.listen_key = ""
@@ -384,12 +415,12 @@ class BinanceGateway(BaseGateway):
         resp = self.rest.get_account()
         return resp.json() if resp and resp.status_code == 200 else None
 
-    def get_all_positions(self):
-        resp = self.rest.get_positions()
+    def get_all_positions(self, *, emergency: bool = False):
+        resp = self.rest.get_positions(emergency=emergency)
         return resp.json() if resp and resp.status_code == 200 else None
 
-    def get_open_orders(self):
-        resp = self.rest.get_open_orders()
+    def get_open_orders(self, *, emergency: bool = False):
+        resp = self.rest.get_open_orders(emergency=emergency)
         return resp.json() if resp and resp.status_code == 200 else None
 
     def get_order(self, symbol: str, order_id: str):
@@ -885,12 +916,35 @@ class BinanceGateway(BaseGateway):
             )
 
         if "@aggTrade" in stream:
+            if self._reject_stale_market_event(
+                stream=stream,
+                symbol=symbol,
+                event_time_ms=event_time_ms,
+                corrected_received_timestamp=corrected_received_timestamp,
+                expected_generation=expected_generation,
+            ):
+                return
             exchange_timestamp = float(data.get("T", event_time_ms) or 0.0) / 1000.0
+            trade_id = int(data["a"])
+            price = float(data["p"])
+            quantity = float(data["q"])
+            if (
+                trade_id < 0
+                or not math.isfinite(price)
+                or price <= 0.0
+                or not math.isfinite(quantity)
+                or quantity <= 0.0
+                or not math.isfinite(exchange_timestamp)
+                or exchange_timestamp <= 0.0
+            ):
+                raise ValueError(
+                    f"invalid aggTrade payload for {symbol}"
+                )
             trade = AggTradeData(
                 symbol,
-                data["a"],
-                float(data["p"]),
-                float(data["q"]),
+                trade_id,
+                price,
+                quantity,
                 data["m"],
                 datetime.fromtimestamp(exchange_timestamp or received_timestamp),
                 exchange_timestamp=exchange_timestamp,
@@ -907,11 +961,28 @@ class BinanceGateway(BaseGateway):
         elif "@markPrice" in stream:
             exchange_timestamp = float(data.get("E", event_time_ms) or 0.0) / 1000.0
             next_funding_timestamp = float(data["T"]) / 1000.0
+            mark_price = float(data["p"])
+            index_price = float(data["i"])
+            funding_rate = float(data["r"])
+            if (
+                not math.isfinite(mark_price)
+                or mark_price <= 0.0
+                or not math.isfinite(index_price)
+                or index_price <= 0.0
+                or not math.isfinite(funding_rate)
+                or not math.isfinite(exchange_timestamp)
+                or exchange_timestamp <= 0.0
+                or not math.isfinite(next_funding_timestamp)
+                or next_funding_timestamp <= 0.0
+            ):
+                raise ValueError(
+                    f"invalid markPrice payload for {symbol}"
+                )
             mark = MarkPriceData(
                 symbol,
-                float(data["p"]),
-                float(data["i"]),
-                float(data["r"]),
+                mark_price,
+                index_price,
+                funding_rate,
                 datetime.fromtimestamp(next_funding_timestamp),
                 datetime.fromtimestamp(exchange_timestamp or received_timestamp),
                 exchange_timestamp=exchange_timestamp,
@@ -927,6 +998,14 @@ class BinanceGateway(BaseGateway):
                 expected_generation=expected_generation,
             )
         elif "@depth" in stream:
+            if self._reject_stale_market_event(
+                stream=stream,
+                symbol=symbol,
+                event_time_ms=event_time_ms,
+                corrected_received_timestamp=corrected_received_timestamp,
+                expected_generation=expected_generation,
+            ):
+                return
             data["_local_received_timestamp"] = received_timestamp
             data["_local_received_monotonic"] = received_monotonic
             data["_local_clock_offset_ms"] = clock_offset_ms
@@ -938,6 +1017,35 @@ class BinanceGateway(BaseGateway):
                 data,
                 expected_generation=expected_generation,
             )
+
+    def _reject_stale_market_event(
+        self,
+        *,
+        stream: str,
+        symbol: str,
+        event_time_ms: int,
+        corrected_received_timestamp: float,
+        expected_generation=None,
+    ) -> bool:
+        if event_time_ms <= 0:
+            return False
+        age_ms = corrected_received_timestamp * 1000.0 - event_time_ms
+        max_ingress_age_ms = float(
+            getattr(self, "max_market_event_ingress_age_ms", 1000.0)
+        )
+        if abs(age_ms) <= max_ingress_age_ms:
+            return False
+        stream_kind = "PUBLIC_DEPTH" if "@depth" in stream else "PUBLIC_TRADE"
+        self._emit_ws_fault(
+            "MARKET_DATA_STALE",
+            (
+                f"{stream_kind}:symbol={symbol}:"
+                f"age={age_ms:.1f}ms>"
+                f"{max_ingress_age_ms:.1f}ms"
+            ),
+            expected_generation=expected_generation,
+        )
+        return True
 
     def _dispatch_transport_callback(
         self,

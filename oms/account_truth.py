@@ -30,6 +30,23 @@ from .order import Order
 class OMSAccountTruth(OMSComponent):
     """Own recovery of exchange orders, fills and account cash flows."""
 
+    @staticmethod
+    def _finite_truth_float(
+        value,
+        field: str,
+        *,
+        minimum: float | None = None,
+    ) -> float:
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field}:not_numeric") from exc
+        if not math.isfinite(normalized):
+            raise ValueError(f"{field}:not_finite")
+        if minimum is not None and normalized < minimum:
+            raise ValueError(f"{field}:below_minimum")
+        return normalized
+
     def _execution_id(self, order: Order, update: ExchangeOrderUpdate) -> str:
         venue = str(getattr(self.gateway, "gateway_name", "UNKNOWN") or "UNKNOWN").upper()
         if update.trade_id >= 0:
@@ -254,21 +271,42 @@ class OMSAccountTruth(OMSComponent):
             )
 
     def _create_recovered_order(self, remote: dict) -> Order:
+        if not isinstance(remote, dict):
+            raise ValueError("remote_order:not_mapping")
         symbol = str(remote.get("symbol", "") or "").upper()
         exchange_oid = str(remote.get("orderId", "") or "")
         client_oid = str(remote.get("clientOrderId", "") or "")
+        if not symbol:
+            raise ValueError("remote_order:missing_symbol")
+        if not client_oid and not exchange_oid:
+            raise ValueError("remote_order:missing_identifier")
         if not client_oid:
             client_oid = f"EXTERNAL_{symbol}_{exchange_oid}"
         side = Side(str(remote.get("side", "BUY") or "BUY").upper())
-        volume = float(remote.get("origQty", remote.get("executedQty", 0.0)) or 0.0)
+        volume = self._finite_truth_float(
+            remote.get("origQty", remote.get("executedQty", 0.0))
+            or 0.0,
+            "remote_order.origQty",
+            minimum=0.0,
+        )
         if volume <= 0:
-            volume = float(remote.get("qty", 0.0) or 0.0)
-        price = float(
+            volume = self._finite_truth_float(
+                remote.get("qty", 0.0) or 0.0,
+                "remote_order.qty",
+                minimum=0.0,
+            )
+        if volume <= 0.0:
+            raise ValueError("remote_order:non_positive_volume")
+        price = self._finite_truth_float(
             remote.get("price", 0.0)
             or remote.get("avgPrice", 0.0)
             or remote.get("trade_price", 0.0)
-            or 1.0
+            or 0.0,
+            "remote_order.price",
+            minimum=0.0,
         )
+        if price <= 0.0:
+            raise ValueError("remote_order:non_positive_price")
         intent = OrderIntent(
             strategy_id="exchange_recovery",
             symbol=symbol,
@@ -303,6 +341,65 @@ class OMSAccountTruth(OMSComponent):
     def _apply_exchange_order_snapshot(self, remote: dict, source: str = "order_query"):
         if not isinstance(remote, dict) or remote.get("_query_status"):
             return False
+        status = str(remote.get("status", "") or "").upper()
+        if status == "EXPIRED_IN_MATCH":
+            status = "EXPIRED"
+        if status not in {
+            "NEW",
+            "PARTIALLY_FILLED",
+            "FILLED",
+            "CANCELED",
+            "EXPIRED",
+            "REJECTED",
+        }:
+            self._schedule_rpi_calibration_runtime_enforcement(
+                terminal_truth_changed=True,
+            )
+            self._audit(
+                "unhandled_order_snapshot_status",
+                status=status,
+                source=source,
+            )
+            return False
+        try:
+            executed_qty = self._finite_truth_float(
+                remote.get("executedQty", 0.0) or 0.0,
+                "remote_order.executedQty",
+                minimum=0.0,
+            )
+            avg_price = self._finite_truth_float(
+                remote.get("avgPrice", 0.0)
+                or remote.get("price", 0.0)
+                or 0.0,
+                "remote_order.avgPrice",
+                minimum=0.0,
+            )
+            update_time_ms = self._finite_truth_float(
+                remote.get("updateTime")
+                or remote.get("time")
+                or time_service.now(),
+                "remote_order.updateTime",
+                minimum=0.0,
+            )
+        except ValueError as exc:
+            self._audit(
+                "invalid_order_snapshot",
+                source=source,
+                detail=str(exc),
+                client_oid=str(remote.get("clientOrderId", "") or ""),
+                exchange_oid=str(remote.get("orderId", "") or ""),
+            )
+            return False
+        if executed_qty > 0.0 and avg_price <= 0.0:
+            self._audit(
+                "invalid_order_snapshot",
+                source=source,
+                detail="remote_order:missing_fill_price",
+                client_oid=str(remote.get("clientOrderId", "") or ""),
+                exchange_oid=str(remote.get("orderId", "") or ""),
+            )
+            return False
+
         client_oid = str(remote.get("clientOrderId", "") or "")
         exchange_oid = str(remote.get("orderId", "") or "")
         with self.lock:
@@ -312,19 +409,6 @@ class OMSAccountTruth(OMSComponent):
             if not order:
                 order = self._create_recovered_order(remote)
 
-        status = str(remote.get("status", "") or "").upper()
-        if status == "EXPIRED_IN_MATCH":
-            status = "EXPIRED"
-        if status not in {"NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED", "REJECTED"}:
-            self._schedule_rpi_calibration_runtime_enforcement(
-                terminal_truth_changed=True,
-            )
-            self._audit("unhandled_order_snapshot_status", status=status, source=source)
-            return False
-
-        executed_qty = float(remote.get("executedQty", 0.0) or 0.0)
-        avg_price = float(remote.get("avgPrice", 0.0) or remote.get("price", 0.0) or 0.0)
-        update_time_ms = remote.get("updateTime") or remote.get("time") or time_service.now()
         remote_order_type = str(remote.get("type", "") or "").upper()
         remote_time_in_force = str(remote.get("timeInForce", "") or "").upper()
         if executed_qty > order.filled_volume + 1e-9:
@@ -357,7 +441,7 @@ class OMSAccountTruth(OMSComponent):
             filled_qty=max(0.0, executed_qty - order.filled_volume),
             filled_price=avg_price,
             cum_filled_qty=executed_qty,
-            update_time=float(update_time_ms) / 1000.0,
+            update_time=update_time_ms / 1000.0,
             seq=0,
             order_type=remote_order_type,
             time_in_force=remote_time_in_force,
@@ -405,6 +489,35 @@ class OMSAccountTruth(OMSComponent):
             return False
         if trade_id <= int(self.trade_cursors.get(symbol, -1)):
             return True
+        try:
+            qty = self._finite_truth_float(
+                trade.get("qty", 0.0) or 0.0,
+                "trade.qty",
+                minimum=0.0,
+            )
+            price = self._finite_truth_float(
+                trade.get("price", 0.0) or 0.0,
+                "trade.price",
+                minimum=0.0,
+            )
+            trade_time_ms = self._finite_truth_float(
+                trade.get("time", time_service.now())
+                or time_service.now(),
+                "trade.time",
+                minimum=0.0,
+            )
+            commission = self._finite_truth_float(
+                trade.get("commission", 0.0) or 0.0,
+                "trade.commission",
+            )
+            realized_pnl = self._finite_truth_float(
+                trade.get("realizedPnl", 0.0) or 0.0,
+                "trade.realizedPnl",
+            )
+        except ValueError:
+            return False
+        if qty <= 0.0 or price <= 0.0:
+            return False
 
         exchange_oid = str(trade.get("orderId", "") or "")
         with self.lock:
@@ -428,7 +541,7 @@ class OMSAccountTruth(OMSComponent):
                 self._advance_trade_cursor(
                     symbol,
                     trade_id,
-                    float(trade.get("time", 0) or 0) / 1000.0,
+                    trade_time_ms / 1000.0,
                     source="rest_confirmed_duplicate",
                 )
                 self._audit(
@@ -442,13 +555,8 @@ class OMSAccountTruth(OMSComponent):
         original_terminal_status = order.status if order.is_terminal() else None
         original_terminal_time = order.last_exchange_update_time
 
-        qty = float(trade.get("qty", 0.0) or 0.0)
-        price = float(trade.get("price", 0.0) or 0.0)
-        if qty <= 0 or price <= 0:
-            return False
         cumulative = min(order.intent.volume, order.filled_volume + qty)
         status = "FILLED" if cumulative >= order.intent.volume - 1e-8 else "PARTIALLY_FILLED"
-        trade_time_ms = int(trade.get("time", time_service.now()) or time_service.now())
         update = ExchangeOrderUpdate(
             client_oid=order.client_oid,
             exchange_oid=order.exchange_oid or exchange_oid,
@@ -459,9 +567,9 @@ class OMSAccountTruth(OMSComponent):
             cum_filled_qty=cumulative,
             update_time=trade_time_ms / 1000.0,
             seq=0,
-            commission=float(trade.get("commission", 0.0) or 0.0),
+            commission=commission,
             commission_asset=str(trade.get("commissionAsset", "") or ""),
-            realized_pnl=float(trade.get("realizedPnl", 0.0) or 0.0),
+            realized_pnl=realized_pnl,
             is_maker=bool(trade.get("maker")) if "maker" in trade else None,
             trade_id=trade_id,
         )
@@ -700,11 +808,22 @@ class OMSAccountTruth(OMSComponent):
             )
             if trades is None:
                 return False
-            valid_ids = [
-                int(trade.get("id", -1))
-                for trade in trades
-                if isinstance(trade, dict) and int(trade.get("id", -1)) >= 0
-            ]
+            if not isinstance(trades, (list, tuple)):
+                return False
+            valid_ids = []
+            for trade in trades:
+                if not isinstance(trade, dict):
+                    return False
+                try:
+                    trade_id = int(trade.get("id", -1))
+                except (TypeError, ValueError):
+                    return False
+                trade_symbol = str(
+                    trade.get("symbol", symbol) or symbol
+                ).upper()
+                if trade_id < 0 or trade_symbol != str(symbol).upper():
+                    return False
+                valid_ids.append(trade_id)
             if valid_ids:
                 self._advance_trade_cursor(
                     symbol,

@@ -6,9 +6,10 @@ from urllib.parse import urlencode
 
 import requests
 
+from event.type import CancelRequest, OrderRequest
 from infrastructure.logger import logger
 from infrastructure.time_service import time_service
-from event.type import CancelRequest, OrderRequest
+
 from .constants import (
     EP_ACCOUNT,
     EP_ALL_OPEN_ORDERS,
@@ -30,6 +31,7 @@ from .constants import (
     REST_URL_MAIN,
     REST_URL_TEST,
 )
+from .rate_limit_budget import BinanceRateLimitBudget
 from .rest_metrics import BinanceRestMetrics
 
 
@@ -43,11 +45,19 @@ class _LocalGuardResponse:
 
 
 class BinanceRestApi:
-    def __init__(self, api_key, api_secret, session, testnet=False):
+    def __init__(
+        self,
+        api_key,
+        api_secret,
+        session,
+        testnet=False,
+        rate_limit_budget: BinanceRateLimitBudget | None = None,
+    ):
         self.api_key = api_key
         self.api_secret = api_secret
         self.session = session
         self.base_url = REST_URL_TEST if testnet else REST_URL_MAIN
+        self.rate_limit_budget = rate_limit_budget
 
         self.request_lock = threading.Lock()
         self.last_request_ts = 0.0
@@ -81,6 +91,7 @@ class BinanceRestApi:
         self.order_clock_guard = None
         self.clock_resync_callback = None
         self.telemetry = BinanceRestMetrics()
+        self._last_budget_rejection_log_at = 0.0
 
     def _sign(self, params: dict):
         query = urlencode(params)
@@ -88,24 +99,186 @@ class BinanceRestApi:
         params["signature"] = signature
         return params
 
-    def _throttle(self, endpoint: str, signed: bool):
+    def _throttle(
+        self,
+        endpoint: str,
+        signed: bool,
+        params=None,
+        *,
+        priority: str = "background",
+    ):
         min_interval = self.min_signed_interval_sec if signed else self.min_public_interval_sec
         endpoint_interval = max(min_interval, self.endpoint_intervals.get(endpoint, min_interval))
+        emergency = str(priority or "").lower() in {
+            "emergency",
+            "safety",
+            "reduce_only",
+        }
+        throttle_key = endpoint
+        if endpoint == EP_OPEN_ORDERS and (params or {}).get("symbol"):
+            throttle_key = (
+                f"{endpoint}:{str(params['symbol']).strip().upper()}"
+            )
 
         with self.request_lock:
             now = time.perf_counter()
             global_wait = max(0.0, min_interval - (now - self.last_request_ts))
             endpoint_wait = max(
                 0.0,
-                endpoint_interval - (now - self.endpoint_last_request_ts.get(endpoint, 0.0)),
+                endpoint_interval
+                - (
+                    now
+                    - self.endpoint_last_request_ts.get(
+                        throttle_key,
+                        0.0,
+                    )
+                ),
             )
-            cooldown_wait = max(0.0, self.endpoint_cooldown_until.get(endpoint, 0.0) - now)
+            # Local transport backoff from normal traffic must not delay
+            # cancellation or reduce-only recovery. Exchange Retry-After
+            # remains authoritative in the cross-process budget coordinator.
+            cooldown_wait = (
+                0.0
+                if emergency
+                else max(
+                    0.0,
+                    self.endpoint_cooldown_until.get(endpoint, 0.0) - now,
+                )
+            )
             wait_time = max(global_wait, endpoint_wait, cooldown_wait)
             if wait_time > 0:
                 time.sleep(wait_time)
             stamp = time.perf_counter()
             self.last_request_ts = stamp
-            self.endpoint_last_request_ts[endpoint] = stamp
+            self.endpoint_last_request_ts[throttle_key] = stamp
+
+    @staticmethod
+    def _request_weight(method: str, endpoint: str, params: dict) -> int:
+        method = str(method or "").upper()
+        params = params or {}
+        if endpoint == EP_DEPTH_SNAPSHOT:
+            limit = int(params.get("limit", 100) or 100)
+            if limit <= 50:
+                return 2
+            if limit <= 100:
+                return 5
+            if limit <= 500:
+                return 10
+            return 20
+        if endpoint == EP_RPI_DEPTH:
+            return 20
+        if endpoint == EP_ACCOUNT:
+            return 5
+        if endpoint == EP_POSITION_RISK:
+            return 5
+        if endpoint == EP_OPEN_ORDERS:
+            return 1 if params.get("symbol") else 40
+        if endpoint == EP_INCOME:
+            return 30
+        if endpoint == EP_COMMISSION_RATE:
+            return 20
+        if endpoint == EP_COUNTDOWN_CANCEL_ALL:
+            return 10
+        if endpoint in {EP_ALL_ORDERS, EP_USER_TRADES}:
+            return 5
+        if endpoint == EP_ORDER and method == "POST":
+            # Binance currently reports zero IP request weight for new-order
+            # placement, but reserving one unit keeps this fail-safe when the
+            # exchange changes accounting before the client is upgraded.
+            return 1
+        return 1
+
+    @staticmethod
+    def _request_priority(method: str, endpoint: str, params: dict) -> str:
+        method = str(method or "").upper()
+        params = params or {}
+        if (
+            endpoint == EP_ORDER
+            and method == "POST"
+            and str(params.get("reduceOnly", "")).lower() == "true"
+        ):
+            return "emergency"
+        if endpoint in {EP_ALL_OPEN_ORDERS, EP_COUNTDOWN_CANCEL_ALL}:
+            return "emergency"
+        if endpoint == EP_ORDER and method == "DELETE":
+            return "emergency"
+        if endpoint == EP_LISTEN_KEY:
+            return "safety"
+        if endpoint == EP_ORDER and method == "POST":
+            return "trading"
+        if (
+            (endpoint == EP_ORDER and method == "GET")
+            or endpoint in {EP_ALL_ORDERS, EP_USER_TRADES}
+        ):
+            # These reads resolve ambiguous submit/cancel outcomes and
+            # backfill executions after a user-stream gap. Treating them as
+            # background work can strand the OMS exactly when the protected
+            # trading reserve is needed to recover order truth.
+            return "trading"
+        if endpoint in {
+            EP_LEVERAGE,
+            EP_MARGIN_TYPE,
+            EP_POSITION_MODE,
+        } and method == "POST":
+            return "trading"
+        return "background"
+
+    def _acquire_rate_limit_budget(
+        self,
+        method: str,
+        endpoint: str,
+        params: dict,
+        priority: str | None,
+    ):
+        budget = self.rate_limit_budget
+        if budget is None:
+            return None
+        resolved_priority = priority or self._request_priority(
+            method,
+            endpoint,
+            params,
+        )
+        decision = budget.acquire(
+            self._request_weight(method, endpoint, params),
+            priority=resolved_priority,
+            endpoint=endpoint,
+        )
+        if decision.allowed:
+            if decision.emergency_bypass:
+                logger.critical(
+                    "Binance REST emergency request bypassed unavailable "
+                    f"local rate coordinator: {decision.reason}"
+                )
+            return None
+        now = time.perf_counter()
+        if now - self._last_budget_rejection_log_at >= 5.0:
+            self._last_budget_rejection_log_at = now
+            logger.error(
+                "Binance REST request blocked by host weight budget "
+                f"endpoint={endpoint} priority={resolved_priority} "
+                f"reason={decision.reason} "
+                f"retry_after={decision.retry_after_sec:.2f}s"
+            )
+        return _LocalGuardResponse(
+            "RATE_LIMIT_BUDGET_EXHAUSTED",
+            f"{decision.reason};retry_after_sec="
+            f"{decision.retry_after_sec:.3f}",
+        )
+
+    def _record_rate_limit_response(self, response) -> None:
+        budget = self.rate_limit_budget
+        if budget is None:
+            return
+        try:
+            budget.record_response(
+                getattr(response, "headers", None),
+                status_code=getattr(response, "status_code", 0),
+            )
+        except Exception as exc:
+            logger.error(
+                "Binance REST rate-limit coordinator could not record "
+                f"exchange response: {type(exc).__name__}:{exc}"
+            )
 
     def _mark_failure_cooldown(self, endpoint: str, attempt: int):
         endpoint_interval = self.endpoint_intervals.get(endpoint, self.min_signed_interval_sec)
@@ -145,7 +318,17 @@ class BinanceRestApi:
         return bool(error_code and error_code in accepted_error_codes)
 
     def get_metrics_snapshot(self) -> dict:
-        return self.telemetry.snapshot()
+        snapshot = self.telemetry.snapshot()
+        budget = self.rate_limit_budget
+        if budget is not None:
+            try:
+                snapshot["host_rate_limit_budget"] = budget.snapshot()
+            except Exception as exc:
+                snapshot["host_rate_limit_budget"] = {
+                    "enabled": True,
+                    "error": f"{type(exc).__name__}:{exc}",
+                }
+        return snapshot
 
     def _record_response_metrics(
         self,
@@ -240,6 +423,7 @@ class BinanceRestApi:
         suppress_error_codes=None,
         pre_send_guard=None,
         max_attempts=None,
+        rate_limit_priority=None,
     ):
         url = self.base_url + endpoint
         base_params = dict(params or {})
@@ -252,7 +436,16 @@ class BinanceRestApi:
             else max(1, int(max_attempts))
         )
         for attempt in range(1, attempt_limit + 1):
-            self._throttle(endpoint, signed)
+            resolved_priority = (
+                rate_limit_priority
+                or self._request_priority(method, endpoint, base_params)
+            )
+            self._throttle(
+                endpoint,
+                signed,
+                base_params,
+                priority=resolved_priority,
+            )
             req_params = dict(base_params)
 
             if signed:
@@ -266,6 +459,14 @@ class BinanceRestApi:
                 guard_rejection = self._run_pre_send_guard(pre_send_guard)
                 if guard_rejection is not None:
                     return guard_rejection
+                budget_rejection = self._acquire_rate_limit_budget(
+                    method,
+                    endpoint,
+                    base_params,
+                    resolved_priority,
+                )
+                if budget_rejection is not None:
+                    return budget_rejection
                 started_monotonic_ns = time.perf_counter_ns()
                 try:
                     response = self.session.send(prepped, timeout=self.timeout_sec)
@@ -287,6 +488,7 @@ class BinanceRestApi:
                     started_monotonic_ns=started_monotonic_ns,
                     completed_monotonic_ns=completed_monotonic_ns,
                 )
+                self._record_rate_limit_response(response)
                 self.endpoint_cooldown_until[endpoint] = 0.0
                 if response.status_code == 200:
                     return response
@@ -478,14 +680,35 @@ class BinanceRestApi:
     def get_account(self):
         return self.request("GET", EP_ACCOUNT, signed=True)
 
-    def get_server_time(self):
-        return self.request("GET", EP_TIME, signed=False)
+    def get_server_time(self, *, emergency=False):
+        return self.request(
+            "GET",
+            EP_TIME,
+            signed=False,
+            rate_limit_priority="emergency" if emergency else None,
+        )
 
-    def get_positions(self):
-        return self.request("GET", EP_POSITION_RISK, signed=True)
+    def get_positions(self, *, emergency=False):
+        return self.request(
+            "GET",
+            EP_POSITION_RISK,
+            signed=True,
+            rate_limit_priority="emergency" if emergency else None,
+        )
 
-    def get_open_orders(self):
-        return self.request("GET", EP_OPEN_ORDERS, signed=True)
+    def get_open_orders(self, symbol=None, *, emergency=False):
+        params = {}
+        if str(symbol or "").strip():
+            params["symbol"] = str(symbol).strip().upper()
+        if emergency:
+            return self.request(
+                "GET",
+                EP_OPEN_ORDERS,
+                params,
+                signed=True,
+                rate_limit_priority="emergency",
+            )
+        return self.request("GET", EP_OPEN_ORDERS, params, signed=True)
 
     def query_order(self, symbol, order_id):
         params = {"symbol": symbol}

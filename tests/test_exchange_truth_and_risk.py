@@ -45,6 +45,7 @@ if "websocket" not in sys.modules:
     websocket_module.WebSocketApp = WebSocketApp
     sys.modules["websocket"] = websocket_module
 
+from data.cache import data_cache
 from event.type import (
     AccountData,
     CommandOutcome,
@@ -366,20 +367,33 @@ class DummyRiskSidecarRest:
         self.server_time_ms = int(server_time_ms or time.time() * 1000)
         self.server_time_status = server_time_status
         self.new_orders = []
+        self.income_history_calls = 0
+        self.open_order_queries = []
 
     def get_account(self):
         return DummyResponse(self.account)
 
-    def get_positions(self):
+    def get_positions(self, **_kwargs):
         return DummyResponse(self.positions)
 
-    def get_open_orders(self):
-        return DummyResponse(self.open_orders)
+    def get_open_orders(self, symbol=None, **_kwargs):
+        normalized = str(symbol or "").upper()
+        self.open_order_queries.append(normalized)
+        if not normalized:
+            return DummyResponse(self.open_orders)
+        return DummyResponse(
+            [
+                row
+                for row in self.open_orders
+                if str(row.get("symbol", "") or "").upper() == normalized
+            ]
+        )
 
     def get_income_history(self, **kwargs):
+        self.income_history_calls += 1
         return DummyResponse(self.income_rows)
 
-    def get_server_time(self):
+    def get_server_time(self, **_kwargs):
         return DummyResponse(
             {"serverTime": self.server_time_ms},
             status_code=self.server_time_status,
@@ -580,6 +594,66 @@ class ExchangeTruthTests(unittest.TestCase):
 
         self.assertEqual(engine.events[-1].type, EVENT_SYSTEM_HEALTH)
         self.assertIn("WS_PARSE_ERROR", engine.events[-1].data)
+
+    def test_gateway_nonfinite_mark_faults_transport_before_publish(self):
+        engine = DummyEngine()
+        gateway = BinanceGateway.__new__(BinanceGateway)
+        gateway.event_engine = engine
+        gateway.gateway_name = "BINANCE"
+        gateway.state = GatewayState.READY
+        gateway._book_lock = threading.RLock()
+        gateway._book_generation = 0
+        gateway.active = True
+        gateway.ws = None
+        gateway.latency_stats = {}
+
+        gateway.on_ws_message(
+            json.dumps(
+                {
+                    "stream": "btcusdt@markPrice@1s",
+                    "data": {
+                        "E": 2_000,
+                        "T": 3_000,
+                        "s": "BTCUSDT",
+                        "p": "NaN",
+                        "i": "100",
+                        "r": "0.0001",
+                    },
+                }
+            )
+        )
+
+        self.assertEqual(gateway.state, GatewayState.ERROR)
+        self.assertFalse(gateway.active)
+        self.assertFalse(
+            any(
+                event.type == "eMarkPrice"
+                for event in engine.events
+            )
+        )
+        self.assertTrue(
+            any(
+                event.type == EVENT_SYSTEM_HEALTH
+                and "WS_HANDLER_FAILURE" in event.data
+                for event in engine.events
+            )
+        )
+
+    def test_market_cache_rejects_nonfinite_mark_without_refreshing_age(self):
+        symbol = "NANUSDT"
+        mark = MarkPriceData(
+            symbol=symbol,
+            mark_price=float("nan"),
+            index_price=100.0,
+            funding_rate=0.0,
+            next_funding_time=datetime.now(),
+            datetime=datetime.now(),
+        )
+
+        self.assertFalse(data_cache.update_mark_price(mark))
+        snapshot = data_cache.get_risk_snapshot(symbol)
+        self.assertEqual(snapshot["mark_price"], 0.0)
+        self.assertIsNone(snapshot["mark_age_ms"])
 
     def test_gateway_classifies_missing_submit_response_as_unknown(self):
         gateway = BinanceGateway.__new__(BinanceGateway)
@@ -1143,6 +1217,100 @@ class RiskExecutionTests(unittest.TestCase):
         )
         self.assertEqual(oms.dead_man_renewals, 1)
 
+    def test_market_data_readiness_reports_failures_without_freezing_oms(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        risk = RiskManager(
+            engine,
+            self.make_risk_config(),
+            oms=oms,
+            gateway=gateway,
+        )
+        snapshots = [
+            {},
+            {
+                "mark_price": 100.0,
+                "mark_age_ms": 10.0,
+                "bid_price": 99.0,
+                "ask_price": 101.0,
+                "book_age_ms": 2000.0,
+            },
+        ]
+
+        with patch(
+            "risk.manager.data_cache.get_risk_snapshot",
+            side_effect=snapshots,
+        ) as get_snapshot:
+            mark_failures = risk.market_data_readiness_failures(now=100.0)
+            book_failures = risk.market_data_readiness_failures(now=101.0)
+
+        self.assertEqual(
+            mark_failures,
+            {"BTCUSDT": "stale_market_data:mark_unavailable"},
+        )
+        self.assertEqual(
+            book_failures,
+            {"BTCUSDT": "stale_market_data:book_age=2000.0ms"},
+        )
+        self.assertEqual(
+            get_snapshot.call_args_list,
+            [
+                unittest.mock.call("BTCUSDT", now=100.0),
+                unittest.mock.call("BTCUSDT", now=101.0),
+            ],
+        )
+        self.assertEqual(oms.frozen_symbols, [])
+        self.assertEqual(risk.frozen_symbols, {})
+        self.assertFalse(risk.kill_switch_triggered)
+
+    def test_freshness_guard_recovers_while_dms_renewal_is_withheld(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        config = self.make_risk_config()
+        config["oms"] = {
+            "venue_dead_man_switch": {"enabled": True},
+        }
+        config["risk"]["market_data_freshness"] = {
+            "enabled": True,
+            "require_mark_price": True,
+            "require_book": True,
+            "max_mark_age_ms": 3000.0,
+            "max_book_age_ms": 1500.0,
+            "poll_interval_sec": 0.05,
+            "breach_checks": 1,
+            "recovery_checks": 1,
+        }
+        risk = RiskManager(engine, config, oms=oms, gateway=gateway)
+        oms.risk_heartbeats.clear()
+        stale = {
+            "mark_price": 100.0,
+            "mark_age_ms": 10.0,
+            "bid_price": 99.0,
+            "ask_price": 101.0,
+            "book_age_ms": 2000.0,
+        }
+        fresh = {**stale, "book_age_ms": 10.0}
+
+        with patch(
+            "risk.manager.data_cache.get_risk_snapshot",
+            side_effect=[stale, fresh],
+        ):
+            self.assertTrue(risk.check_market_data_freshness(now=100.0))
+            self.assertIn("BTCUSDT", risk.frozen_symbols)
+            oms.symbol_guards["BTCUSDT"] = {
+                "stale_market_data": risk.frozen_symbols["BTCUSDT"],
+            }
+
+            self.assertTrue(risk.check_market_data_freshness(now=101.0))
+
+        self.assertEqual(risk.frozen_symbols, {})
+        self.assertEqual(len(oms.unfrozen_symbols), 1)
+        self.assertEqual(oms.dead_man_renewals, 1)
+        self.assertEqual(len(oms.risk_heartbeats), 2)
+        self.assertTrue(risk._venue_dms_renewal_authorized)
+
     def test_risk_status_snapshot_exposes_cash_flow_adjusted_pnl_and_margin(self):
         engine = DummyEngine()
         gateway = DummyGateway()
@@ -1351,6 +1519,122 @@ class RiskExecutionTests(unittest.TestCase):
         self.assertFalse(risk.kill_switch_triggered)
         self.assertTrue(oms.frozen_symbols)
         self.assertIn("divergence:", oms.frozen_symbols[-1][1])
+
+    def test_nonfinite_mark_freezes_symbol(self):
+        oms = DummyOMS()
+        risk = RiskManager(
+            DummyEngine(),
+            self.make_risk_config(),
+            oms=oms,
+            gateway=DummyGateway(),
+        )
+
+        risk.on_mark_price(
+            Event(
+                "eMarkPrice",
+                MarkPriceData(
+                    symbol="BTCUSDT",
+                    mark_price=float("nan"),
+                    index_price=100.0,
+                    funding_rate=0.0,
+                    next_funding_time=datetime.now(),
+                    datetime=datetime.now(),
+                ),
+            )
+        )
+
+        self.assertTrue(oms.frozen_symbols)
+        self.assertEqual(
+            oms.frozen_symbols[-1][:2],
+            ("BTCUSDT", "invalid_mark_price"),
+        )
+
+    def test_nonfinite_account_equity_triggers_kill_switch(self):
+        oms = DummyOMS()
+        risk = RiskManager(
+            DummyEngine(),
+            self.make_risk_config(),
+            oms=oms,
+            gateway=DummyGateway(),
+        )
+        account = AccountData(
+            balance=1000.0,
+            equity=float("nan"),
+            available=1000.0,
+            used_margin=0.0,
+            datetime=datetime.now(),
+        )
+
+        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account))
+
+        self.assertTrue(risk.kill_switch_triggered)
+        self.assertIn("non-finite", risk.kill_reason)
+        self.assertTrue(oms.halt_reasons)
+
+    def test_string_encoded_nonfinite_risk_state_fails_closed(self):
+        oms = DummyOMS()
+        oms.journal = types.SimpleNamespace(
+            load=lambda: [
+                {
+                    "kind": "risk_state",
+                    "payload": {
+                        "risk_day": "2026-07-27",
+                        "day_start_equity": "NaN",
+                        "kill_switch_triggered": False,
+                        "kill_state": "ARMED",
+                    },
+                }
+            ]
+        )
+
+        risk = RiskManager(
+            DummyEngine(),
+            self.make_risk_config(),
+            oms=oms,
+            gateway=DummyGateway(),
+        )
+
+        self.assertTrue(risk.kill_switch_triggered)
+        self.assertEqual(risk.kill_state, "FAILED")
+        self.assertIn("risk_state_corrupt:non_finite", risk.kill_reason)
+        self.assertTrue(oms.halt_reasons)
+
+    def test_kill_supervisor_continues_after_initial_timeout(self):
+        oms = DummyOMS()
+        gateway = DummyGateway()
+        gateway.open_orders = None
+        config = self.make_risk_config()
+        config["risk"]["kill_switch"] = {
+            "verify_interval_sec": 0.05,
+            "verify_timeout_sec": 0.05,
+            "flatten_retry_sec": 0.05,
+            "empty_snapshots_required": 2,
+        }
+        risk = RiskManager(
+            DummyEngine(),
+            config,
+            oms=oms,
+            gateway=gateway,
+        )
+
+        risk.trigger_kill_switch("persistent-test")
+        time.sleep(0.16)
+
+        self.assertTrue(risk.kill_switch_triggered)
+        self.assertTrue(risk._kill_supervisor_thread.is_alive())
+
+        gateway.open_orders = []
+        gateway.positions = []
+        deadline = time.time() + 1.0
+        while (
+            risk.kill_state != "FLAT_VERIFIED"
+            and time.time() < deadline
+        ):
+            time.sleep(0.02)
+
+        self.assertEqual(risk.kill_state, "FLAT_VERIFIED")
+        risk._kill_supervisor_thread.join(timeout=0.5)
+        self.assertFalse(risk._kill_supervisor_thread.is_alive())
 
 
     def test_latency_limit_uses_exchange_timestamp_over_local_datetime(self):
@@ -1622,6 +1906,50 @@ class RiskExecutionTests(unittest.TestCase):
             "processing_lag:first",
         )
 
+    def test_dynamic_latency_reason_does_not_repeat_symbol_freeze(self):
+        engine = DummyEngine()
+        oms = DummyOMS()
+        risk = RiskManager(
+            engine,
+            self.make_risk_config(),
+            oms=oms,
+            gateway=DummyGateway(),
+        )
+
+        risk._freeze_symbol("BTCUSDT", "latency:1500.0ms>1200ms")
+        risk._freeze_symbol("BTCUSDT", "latency:4500.0ms>1200ms")
+
+        self.assertEqual(len(oms.frozen_symbols), 1)
+        self.assertEqual(
+            risk.frozen_symbols["BTCUSDT"],
+            "latency:1500.0ms>1200ms",
+        )
+
+    def test_dynamic_processing_lag_does_not_repeat_venue_freeze(self):
+        engine = DummyEngine()
+        oms = DummyOMS()
+        risk = RiskManager(
+            engine,
+            self.make_risk_config(),
+            oms=oms,
+            gateway=DummyGateway(),
+        )
+
+        risk._freeze_venue(
+            "BINANCE",
+            "processing_lag:1500.0ms>1200ms",
+        )
+        risk._freeze_venue(
+            "BINANCE",
+            "processing_lag:4500.0ms>1200ms",
+        )
+
+        self.assertEqual(len(oms.frozen_venues), 1)
+        self.assertEqual(
+            risk.frozen_venues["BINANCE"],
+            "processing_lag:1500.0ms>1200ms",
+        )
+
     def test_watchdog_stale_recovery_cannot_clear_new_venue_fault(self):
         oms = DummyOMS()
         snapshot = {
@@ -1709,6 +2037,36 @@ class RiskExecutionTests(unittest.TestCase):
 
         self.assertTrue(oms.halt_reasons)
         self.assertEqual(oms.flatten_reasons, ["KillSwitch: test_kill"])
+
+    def test_kill_verification_uses_emergency_rest_reserve(self):
+        class PriorityGateway(DummyGateway):
+            supports_emergency_query_priority = True
+
+            def __init__(self):
+                super().__init__()
+                self.open_order_priorities = []
+                self.position_priorities = []
+
+            def get_open_orders(self, *, emergency=False):
+                self.open_order_priorities.append(bool(emergency))
+                return self.open_orders
+
+            def get_all_positions(self, *, emergency=False):
+                self.position_priorities.append(bool(emergency))
+                return self.positions
+
+        gateway = PriorityGateway()
+        risk = RiskManager(
+            DummyEngine(),
+            self.make_risk_config(),
+            oms=DummyOMS(),
+            gateway=gateway,
+        )
+
+        self.assertEqual(risk._query_kill_open_orders(), [])
+        self.assertEqual(risk._query_kill_positions(), set())
+        self.assertEqual(gateway.open_order_priorities, [True])
+        self.assertEqual(gateway.position_priorities, [True])
 
     def test_recovered_kill_sequence_resumes_to_flat_verified(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1827,6 +2185,28 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             "external_cash_flow_total": cash_flow,
             "captured_at": captured_at,
         }
+
+    def test_disabled_supervisor_accepts_halt_handoff_with_reason_payload(self):
+        supervisor = IndependentRiskSupervisor(
+            DummyOMS(),
+            {
+                "symbols": ["BTCUSDT"],
+                "risk": {
+                    "independent_supervisor": {
+                        "enabled": False,
+                    }
+                },
+            },
+        )
+
+        result = supervisor.resume_shutdown_guard(
+            reason="oms_halt:test",
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertTrue(result["kill_latched"])
+        self.assertTrue(result["persisted"])
+        self.assertEqual(result["reason"], "supervisor_disabled")
 
     def test_sidecar_stale_parent_cancels_and_exits_after_orphan_window(self):
         exchange = DummySidecarExchange(healthy=True)
@@ -2054,6 +2434,110 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                 DummySidecarExchange(),
                 self.make_settings(gross_kill_multiplier=float("inf")),
             )
+
+    def test_sidecar_rejects_non_finite_supervision_intervals(self):
+        for field in (
+            "parent_heartbeat_timeout_sec",
+            "exchange_max_age_sec",
+            "cancel_retry_sec",
+            "orphan_exit_sec",
+            "parent_loss_flatten_delay_sec",
+            "flatten_retry_sec",
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, field):
+                    RiskSidecarCore(
+                        DummySidecarExchange(),
+                        self.make_settings(**{field: float("inf")}),
+                    )
+
+    def test_sidecar_missing_account_truth_fails_closed(self):
+        cases = (
+            (
+                {
+                    "account": {},
+                    "positions": [],
+                    "open_orders": [],
+                },
+                "margin_snapshot_missing",
+                "REDUCE_ONLY",
+            ),
+            (
+                {
+                    "account": {
+                        "totalMaintMargin": "0",
+                        "totalMarginBalance": "0",
+                    },
+                    "positions": [],
+                    "open_orders": [],
+                },
+                "account_margin_balance_non_positive",
+                "KILL",
+            ),
+            (
+                {
+                    "account": {
+                        "totalMaintMargin": "0",
+                        "totalMarginBalance": "1000",
+                    },
+                    "positions": {},
+                    "open_orders": [],
+                },
+                "risk_snapshot_invalid",
+                "REDUCE_ONLY",
+            ),
+        )
+        for index, (snapshot, expected_reason, expected_action) in enumerate(
+            cases
+        ):
+            with self.subTest(expected_reason=expected_reason):
+                exchange = DummySidecarExchange(risk_snapshot=snapshot)
+                core = RiskSidecarCore(
+                    exchange,
+                    self.make_settings(),
+                    now=650.0 + index,
+                )
+                heartbeat_at = 650.1 + index
+                core.receive_parent_heartbeat(
+                    1,
+                    sent_monotonic=heartbeat_at,
+                    now=heartbeat_at,
+                )
+
+                status, _ = core.step(now=heartbeat_at)
+
+                self.assertEqual(status["risk_action"], expected_action)
+                self.assertEqual(status["reason"], expected_reason)
+
+    def test_sidecar_rejects_overexecuted_open_order_snapshot(self):
+        exchange = DummySidecarExchange(
+            risk_snapshot={
+                "account": {
+                    "totalMaintMargin": "0",
+                    "totalMarginBalance": "1000",
+                },
+                "positions": [],
+                "open_orders": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "origQty": "1",
+                        "executedQty": "2",
+                        "price": "100",
+                    }
+                ],
+            }
+        )
+        core = RiskSidecarCore(exchange, self.make_settings(), now=655.0)
+        core.receive_parent_heartbeat(
+            1,
+            sent_monotonic=655.1,
+            now=655.1,
+        )
+
+        status, _ = core.step(now=655.1)
+
+        self.assertEqual(status["risk_action"], "REDUCE_ONLY")
+        self.assertEqual(status["reason"], "open_order_invalid:BTCUSDT")
 
     def test_sidecar_daily_loss_is_adjusted_for_external_cash_flow(self):
         day_time = datetime(
@@ -2721,6 +3205,74 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                 any(".corrupt." in name for name in os.listdir(tmpdir))
             )
 
+    def test_sidecar_negative_persisted_loss_recovers_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "sidecar-state.json")
+            settings = self.make_settings(
+                state_path=state_path,
+                state_required=True,
+            )
+            RiskSidecarCore(
+                DummySidecarExchange(),
+                settings,
+                now=610.0,
+            )
+            with open(state_path, "r", encoding="utf-8") as handle:
+                record = json.load(handle)
+            record["payload"]["deployment_loss"] = -1.0
+            record["sha256"] = RiskSidecarCore._state_checksum(
+                record["payload"]
+            )
+            with open(state_path, "w", encoding="utf-8") as handle:
+                json.dump(record, handle, allow_nan=False)
+
+            recovered = RiskSidecarCore(
+                DummySidecarExchange(),
+                settings,
+                now=611.0,
+            )
+
+            self.assertTrue(recovered.kill_latched)
+            self.assertEqual(recovered.stage, "FAILED")
+            self.assertIn(
+                "state.deployment_loss must be non-negative",
+                recovered.state_load_error,
+            )
+
+    def test_sidecar_state_replace_retries_transient_windows_conflict(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "sidecar-state.json")
+            real_replace = os.replace
+            attempts = 0
+
+            def transient_replace(source, destination):
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    error = PermissionError("transient state file lock")
+                    error.winerror = 5
+                    raise error
+                return real_replace(source, destination)
+
+            with patch.object(
+                independent_supervisor_module.os,
+                "replace",
+                side_effect=transient_replace,
+            ):
+                core = RiskSidecarCore(
+                    DummySidecarExchange(),
+                    self.make_settings(
+                        state_path=state_path,
+                        state_required=True,
+                    ),
+                    now=620.0,
+                )
+
+            self.assertEqual(attempts, 3)
+            self.assertTrue(os.path.exists(state_path))
+            self.assertFalse(core.kill_latched)
+            self.assertEqual(core.state_persist_error, "")
+
     def test_binance_sidecar_snapshot_and_reduce_only_flatten(self):
         rest = DummyRiskSidecarRest(
             positions=[
@@ -2850,6 +3402,47 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
 
         self.assertTrue(ok, reason)
         self.assertEqual(snapshot["external_cash_flow_total"], 100.0)
+
+        ok, cached_snapshot, reason = exchange.get_risk_snapshot()
+
+        self.assertTrue(ok, reason)
+        self.assertEqual(
+            cached_snapshot["external_cash_flow_total"],
+            100.0,
+        )
+        self.assertEqual(rest.income_history_calls, 1)
+
+    def test_sidecar_scopes_open_order_polls_between_full_audits(self):
+        rest = DummyRiskSidecarRest(
+            open_orders=[
+                {"symbol": "BTCUSDT", "orderId": 1},
+                {"symbol": "ETHUSDT", "orderId": 2},
+            ]
+        )
+        exchange = BinanceRiskSidecarExchange.__new__(
+            BinanceRiskSidecarExchange
+        )
+        exchange.rest = rest
+        exchange.symbols = ("BTCUSDT",)
+        exchange.full_open_orders_audit_interval_sec = 60.0
+        exchange._last_full_open_orders_audit_monotonic = 0.0
+        exchange._known_open_order_symbols = set()
+
+        ok, first_rows, reason = exchange._get_open_orders_snapshot()
+        self.assertTrue(ok, reason)
+        self.assertEqual(len(first_rows), 2)
+
+        rest.open_orders = [
+            {"symbol": "BTCUSDT", "orderId": 3},
+        ]
+        ok, scoped_rows, reason = exchange._get_open_orders_snapshot()
+
+        self.assertTrue(ok, reason)
+        self.assertEqual(scoped_rows, rest.open_orders)
+        self.assertEqual(
+            rest.open_order_queries,
+            ["", "BTCUSDT", "ETHUSDT"],
+        )
 
     def test_binance_sidecar_syncs_clock_before_emergency_flatten(self):
         from infrastructure.time_service import time_service
@@ -3425,6 +4018,89 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             oms.risk_heartbeats[-1],
             ("independent_supervisor", True, ""),
         )
+
+    def test_parent_supervisor_rejects_non_finite_liveness_intervals(self):
+        for field in (
+            "heartbeat_interval_sec",
+            "status_max_age_sec",
+            "stop_timeout_sec",
+        ):
+            with self.subTest(field=field):
+                config = {
+                    "symbols": ["BTCUSDT"],
+                    "risk": {
+                        "risk_control_heartbeat": {
+                            "enabled": True,
+                            "required_source": "independent_supervisor",
+                        },
+                        "independent_supervisor": {
+                            "enabled": True,
+                            "api_key": "risk-test-key",
+                            "api_secret": "risk-test-secret",
+                            field: float("inf"),
+                        },
+                    },
+                }
+                with self.assertRaisesRegex(ValueError, field):
+                    IndependentRiskSupervisor(DummyOMS(), config)
+
+    def test_parent_supervisor_rejects_malformed_child_status(self):
+        config = {
+            "symbols": ["BTCUSDT"],
+            "risk": {
+                "risk_control_heartbeat": {
+                    "enabled": True,
+                    "required_source": "independent_supervisor",
+                },
+                "independent_supervisor": {
+                    "enabled": True,
+                    "api_key": "risk-test-key",
+                    "api_secret": "risk-test-secret",
+                },
+            },
+        }
+        supervisor = IndependentRiskSupervisor(DummyOMS(), config)
+        supervisor.status_queue = queue.Queue()
+        supervisor.status_queue.put(
+            {
+                "session_id": supervisor.session_id,
+                "sequence": 1,
+                "healthy": "true",
+                "reason": "",
+            }
+        )
+
+        supervisor._drain_status(time.perf_counter())
+
+        self.assertEqual(supervisor.last_status, {})
+        self.assertEqual(
+            supervisor.last_status_protocol_error,
+            "status_healthy_invalid",
+        )
+
+        captured_at = time.perf_counter()
+        supervisor.status_queue.put(
+            {
+                "session_id": supervisor.session_id,
+                "sequence": 2,
+                "healthy": True,
+                "reason": "",
+                "reported_at": time.time(),
+                "risk_action": "NONE",
+                "stage": "ARMED",
+                "exchange_healthy": True,
+                "kill_latched": False,
+                "quiesced": False,
+                "risk_snapshot_sequence": 1,
+                "risk_snapshot_captured_monotonic": captured_at,
+                "risk_metrics": {},
+            }
+        )
+
+        supervisor._drain_status(captured_at)
+
+        self.assertEqual(supervisor.last_status["sequence"], 2)
+        self.assertEqual(supervisor.last_status_protocol_error, "")
 
     def test_parent_supervisor_propagates_hard_breach_to_kill_switch(self):
         oms = DummyOMS()

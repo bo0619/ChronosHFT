@@ -10,6 +10,9 @@ from datetime import datetime, timezone
 DEFAULT_ADMIN_DIR = os.path.join("storage", "admin")
 DEFAULT_COMMAND_TTL_SEC = 10.0
 DEFAULT_SESSION_MAX_AGE_SEC = 2.0
+ATOMIC_REPLACE_MAX_ATTEMPTS = 5
+ATOMIC_REPLACE_RETRY_BASE_SEC = 0.01
+TRANSIENT_WINDOWS_REPLACE_ERRORS = frozenset({5, 32, 33})
 ADMIN_SESSION_SCHEMA = "chronoshft.admin_session.v1"
 ADMIN_COMMAND_SCHEMA = "chronoshft.admin_command.v1"
 _WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
@@ -155,6 +158,10 @@ def _ensure_dir(path: str):
     return path
 
 
+def _sleep_before_atomic_replace_retry(delay_sec: float) -> None:
+    time.sleep(delay_sec)
+
+
 def _utc_now_iso() -> str:
     return (
         datetime.now(timezone.utc)
@@ -231,7 +238,21 @@ def _atomic_write_json(path: str, payload: dict) -> None:
             json.dump(payload, handle, ensure_ascii=True, allow_nan=False)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
+        for attempt in range(ATOMIC_REPLACE_MAX_ATTEMPTS):
+            try:
+                os.replace(temporary_path, path)
+                break
+            except OSError as exc:
+                retryable = isinstance(exc, PermissionError) or getattr(
+                    exc,
+                    "winerror",
+                    None,
+                ) in TRANSIENT_WINDOWS_REPLACE_ERRORS
+                if not retryable or attempt + 1 >= ATOMIC_REPLACE_MAX_ATTEMPTS:
+                    raise
+                _sleep_before_atomic_replace_retry(
+                    ATOMIC_REPLACE_RETRY_BASE_SEC * (2**attempt)
+                )
     finally:
         try:
             os.remove(temporary_path)
@@ -427,9 +448,20 @@ class AdminControlServer:
         self.session_id = uuid.uuid4().hex
         self.started_at_wall = time.time()
         self.started_at_utc = _utc_now_iso()
+        self.session_heartbeat_interval_sec = min(
+            0.5,
+            self.session_max_age_sec / 4.0,
+        )
+        self._closed = False
+        self._last_session_publish_monotonic = 0.0
         self._publish_session()
 
-    def _publish_session(self):
+    def _publish_session(self, now_monotonic=None):
+        published_monotonic = (
+            time.perf_counter()
+            if now_monotonic is None
+            else float(now_monotonic)
+        )
         _atomic_write_json(
             self.paths["session_path"],
             {
@@ -441,15 +473,58 @@ class AdminControlServer:
                 "heartbeat_at": _utc_now_iso(),
             },
         )
+        self._last_session_publish_monotonic = published_monotonic
 
     def poll_once(self):
-        self._publish_session()
+        if self._closed:
+            return False
+        now_monotonic = time.perf_counter()
+        if (
+            now_monotonic - self._last_session_publish_monotonic
+            >= self.session_heartbeat_interval_sec
+        ):
+            self._publish_session(now_monotonic)
         inbox_dir = self.paths["inbox_dir"]
         for name in sorted(os.listdir(inbox_dir)):
             if not name.endswith(".json"):
                 continue
             command_path = os.path.join(inbox_dir, name)
             self._process_command_file(command_path)
+        return True
+
+    def close(self) -> bool:
+        """Withdraw only this process's advertised admin session."""
+        self._closed = True
+        session_path = self.paths["session_path"]
+        try:
+            session = _load_strict_json_object(
+                session_path,
+                "active admin session",
+            )
+        except ValueError:
+            if not os.path.exists(session_path):
+                return True
+            raise
+        if str(session.get("session_id", "") or "") != self.session_id:
+            return True
+        for attempt in range(ATOMIC_REPLACE_MAX_ATTEMPTS):
+            try:
+                os.remove(session_path)
+                return True
+            except FileNotFoundError:
+                return True
+            except OSError as exc:
+                retryable = isinstance(exc, PermissionError) or getattr(
+                    exc,
+                    "winerror",
+                    None,
+                ) in TRANSIENT_WINDOWS_REPLACE_ERRORS
+                if not retryable or attempt + 1 >= ATOMIC_REPLACE_MAX_ATTEMPTS:
+                    raise
+                _sleep_before_atomic_replace_retry(
+                    ATOMIC_REPLACE_RETRY_BASE_SEC * (2**attempt)
+                )
+        return False
 
     def _process_command_file(self, command_path: str):
         try:

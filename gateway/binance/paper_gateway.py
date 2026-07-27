@@ -56,7 +56,12 @@ from infrastructure.commission_truth import resolve_passive_fee_rate
 from infrastructure.logger import logger
 from infrastructure.time_service import time_service
 
-from .constants import EP_DEPTH_SNAPSHOT, EP_RPI_DEPTH, REST_URL_MAIN
+from .constants import (
+    EP_DEPTH_SNAPSHOT,
+    EP_PREMIUM_INDEX,
+    EP_RPI_DEPTH,
+    REST_URL_MAIN,
+)
 from .ws_api import BinanceWsApi
 
 
@@ -106,6 +111,15 @@ class _PublicBinanceRest:
             rpi=True,
         )
 
+    def get_premium_index(self, symbol: str, *, timeout_sec: float = None):
+        return self._get_json(
+            EP_PREMIUM_INDEX,
+            {"symbol": str(symbol or "").upper()},
+            minimum_interval=0.05,
+            timeout_sec=timeout_sec,
+            attempts=1,
+        )
+
     def _get_json(
         self,
         endpoint: str,
@@ -113,8 +127,16 @@ class _PublicBinanceRest:
         *,
         minimum_interval: float,
         rpi: bool = False,
+        timeout_sec: float = None,
+        attempts: int = 2,
     ):
-        for attempt in range(2):
+        attempts = max(1, int(attempts or 1))
+        request_timeout = (
+            self.timeout_sec
+            if timeout_sec is None
+            else max(0.05, float(timeout_sec or 0.0))
+        )
+        for attempt in range(attempts):
             with self._lock:
                 now = time.perf_counter()
                 reference = self._last_rpi_request_at if rpi else self._last_request_at
@@ -129,7 +151,7 @@ class _PublicBinanceRest:
                 response = self.session.get(
                     self.base_url + endpoint,
                     params=params,
-                    timeout=self.timeout_sec,
+                    timeout=request_timeout,
                 )
                 if response.status_code == 200:
                     payload = response.json()
@@ -142,7 +164,7 @@ class _PublicBinanceRest:
                 logger.error(
                     f"[BINANCE_PAPER] Public REST exception endpoint={endpoint}: {exc}"
                 )
-            if attempt == 0:
+            if attempt + 1 < attempts:
                 time.sleep(0.25)
         return None
 
@@ -227,9 +249,70 @@ class BinancePaperGateway(BaseGateway):
         self.emit_full_orderbook_events = bool(
             self.market_data_config.get("emit_full_orderbook_events", False)
         )
+        default_ingress_age_ms = (
+            (self.config.get("risk", {}).get("tech_health", {}) or {}).get(
+                "max_latency_ms",
+                1000.0,
+            )
+        )
+        self.max_market_event_ingress_age_ms = max(
+            100.0,
+            self._finite_nonnegative(
+                self.market_data_config.get(
+                    "max_market_event_ingress_age_ms",
+                    default_ingress_age_ms,
+                ),
+                1000.0,
+            ),
+        )
+        self.stream_ready_timeout_sec = max(
+            1.0,
+            float(
+                self.market_data_config.get("stream_ready_timeout_sec", 10.0)
+                or 10.0
+            ),
+        )
         self.max_book_buffer = max(
             100,
             int(self.paper_config.get("max_book_buffer", 50_000) or 50_000),
+        )
+        self.mark_startup_timeout_sec = max(
+            1.0,
+            float(
+                self.paper_config.get("mark_startup_timeout_sec", 10.0)
+                or 10.0
+            ),
+        )
+        self.mark_rest_request_timeout_sec = max(
+            0.25,
+            float(
+                self.paper_config.get("mark_rest_request_timeout_sec", 2.0)
+                or 2.0
+            ),
+        )
+        self.mark_rest_poll_interval_sec = max(
+            0.25,
+            float(
+                self.paper_config.get("mark_rest_poll_interval_sec", 1.0)
+                or 1.0
+            ),
+        )
+        self.mark_ws_stale_after_sec = max(
+            0.5,
+            float(
+                self.paper_config.get("mark_ws_stale_after_sec", 2.0)
+                or 2.0
+            ),
+        )
+        self.mark_rest_max_exchange_age_sec = max(
+            0.5,
+            float(
+                self.paper_config.get(
+                    "mark_rest_max_exchange_age_sec",
+                    3.0,
+                )
+                or 3.0
+            ),
         )
 
         account_config = self.config.get("account", {}) or {}
@@ -345,6 +428,9 @@ class BinancePaperGateway(BaseGateway):
         self._fault_lock = threading.Lock()
         self._fault_epoch = 0
         self._closing = False
+        self._last_ws_mark_received_monotonic: dict[str, float] = {}
+        self._mark_fallback_stop = threading.Event()
+        self._mark_fallback_thread: threading.Thread | None = None
 
         self._commands: queue.Queue[_EngineCommand] = queue.Queue(maxsize=queue_size)
         self._worker: threading.Thread | None = None
@@ -407,6 +493,15 @@ class BinancePaperGateway(BaseGateway):
             self.ws = ws
             ws.start_market_stream(self.symbols)
 
+        if not ws.wait_until_connected(
+            names=("PublicWS", "MarketWS"),
+            timeout_sec=self.stream_ready_timeout_sec,
+        ):
+            if self._book_generation_is_current(generation):
+                self._fault("PUBLIC_STREAM_READY_TIMEOUT")
+            ws.close()
+            return False
+
         all_synced = all(
             self._resync_book(symbol, expected_generation=generation)
             for symbol in self.symbols
@@ -414,6 +509,12 @@ class BinancePaperGateway(BaseGateway):
         if not all_synced:
             if self._book_generation_is_current(generation):
                 self._fault("WS_HANDLER_FAILURE:PUBLIC_BOOK_INITIALIZATION_FAILED")
+            ws.close()
+            return False
+
+        if not self._wait_for_initial_marks(generation):
+            if self._book_generation_is_current(generation):
+                self._fault("PUBLIC_MARK_INITIALIZATION_FAILED")
             ws.close()
             return False
 
@@ -428,6 +529,7 @@ class BinancePaperGateway(BaseGateway):
             ):
                 ws.close()
                 return False
+            self._start_mark_fallback(generation)
         logger.info(
             "[BINANCE_PAPER] Ready on production public data; "
             f"RPI fill model={self.rpi_fill_model}"
@@ -439,6 +541,7 @@ class BinancePaperGateway(BaseGateway):
             self._closing = True
             self._accepting_orders = False
             self.active = False
+            self._mark_fallback_stop.set()
             self._invalidate_public_book_lifecycle()
             ws = self.ws
             self.ws = None
@@ -450,10 +553,23 @@ class BinancePaperGateway(BaseGateway):
 
     def close(self):
         self.begin_shutdown()
+        mark_fallback_stopped = True
+        mark_thread = self._mark_fallback_thread
+        if (
+            mark_thread is not None
+            and mark_thread is not threading.current_thread()
+            and mark_thread.is_alive()
+        ):
+            mark_thread.join(timeout=self.mark_rest_request_timeout_sec + 0.5)
+            mark_fallback_stopped = not mark_thread.is_alive()
+            if not mark_fallback_stopped:
+                logger.critical(
+                    "[BINANCE_PAPER] Mark-price fallback thread did not stop cleanly"
+                )
         with self._lifecycle_lock:
             if self.state == GatewayState.DISCONNECTED and not self._worker_running:
                 self.rest.close()
-                return True
+                return mark_fallback_stopped
 
         worker_stopped = True
         if self._worker_running:
@@ -471,7 +587,7 @@ class BinancePaperGateway(BaseGateway):
 
         self.rest.close()
         self.set_state(GatewayState.DISCONNECTED)
-        return worker_stopped
+        return bool(worker_stopped and mark_fallback_stopped)
 
     def recover_connectivity(self, recovery_context=None):
         with self._lifecycle_lock:
@@ -493,6 +609,15 @@ class BinancePaperGateway(BaseGateway):
             self.ws = ws
             ws.start_market_stream(self.symbols)
 
+        if not ws.wait_until_connected(
+            names=("PublicWS", "MarketWS"),
+            timeout_sec=self.stream_ready_timeout_sec,
+        ):
+            if self._book_generation_is_current(generation):
+                self._fault("PUBLIC_STREAM_RECOVERY_TIMEOUT")
+            ws.close()
+            return False
+
         all_synced = all(
             self._resync_book(symbol, expected_generation=generation)
             for symbol in self.symbols
@@ -500,6 +625,11 @@ class BinancePaperGateway(BaseGateway):
         if not all_synced:
             if self._book_generation_is_current(generation):
                 self._fault("WS_HANDLER_FAILURE:PUBLIC_BOOK_RECOVERY_FAILED")
+            ws.close()
+            return False
+        if not self._wait_for_initial_marks(generation):
+            if self._book_generation_is_current(generation):
+                self._fault("PUBLIC_MARK_RECOVERY_FAILED")
             ws.close()
             return False
         with self._lifecycle_lock:
@@ -510,6 +640,7 @@ class BinancePaperGateway(BaseGateway):
             ):
                 ws.close()
                 return False
+            self._start_mark_fallback(generation)
             if recovery_context:
                 owner = str(recovery_context.get("owner", "") or "")
                 epoch = int(recovery_context.get("epoch", 0) or 0)
@@ -610,9 +741,10 @@ class BinancePaperGateway(BaseGateway):
             corrected_received_timestamp
             or (received_timestamp + clock_offset_ms / 1000.0)
         )
+        normalized_stream = str(stream or "").lower()
         event_ms = int(
             data.get("E", 0)
-            or (0 if "@markPrice" in stream else data.get("T", 0))
+            or (0 if "@markprice" in normalized_stream else data.get("T", 0))
             or 0
         )
         if event_ms:
@@ -620,7 +752,14 @@ class BinancePaperGateway(BaseGateway):
                 corrected_received_timestamp * 1000.0 - event_ms
             )
 
-        if "@aggTrade" in stream:
+        if "@aggtrade" in normalized_stream:
+            if self._reject_stale_market_event(
+                stream=normalized_stream,
+                symbol=symbol,
+                event_time_ms=event_ms,
+                corrected_received_timestamp=corrected_received_timestamp,
+            ):
+                return
             trade = AggTradeData(
                 symbol=symbol,
                 trade_id=int(data.get("a", -1)),
@@ -647,7 +786,7 @@ class BinancePaperGateway(BaseGateway):
             )
             return
 
-        if "@markPrice" in stream:
+        if "@markprice" in normalized_stream:
             next_funding_ms = int(data.get("T", 0) or 0)
             event_time_ms = int(data.get("E", 0) or 0)
             next_funding_timestamp = (
@@ -671,6 +810,10 @@ class BinancePaperGateway(BaseGateway):
                 corrected_received_timestamp=corrected_received_timestamp,
                 next_funding_timestamp=next_funding_timestamp,
             )
+            with self._book_lock:
+                if not self._book_generation_matches_locked(message_generation):
+                    return
+                self._last_ws_mark_received_monotonic[symbol] = received_monotonic
             self._publish_public_market_update(
                 message_generation,
                 EVENT_MARK_PRICE,
@@ -679,7 +822,14 @@ class BinancePaperGateway(BaseGateway):
             )
             return
 
-        if "@depth" in stream:
+        if "@depth" in normalized_stream:
+            if self._reject_stale_market_event(
+                stream=normalized_stream,
+                symbol=symbol,
+                event_time_ms=event_ms,
+                corrected_received_timestamp=corrected_received_timestamp,
+            ):
+                return
             data["_local_received_timestamp"] = received_timestamp
             data["_local_received_monotonic"] = received_monotonic
             data["_local_clock_offset_ms"] = clock_offset_ms
@@ -691,6 +841,190 @@ class BinancePaperGateway(BaseGateway):
                 data,
                 expected_generation=message_generation,
             )
+
+    def _reject_stale_market_event(
+        self,
+        *,
+        stream: str,
+        symbol: str,
+        event_time_ms: int,
+        corrected_received_timestamp: float,
+    ) -> bool:
+        if event_time_ms <= 0:
+            return False
+        age_ms = corrected_received_timestamp * 1000.0 - event_time_ms
+        if abs(age_ms) <= self.max_market_event_ingress_age_ms:
+            return False
+        stream_kind = "PUBLIC_DEPTH" if "@depth" in stream else "PUBLIC_TRADE"
+        self._fault(
+            "MARKET_DATA_STALE:"
+            f"{stream_kind}:symbol={symbol}:"
+            f"age={age_ms:.1f}ms>"
+            f"{self.max_market_event_ingress_age_ms:.1f}ms"
+        )
+        return True
+
+    def _wait_for_initial_marks(self, generation: int) -> bool:
+        deadline = time.perf_counter() + self.mark_startup_timeout_sec
+        missing = set(self.symbols)
+        while missing and time.perf_counter() < deadline:
+            for symbol in sorted(missing):
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.0:
+                    break
+                payload = self.rest.get_premium_index(
+                    symbol,
+                    timeout_sec=min(
+                        self.mark_rest_request_timeout_sec,
+                        remaining,
+                    ),
+                )
+                if not payload:
+                    break
+                if str(payload.get("symbol", "") or "").upper() != symbol:
+                    break
+                if self._publish_rest_mark(
+                    payload,
+                    expected_generation=generation,
+                ):
+                    missing.discard(symbol)
+                elif not self._book_generation_is_current(generation):
+                    return False
+            if missing and time.perf_counter() < deadline:
+                time.sleep(min(0.25, max(0.0, deadline - time.perf_counter())))
+        if missing:
+            logger.error(
+                "[BINANCE_PAPER] Initial mark-price readiness timed out; "
+                f"missing={sorted(missing)}"
+            )
+            return False
+        return True
+
+    def _publish_rest_mark(self, payload: dict, *, expected_generation: int) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        symbol = str(payload.get("symbol", "") or "").upper()
+        try:
+            mark_price = float(payload.get("markPrice", 0.0) or 0.0)
+            index_price = float(payload.get("indexPrice", 0.0) or 0.0)
+            funding_rate = float(payload.get("lastFundingRate", 0.0) or 0.0)
+            event_time_ms = int(payload.get("time", 0) or 0)
+            next_funding_ms = int(payload.get("nextFundingTime", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (
+            symbol not in self.symbols
+            or not math.isfinite(mark_price)
+            or not math.isfinite(index_price)
+            or not math.isfinite(funding_rate)
+            or mark_price <= 0.0
+            or index_price <= 0.0
+            or event_time_ms <= 0
+        ):
+            return False
+        (
+            received_timestamp,
+            received_monotonic,
+            corrected_received_timestamp,
+            clock_offset_ms,
+        ) = time_service.capture_timestamp()
+        exchange_timestamp = (
+            event_time_ms / 1000.0 if event_time_ms else received_timestamp
+        )
+        exchange_age_sec = abs(
+            corrected_received_timestamp - exchange_timestamp
+        )
+        if exchange_age_sec > self.mark_rest_max_exchange_age_sec:
+            return False
+        next_funding_timestamp = (
+            next_funding_ms / 1000.0 if next_funding_ms else 0.0
+        )
+        mark = MarkPriceData(
+            symbol=symbol,
+            mark_price=mark_price,
+            index_price=index_price,
+            funding_rate=funding_rate,
+            next_funding_time=datetime.fromtimestamp(
+                next_funding_timestamp or received_timestamp
+            ),
+            datetime=datetime.fromtimestamp(exchange_timestamp),
+            exchange_timestamp=exchange_timestamp,
+            received_timestamp=received_timestamp,
+            received_monotonic=received_monotonic,
+            clock_offset_ms=clock_offset_ms,
+            corrected_received_timestamp=corrected_received_timestamp,
+            next_funding_timestamp=next_funding_timestamp,
+        )
+        return self._publish_public_market_update(
+            expected_generation,
+            EVENT_MARK_PRICE,
+            mark,
+            worker_kind="mark",
+        )
+
+    def _start_mark_fallback(self, generation: int) -> None:
+        self._mark_fallback_stop.set()
+        stop_event = threading.Event()
+        self._mark_fallback_stop = stop_event
+        thread = threading.Thread(
+            target=self._mark_fallback_loop,
+            args=(generation, stop_event),
+            daemon=True,
+            name="BinancePaperMarkFallback",
+        )
+        self._mark_fallback_thread = thread
+        thread.start()
+
+    def _mark_fallback_loop(
+        self,
+        generation: int,
+        stop_event: threading.Event,
+    ) -> None:
+        fallback_logged = False
+        while not stop_event.wait(self.mark_rest_poll_interval_sec):
+            with self._book_lock:
+                if (
+                    self._closing
+                    or not self.active
+                    or self._book_generation != generation
+                ):
+                    return
+                now = time.perf_counter()
+                stale_symbols = [
+                    symbol
+                    for symbol in self.symbols
+                    if now
+                    - float(
+                        self._last_ws_mark_received_monotonic.get(symbol, 0.0)
+                        or 0.0
+                    )
+                    > self.mark_ws_stale_after_sec
+                ]
+            if not stale_symbols:
+                fallback_logged = False
+                continue
+            if not fallback_logged:
+                logger.warning(
+                    "[BINANCE_PAPER] WebSocket mark-price stream is stale; "
+                    "using public premiumIndex fallback"
+                )
+                fallback_logged = True
+            for symbol in stale_symbols:
+                if stop_event.is_set():
+                    return
+                payload = self.rest.get_premium_index(
+                    symbol,
+                    timeout_sec=self.mark_rest_request_timeout_sec,
+                )
+                if not payload:
+                    break
+                if not self._publish_rest_mark(
+                    payload,
+                    expected_generation=generation,
+                ):
+                    if not self._book_generation_is_current(generation):
+                        return
+                    break
 
     @staticmethod
     def _stamp_market_dispatch(data):
@@ -777,6 +1111,7 @@ class BinancePaperGateway(BaseGateway):
             self.book_resyncing.clear()
             self.book_recovery_generation.clear()
             self.book_recovery_tokens.clear()
+            self._last_ws_mark_received_monotonic.clear()
             return generation
 
     def _resync_book(
@@ -2589,6 +2924,7 @@ class BinancePaperGateway(BaseGateway):
         with self._fault_lock:
             self._accepting_orders = False
             self.active = False
+            self._mark_fallback_stop.set()
             if self._closing:
                 return
             self._fault_epoch += 1

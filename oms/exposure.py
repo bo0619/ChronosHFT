@@ -1,6 +1,7 @@
 # file: oms/exposure.py
 # [FIX-RISK] check_risk(): ?? worst-case ?????????
 
+import math
 from collections import defaultdict
 from event.type import Side, PositionData
 from data.cache import data_cache
@@ -50,8 +51,27 @@ class ExposureManager:
         qty: float,
         price: float,
     ) -> float:
+        try:
+            qty = float(qty)
+            price = float(price)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Fill quantity and price must be numeric") from exc
+        if (
+            not math.isfinite(qty)
+            or qty <= 0.0
+            or not math.isfinite(price)
+            or price <= 0.0
+        ):
+            raise ValueError(
+                "Fill quantity and price must be finite and positive"
+            )
         current_pos = positions[key]
         avg_price = average_prices[key]
+        if (
+            not math.isfinite(float(current_pos))
+            or not math.isfinite(float(avg_price))
+        ):
+            raise ValueError(f"Exposure ledger is invalid for {key}")
         signed_qty = qty if side == Side.BUY else -qty
         next_pos = current_pos + signed_qty
         realized_pnl = 0.0
@@ -485,10 +505,19 @@ class ExposureManager:
 
     def _get_price_for_risk(self, symbol: str, fallback_price: float = 0.0) -> float:
         mark_price = data_cache.get_mark_price(symbol)
-        if mark_price > 0:
+        if math.isfinite(mark_price) and mark_price > 0:
             return mark_price
 
         bid_price, ask_price = data_cache.get_best_quote(symbol)
+        try:
+            bid_price = float(bid_price)
+            ask_price = float(ask_price)
+        except (TypeError, ValueError):
+            bid_price = ask_price = 0.0
+        if not math.isfinite(bid_price):
+            bid_price = 0.0
+        if not math.isfinite(ask_price):
+            ask_price = 0.0
         if bid_price > 0 and ask_price > 0:
             return (bid_price + ask_price) / 2.0
         if bid_price > 0:
@@ -496,10 +525,16 @@ class ExposureManager:
         if ask_price > 0:
             return ask_price
 
-        avg_price = abs(self.avg_prices[symbol] or 0.0)
+        avg_price = abs(float(self.avg_prices[symbol] or 0.0))
+        if not math.isfinite(avg_price):
+            avg_price = 0.0
         if avg_price > 0:
             return avg_price
-        return fallback_price
+        try:
+            fallback_price = float(fallback_price)
+        except (TypeError, ValueError):
+            return 0.0
+        return fallback_price if math.isfinite(fallback_price) else 0.0
 
     # ----------------------------------------------------------
     # ????
@@ -515,5 +550,23 @@ class ExposureManager:
 
     def force_sync(self, symbol: str, volume: float, price: float):
         """?????????????????"""
+        symbol = str(symbol or "").upper().strip()
+        try:
+            volume = float(volume)
+            price = float(price)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Position volume and price must be numeric"
+            ) from exc
+        if (
+            not symbol
+            or not math.isfinite(volume)
+            or not math.isfinite(price)
+            or price < 0.0
+            or (abs(volume) > 1e-9 and price <= 0.0)
+        ):
+            raise ValueError(
+                f"Invalid position truth for {symbol or 'UNKNOWN'}"
+            )
         self.net_positions[symbol] = volume
-        self.avg_prices[symbol] = price
+        self.avg_prices[symbol] = price if abs(volume) > 1e-9 else 0.0

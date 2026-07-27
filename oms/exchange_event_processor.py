@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 
 from infrastructure.logger import logger
@@ -25,6 +26,39 @@ from .order import Order
 class OMSExchangeEventProcessor(OMSComponent):
     """Own deterministic exchange-event and recovered-command application."""
 
+    _SUPPORTED_ORDER_UPDATE_STATUSES = {
+        "NEW",
+        "PARTIALLY_FILLED",
+        "FILLED",
+        "CANCELED",
+        "EXPIRED",
+        "REJECTED",
+    }
+    _ORDER_UPDATE_NONNEGATIVE_FLOAT_FIELDS = (
+        "filled_qty",
+        "filled_price",
+        "cum_filled_qty",
+        "update_time",
+        "received_timestamp",
+        "received_monotonic",
+        "dispatch_timestamp",
+        "dispatch_monotonic",
+        "corrected_received_timestamp",
+    )
+    _ORDER_UPDATE_OPTIONAL_FLOAT_FIELDS = (
+        "commission",
+        "realized_pnl",
+        "clock_offset_ms",
+    )
+    _ACCOUNT_UPDATE_NONNEGATIVE_TIME_FIELDS = (
+        "event_time",
+        "received_timestamp",
+        "received_monotonic",
+        "dispatch_timestamp",
+        "dispatch_monotonic",
+        "corrected_received_timestamp",
+    )
+
     def on_exchange_update(self, event):
         try:
             self._append_and_process(event)
@@ -34,6 +68,16 @@ class OMSExchangeEventProcessor(OMSComponent):
 
     def on_exchange_account_update(self, event):
         update: ExchangeAccountUpdate = event.data
+        invalid_detail = self._normalize_exchange_account_update_numbers(
+            update
+        )
+        if invalid_detail:
+            with self.lock:
+                self._quarantine_invalid_account_update_locked(
+                    update,
+                    invalid_detail,
+                )
+            return
         if str(update.reason or "").upper() in self.CASH_FLOW_DIRTY_REASONS:
             self.mark_external_cash_flow_truth_unavailable(
                 f"account_update:{str(update.reason).upper()}"
@@ -153,7 +197,138 @@ class OMSExchangeEventProcessor(OMSComponent):
                 "[OMS] Exchange position correction without an active local order: "
                 f"{unexpected_positions}"
             )
-            self.trigger_reconcile("Unexpected exchange account position correction")
+            self.trigger_reconcile(
+                "Unexpected exchange account position correction"
+            )
+
+    @classmethod
+    def _normalize_exchange_account_update_numbers(
+        cls,
+        update: ExchangeAccountUpdate,
+    ) -> str:
+        normalized_scalars = {}
+        for field in ("wallet_balance", "available_balance", "clock_offset_ms"):
+            raw_value = getattr(update, field, None)
+            if raw_value is None and field != "wallet_balance":
+                normalized_scalars[field] = None
+                continue
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                return f"{field}:not_numeric"
+            if not math.isfinite(value):
+                return f"{field}:not_finite"
+            normalized_scalars[field] = value
+
+        for field in cls._ACCOUNT_UPDATE_NONNEGATIVE_TIME_FIELDS:
+            raw_value = getattr(update, field, 0.0)
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                return f"{field}:not_numeric"
+            if not math.isfinite(value):
+                return f"{field}:not_finite"
+            if value < 0.0:
+                return f"{field}:negative"
+            normalized_scalars[field] = value
+
+        raw_balances = getattr(update, "balances", {})
+        if not isinstance(raw_balances, dict):
+            return "balances:not_mapping"
+        normalized_balances = {}
+        for raw_asset, raw_payload in raw_balances.items():
+            asset = str(raw_asset or "").upper().strip()
+            if not asset:
+                return "balances:empty_asset"
+            if not isinstance(raw_payload, dict):
+                return f"balances:{asset}:not_mapping"
+            payload = dict(raw_payload)
+            for field in (
+                "wallet_balance",
+                "available_balance",
+                "balance_change",
+            ):
+                raw_value = payload.get(field)
+                if raw_value is None:
+                    continue
+                try:
+                    value = float(raw_value)
+                except (TypeError, ValueError):
+                    return f"balances:{asset}:{field}:not_numeric"
+                if not math.isfinite(value):
+                    return f"balances:{asset}:{field}:not_finite"
+                payload[field] = value
+            normalized_balances[asset] = payload
+
+        raw_positions = getattr(update, "positions", {})
+        if not isinstance(raw_positions, dict):
+            return "positions:not_mapping"
+        normalized_positions = {}
+        for raw_symbol, raw_payload in raw_positions.items():
+            symbol = str(raw_symbol or "").upper().strip()
+            if not symbol:
+                return "positions:empty_symbol"
+            if not isinstance(raw_payload, dict):
+                return f"positions:{symbol}:not_mapping"
+            payload = dict(raw_payload)
+            for field in ("volume", "entry_price", "unrealized_pnl"):
+                raw_value = payload.get(field, 0.0)
+                try:
+                    value = float(raw_value)
+                except (TypeError, ValueError):
+                    return f"positions:{symbol}:{field}:not_numeric"
+                if not math.isfinite(value):
+                    return f"positions:{symbol}:{field}:not_finite"
+                if field == "entry_price" and value < 0.0:
+                    return f"positions:{symbol}:{field}:negative"
+                payload[field] = value
+            normalized_positions[symbol] = payload
+
+        for field, value in normalized_scalars.items():
+            setattr(update, field, value)
+        update.balances = normalized_balances
+        update.positions = normalized_positions
+        return ""
+
+    def _quarantine_invalid_account_update_locked(
+        self,
+        update: ExchangeAccountUpdate,
+        detail: str,
+    ) -> None:
+        reason = f"account_truth:invalid_update:{detail}"
+        self._audit(
+            "invalid_exchange_account_update",
+            reason=reason,
+            asset=str(getattr(update, "asset", "") or "").upper(),
+            update_reason=str(getattr(update, "reason", "") or ""),
+            detail=detail,
+            wallet_balance=repr(
+                getattr(update, "wallet_balance", None)
+            )[:160],
+            available_balance=repr(
+                getattr(update, "available_balance", None)
+            )[:160],
+            balances=repr(getattr(update, "balances", None))[:1000],
+            positions=repr(getattr(update, "positions", None))[:1000],
+        )
+        if self.state not in {
+            LifecycleState.HALTED,
+            LifecycleState.RECONCILING,
+        }:
+            previous_state = self.state
+            self.state = LifecycleState.FROZEN
+            self._lifecycle_generation += 1
+            self.last_freeze_reason = reason
+            self._sync_capability_mode(reason)
+            self._audit(
+                "lifecycle",
+                state=self.state.value,
+                reason=reason,
+                previous_state=previous_state.value,
+            )
+        self._queue_reconcile_request_locked(
+            f"Invalid exchange account update: {detail}",
+        )
 
     def _append_and_process(self, event):
         self.event_log.append(event)
@@ -203,6 +378,122 @@ class OMSExchangeEventProcessor(OMSComponent):
             order.client_oid,
         )
 
+    @classmethod
+    def _normalize_exchange_order_update_numbers(
+        cls,
+        update: ExchangeOrderUpdate,
+    ) -> str:
+        normalized = {}
+        for field in cls._ORDER_UPDATE_NONNEGATIVE_FLOAT_FIELDS:
+            raw_value = getattr(update, field, 0.0)
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                return f"{field}:not_numeric"
+            if not math.isfinite(value):
+                return f"{field}:not_finite"
+            if value < 0.0:
+                return f"{field}:negative"
+            normalized[field] = value
+
+        for field in cls._ORDER_UPDATE_OPTIONAL_FLOAT_FIELDS:
+            raw_value = getattr(update, field, None)
+            if raw_value is None:
+                normalized[field] = None
+                continue
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                return f"{field}:not_numeric"
+            if not math.isfinite(value):
+                return f"{field}:not_finite"
+            normalized[field] = value
+
+        for field, minimum in (("seq", 0), ("trade_id", -1)):
+            raw_value = getattr(update, field, minimum)
+            try:
+                numeric_value = float(raw_value)
+            except (TypeError, ValueError):
+                return f"{field}:not_integer"
+            if (
+                not math.isfinite(numeric_value)
+                or not numeric_value.is_integer()
+            ):
+                return f"{field}:not_integer"
+            value = int(numeric_value)
+            if value < minimum:
+                return f"{field}:below_minimum"
+            normalized[field] = value
+
+        filled_qty = normalized["filled_qty"]
+        cumulative_qty = normalized["cum_filled_qty"]
+        tolerance = max(1e-9, abs(cumulative_qty) * 1e-9)
+        if filled_qty > cumulative_qty + tolerance:
+            return "filled_qty:exceeds_cumulative"
+
+        for field, value in normalized.items():
+            setattr(update, field, value)
+        return ""
+
+    def _quarantine_invalid_order_update_locked(
+        self,
+        update: ExchangeOrderUpdate,
+        detail: str,
+    ) -> None:
+        suspicious_oid = str(
+            getattr(update, "client_oid", "")
+            or getattr(update, "exchange_oid", "")
+            or ""
+        )
+        symbol = str(getattr(update, "symbol", "") or "").upper()
+        reason = (
+            f"execution_truth:{symbol or 'UNKNOWN'}:"
+            f"{suspicious_oid or 'UNKNOWN'}:invalid_update:{detail}"
+        )
+        raw_values = {
+            field: repr(getattr(update, field, None))[:160]
+            for field in (
+                *self._ORDER_UPDATE_NONNEGATIVE_FLOAT_FIELDS,
+                *self._ORDER_UPDATE_OPTIONAL_FLOAT_FIELDS,
+                "seq",
+                "trade_id",
+            )
+        }
+        self._audit(
+            "invalid_exchange_order_update",
+            reason=reason,
+            client_oid=str(getattr(update, "client_oid", "") or ""),
+            exchange_oid=str(getattr(update, "exchange_oid", "") or ""),
+            symbol=symbol,
+            status=str(getattr(update, "status", "") or ""),
+            detail=detail,
+            raw_values=raw_values,
+        )
+        if self.state not in {
+            LifecycleState.HALTED,
+            LifecycleState.RECONCILING,
+        }:
+            previous_state = self.state
+            self.state = LifecycleState.FROZEN
+            self._lifecycle_generation += 1
+            self.last_freeze_reason = reason
+            self._sync_capability_mode(reason)
+            self._audit(
+                "lifecycle",
+                state=self.state.value,
+                reason=reason,
+                previous_state=previous_state.value,
+            )
+        self._queue_reconcile_request_locked(
+            f"Invalid exchange order update: {detail}",
+            suspicious_oid,
+        )
+
+    def _invalidate_rpi_terminal_truth_locked(self) -> None:
+        self._schedule_rpi_calibration_runtime_enforcement(
+            terminal_truth_changed=True,
+        )
+
     def _apply_event(self, event):
         if event.type != "eExchangeOrderUpdate":
             return
@@ -211,10 +502,19 @@ class OMSExchangeEventProcessor(OMSComponent):
         update.status = str(update.status or "").upper()
         if update.status == "EXPIRED_IN_MATCH":
             update.status = "EXPIRED"
+        invalid_detail = self._normalize_exchange_order_update_numbers(update)
         with self.lock:
             order = self.orders.get(update.client_oid)
             if not order and update.exchange_oid:
                 order = self.exchange_id_map.get(update.exchange_oid)
+
+            if invalid_detail:
+                self._invalidate_rpi_terminal_truth_locked()
+                self._quarantine_invalid_order_update_locked(
+                    update,
+                    invalid_detail,
+                )
+                return
 
             if not order:
                 suspicious = update.client_oid or update.exchange_oid
@@ -289,6 +589,21 @@ class OMSExchangeEventProcessor(OMSComponent):
             self._schedule_rpi_calibration_runtime_enforcement(
                 terminal_truth_changed=True,
             )
+
+            if update.status not in self._SUPPORTED_ORDER_UPDATE_STATUSES:
+                status_label = (update.status or "EMPTY")[:64]
+                self._audit(
+                    "unhandled_exchange_status",
+                    client_oid=order.client_oid,
+                    exchange_oid=update.exchange_oid,
+                    symbol=order.intent.symbol,
+                    status=status_label,
+                )
+                self._quarantine_invalid_order_update_locked(
+                    update,
+                    f"status:unsupported:{status_label}",
+                )
+                return
 
             if update.exchange_oid and order.exchange_oid and order.exchange_oid != update.exchange_oid:
                 self._audit(
@@ -550,20 +865,6 @@ class OMSExchangeEventProcessor(OMSComponent):
                         order.mark_filled(update_time=update.update_time, seq=update.seq)
                         self._write_tombstone(order)
 
-                else:
-                    self._audit(
-                        "unhandled_exchange_status",
-                        client_oid=order.client_oid,
-                        status=update.status,
-                    )
-                    order.note_exchange_update(
-                        exchange_status=update.status,
-                        update_time=update.update_time,
-                        seq=update.seq,
-                        exchange_oid=update.exchange_oid,
-                    )
-                    return
-
             except ValueError as exc:
                 self._audit(
                     "invalid_transition",
@@ -619,6 +920,17 @@ class OMSExchangeEventProcessor(OMSComponent):
             raise JournalCorruptionError(
                 f"Malformed execution record {execution_id}: {exc}"
             ) from exc
+        if (
+            not math.isfinite(cumulative_qty)
+            or cumulative_qty <= 0.0
+            or not math.isfinite(fill_price)
+            or fill_price <= 0.0
+            or not math.isfinite(exchange_time)
+            or exchange_time < 0.0
+        ):
+            raise JournalCorruptionError(
+                f"Invalid execution values for {execution_id}"
+            )
 
         delta = cumulative_qty - order.filled_volume
         if delta <= 1e-9:

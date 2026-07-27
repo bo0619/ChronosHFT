@@ -2388,6 +2388,7 @@ def validate_live_runtime_config(
     oms = _section(config, "oms")
     risk = _section(config, "risk")
     limits = _section(risk, "limits")
+    tech_health = _section(risk, "tech_health")
     market_freshness = _section(risk, "market_data_freshness")
     margin_health = _section(risk, "margin_health")
     funding_guard = _section(risk, "funding_guard")
@@ -2416,6 +2417,26 @@ def validate_live_runtime_config(
     if market_data.get("testnet") is not False:
         violations.append(
             "system.market_data.testnet must be the JSON boolean false"
+        )
+    risk_latency_ms = _positive_finite_value(
+        tech_health.get("max_latency_ms")
+    )
+    ingress_age_ms = _positive_finite_value(
+        market_data.get(
+            "max_market_event_ingress_age_ms",
+            risk_latency_ms or 1000.0,
+        )
+    )
+    if ingress_age_ms is None or ingress_age_ms < 100.0:
+        violations.append(
+            "system.market_data.max_market_event_ingress_age_ms must be "
+            "finite and at least 100ms"
+        )
+    elif risk_latency_ms is not None and ingress_age_ms > risk_latency_ms:
+        violations.append(
+            "system.market_data.max_market_event_ingress_age_ms must be no "
+            "greater than risk.tech_health.max_latency_ms so stale batches "
+            "are rejected before symbol circuit breakers"
         )
     if web_dashboard.get("enabled") is not True:
         violations.append("system.web_dashboard.enabled must be JSON true")

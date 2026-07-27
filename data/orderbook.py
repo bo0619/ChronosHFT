@@ -16,6 +16,7 @@ class LocalOrderBook:
         self.asks = {}
         self.last_update_id = 0
         self.initialized = False
+        self._awaiting_first_delta = True
         self.last_exchange_ts = 0.0
         self.last_received_ts = 0.0
         self.last_received_monotonic = 0.0
@@ -43,6 +44,7 @@ class LocalOrderBook:
         self.asks = asks
         self.last_update_id = last_update_id
         self.initialized = True
+        self._awaiting_first_delta = True
         self._recompute_best_quotes()
         logger.info(f"[{self.symbol}] OrderBook Snapshot Loaded. ID={self.last_update_id}")
 
@@ -105,13 +107,29 @@ class LocalOrderBook:
         if u < self.last_update_id:
             return
 
-        if pu != self.last_update_id:
-            if U <= self.last_update_id and u >= self.last_update_id:
-                pass
-            else:
-                logger.error(f"[{self.symbol}] OrderBook Gap Detected! Local={self.last_update_id}, Remote_PU={pu}")
-                self.initialized = False
-                raise OrderBookGapError(f"Gap detected for {self.symbol}")
+        if self._awaiting_first_delta:
+            # The first buffered event after a REST snapshot bridges two
+            # independently sampled streams, so ``pu`` need not equal the
+            # snapshot ID. Binance accepts the first event whose range
+            # contains the snapshot's lastUpdateId, including the boundary
+            # case where ``u == lastUpdateId``.
+            sequence_valid = (
+                pu == self.last_update_id
+                or U <= self.last_update_id <= u
+            )
+        else:
+            # Once the bridge is established, USD-M Futures requires every
+            # event's previous-final ID to match the prior event's final ID.
+            # Accepting a later overlapping range would hide a dropped event.
+            sequence_valid = pu == self.last_update_id
+        if not sequence_valid:
+            logger.error(
+                f"[{self.symbol}] OrderBook Gap Detected! "
+                f"Local={self.last_update_id}, Remote_U={U}, "
+                f"Remote_u={u}, Remote_PU={pu}"
+            )
+            self.initialized = False
+            raise OrderBookGapError(f"Gap detected for {self.symbol}")
 
         bid_levels_dirty = False
         ask_levels_dirty = False
@@ -132,6 +150,7 @@ class LocalOrderBook:
             self._reject_integrity(str(exc))
 
         self.last_update_id = u
+        self._awaiting_first_delta = False
         self.last_exchange_ts = self._extract_exchange_ts(delta)
         self.last_received_ts = float(received_timestamp)
         self.last_received_monotonic = float(received_monotonic)

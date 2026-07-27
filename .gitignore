@@ -54,5 +54,9 @@ tests/*
 !tests/test_oos_reconstruction.py
 !tests/test_external_alerts.py
 !tests/test_binance_account_configuration_verify_only.py
+!tests/test_binance_rate_limit_budget.py
+!tests/test_binance_truth_provider.py
+!tests/test_binance_ws_routes.py
+!tests/test_data_recorder.py
 !tests/test_live_canary_evidence_collector.py
 !tests/test_rpi_terminal_truth_static.py

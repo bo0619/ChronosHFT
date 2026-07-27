@@ -42,6 +42,16 @@
         "log_path": "logs",
         "log_console": false,
         "web_port": 8000,
+        "binance_rest_rate_limit": {
+            "_comment": "One host/IP budget shared by the main process and independent risk sidecar. Background queries cannot consume the trading or emergency reserves.",
+            "enabled": true,
+            "request_weight_limit": 2400,
+            "trading_reserve": 300,
+            "emergency_reserve": 300,
+            "state_path": "storage/binance_rate_limit_budget.sqlite3",
+            "sqlite_timeout_sec": 2.0,
+            "full_open_orders_audit_interval_sec": 60.0
+        },
         "web_dashboard": {
             "_comment": "Loopback-only read-only monitoring UI. It never exposes API credentials or accepts trading commands.",
             "enabled": true,
@@ -150,7 +160,9 @@
             "emit_full_orderbook_events": false,
             "max_book_buffer": 50000,
             "book_resync_max_attempts": 3,
-            "book_resync_retry_sec": 0.25
+            "book_resync_retry_sec": 0.25,
+            "stream_ready_timeout_sec": 10.0,
+            "max_market_event_ingress_age_ms": 500.0
         },
         "strategy_runtime": {
             "queue_warn_depth": 100,

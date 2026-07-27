@@ -27,6 +27,7 @@ from event.type import (
     EVENT_AGG_TRADE,
     EVENT_EXCHANGE_ACCOUNT_UPDATE,
     EVENT_EXCHANGE_ORDER_UPDATE,
+    EVENT_MARK_PRICE,
     EVENT_ORDERBOOK,
     EVENT_SYSTEM_HEALTH,
 )
@@ -107,6 +108,18 @@ def make_book(*, bid_price=100.0, ask_price=101.0, bid_qty=1.0, ask_qty=1.0):
         exchange_timestamp=now,
         depth_levels=1,
     )
+
+
+def make_mark_payload(*, symbol=SYMBOL, mark_price="100.5"):
+    now_ms = int(time.time() * 1000)
+    return {
+        "symbol": symbol,
+        "markPrice": mark_price,
+        "indexPrice": "100.4",
+        "lastFundingRate": "0.0001",
+        "nextFundingTime": now_ms + 3_600_000,
+        "time": now_ms,
+    }
 
 
 def make_gateway_config(*, rpi_fill_model="disabled"):
@@ -243,6 +256,56 @@ class PaperGatewayTests(unittest.TestCase):
         self.assertEqual(trade.dispatch_timestamp, 2_000.008)
         self.assertEqual(trade.dispatch_monotonic, 70.004)
 
+    @patch(
+        "gateway.binance.paper_gateway.time_service.capture_timestamp",
+        return_value=(2000.0, 70.0, 2000.0, 0.0),
+    )
+    def test_stale_public_trade_is_rejected_before_queues_and_faults_transport(
+        self,
+        _capture,
+    ):
+        config = make_gateway_config()
+        config["system"]["market_data"][
+            "max_market_event_ingress_age_ms"
+        ] = 1200.0
+        self.gateway = BinancePaperGateway(self.engine, config)
+        self.gateway.orderbooks = {SYMBOL: object()}
+        self.gateway.active = True
+        self.gateway.state = GatewayState.READY
+        self.gateway._submit_worker = lambda *_args, **_kwargs: True
+        payload = json.dumps(
+            {
+                "stream": f"{SYMBOL.lower()}@aggTrade",
+                "data": {
+                    "E": 1_997_000,
+                    "s": SYMBOL,
+                    "a": 11,
+                    "p": "100.0",
+                    "q": "0.1",
+                    "T": 1_997_000,
+                    "m": False,
+                },
+            }
+        )
+
+        self.gateway.on_ws_message(payload)
+
+        self.assertFalse(
+            any(event.type == EVENT_AGG_TRADE for event in self.engine.events)
+        )
+        self.assertFalse(self.gateway.active)
+        self.assertEqual(self.gateway.state, GatewayState.ERROR)
+        self.assertTrue(
+            any(
+                event.type == EVENT_SYSTEM_HEALTH
+                and str(event.data).startswith(
+                    "FREEZE_VENUE:BINANCE_PAPER:"
+                    "MARKET_DATA_STALE:PUBLIC_TRADE:"
+                )
+                for event in self.engine.events
+            )
+        )
+
     def test_connect_uses_only_production_public_market_capabilities(self):
         self.gateway = BinancePaperGateway(self.engine, make_gateway_config())
         snapshot = {
@@ -256,9 +319,17 @@ class PaperGatewayTests(unittest.TestCase):
             "get_depth_snapshot",
             return_value=snapshot,
         ) as depth, patch.object(
+            self.gateway.rest,
+            "get_premium_index",
+            return_value=make_mark_payload(),
+        ) as premium_index, patch.object(
             BinanceWsApi,
             "start_market_stream",
         ) as market_stream, patch.object(
+            BinanceWsApi,
+            "wait_until_connected",
+            return_value=True,
+        ) as wait_until_connected, patch.object(
             BinanceWsApi,
             "start_user_stream",
             side_effect=AssertionError("paper mode must never start a user stream"),
@@ -266,7 +337,12 @@ class PaperGatewayTests(unittest.TestCase):
             self.assertTrue(self.gateway.connect([SYMBOL]))
 
         depth.assert_called_once_with(SYMBOL)
+        premium_index.assert_called_once_with(SYMBOL, timeout_sec=2.0)
         market_stream.assert_called_once_with([SYMBOL])
+        wait_until_connected.assert_called_once_with(
+            names=("PublicWS", "MarketWS"),
+            timeout_sec=10.0,
+        )
         user_stream.assert_not_called()
         self.assertFalse(self.gateway.testnet)
         self.assertEqual(self.gateway.environment, "PAPER_LIVE_DATA")
@@ -275,6 +351,119 @@ class PaperGatewayTests(unittest.TestCase):
         self.assertFalse(hasattr(self.gateway.rest, "api_key"))
         self.assertFalse(hasattr(self.gateway.rest, "api_secret"))
         self.assertNotIn("X-MBX-APIKEY", self.gateway.rest.session.headers)
+        mark_event = next(
+            event
+            for event in self.engine.events
+            if event.type == EVENT_MARK_PRICE
+        )
+        self.assertEqual(mark_event.data.symbol, SYMBOL)
+        self.assertEqual(mark_event.data.mark_price, 100.5)
+        self.assertTrue(
+            wait_until(
+                lambda: self.gateway._marks.get(SYMBOL) == 100.5
+            )
+        )
+
+    def test_connect_fails_closed_when_initial_mark_is_unavailable(self):
+        self.gateway = BinancePaperGateway(self.engine, make_gateway_config())
+        self.gateway.mark_startup_timeout_sec = 0.01
+        snapshot = {
+            "lastUpdateId": 10,
+            "bids": [["100", "1"]],
+            "asks": [["101", "1"]],
+        }
+
+        with patch.object(
+            self.gateway.rest,
+            "get_depth_snapshot",
+            return_value=snapshot,
+        ), patch.object(
+            self.gateway.rest,
+            "get_premium_index",
+            return_value=None,
+        ), patch.object(
+            BinanceWsApi,
+            "start_market_stream",
+        ), patch.object(
+            BinanceWsApi,
+            "wait_until_connected",
+            return_value=True,
+        ):
+            self.assertFalse(self.gateway.connect([SYMBOL]))
+
+        self.assertEqual(self.gateway.state, GatewayState.ERROR)
+        self.assertFalse(self.gateway._accepting_orders)
+        self.assertFalse(self.gateway.active)
+        self.assertTrue(
+            any(
+                event.type == EVENT_SYSTEM_HEALTH
+                and event.data
+                == "FREEZE_VENUE:BINANCE_PAPER:PUBLIC_MARK_INITIALIZATION_FAILED"
+                for event in self.engine.events
+            )
+        )
+
+    def test_connect_fails_closed_before_snapshot_when_market_stream_is_unready(self):
+        self.gateway = BinancePaperGateway(self.engine, make_gateway_config())
+
+        with patch.object(
+            self.gateway.rest,
+            "get_depth_snapshot",
+        ) as depth, patch.object(
+            BinanceWsApi,
+            "start_market_stream",
+        ), patch.object(
+            BinanceWsApi,
+            "wait_until_connected",
+            return_value=False,
+        ) as wait_until_connected:
+            self.assertFalse(self.gateway.connect([SYMBOL]))
+
+        wait_until_connected.assert_called_once_with(
+            names=("PublicWS", "MarketWS"),
+            timeout_sec=10.0,
+        )
+        depth.assert_not_called()
+        self.assertEqual(self.gateway.state, GatewayState.ERROR)
+        self.assertFalse(self.gateway._accepting_orders)
+        self.assertFalse(self.gateway.active)
+        self.assertTrue(
+            any(
+                event.type == EVENT_SYSTEM_HEALTH
+                and event.data
+                == "FREEZE_VENUE:BINANCE_PAPER:PUBLIC_STREAM_READY_TIMEOUT"
+                for event in self.engine.events
+            )
+        )
+
+    def test_rest_mark_fallback_refreshes_stale_websocket_mark(self):
+        gateway = self.start_offline()
+        gateway.mark_rest_poll_interval_sec = 0.01
+        gateway.mark_ws_stale_after_sec = 0.01
+        generation = gateway._book_generation
+
+        with patch.object(
+            gateway.rest,
+            "get_premium_index",
+            return_value=make_mark_payload(),
+        ) as premium_index:
+            gateway._start_mark_fallback(generation)
+            self.assertTrue(
+                wait_until(
+                    lambda: gateway._marks.get(SYMBOL) == 100.5
+                )
+            )
+            gateway._mark_fallback_stop.set()
+
+        premium_index.assert_called()
+        self.assertTrue(
+            any(
+                event.type == EVENT_MARK_PRICE
+                and event.data.symbol == SYMBOL
+                and event.data.mark_price == 100.5
+                for event in self.engine.events
+            )
+        )
 
     def test_public_ws_fault_uses_supervisor_recoverable_reason(self):
         gateway = self.start_offline()
@@ -326,10 +515,12 @@ class PaperGatewayTests(unittest.TestCase):
 
     def test_recovery_cannot_overwrite_concurrent_paper_fault(self):
         gateway = self.start_offline()
+        gateway._wait_for_initial_marks = lambda _generation: True
         entered_resync = threading.Event()
         release_resync = threading.Event()
         recovery_ws = SimpleNamespace(
             start_market_stream=lambda _symbols: None,
+            wait_until_connected=lambda **_kwargs: True,
             close=lambda: None,
         )
         gateway._new_public_ws = lambda _generation: recovery_ws
@@ -370,10 +561,12 @@ class PaperGatewayTests(unittest.TestCase):
 
     def test_close_cannot_be_overwritten_by_paper_recovery(self):
         gateway = self.start_offline()
+        gateway._wait_for_initial_marks = lambda _generation: True
         entered_resync = threading.Event()
         release_resync = threading.Event()
         recovery_ws = SimpleNamespace(
             start_market_stream=lambda _symbols: None,
+            wait_until_connected=lambda **_kwargs: True,
             close=lambda: None,
         )
         gateway._new_public_ws = lambda _generation: recovery_ws
@@ -856,6 +1049,12 @@ class PaperGatewayTests(unittest.TestCase):
                     target=lambda: gateway._handle_market_message(
                         stream,
                         data,
+                        received_timestamp=float(data["E"]) / 1000.0,
+                        received_monotonic=1.0,
+                        corrected_received_timestamp=(
+                            float(data["E"]) / 1000.0
+                        ),
+                        clock_offset_ms=0.0,
                         expected_generation=generation,
                     )
                 )
@@ -1520,6 +1719,97 @@ class PaperRuntimeIntegrationTests(unittest.TestCase):
             self.assertEqual(config["api_secret"], "")
         finally:
             gateway.rest.close()
+
+    def test_live_gateway_factory_shares_one_host_rate_limit_budget(self):
+        config = {
+            "execution": {"mode": "live"},
+            "paper_trade": {"enabled": False},
+            "api_key": "main-key",
+            "api_secret": "main-secret",
+            "testnet": False,
+            "symbols": ["BTCUSDT"],
+            "system": {
+                "binance_rest_rate_limit": {
+                    "enabled": True,
+                    "request_weight_limit": 2400,
+                    "trading_reserve": 300,
+                    "emergency_reserve": 300,
+                    "full_open_orders_audit_interval_sec": 45.0,
+                }
+            },
+        }
+        engine = DispatchingEngine()
+        shared_budget = object()
+        gateway_instance = object()
+        truth_instance = object()
+
+        with (
+            patch(
+                "main.BinanceRateLimitBudget.from_config",
+                return_value=shared_budget,
+            ) as budget_factory,
+            patch(
+                "main.BinanceGateway",
+                return_value=gateway_instance,
+            ) as gateway_type,
+            patch(
+                "main.BinanceTruthSnapshotProvider",
+                return_value=truth_instance,
+            ) as truth_type,
+        ):
+            gateway, truth = build_gateway_bundle(
+                engine,
+                config,
+                {"environment": "production"},
+            )
+
+        self.assertIs(gateway, gateway_instance)
+        self.assertIs(truth, truth_instance)
+        budget_factory.assert_called_once_with(
+            config["system"]["binance_rest_rate_limit"]
+        )
+        self.assertIs(
+            gateway_type.call_args.kwargs["rate_limit_budget"],
+            shared_budget,
+        )
+        self.assertIs(
+            truth_type.call_args.kwargs["rate_limit_budget"],
+            shared_budget,
+        )
+        self.assertEqual(
+            truth_type.call_args.kwargs[
+                "full_open_orders_audit_interval_sec"
+            ],
+            45.0,
+        )
+
+    def test_live_gateway_factory_rejects_disabled_host_budget(self):
+        config = {
+            "execution": {"mode": "live"},
+            "paper_trade": {"enabled": False},
+            "api_key": "main-key",
+            "api_secret": "main-secret",
+            "testnet": False,
+            "symbols": ["BTCUSDT"],
+            "system": {
+                "binance_rest_rate_limit": {"enabled": False}
+            },
+        }
+
+        with (
+            patch("main.BinanceGateway") as gateway_type,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "cannot be disabled",
+            ),
+        ):
+            build_gateway_bundle(
+                DispatchingEngine(),
+                config,
+                {"environment": "production"},
+            )
+
+        gateway_type.assert_not_called()
 
     def test_gateway_shutdown_cancellations_are_drainable_before_oms_stop(self):
         engine = EventEngine()

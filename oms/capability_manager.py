@@ -108,6 +108,9 @@ class OMSCapabilityManager(OMSComponent):
             raise ValueError(f"Unsupported trading mode override: {mode}")
         constraint_key = self._mode_constraint_key(reason)
         force_generation = constraint_key == "venue_dead_man_switch:"
+        journal_error = None
+        selected = False
+        reduce_only_selected = False
         with self.lock:
             previous_mode = (
                 self.mode_override.value if self.mode_override else ""
@@ -130,25 +133,36 @@ class OMSCapabilityManager(OMSComponent):
                 constraint_generation
             )
             self._refresh_selected_mode_constraint()
-            self._sync_capability_mode(self.mode_override_reason or reason)
-            selected = (
-                self.mode_override == mode
-                and self.mode_override_reason == reason
+            try:
+                self._sync_capability_mode(
+                    self.mode_override_reason or reason
+                )
+                selected = (
+                    self.mode_override == mode
+                    and self.mode_override_reason == reason
+                )
+                reduce_only_selected = (
+                    self.mode_override == OMSCapabilityMode.REDUCE_ONLY
+                    and previous_constraint != (mode, reason)
+                )
+                self._audit(
+                    "trading_mode_override_set",
+                    mode=mode.value,
+                    reason=reason,
+                    constraint_key=constraint_key,
+                    constraint_generation=constraint_generation,
+                    selected=selected,
+                    previous_mode=previous_mode,
+                    previous_reason=previous_reason,
+                )
+            except JournalError as exc:
+                journal_error = exc
+        if journal_error is not None:
+            self._fail_closed_on_journal_error(
+                journal_error,
+                "set_trading_mode",
             )
-            reduce_only_selected = (
-                self.mode_override == OMSCapabilityMode.REDUCE_ONLY
-                and previous_constraint != (mode, reason)
-            )
-            self._audit(
-                "trading_mode_override_set",
-                mode=mode.value,
-                reason=reason,
-                constraint_key=constraint_key,
-                constraint_generation=constraint_generation,
-                selected=selected,
-                previous_mode=previous_mode,
-                previous_reason=previous_reason,
-            )
+            return False
         if reduce_only_selected:
             self._wait_for_outbound_risk_sends(
                 f"trading_mode_reduce_only:{reason}"
@@ -312,11 +326,19 @@ class OMSCapabilityManager(OMSComponent):
                     self.rejected_risk_control_heartbeat_sources.add(source)
                     should_audit = True
             if should_audit:
-                self._audit(
-                    "risk_control_heartbeat_source_rejected",
-                    source=source,
-                    required_source=self.risk_control_heartbeat_required_source,
-                )
+                try:
+                    self._audit(
+                        "risk_control_heartbeat_source_rejected",
+                        source=source,
+                        required_source=(
+                            self.risk_control_heartbeat_required_source
+                        ),
+                    )
+                except JournalError as exc:
+                    self._fail_closed_on_journal_error(
+                        exc,
+                        "risk_control_heartbeat_source_rejected",
+                    )
             return False
         with self.lock:
             previous_status = self.risk_control_heartbeat_status
@@ -328,12 +350,19 @@ class OMSCapabilityManager(OMSComponent):
             self.risk_control_heartbeat_reason = reason
 
         if status != previous_status or reason != previous_reason:
-            self._audit(
-                "risk_control_heartbeat_status",
-                status=status,
-                source=source,
-                reason=reason,
-            )
+            try:
+                self._audit(
+                    "risk_control_heartbeat_status",
+                    status=status,
+                    source=source,
+                    reason=reason,
+                )
+            except JournalError as exc:
+                self._fail_closed_on_journal_error(
+                    exc,
+                    "risk_control_heartbeat",
+                )
+                return False
         return healthy
 
     def get_risk_control_heartbeat_snapshot(self) -> dict:

@@ -40,6 +40,9 @@ _HARD_CLOCK_FAILURE_PREFIXES = (
     "clock_phase_error_non_finite",
     "clock_phase_threshold_invalid",
 )
+STATE_REPLACE_MAX_ATTEMPTS = 5
+STATE_REPLACE_RETRY_BASE_SEC = 0.01
+TRANSIENT_WINDOWS_REPLACE_ERRORS = frozenset({5, 32, 33})
 
 
 def _finite_float(value, label: str) -> float:
@@ -50,6 +53,23 @@ def _finite_float(value, label: str) -> float:
     if not math.isfinite(result):
         raise ValueError(f"{label} must be a finite number")
     return result
+
+
+def _replace_state_file(source: str, destination: str) -> None:
+    """Replace one durable state file, tolerating brief Windows file locks."""
+    for attempt in range(STATE_REPLACE_MAX_ATTEMPTS):
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as exc:
+            retryable = isinstance(exc, PermissionError) or getattr(
+                exc,
+                "winerror",
+                None,
+            ) in TRANSIENT_WINDOWS_REPLACE_ERRORS
+            if not retryable or attempt + 1 >= STATE_REPLACE_MAX_ATTEMPTS:
+                raise
+            time.sleep(STATE_REPLACE_RETRY_BASE_SEC * (2**attempt))
 
 
 def _is_truthy(value) -> bool:
@@ -81,8 +101,20 @@ class BinanceRiskSidecarExchange:
     ):
         import requests
 
+        from gateway.binance.rate_limit_budget import BinanceRateLimitBudget
         from gateway.binance.rest_api import BinanceRestApi
 
+        settings = settings or {}
+        rate_limit_settings = dict(
+            settings.get("rest_rate_limit", {}) or {}
+        )
+        if rate_limit_settings.get("enabled", True) is not True:
+            raise ValueError(
+                "risk sidecar requires Binance REST rate-limit coordination"
+            )
+        self.rate_limit_budget = BinanceRateLimitBudget.from_config(
+            rate_limit_settings
+        )
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
         self.rest = BinanceRestApi(
@@ -90,9 +122,9 @@ class BinanceRiskSidecarExchange:
             api_secret,
             self.session,
             testnet=testnet,
+            rate_limit_budget=self.rate_limit_budget,
         )
         self.rest.clock_resync_callback = self.sync_exchange_clock
-        settings = settings or {}
         self.symbols = tuple(
             sorted(
                 {
@@ -135,6 +167,29 @@ class BinanceRiskSidecarExchange:
             1,
             int(settings.get("cash_flow_max_pages", 5) or 5),
         )
+        self.cash_flow_poll_interval_sec = max(
+            1.0,
+            _finite_float(
+                settings.get("cash_flow_poll_interval_sec", 30.0) or 30.0,
+                "cash_flow_poll_interval_sec",
+            ),
+        )
+        self._last_cash_flow_poll_monotonic = 0.0
+        self._cached_external_cash_flow_total = 0.0
+        self._cash_flow_cache_initialized = False
+        self.full_open_orders_audit_interval_sec = max(
+            5.0,
+            _finite_float(
+                settings.get(
+                    "full_open_orders_audit_interval_sec",
+                    60.0,
+                )
+                or 60.0,
+                "full_open_orders_audit_interval_sec",
+            ),
+        )
+        self._last_full_open_orders_audit_monotonic = 0.0
+        self._known_open_order_symbols = set()
         self.clock_sync_enabled = bool(
             settings.get("clock_sync_enabled", True)
         )
@@ -247,7 +302,7 @@ class BinanceRiskSidecarExchange:
         self._clock_anchor_monotonic = 0.0
         self.clock_reason = "clock_sync_missing"
 
-    def _collect_clock_samples(self):
+    def _collect_clock_samples(self, *, emergency: bool = False):
         sample_count = max(1, int(getattr(self, "clock_sample_count", 1)))
         min_samples = max(
             1,
@@ -276,8 +331,14 @@ class BinanceRiskSidecarExchange:
         for index in range(sample_count):
             started_monotonic = time.perf_counter()
             started_ms = time.time() * 1000.0
+            if emergency:
+                server_time_response = self.rest.get_server_time(
+                    emergency=True
+                )
+            else:
+                server_time_response = self.rest.get_server_time()
             ok, payload, reason = self._response_payload(
-                self.rest.get_server_time(),
+                server_time_response,
                 dict,
                 "server_time",
             )
@@ -341,10 +402,12 @@ class BinanceRiskSidecarExchange:
             "uncertainty_ms": rtt_ms / 2.0 + dispersion_ms,
         }, ""
 
-    def sync_exchange_clock(self):
+    def sync_exchange_clock(self, *, emergency: bool = False):
         from infrastructure.time_service import time_service
 
-        sample, reason = self._collect_clock_samples()
+        sample, reason = self._collect_clock_samples(
+            emergency=emergency,
+        )
         if sample is None:
             self.clock_reason = reason
             return False, reason
@@ -512,6 +575,8 @@ class BinanceRiskSidecarExchange:
             and not str(getattr(self, "clock_reason", "") or "")
         ):
             return True, ""
+        if force:
+            return self.sync_exchange_clock(emergency=True)
         return self.sync_exchange_clock()
 
     def check_account_channel(self):
@@ -672,10 +737,8 @@ class BinanceRiskSidecarExchange:
             )
             if not positions_ok:
                 return False, {}, reason
-            orders_ok, open_orders, reason = self._response_payload(
-                self.rest.get_open_orders(),
-                list,
-                "open_orders",
+            orders_ok, open_orders, reason = (
+                self._get_open_orders_snapshot()
             )
             if not orders_ok:
                 return False, {}, reason
@@ -701,7 +764,7 @@ class BinanceRiskSidecarExchange:
             external_cash_flow_total = 0.0
             if getattr(self, "daily_loss_enabled", False):
                 cash_flow_ok, external_cash_flow_total, reason = (
-                    self._get_daily_external_cash_flow()
+                    self._get_cached_daily_external_cash_flow()
                 )
                 if not cash_flow_ok:
                     return False, {}, reason
@@ -828,6 +891,109 @@ class BinanceRiskSidecarExchange:
                 return True, total, ""
         return False, 0.0, "income_history_page_limit_exceeded"
 
+    def _get_cached_daily_external_cash_flow(self):
+        now = time.perf_counter()
+        initialized = bool(
+            getattr(self, "_cash_flow_cache_initialized", False)
+        )
+        last_poll = float(
+            getattr(self, "_last_cash_flow_poll_monotonic", 0.0) or 0.0
+        )
+        interval = max(
+            1.0,
+            float(
+                getattr(self, "cash_flow_poll_interval_sec", 30.0)
+                or 30.0
+            ),
+        )
+        if initialized and now - last_poll < interval:
+            return (
+                True,
+                float(
+                    getattr(
+                        self,
+                        "_cached_external_cash_flow_total",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+                "",
+            )
+
+        ok, total, reason = self._get_daily_external_cash_flow()
+        if not ok:
+            return False, 0.0, reason
+        self._cached_external_cash_flow_total = float(total)
+        self._last_cash_flow_poll_monotonic = now
+        self._cash_flow_cache_initialized = True
+        return True, float(total), ""
+
+    def _get_open_orders_snapshot(self):
+        symbols = tuple(getattr(self, "symbols", ()) or ())
+        now = time.perf_counter()
+        last_full_audit = float(
+            getattr(
+                self,
+                "_last_full_open_orders_audit_monotonic",
+                0.0,
+            )
+            or 0.0
+        )
+        interval = max(
+            5.0,
+            float(
+                getattr(
+                    self,
+                    "full_open_orders_audit_interval_sec",
+                    60.0,
+                )
+                or 60.0
+            ),
+        )
+        if not symbols or last_full_audit <= 0.0 or now - last_full_audit >= interval:
+            ok, rows, reason = self._response_payload(
+                self.rest.get_open_orders(),
+                list,
+                "open_orders",
+            )
+            if not ok:
+                return False, [], reason
+            self._last_full_open_orders_audit_monotonic = now
+            self._remember_open_order_symbols(rows)
+            return True, rows, ""
+
+        rows = []
+        known_symbols = set(
+            getattr(self, "_known_open_order_symbols", set()) or set()
+        )
+        for symbol in sorted(set(symbols) | known_symbols):
+            ok, symbol_rows, reason = self._response_payload(
+                self.rest.get_open_orders(symbol),
+                list,
+                f"open_orders:{symbol}",
+            )
+            if not ok:
+                return False, [], reason
+            rows.extend(symbol_rows)
+        self._remember_open_order_symbols(rows)
+        return True, rows, ""
+
+    def _remember_open_order_symbols(self, rows):
+        known_symbols = getattr(
+            self,
+            "_known_open_order_symbols",
+            None,
+        )
+        if known_symbols is None:
+            known_symbols = set()
+            self._known_open_order_symbols = known_symbols
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol", "") or "").strip().upper()
+            if symbol:
+                known_symbols.add(symbol)
+
     def emergency_cancel(self, symbols, countdown_time_ms: int):
         failures = []
         clock_ok, clock_reason = self._ensure_exchange_clock(force=True)
@@ -839,7 +1005,7 @@ class BinanceRiskSidecarExchange:
             if str(symbol or "").strip()
         }
         try:
-            response = self.rest.get_open_orders()
+            response = self.rest.get_open_orders(emergency=True)
             status_code = getattr(response, "status_code", None)
             if status_code != 200:
                 failures.append(
@@ -907,7 +1073,7 @@ class BinanceRiskSidecarExchange:
 
         clock_ok, clock_reason = self._ensure_exchange_clock(force=True)
         ok, positions, reason = self._response_payload(
-            self.rest.get_positions(),
+            self.rest.get_positions(emergency=True),
             list,
             "positions",
         )
@@ -1062,7 +1228,12 @@ class RiskSidecarCore:
         now: float = None,
         snapshot_worker=None,
     ):
-        now = time.perf_counter() if now is None else float(now)
+        now = _finite_float(
+            time.perf_counter() if now is None else now,
+            "now",
+        )
+        if now < 0.0:
+            raise ValueError("now must be non-negative")
         self.exchange = exchange
         self.snapshot_worker = snapshot_worker
         self.symbols = tuple(
@@ -1110,7 +1281,10 @@ class RiskSidecarCore:
         )
         self.parent_heartbeat_timeout_sec = max(
             0.1,
-            float(settings.get("parent_heartbeat_timeout_sec", 1.5) or 1.5),
+            _finite_float(
+                settings.get("parent_heartbeat_timeout_sec", 1.5) or 1.5,
+                "parent_heartbeat_timeout_sec",
+            ),
         )
         configured_exchange_poll_interval_sec = max(
             0.1,
@@ -1133,7 +1307,10 @@ class RiskSidecarCore:
         )
         self.exchange_max_age_sec = max(
             self.exchange_poll_interval_sec,
-            float(settings.get("exchange_max_age_sec", 10.0) or 10.0),
+            _finite_float(
+                settings.get("exchange_max_age_sec", 10.0) or 10.0,
+                "exchange_max_age_sec",
+            ),
         )
         self.snapshot_worker_timeout_sec = min(
             self.exchange_max_age_sec,
@@ -1165,11 +1342,17 @@ class RiskSidecarCore:
         )
         self.cancel_retry_sec = max(
             0.1,
-            float(settings.get("cancel_retry_sec", 2.0) or 2.0),
+            _finite_float(
+                settings.get("cancel_retry_sec", 2.0) or 2.0,
+                "cancel_retry_sec",
+            ),
         )
         self.orphan_exit_sec = max(
             self.parent_heartbeat_timeout_sec,
-            float(settings.get("orphan_exit_sec", 30.0) or 30.0),
+            _finite_float(
+                settings.get("orphan_exit_sec", 30.0) or 30.0,
+                "orphan_exit_sec",
+            ),
         )
         self.emergency_countdown_time_ms = max(
             1,
@@ -1382,11 +1565,17 @@ class RiskSidecarCore:
         self.flatten_enabled = bool(settings.get("flatten_enabled", True))
         self.parent_loss_flatten_delay_sec = max(
             0.0,
-            float(settings.get("parent_loss_flatten_delay_sec", 3.0) or 0.0),
+            _finite_float(
+                settings.get("parent_loss_flatten_delay_sec", 3.0) or 0.0,
+                "parent_loss_flatten_delay_sec",
+            ),
         )
         self.flatten_retry_sec = max(
             0.1,
-            float(settings.get("flatten_retry_sec", 2.0) or 2.0),
+            _finite_float(
+                settings.get("flatten_retry_sec", 2.0) or 2.0,
+                "flatten_retry_sec",
+            ),
         )
         self.flat_verification_checks = max(
             1,
@@ -1622,7 +1811,7 @@ class RiskSidecarCore:
             f"{self.state_path}.corrupt.{int(time.time() * 1000)}"
         )
         try:
-            os.replace(self.state_path, quarantine_path)
+            _replace_state_file(self.state_path, quarantine_path)
         except OSError:
             pass
 
@@ -1760,13 +1949,15 @@ class RiskSidecarCore:
                 payload.get("deployment_adjusted_equity", 0.0) or 0.0,
                 "state.deployment_adjusted_equity",
             )
-            self.deployment_loss = max(
-                0.0,
-                _finite_float(
-                    payload.get("deployment_loss", 0.0) or 0.0,
-                    "state.deployment_loss",
-                ),
+            deployment_loss = _finite_float(
+                payload.get("deployment_loss", 0.0) or 0.0,
+                "state.deployment_loss",
             )
+            if deployment_loss < 0.0:
+                raise ValueError(
+                    "state.deployment_loss must be non-negative"
+                )
+            self.deployment_loss = deployment_loss
             if self.quiesced:
                 self.stage = "QUIESCED"
             else:
@@ -1862,7 +2053,7 @@ class RiskSidecarCore:
                 handle.flush()
                 if self.state_fsync:
                     os.fsync(handle.fileno())
-            os.replace(temp_path, absolute_path)
+            _replace_state_file(temp_path, absolute_path)
             if self.state_fsync and os.name != "nt":
                 directory_fd = os.open(state_dir, os.O_RDONLY)
                 try:
@@ -2655,17 +2846,26 @@ class RiskSidecarCore:
         return self.funding_action, self.funding_reason
 
     def _evaluate_risk_snapshot(self, snapshot: dict):
-        account = snapshot.get("account", {}) or {}
-        positions = snapshot.get("positions", []) or []
-        open_orders = snapshot.get("open_orders", []) or []
+        if not isinstance(snapshot, dict):
+            return "REDUCE_ONLY", "risk_snapshot_invalid", {}
+        account = snapshot.get("account")
+        positions = snapshot.get("positions")
+        open_orders = snapshot.get("open_orders")
+        if (
+            not isinstance(account, dict)
+            or not isinstance(positions, list)
+            or not isinstance(open_orders, list)
+        ):
+            return "REDUCE_ONLY", "risk_snapshot_invalid", {}
+        if (
+            "totalMaintMargin" not in account
+            or "totalMarginBalance" not in account
+        ):
+            return "REDUCE_ONLY", "margin_snapshot_missing", {}
         try:
-            maintenance_margin = float(
-                account.get("totalMaintMargin", 0.0) or 0.0
-            )
-            margin_balance = float(
-                account.get("totalMarginBalance", 0.0) or 0.0
-            )
-        except (TypeError, ValueError):
+            maintenance_margin = float(account["totalMaintMargin"])
+            margin_balance = float(account["totalMarginBalance"])
+        except (TypeError, ValueError, OverflowError):
             return "REDUCE_ONLY", "margin_snapshot_invalid", {}
         if (
             not math.isfinite(maintenance_margin)
@@ -2674,6 +2874,8 @@ class RiskSidecarCore:
             or margin_balance < 0.0
         ):
             return "REDUCE_ONLY", "margin_snapshot_invalid", {}
+        if margin_balance <= 0.0:
+            return "KILL", "account_margin_balance_non_positive", {}
         maintenance_margin_ratio = (
             maintenance_margin / margin_balance
             if margin_balance > 0.0
@@ -2770,6 +2972,7 @@ class RiskSidecarCore:
                 or not math.isfinite(stop_price)
                 or original_qty < 0.0
                 or executed_qty < 0.0
+                or executed_qty > original_qty + 1e-9
             ):
                 return "REDUCE_ONLY", f"open_order_invalid:{symbol}", {}
             remaining_qty = max(0.0, original_qty - executed_qty)
@@ -3969,15 +4172,24 @@ class IndependentRiskSupervisor:
 
         self.heartbeat_interval_sec = max(
             0.05,
-            float(self.config.get("heartbeat_interval_sec", 0.25) or 0.25),
+            _finite_float(
+                self.config.get("heartbeat_interval_sec", 0.25) or 0.25,
+                "heartbeat_interval_sec",
+            ),
         )
         self.status_max_age_sec = max(
             self.heartbeat_interval_sec,
-            float(self.config.get("status_max_age_sec", 2.0) or 2.0),
+            _finite_float(
+                self.config.get("status_max_age_sec", 2.0) or 2.0,
+                "status_max_age_sec",
+            ),
         )
         self.stop_timeout_sec = max(
             0.5,
-            float(self.config.get("stop_timeout_sec", 10.0) or 10.0),
+            _finite_float(
+                self.config.get("stop_timeout_sec", 10.0) or 10.0,
+                "stop_timeout_sec",
+            ),
         )
         self.control_enqueue_timeout_sec = max(
             0.01,
@@ -4011,6 +4223,13 @@ class IndependentRiskSupervisor:
         limits_config = dict(risk_config.get("limits", {}) or {})
         margin_config = dict(risk_config.get("margin_health", {}) or {})
         cash_flow_config = dict(risk_config.get("cash_flow_truth", {}) or {})
+        rest_rate_limit_config = dict(
+            config.get("system", {}).get(
+                "binance_rest_rate_limit",
+                {},
+            )
+            or {}
+        )
         funding_guard_config = dict(
             risk_config.get("funding_guard", {}) or {}
         )
@@ -4022,6 +4241,14 @@ class IndependentRiskSupervisor:
             "api_secret": str(self.config.get("api_secret", "") or ""),
             "testnet": bool(config.get("testnet", False)),
             "symbols": list(config.get("symbols", [])),
+            "rest_rate_limit": rest_rate_limit_config,
+            "full_open_orders_audit_interval_sec": float(
+                rest_rate_limit_config.get(
+                    "full_open_orders_audit_interval_sec",
+                    60.0,
+                )
+                or 60.0
+            ),
             "funding_guard": funding_guard_config,
             "emergency_countdown_time_ms": int(
                 self.config.get("emergency_countdown_time_ms", 1000) or 1000
@@ -4109,6 +4336,9 @@ class IndependentRiskSupervisor:
                 )
                 or []
             ),
+            "cash_flow_poll_interval_sec": float(
+                cash_flow_config.get("poll_interval_sec", 30.0) or 30.0
+            ),
             "seed_risk_day": str(
                 getattr(self.risk_manager, "risk_day", "") or ""
             ),
@@ -4186,6 +4416,7 @@ class IndependentRiskSupervisor:
         self.parent_heartbeat_suspended_reason = ""
         self.last_status = {}
         self.last_status_received_at = 0.0
+        self.last_status_protocol_error = ""
         self.started_at = 0.0
         self.recovery_count = 0
         self.last_recovery_snapshot_sequence = 0
@@ -4197,6 +4428,7 @@ class IndependentRiskSupervisor:
             return True
         self.last_status = {}
         self.last_status_received_at = 0.0
+        self.last_status_protocol_error = ""
         self.last_recovery_snapshot_sequence = 0
         self.recovery_count = 0
         self.heartbeat_sequence = 0
@@ -4257,20 +4489,122 @@ class IndependentRiskSupervisor:
         if delivered:
             self.last_heartbeat_sent_at = now
 
+    @staticmethod
+    def _validate_status_payload(status: dict) -> dict:
+        if not isinstance(status, dict):
+            raise ValueError("status_not_object")
+        sequence = status.get("sequence")
+        if (
+            isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence <= 0
+        ):
+            raise ValueError("status_sequence_invalid")
+        healthy = status.get("healthy")
+        if not isinstance(healthy, bool):
+            raise ValueError("status_healthy_invalid")
+        if not isinstance(status.get("reason", ""), str):
+            raise ValueError("status_reason_invalid")
+        for field in (
+            "exchange_healthy",
+            "kill_latched",
+            "quiesced",
+            "state_recovered",
+        ):
+            if field in status and not isinstance(status[field], bool):
+                raise ValueError(f"status_{field}_invalid")
+        for field in (
+            "risk_snapshot_sequence",
+            "state_generation",
+            "parent_sequence",
+            "flat_verification_count",
+        ):
+            value = status.get(field)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise ValueError(f"status_{field}_invalid")
+        for field in (
+            "reported_at",
+            "risk_snapshot_captured_at",
+            "risk_snapshot_captured_monotonic",
+            "quiesced_at",
+        ):
+            if field not in status:
+                continue
+            value = _finite_float(status[field], f"status.{field}")
+            if value < 0.0:
+                raise ValueError(f"status_{field}_invalid")
+        risk_action = str(status.get("risk_action", "NONE") or "NONE").upper()
+        if risk_action not in {"NONE", "REDUCE_ONLY", "KILL"}:
+            raise ValueError("status_risk_action_invalid")
+        stage = str(status.get("stage", "") or "").upper()
+        if stage and stage not in {
+            "ARMED",
+            "CANCEL_PENDING",
+            "CANCEL_VERIFIED",
+            "FLATTENING",
+            "FLAT_VERIFIED",
+            "FAILED",
+            "QUIESCED",
+        }:
+            raise ValueError("status_stage_invalid")
+        if "risk_metrics" in status and not isinstance(
+            status["risk_metrics"],
+            dict,
+        ):
+            raise ValueError("status_risk_metrics_invalid")
+        if healthy and (
+            risk_action != "NONE"
+            or stage != "ARMED"
+            or status.get("exchange_healthy") is not True
+            or status.get("kill_latched", False) is not False
+            or status.get("quiesced", False) is not False
+            or int(status.get("risk_snapshot_sequence", 0) or 0) <= 0
+            or float(
+                status.get("risk_snapshot_captured_monotonic", 0.0) or 0.0
+            )
+            <= 0.0
+        ):
+            raise ValueError("status_healthy_state_inconsistent")
+        return dict(status)
+
     def _drain_status(self, now: float):
         while True:
             try:
                 status = self.status_queue.get_nowait()
             except queue.Empty:
                 break
+            except (OSError, ValueError) as exc:
+                self.last_status = {}
+                self.last_status_received_at = 0.0
+                self.last_status_protocol_error = (
+                    f"status_queue_error:{type(exc).__name__}:{exc}"
+                )
+                break
+            if not isinstance(status, dict):
+                self.last_status = {}
+                self.last_status_received_at = 0.0
+                self.last_status_protocol_error = "status_not_object"
+                continue
             if str(status.get("session_id", "") or "") != self.session_id:
                 continue
-            if int(status.get("sequence", 0) or 0) <= int(
+            try:
+                validated = self._validate_status_payload(status)
+            except (TypeError, ValueError, OverflowError) as exc:
+                self.last_status = {}
+                self.last_status_received_at = 0.0
+                self.last_status_protocol_error = str(exc)
+                continue
+            if validated["sequence"] <= int(
                 self.last_status.get("sequence", 0) or 0
             ):
                 continue
-            self.last_status = dict(status)
+            self.last_status = validated
             self.last_status_received_at = now
+            self.last_status_protocol_error = ""
 
     def _record_oms_heartbeat(self, healthy: bool, reason: str):
         record = getattr(self.oms, "record_risk_control_heartbeat", None)
@@ -4392,7 +4726,13 @@ class IndependentRiskSupervisor:
         self._send_heartbeat(now)
         self._drain_status(now)
         if not self.last_status:
-            self._apply_oms_health(False, "supervisor_status_missing")
+            reason = (
+                "supervisor_status_invalid:"
+                f"{self.last_status_protocol_error}"
+                if self.last_status_protocol_error
+                else "supervisor_status_missing"
+            )
+            self._apply_oms_health(False, reason)
             return False
         status_age = max(0.0, now - self.last_status_received_at)
         if status_age > self.status_max_age_sec:
@@ -4415,14 +4755,14 @@ class IndependentRiskSupervisor:
     def _control_failure_result(
         self,
         command_type: str,
-        reason: str,
+        failure_reason: str,
         request_id: str = "",
         **payload,
     ) -> dict:
         command_type = str(command_type or "").upper()
         result = {
             "accepted": False,
-            "reason": str(reason or "supervisor_control_failed"),
+            "reason": str(failure_reason or "supervisor_control_failed"),
             "request_id": str(request_id or ""),
         }
         if command_type == "QUIESCE":
@@ -4787,6 +5127,7 @@ class IndependentRiskSupervisor:
                 )
             ),
             "reason": str(self.last_status.get("reason", "") or ""),
+            "status_protocol_error": self.last_status_protocol_error,
             "status_age_sec": status_age,
             "parent_sequence": int(
                 self.last_status.get("parent_sequence", 0) or 0

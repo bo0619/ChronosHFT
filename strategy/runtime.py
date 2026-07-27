@@ -66,10 +66,12 @@ class StrategyRuntime:
     def start(self):
         if self._active:
             return
-        self._active = True
-        self._async_stop_thread = None
-        self._async_stop_result = None
-        self._async_stop_error = None
+        with self._condition:
+            self._rebase_pending_work_locked(time.perf_counter())
+            self._active = True
+            self._async_stop_thread = None
+            self._async_stop_result = None
+            self._async_stop_error = None
         if self._thread is None or not self._thread.is_alive():
             self._thread = Thread(
                 target=self._run,
@@ -78,6 +80,17 @@ class StrategyRuntime:
             )
             self._thread.start()
         logger.info(f"[StrategyRuntime] started for {getattr(self.strategy, 'name', 'strategy')}")
+
+    def _rebase_pending_work_locked(self, started_at: float) -> None:
+        """Treat pre-start state snapshots as startup work, not live backlog."""
+        self._control_queue = deque(
+            (kind, started_at, payload)
+            for kind, _enqueued_at, payload in self._control_queue
+        )
+        self._pending_market = {
+            key: (started_at, payload)
+            for key, (_enqueued_at, payload) in self._pending_market.items()
+        }
 
     def stop(self, timeout_sec=None):
         self._active = False
@@ -207,8 +220,7 @@ class StrategyRuntime:
         enqueued_at = time.perf_counter()
         with self._condition:
             if key in self._pending_market:
-                first_seen_at, _ = self._pending_market[key]
-                self._pending_market[key] = (first_seen_at, payload)
+                self._pending_market[key] = (enqueued_at, payload)
                 self._stats["coalesced_market_events"] += 1
             else:
                 self._pending_market[key] = (enqueued_at, payload)

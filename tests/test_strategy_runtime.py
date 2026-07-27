@@ -1,6 +1,7 @@
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from strategy.runtime import StrategyRuntime
 
@@ -58,6 +59,28 @@ class StrategyRuntimeTests(unittest.TestCase):
         self.assertEqual(strategy.orders, ["oid-1"])
         self.assertEqual(strategy.accounts, [1000.0])
         self.assertEqual(strategy.health, ["FROZEN:test"])
+
+    def test_start_rebases_prestart_state_without_reporting_false_backlog(self):
+        strategy = DummyStrategy()
+        runtime = StrategyRuntime(strategy, start_thread=False)
+        runtime.on_order(SimpleNamespace(order_id="oid-1"))
+        runtime.on_orderbook(SimpleNamespace(symbol="BTCUSDT", sequence=1))
+        worker = MagicMock()
+        worker.is_alive.return_value = False
+
+        with patch("strategy.runtime.time.perf_counter", return_value=50.0), patch(
+            "strategy.runtime.Thread",
+            return_value=worker,
+        ):
+            runtime.start()
+
+        self.assertEqual(runtime._control_queue[0][1], 50.0)
+        self.assertEqual(
+            runtime._pending_market[("orderbook", "BTCUSDT")][0],
+            50.0,
+        )
+        self.assertEqual(runtime.get_metrics_snapshot()["max_wait_ms"], 0.0)
+        worker.start.assert_called_once_with()
 
     def test_async_runtime_does_not_execute_inline(self):
         strategy = DummyStrategy()

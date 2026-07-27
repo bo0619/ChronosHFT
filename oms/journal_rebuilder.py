@@ -455,8 +455,27 @@ class OMSJournalRebuilder(OMSComponent):
                 income_id = str(payload.get("income_id", "") or "")
                 if income_id in external_cash_flow_ids:
                     continue
+                try:
+                    cash_flow_amount = float(
+                        payload.get("amount", 0.0) or 0.0
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise JournalCorruptionError(
+                        "Invalid external cash-flow amount at journal "
+                        f"record {record_index}"
+                    ) from exc
+                if not math.isfinite(cash_flow_amount):
+                    raise JournalCorruptionError(
+                        "Non-finite external cash-flow amount at journal "
+                        f"record {record_index}"
+                    )
                 external_cash_flow_ids.add(income_id)
-                external_cash_flow_total += float(payload.get("amount", 0.0) or 0.0)
+                external_cash_flow_total += cash_flow_amount
+                if not math.isfinite(external_cash_flow_total):
+                    raise JournalCorruptionError(
+                        "External cash-flow total overflow at journal "
+                        f"record {record_index}"
+                    )
             elif kind == "cash_flow_scan_completed":
                 external_cash_flow_scan_end_ms = max(
                     external_cash_flow_scan_end_ms,

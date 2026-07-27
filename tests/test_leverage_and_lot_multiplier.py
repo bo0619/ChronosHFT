@@ -73,7 +73,7 @@ from infrastructure.config_scaling import (
     resolve_runtime_secrets,
 )
 from infrastructure.paper_trade import apply_paper_trade_mode, is_paper_trade
-from main import run_live_risk_checks
+from main import run_live_risk_checks, wait_for_initial_market_data_readiness
 from oms.engine import OMS
 
 
@@ -151,6 +151,55 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
 
         self.assertTrue(run_live_risk_checks(risk, supervisor))
         self.assertEqual(calls, ["supervisor", "funding", "risk"])
+
+    def test_initial_market_data_readiness_waits_for_recovery(self):
+        readiness = MagicMock(
+            side_effect=[
+                {"BTCUSDT": "stale_market_data:book_age=1600.0ms"},
+                {},
+            ]
+        )
+        risk = SimpleNamespace(
+            market_data_readiness_failures=readiness,
+            check_funding_guard=MagicMock(return_value=True),
+            check_market_data_freshness=MagicMock(return_value=True),
+        )
+        supervisor = SimpleNamespace(tick=MagicMock(return_value=True))
+
+        with patch("main.time.sleep") as sleep:
+            ready = wait_for_initial_market_data_readiness(
+                risk,
+                supervisor,
+                timeout_sec=1.0,
+                poll_interval_sec=0.01,
+            )
+
+        self.assertTrue(ready)
+        self.assertEqual(readiness.call_count, 2)
+        self.assertEqual(risk.check_funding_guard.call_count, 2)
+        self.assertEqual(risk.check_market_data_freshness.call_count, 2)
+        self.assertEqual(supervisor.tick.call_count, 2)
+        sleep.assert_called_once_with(0.01)
+
+    def test_initial_market_data_readiness_times_out_fail_closed(self):
+        failures = {"BTCUSDT": "stale_market_data:book_unavailable"}
+        risk = SimpleNamespace(
+            market_data_readiness_failures=MagicMock(return_value=failures),
+            check_funding_guard=MagicMock(return_value=True),
+            check_market_data_freshness=MagicMock(return_value=True),
+        )
+
+        with patch("main.logger.error") as log_error:
+            ready = wait_for_initial_market_data_readiness(
+                risk,
+                timeout_sec=0.0,
+            )
+
+        self.assertFalse(ready)
+        risk.market_data_readiness_failures.assert_called_once_with()
+        log_error.assert_called_once_with(
+            f"Initial market-data readiness timed out: {failures}"
+        )
 
     def test_root_config_injects_fail_closed_market_freshness_defaults(self):
         payload = {"symbols": ["BTCUSDT"], "risk": {"limits": {}}}

@@ -62,6 +62,15 @@ CASH_FLOW_TRUTH_DEFAULTS = {
     "recovery_checks": 2,
     "external_income_types": ["TRANSFER"],
 }
+BINANCE_REST_RATE_LIMIT_DEFAULTS = {
+    "enabled": True,
+    "request_weight_limit": 2400,
+    "trading_reserve": 300,
+    "emergency_reserve": 300,
+    "state_path": "storage/binance_rate_limit_budget.sqlite3",
+    "sqlite_timeout_sec": 2.0,
+    "full_open_orders_audit_interval_sec": 60.0,
+}
 RISK_CONTROL_HEARTBEAT_DEFAULTS = {
     "enabled": True,
     "max_age_sec": 2.0,
@@ -412,6 +421,13 @@ def apply_production_safety_defaults(config: dict) -> dict:
     for key, value in TIME_SYNC_DEFAULTS.items():
         time_sync.setdefault(key, value)
 
+    rest_rate_limit = system.get("binance_rest_rate_limit")
+    if not isinstance(rest_rate_limit, dict):
+        rest_rate_limit = {}
+        system["binance_rest_rate_limit"] = rest_rate_limit
+    for key, value in BINANCE_REST_RATE_LIMIT_DEFAULTS.items():
+        rest_rate_limit.setdefault(key, value)
+
     evidence_recorder = system.get("evidence_recorder")
     if not isinstance(evidence_recorder, dict):
         evidence_recorder = {}
@@ -460,6 +476,17 @@ def apply_production_safety_defaults(config: dict) -> dict:
     if not isinstance(risk, dict):
         risk = {}
         configured["risk"] = risk
+    market_data = system.get("market_data")
+    if not isinstance(market_data, dict):
+        market_data = {}
+        system["market_data"] = market_data
+    tech_health = risk.get("tech_health")
+    if not isinstance(tech_health, dict):
+        tech_health = {}
+    market_data.setdefault(
+        "max_market_event_ingress_age_ms",
+        tech_health.get("max_latency_ms", 1000.0),
+    )
 
     freshness = risk.get("market_data_freshness")
     if not isinstance(freshness, dict):

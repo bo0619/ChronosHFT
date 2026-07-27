@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from event.type import OMSCapabilityMode
 from infrastructure.watchdog import (
@@ -6,6 +7,7 @@ from infrastructure.watchdog import (
     emit_market_data_stale_if_needed,
     emit_strategy_runtime_backlog_if_needed,
 )
+from strategy.runtime import StrategyRuntime
 
 
 class DummyEngine:
@@ -101,7 +103,41 @@ class DummyStrategyRuntime:
         return dict(self.metrics)
 
 
+class RecordingStrategy:
+    name = "recording"
+
+    def __init__(self):
+        self.orderbooks = []
+
+    def on_orderbook(self, payload):
+        self.orderbooks.append(payload)
+
+
 class MarketDataWatchdogTests(unittest.TestCase):
+    def test_market_coalescing_uses_latest_payload_timestamp(self):
+        strategy = RecordingStrategy()
+        runtime = StrategyRuntime(strategy, start_thread=False)
+        first = type("Book", (), {"symbol": "BTCUSDT", "value": 1})()
+        latest = type("Book", (), {"symbol": "BTCUSDT", "value": 2})()
+
+        with patch(
+            "strategy.runtime.time.perf_counter",
+            side_effect=(10.0, 20.0),
+        ):
+            runtime.on_orderbook(first)
+            runtime.on_orderbook(latest)
+
+        queued_at, queued_payload = runtime._pending_market[
+            ("orderbook", "BTCUSDT")
+        ]
+        self.assertEqual(queued_at, 20.0)
+        self.assertIs(queued_payload, latest)
+        self.assertEqual(len(runtime._market_queue), 1)
+        self.assertEqual(
+            runtime.get_metrics_snapshot()["coalesced_market_events"],
+            1,
+        )
+
     def test_emit_market_data_stale_if_needed_emits_once(self):
         engine = DummyEngine()
 

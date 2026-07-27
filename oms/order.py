@@ -1,3 +1,4 @@
+import math
 import time
 from typing import Dict, Set
 
@@ -199,7 +200,11 @@ class Order:
 
     @classmethod
     def from_record(cls, payload: dict):
+        if not isinstance(payload, dict):
+            raise ValueError("Order snapshot must be an object")
         intent_payload = payload.get("intent", {})
+        if not isinstance(intent_payload, dict):
+            raise ValueError("Order intent snapshot must be an object")
         intent = OrderIntent(
             strategy_id=intent_payload.get("strategy_id", "recovered"),
             symbol=intent_payload.get("symbol", ""),
@@ -238,7 +243,86 @@ class Order:
         order.last_exchange_status = payload.get("last_exchange_status", "")
         order.last_exchange_update_time = float(payload.get("last_exchange_update_time", 0.0))
         order.recovered_from_journal = True
+        order._validate_recovered_state()
         return order
+
+    def _validate_recovered_state(self) -> None:
+        if not str(self.client_oid or ""):
+            raise ValueError("Recovered order is missing client_oid")
+        if not str(self.intent.symbol or ""):
+            raise ValueError(
+                f"Recovered order {self.client_oid} is missing symbol"
+            )
+
+        numeric_fields = {
+            "intent.price": self.intent.price,
+            "intent.volume": self.intent.volume,
+            "filled_volume": self.filled_volume,
+            "avg_price": self.avg_price,
+            "cumulative_cost": self.cumulative_cost,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "last_exchange_update_time": self.last_exchange_update_time,
+        }
+        for field, value in numeric_fields.items():
+            if not math.isfinite(float(value)):
+                raise ValueError(
+                    f"Recovered order {self.client_oid} has non-finite {field}"
+                )
+        if self.intent.price <= 0.0 or self.intent.volume <= 0.0:
+            raise ValueError(
+                f"Recovered order {self.client_oid} has invalid intent values"
+            )
+        if (
+            self.filled_volume < 0.0
+            or self.avg_price < 0.0
+            or self.cumulative_cost < 0.0
+            or self.created_at < 0.0
+            or self.updated_at < 0.0
+            or self.last_exchange_update_time < 0.0
+            or self.last_update_seq < 0
+        ):
+            raise ValueError(
+                f"Recovered order {self.client_oid} has negative state"
+            )
+        if self.filled_volume > self.intent.volume + 1e-6:
+            raise ValueError(
+                f"Recovered order {self.client_oid} is overfilled"
+            )
+        if self.filled_volume > 1e-9:
+            if self.avg_price <= 0.0:
+                raise ValueError(
+                    f"Recovered order {self.client_oid} has no fill price"
+                )
+            expected_cost = self.filled_volume * self.avg_price
+            tolerance = max(1e-8, abs(expected_cost) * 1e-8)
+            if abs(self.cumulative_cost - expected_cost) > tolerance:
+                raise ValueError(
+                    f"Recovered order {self.client_oid} has inconsistent cost"
+                )
+        elif self.avg_price > 1e-9 or self.cumulative_cost > 1e-9:
+            raise ValueError(
+                f"Recovered order {self.client_oid} has cost without fills"
+            )
+
+        for field in (
+            "calibration_depth_bps",
+            "calibration_reference_mid",
+        ):
+            value = getattr(self.intent, field, None)
+            if value is None:
+                continue
+            try:
+                value = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Recovered order {self.client_oid} has invalid {field}"
+                ) from exc
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"Recovered order {self.client_oid} has non-finite {field}"
+                )
+            setattr(self.intent, field, value)
 
     def note_exchange_update(
         self,
@@ -332,8 +416,34 @@ class Order:
         seq: int = 0,
         exchange_status: str = "PARTIALLY_FILLED",
     ):
+        try:
+            fill_qty = float(fill_qty)
+            fill_price = float(fill_price)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Fill is not numeric for {self.client_oid}"
+            ) from exc
+        if not math.isfinite(fill_qty):
+            raise ValueError(
+                f"Fill quantity is not finite for {self.client_oid}"
+            )
         if fill_qty <= 0:
             return False
+        if not math.isfinite(fill_price) or fill_price <= 0.0:
+            raise ValueError(
+                f"Fill price must be finite and positive for {self.client_oid}"
+            )
+        if (
+            not math.isfinite(self.intent.volume)
+            or self.intent.volume <= 0.0
+            or not math.isfinite(self.filled_volume)
+            or self.filled_volume < 0.0
+            or not math.isfinite(self.cumulative_cost)
+            or self.cumulative_cost < 0.0
+        ):
+            raise ValueError(
+                f"Order fill state is invalid for {self.client_oid}"
+            )
 
         remaining = max(0.0, self.intent.volume - self.filled_volume)
         if fill_qty > remaining + 1e-6:

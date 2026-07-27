@@ -45,6 +45,10 @@ class RiskManager:
             "FAILED",
         }
     )
+    VALID_KILL_STATES = RESUMABLE_KILL_STATES | {
+        "ARMED",
+        "FLAT_VERIFIED",
+    }
 
     def __init__(self, engine, config: dict, oms=None, gateway=None):
         self.engine = engine
@@ -625,14 +629,19 @@ class RiskManager:
             or self.kill_switch_triggered
             or bool(getattr(self.oms, "_shutdown_requested", False))
             or bool(getattr(self.oms, "_stopped", False))
-            or has_guards
+        ):
+            return False
+        if (
+            has_guards
             or mode_constraints
             or not callable(can_open_new_risk)
             or not bool(can_open_new_risk())
         ):
-            # Let the venue countdown expire whenever any local or independent
-            # safety constraint has stopped new risk.
-            return False
+            # Withhold renewal while new risk is blocked, but keep the risk
+            # cycle running so transient guards can accumulate recovery checks.
+            # A guard that persists past max_renewal_age still fails closed on
+            # the health check above.
+            return True
 
         renewal_allowed = getattr(
             self.oms,
@@ -702,16 +711,97 @@ class RiskManager:
         if not latest:
             return
 
-        self.risk_day = str(latest.get("risk_day", "") or "")
-        self.initial_equity = float(latest.get("day_start_equity", 0.0) or 0.0)
-        self.initial_external_cash_flow_total = float(
-            latest.get("day_start_external_cash_flow_total", 0.0) or 0.0
+        try:
+            restored_numbers = {
+                "initial_equity": float(
+                    latest.get("day_start_equity", 0.0) or 0.0
+                ),
+                "initial_external_cash_flow_total": float(
+                    latest.get(
+                        "day_start_external_cash_flow_total",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+                "peak_equity": float(
+                    latest.get("peak_equity", 0.0) or 0.0
+                ),
+                "last_equity": float(
+                    latest.get("last_equity", 0.0) or 0.0
+                ),
+                "deployment_start_equity": float(
+                    latest.get("deployment_start_equity", 0.0) or 0.0
+                ),
+                "deployment_start_external_cash_flow_total": float(
+                    latest.get(
+                        "deployment_start_external_cash_flow_total",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+                "deployment_adjusted_equity": float(
+                    latest.get("deployment_adjusted_equity", 0.0) or 0.0
+                ),
+                "deployment_loss": float(
+                    latest.get("deployment_loss", 0.0) or 0.0
+                ),
+            }
+        except (TypeError, ValueError) as exc:
+            self._fail_closed_on_restored_risk_state(
+                f"non_numeric:{type(exc).__name__}"
+            )
+            return
+        if not all(
+            math.isfinite(value)
+            for value in restored_numbers.values()
+        ):
+            self._fail_closed_on_restored_risk_state("non_finite")
+            return
+        if restored_numbers["deployment_loss"] < 0.0:
+            self._fail_closed_on_restored_risk_state(
+                "negative_deployment_loss"
+            )
+            return
+
+        restored_kill_state = str(
+            latest.get("kill_state", "ARMED") or "ARMED"
         )
-        self.peak_equity = float(latest.get("peak_equity", 0.0) or 0.0)
-        self.last_equity = float(latest.get("last_equity", 0.0) or 0.0)
-        self.kill_state = str(latest.get("kill_state", "ARMED") or "ARMED")
+        restored_kill_latch = latest.get(
+            "kill_switch_triggered",
+            False,
+        )
+        if not isinstance(restored_kill_latch, bool):
+            self._fail_closed_on_restored_risk_state(
+                "kill_latch_not_boolean"
+            )
+            return
+        if restored_kill_state not in self.VALID_KILL_STATES:
+            self._fail_closed_on_restored_risk_state(
+                f"invalid_kill_state:{restored_kill_state}"
+            )
+            return
+        if (
+            restored_kill_latch
+            and restored_kill_state == "ARMED"
+        ) or (
+            not restored_kill_latch
+            and restored_kill_state != "ARMED"
+        ):
+            self._fail_closed_on_restored_risk_state(
+                "inconsistent_kill_latch"
+            )
+            return
+
+        self.risk_day = str(latest.get("risk_day", "") or "")
+        self.initial_equity = restored_numbers["initial_equity"]
+        self.initial_external_cash_flow_total = restored_numbers[
+            "initial_external_cash_flow_total"
+        ]
+        self.peak_equity = restored_numbers["peak_equity"]
+        self.last_equity = restored_numbers["last_equity"]
+        self.kill_state = restored_kill_state
         self.kill_reason = str(latest.get("kill_reason", "") or "")
-        self.kill_switch_triggered = bool(latest.get("kill_switch_triggered", False))
+        self.kill_switch_triggered = restored_kill_latch
         stored_deployment_id = str(
             latest.get("deployment_id", "") or ""
         ).strip()
@@ -755,23 +845,34 @@ class RiskManager:
             self.kill_state = "FAILED"
             self.kill_reason = "deployment_policy_mismatch"
             return
-        self.deployment_start_equity = float(
-            latest.get("deployment_start_equity", 0.0) or 0.0
+        self.deployment_start_equity = restored_numbers[
+            "deployment_start_equity"
+        ]
+        self.deployment_start_external_cash_flow_total = (
+            restored_numbers[
+                "deployment_start_external_cash_flow_total"
+            ]
         )
-        self.deployment_start_external_cash_flow_total = float(
-            latest.get(
-                "deployment_start_external_cash_flow_total",
-                0.0,
-            )
-            or 0.0
-        )
-        self.deployment_adjusted_equity = float(
-            latest.get("deployment_adjusted_equity", 0.0) or 0.0
-        )
-        self.deployment_loss = max(
-            0.0,
-            float(latest.get("deployment_loss", 0.0) or 0.0),
-        )
+        self.deployment_adjusted_equity = restored_numbers[
+            "deployment_adjusted_equity"
+        ]
+        self.deployment_loss = restored_numbers["deployment_loss"]
+
+    def _fail_closed_on_restored_risk_state(self, detail: str) -> None:
+        reason = f"risk_state_corrupt:{detail}"
+        self.kill_switch_triggered = True
+        self.kill_state = "FAILED"
+        self.kill_reason = reason
+        logger.critical(f"[Risk] {reason}")
+        halt = getattr(self.oms, "halt_system", None)
+        if callable(halt):
+            try:
+                halt(f"RiskManager: {reason}")
+            except Exception as exc:
+                logger.critical(
+                    "[Risk] Could not halt OMS after risk-state "
+                    f"corruption: {type(exc).__name__}:{exc}"
+                )
 
     def _persist_risk_state(self, reason: str):
         journal = getattr(self.oms, "journal", None)
@@ -882,25 +983,45 @@ class RiskManager:
             self._log_warn("Order rate limit exceeded")
             return False
 
-        if req.volume > self.max_order_qty:
+        try:
+            price = float(req.price)
+            volume = float(req.volume)
+        except (TypeError, ValueError):
+            self._log_warn("Order price or volume is not numeric")
+            return False
+        if (
+            not math.isfinite(price)
+            or price <= 0.0
+            or not math.isfinite(volume)
+            or volume <= 0.0
+        ):
+            self._log_warn("Order price or volume is not finite and positive")
+            return False
+
+        if volume > self.max_order_qty:
             self._log_warn(f"Order volume {req.volume} > {self.max_order_qty}")
             return False
 
-        notional = req.price * req.volume
-        if notional > self.max_order_notional:
+        notional = price * volume
+        if not math.isfinite(notional) or notional > self.max_order_notional:
             self._log_warn(f"Order notional {notional:.2f} > {self.max_order_notional}")
             return False
 
         mark_price = data_cache.get_mark_price(req.symbol)
         if mark_price > 0:
-            deviation = abs(req.price - mark_price) / mark_price
+            deviation = abs(price - mark_price) / mark_price
             if deviation > self.max_deviation_pct:
                 self._log_warn(f"Order price deviation {deviation:.2%} > {self.max_deviation_pct:.2%}")
                 return False
 
         if self.oms:
             current_vol = self.oms.exposure.net_positions.get(req.symbol, 0.0)
-            new_notional = (abs(current_vol) + req.volume) * req.price
+            if not math.isfinite(float(current_vol)):
+                self._log_warn(
+                    f"Current position is non-finite for {req.symbol}"
+                )
+                return False
+            new_notional = (abs(current_vol) + volume) * price
             if new_notional > self.max_pos_notional:
                 self._log_warn(f"Projected position {new_notional:.2f} > {self.max_pos_notional}")
                 return False
@@ -909,8 +1030,8 @@ class RiskManager:
                 gross_notional = self.oms.exposure.estimate_account_gross_notional(
                     symbol=req.symbol,
                     side=order_side,
-                    volume=req.volume,
-                    order_price=req.price,
+                    volume=volume,
+                    order_price=price,
                 )
                 if gross_notional is None:
                     self._log_warn(f"Account gross exposure unavailable for {req.symbol}")
@@ -929,17 +1050,36 @@ class RiskManager:
 
     def on_mark_price(self, event: Event):
         self._refresh_rearm_state()
+        data = event.data
+        symbol = str(getattr(data, "symbol", "") or "").upper()
+        try:
+            mark_price = float(getattr(data, "mark_price", 0.0))
+            index_price = float(getattr(data, "index_price", 0.0))
+        except (TypeError, ValueError):
+            mark_price = 0.0
+            index_price = 0.0
+        if (
+            not symbol
+            or not math.isfinite(mark_price)
+            or mark_price <= 0.0
+            or not math.isfinite(index_price)
+            or index_price <= 0.0
+        ):
+            if self.active and not self.kill_switch_triggered and symbol:
+                self._freeze_symbol(
+                    symbol,
+                    "invalid_mark_price",
+                )
+            return
         if self.active and self.funding_guard_policy.enabled:
-            self._evaluate_funding_mark(event.data)
+            self._evaluate_funding_mark(data)
         if self.kill_switch_triggered or not self.active:
             return
 
-        data = event.data
-        if data.index_price <= 0 or self.volatility_halt_threshold <= 0:
+        if self.volatility_halt_threshold <= 0:
             return
 
-        symbol = getattr(data, "symbol", "").upper()
-        divergence = abs(data.mark_price - data.index_price) / data.index_price
+        divergence = abs(mark_price - index_price) / index_price
         if divergence > self.volatility_halt_threshold:
             if symbol:
                 self.divergence_breach_by_symbol[symbol] += 1
@@ -1304,13 +1444,51 @@ class RiskManager:
             return
 
         account = event.data
+        try:
+            account_numbers = {
+                "balance": float(getattr(account, "balance", 0.0)),
+                "equity": float(getattr(account, "equity", 0.0)),
+                "available": float(getattr(account, "available", 0.0)),
+                "used_margin": float(
+                    getattr(account, "used_margin", 0.0)
+                ),
+                "external_cash_flow_total": float(
+                    getattr(
+                        account,
+                        "external_cash_flow_total",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+            }
+        except (TypeError, ValueError):
+            self.trigger_kill_switch(
+                "Account update contains non-numeric risk values"
+            )
+            return
+        if (
+            not all(
+                math.isfinite(value)
+                for value in account_numbers.values()
+            )
+            or account_numbers["equity"] <= 0.0
+            or account_numbers["used_margin"] < 0.0
+        ):
+            self.trigger_kill_switch(
+                "Account update contains invalid or non-finite risk values"
+            )
+            return
+        account_equity = account_numbers["equity"]
+        current_external_cash_flow_total = account_numbers[
+            "external_cash_flow_total"
+        ]
         if self._check_cash_flow_truth(account):
             return
         if self.max_deployed_capital > 0.0:
             try:
                 capital_envelope_safe = (
                     deployed_capital_within_equity_limit(
-                        equity=account.equity,
+                        equity=account_equity,
                         max_deployed_capital=self.max_deployed_capital,
                         maximum_fraction=(
                             MAX_CANARY_DEPLOYED_EQUITY_FRACTION
@@ -1329,27 +1507,24 @@ class RiskManager:
         risk_state_changed = False
         if self.risk_day != current_risk_day:
             self.risk_day = current_risk_day
-            self.initial_equity = account.equity
-            self.initial_external_cash_flow_total = float(
-                getattr(account, "external_cash_flow_total", 0.0) or 0.0
+            self.initial_equity = account_equity
+            self.initial_external_cash_flow_total = (
+                current_external_cash_flow_total
             )
-            self.peak_equity = account.equity
+            self.peak_equity = account_equity
             risk_state_changed = True
         elif self.initial_equity == 0:
-            self.initial_equity = account.equity
-            self.initial_external_cash_flow_total = float(
-                getattr(account, "external_cash_flow_total", 0.0) or 0.0
+            self.initial_equity = account_equity
+            self.initial_external_cash_flow_total = (
+                current_external_cash_flow_total
             )
-            self.peak_equity = account.equity
+            self.peak_equity = account_equity
             risk_state_changed = True
 
-        current_external_cash_flow_total = float(
-            getattr(account, "external_cash_flow_total", 0.0) or 0.0
-        )
         external_cash_flow_delta = (
             current_external_cash_flow_total - self.initial_external_cash_flow_total
         )
-        adjusted_equity = account.equity - external_cash_flow_delta
+        adjusted_equity = account_equity - external_cash_flow_delta
         if self.max_deployment_loss > 0.0:
             baseline_missing = self.deployment_start_equity <= 0.0
             (
@@ -1358,7 +1533,7 @@ class RiskManager:
                 self.deployment_adjusted_equity,
                 self.deployment_loss,
             ) = update_deployment_loss(
-                equity=account.equity,
+                equity=account_equity,
                 external_cash_flow_total=current_external_cash_flow_total,
                 start_equity=self.deployment_start_equity,
                 start_external_cash_flow_total=(
@@ -1369,7 +1544,7 @@ class RiskManager:
         if adjusted_equity > self.peak_equity:
             self.peak_equity = adjusted_equity
             risk_state_changed = True
-        self.last_equity = account.equity
+        self.last_equity = account_equity
 
         if risk_state_changed:
             self._persist_risk_state("account_baseline_or_peak")
@@ -1404,7 +1579,11 @@ class RiskManager:
                 prefixes=("deployment_loss_reduce_only:",),
             )
 
-        drawdown = self.initial_equity - account.equity + external_cash_flow_delta
+        drawdown = (
+            self.initial_equity
+            - account_equity
+            + external_cash_flow_delta
+        )
         if self.max_daily_loss > 0 and drawdown > self.max_daily_loss:
             self.trigger_kill_switch(f"Daily loss limit breached: -{drawdown:.2f}")
             return
@@ -1424,7 +1603,16 @@ class RiskManager:
             return False
 
         synced = bool(getattr(account, "cash_flow_snapshot_synced", False))
-        snapshot_time = float(getattr(account, "cash_flow_snapshot_time", 0.0) or 0.0)
+        try:
+            snapshot_time = float(
+                getattr(account, "cash_flow_snapshot_time", 0.0)
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            snapshot_time = 0.0
+        if not math.isfinite(snapshot_time) or snapshot_time < 0.0:
+            snapshot_time = 0.0
+            synced = False
         snapshot_age_sec = (
             max(0.0, time.time() - snapshot_time)
             if snapshot_time
@@ -1473,7 +1661,19 @@ class RiskManager:
         ):
             return False
 
-        snapshot_time = float(getattr(account, "margin_snapshot_time", 0.0) or 0.0)
+        try:
+            snapshot_time = float(
+                getattr(account, "margin_snapshot_time", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            snapshot_time = 0.0
+        if not math.isfinite(snapshot_time) or snapshot_time < 0.0:
+            self.margin_recovery_count = 0
+            self._set_trading_mode(
+                OMSCapabilityMode.REDUCE_ONLY,
+                "margin_health:invalid_snapshot_time",
+            )
+            return False
         snapshot_age_sec = max(0.0, time.time() - snapshot_time) if snapshot_time else float("inf")
         if (
             self.margin_snapshot_max_age_sec > 0.0
@@ -1486,8 +1686,14 @@ class RiskManager:
             )
             return False
 
-        ratio = float(getattr(account, "maintenance_margin_ratio", 0.0) or 0.0)
-        if math.isnan(ratio) or ratio < 0.0:
+        try:
+            ratio = float(
+                getattr(account, "maintenance_margin_ratio", 0.0)
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            ratio = float("nan")
+        if not math.isfinite(ratio) or ratio < 0.0:
             self.trigger_kill_switch(f"Invalid maintenance margin ratio: {ratio!r}")
             return True
         if ratio >= self.margin_kill_ratio:
@@ -1544,6 +1750,8 @@ class RiskManager:
             self._publish_risk_control_heartbeat("risk_live_loop")
             return True
         now = time.perf_counter() if now is None else float(now)
+        if not math.isfinite(now):
+            now = time.perf_counter()
         if now - self._last_freshness_poll_at < self.freshness_poll_interval_sec:
             self._publish_risk_control_heartbeat("risk_live_loop")
             return True
@@ -1583,22 +1791,57 @@ class RiskManager:
         self._publish_risk_control_heartbeat("risk_live_loop")
         return True
 
+    def market_data_readiness_failures(self, now: float = None) -> dict[str, str]:
+        """Inspect startup market-data readiness without mutating risk state."""
+        if not self.market_freshness_enabled:
+            return {}
+        now = time.perf_counter() if now is None else float(now)
+        if not math.isfinite(now):
+            now = time.perf_counter()
+        failures = {}
+        for symbol in sorted(self._tracked_symbols()):
+            reason = self._freshness_failure_reason(
+                data_cache.get_risk_snapshot(symbol, now=now)
+            )
+            if reason:
+                failures[symbol] = reason
+        return failures
+
     def _freshness_failure_reason(self, snapshot: dict) -> str:
-        mark_price = float(snapshot.get("mark_price", 0.0) or 0.0)
+        try:
+            mark_price = float(
+                snapshot.get("mark_price", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            mark_price = 0.0
+        if not math.isfinite(mark_price):
+            return "stale_market_data:mark_invalid"
         mark_age_ms = snapshot.get("mark_age_ms")
         if self.require_mark_price and mark_price <= 0:
             return "stale_market_data:mark_unavailable"
         if mark_price > 0 and mark_age_ms is None:
             return "stale_market_data:mark_timestamp_missing"
+        if mark_age_ms is not None:
+            try:
+                mark_age_ms = float(mark_age_ms)
+            except (TypeError, ValueError):
+                return "stale_market_data:mark_timestamp_invalid"
+            if not math.isfinite(mark_age_ms) or mark_age_ms < 0.0:
+                return "stale_market_data:mark_timestamp_invalid"
         if (
             mark_price > 0
             and self.max_mark_age_ms > 0
-            and float(mark_age_ms) > self.max_mark_age_ms
+            and mark_age_ms > self.max_mark_age_ms
         ):
-            return f"stale_market_data:mark_age={float(mark_age_ms):.1f}ms"
+            return f"stale_market_data:mark_age={mark_age_ms:.1f}ms"
 
-        bid = float(snapshot.get("bid_price", 0.0) or 0.0)
-        ask = float(snapshot.get("ask_price", 0.0) or 0.0)
+        try:
+            bid = float(snapshot.get("bid_price", 0.0) or 0.0)
+            ask = float(snapshot.get("ask_price", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return "stale_market_data:book_invalid"
+        if not math.isfinite(bid) or not math.isfinite(ask):
+            return "stale_market_data:book_invalid"
         book_age_ms = snapshot.get("book_age_ms")
         if self.require_book and (bid <= 0 or ask <= 0):
             return "stale_market_data:book_unavailable"
@@ -1609,12 +1852,19 @@ class RiskManager:
             )
         if (bid > 0 or ask > 0) and book_age_ms is None:
             return "stale_market_data:book_timestamp_missing"
+        if book_age_ms is not None:
+            try:
+                book_age_ms = float(book_age_ms)
+            except (TypeError, ValueError):
+                return "stale_market_data:book_timestamp_invalid"
+            if not math.isfinite(book_age_ms) or book_age_ms < 0.0:
+                return "stale_market_data:book_timestamp_invalid"
         if (
             (bid > 0 or ask > 0)
             and self.max_book_age_ms > 0
-            and float(book_age_ms) > self.max_book_age_ms
+            and book_age_ms > self.max_book_age_ms
         ):
-            return f"stale_market_data:book_age={float(book_age_ms):.1f}ms"
+            return f"stale_market_data:book_age={book_age_ms:.1f}ms"
         return ""
 
     def _poll_external_cash_flow_truth(self):
@@ -1718,21 +1968,26 @@ class RiskManager:
     def _supervise_kill_switch(self):
         deadline = time.perf_counter() + self.kill_verify_timeout_sec
         next_flatten_at = time.perf_counter() + self.kill_flatten_retry_sec
-        while self.kill_switch_triggered and time.perf_counter() < deadline:
+        timeout_reported = False
+        while self.kill_switch_triggered:
             now = time.perf_counter()
             allow_flatten = now >= next_flatten_at
             if self._verify_kill_state_safely(allow_flatten=allow_flatten):
                 return
             if allow_flatten:
                 next_flatten_at = now + self.kill_flatten_retry_sec
+            if now >= deadline and not timeout_reported:
+                self._set_kill_state(
+                    "FAILED",
+                    "kill_verification_timeout_continuing",
+                )
+                logger.critical(
+                    "[KillSwitch] Initial flat-state verification timed "
+                    f"out after {self.kill_verify_timeout_sec:.1f}s; "
+                    "cancellation and flatten supervision will continue"
+                )
+                timeout_reported = True
             time.sleep(self.kill_verify_interval_sec)
-
-        if self.kill_switch_triggered and self.kill_state != "FLAT_VERIFIED":
-            self._set_kill_state("FAILED", "kill_verification_timeout")
-            logger.critical(
-                f"[KillSwitch] Failed to verify flat state within "
-                f"{self.kill_verify_timeout_sec:.1f}s"
-            )
 
     def _verify_kill_state_safely(self, allow_flatten: bool) -> bool:
         with self._kill_verification_lock:
@@ -1915,7 +2170,17 @@ class RiskManager:
         if not callable(query):
             return None
         try:
-            remote_orders = query()
+            remote_orders = (
+                query(emergency=True)
+                if bool(
+                    getattr(
+                        self.gateway,
+                        "supports_emergency_query_priority",
+                        False,
+                    )
+                )
+                else query()
+            )
         except Exception as exc:
             logger.error(f"[KillSwitch] open-order verification failed: {exc}")
             return None
@@ -1960,7 +2225,17 @@ class RiskManager:
         if not callable(query):
             return None
         try:
-            remote_positions = query()
+            remote_positions = (
+                query(emergency=True)
+                if bool(
+                    getattr(
+                        self.gateway,
+                        "supports_emergency_query_priority",
+                        False,
+                    )
+                )
+                else query()
+            )
         except Exception as exc:
             logger.error(f"[KillSwitch] position verification failed: {exc}")
             return None
@@ -2234,7 +2509,11 @@ class RiskManager:
         existing_reason = str(
             (owners.get(owner) or {}).get("reason", "") or ""
         )
-        if existing_reason == reason:
+        # A live latency figure changes on every update. Re-freezing the same
+        # owner for each numeric variation repeats cancellation, journaling,
+        # logging and event publication, amplifying an already stale queue.
+        # Keep the first durable guard until its guarded recovery clears it.
+        if existing_reason:
             return
 
         logger.error(f"[Risk] Symbol circuit breaker {symbol}: {reason}")
@@ -2426,10 +2705,12 @@ class RiskManager:
 
         venue = venue.upper()
         existing_reason = self.frozen_venues.get(venue, "")
+        existing_owner = self._risk_symbol_guard_owner(existing_reason)
+        next_owner = self._risk_symbol_guard_owner(reason)
+        if existing_reason and existing_owner == next_owner:
+            return
         self.frozen_venues[venue] = reason
         self.venue_recovery_by_venue[venue] = 0
-        if existing_reason == reason:
-            return
 
         logger.error(f"[Risk] Venue circuit breaker {venue}: {reason}")
         self._log_warn(f"Venue frozen {venue}: {reason}")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 
@@ -15,6 +16,129 @@ from .component import OMSComponent
 
 class OMSReconciler(OMSComponent):
     """Own truth reconciliation, retry and full-reset workflows."""
+
+    @staticmethod
+    def _finite_snapshot_float(
+        value,
+        field: str,
+        *,
+        nonnegative: bool = False,
+    ) -> float:
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"exchange snapshot {field} is not numeric"
+            ) from exc
+        if not math.isfinite(normalized):
+            raise ValueError(
+                f"exchange snapshot {field} is not finite"
+            )
+        if nonnegative and normalized < 0.0:
+            raise ValueError(
+                f"exchange snapshot {field} is negative"
+            )
+        return normalized
+
+    def _normalize_remote_account(
+        self,
+        account,
+        *,
+        require_initial_margin: bool = False,
+    ):
+        if not isinstance(account, dict):
+            raise ValueError("remote account snapshot must be an object")
+        normalized = dict(account)
+        required_fields = ["totalWalletBalance"]
+        if require_initial_margin:
+            required_fields.append("totalInitialMargin")
+        for field in required_fields:
+            if field not in normalized or normalized[field] is None:
+                raise ValueError(
+                    f"remote account snapshot is missing {field}"
+                )
+        for field, nonnegative in (
+            ("totalWalletBalance", False),
+            ("totalInitialMargin", True),
+        ):
+            if normalized.get(field) is None:
+                continue
+            normalized[field] = self._finite_snapshot_float(
+                normalized[field],
+                f"account.{field}",
+                nonnegative=nonnegative,
+            )
+        for field, nonnegative in (
+            ("availableBalance", False),
+            ("totalMaintMargin", True),
+            ("totalMarginBalance", False),
+        ):
+            if normalized.get(field) is None:
+                continue
+            normalized[field] = self._finite_snapshot_float(
+                normalized[field],
+                f"account.{field}",
+                nonnegative=nonnegative,
+            )
+        return normalized
+
+    def _normalize_remote_positions(self, positions):
+        if not isinstance(positions, (list, tuple)):
+            raise ValueError("remote positions snapshot must be a list")
+        normalized = []
+        seen_symbols = set()
+        for index, position in enumerate(positions):
+            if not isinstance(position, dict):
+                raise ValueError(
+                    f"remote position entry {index} must be an object"
+                )
+            symbol = str(position.get("symbol", "") or "").upper().strip()
+            if not symbol:
+                raise ValueError(
+                    f"remote position entry {index} is missing symbol"
+                )
+            position_side = str(
+                position.get("positionSide", "BOTH") or "BOTH"
+            ).upper()
+            if position_side != "BOTH":
+                raise ValueError(
+                    f"remote position {symbol} is not one-way/BOTH"
+                )
+            if symbol in seen_symbols:
+                raise ValueError(
+                    f"remote positions snapshot contains duplicate {symbol}"
+                )
+            seen_symbols.add(symbol)
+            payload = dict(position)
+            payload["symbol"] = symbol
+            payload["positionAmt"] = self._finite_snapshot_float(
+                payload.get("positionAmt", 0.0),
+                f"positions.{symbol}.positionAmt",
+            )
+            payload["entryPrice"] = self._finite_snapshot_float(
+                payload.get("entryPrice", 0.0),
+                f"positions.{symbol}.entryPrice",
+                nonnegative=True,
+            )
+            for field in (
+                "unRealizedProfit",
+                "isolatedWallet",
+                "initialMargin",
+                "maintMargin",
+            ):
+                if payload.get(field) is None:
+                    continue
+                payload[field] = self._finite_snapshot_float(
+                    payload[field],
+                    f"positions.{symbol}.{field}",
+                    nonnegative=field in {
+                        "isolatedWallet",
+                        "initialMargin",
+                        "maintMargin",
+                    },
+                )
+            normalized.append(payload)
+        return normalized
 
     def _normalize_remote_open_orders(self, remote_orders):
         if not isinstance(remote_orders, (list, tuple)):
@@ -415,6 +539,14 @@ class OMSReconciler(OMSComponent):
             remote_positions = self.query_positions()
             remote_orders = self.query_open_orders()
             remote_account = self.query_account_info()
+            if remote_positions is not None:
+                remote_positions = self._normalize_remote_positions(
+                    remote_positions
+                )
+            if remote_account:
+                remote_account = self._normalize_remote_account(
+                    remote_account
+                )
 
             recovery_symbols = set(self.config.get("symbols", []))
             if remote_positions is not None:
@@ -740,6 +872,11 @@ class OMSReconciler(OMSComponent):
             snapshot_end_ms = time_service.now()
             if open_orders is None or not account or positions is None:
                 raise RuntimeError("API failed while acquiring stable exchange snapshot")
+            account = self._normalize_remote_account(
+                account,
+                require_initial_margin=True,
+            )
+            positions = self._normalize_remote_positions(positions)
 
             signature = self._exchange_snapshot_signature(account, positions, open_orders)
             if signature == previous_signature:

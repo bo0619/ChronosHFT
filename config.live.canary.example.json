@@ -27,10 +27,21 @@
     "offline_evidence_max_age_sec": 900
   },
   "system": {
+    "binance_rest_rate_limit": {
+      "_comment": "IP-scoped, cross-process request budget. Background truth polling stops at 1800, normal trading at 2100, and only emergency risk actions may use the final 300 weight/minute.",
+      "enabled": true,
+      "request_weight_limit": 2400,
+      "trading_reserve": 300,
+      "emergency_reserve": 300,
+      "state_path": "storage/binance_rate_limit_budget.sqlite3",
+      "sqlite_timeout_sec": 2.0,
+      "full_open_orders_audit_interval_sec": 60.0
+    },
     "market_data": {
       "environment": "production",
       "testnet": false,
-      "public_only": false
+      "public_only": false,
+      "max_market_event_ingress_age_ms": 1000.0
     },
     "time_sync": {
       "startup_required": true,

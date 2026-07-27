@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 
 import launcher as launcher_module
 import main as main_module
+from infrastructure import admin_control as admin_control_module
 
 
 class FakeLogger:
@@ -28,6 +29,10 @@ class FakeLogger:
 
     def set_alert_callback(self, callback):
         self.alert_callback = callback
+
+    def flush(self, timeout_sec=1.0):
+        self.flush_timeout_sec = timeout_sec
+        return True
 
     def _record(self, level, message):
         self.messages.append((level, message))
@@ -104,6 +109,28 @@ class FakeDashboard:
 
 
 class MainDashboardStartupTests(unittest.TestCase):
+    def test_flat_shutdown_truth_uses_emergency_rest_reserve(self):
+        class SnapshotProvider:
+            supports_emergency_query_priority = True
+
+            def __init__(self):
+                self.priorities = []
+
+            def get_all_positions(self, *, emergency=False):
+                self.priorities.append(bool(emergency))
+                return []
+
+        provider = SnapshotProvider()
+
+        self.assertTrue(
+            main_module.verify_account_flat(
+                provider,
+                required_flat_snapshots=2,
+                settle_interval_sec=0.01,
+            )
+        )
+        self.assertEqual(provider.priorities, [True, True])
+
     @staticmethod
     def config():
         return {
@@ -272,6 +299,7 @@ class MainDashboardStartupTests(unittest.TestCase):
         gateway = FakeGateway("gateway")
         truth_provider = FakeTruthProvider("truth_provider")
         recorder = Component("recorder")
+        admin_control = Component("admin_control")
         engine = FakeEngine("engine")
         clock = Component("clock")
         oms = FakeOms()
@@ -286,6 +314,7 @@ class MainDashboardStartupTests(unittest.TestCase):
             "truth_monitor": truth_monitor,
             "venue_supervisor": venue,
             "recorder": recorder,
+            "admin_control": admin_control,
             "time_service": clock,
             "event_engine_config": {"shutdown_drain_timeout_sec": 1.5},
         }
@@ -299,6 +328,7 @@ class MainDashboardStartupTests(unittest.TestCase):
         self.assertLess(names.index("strategy_stop"), names.index("oms_begin"))
         self.assertLess(names.index("oms_begin"), names.index("cancel_verified"))
         self.assertLess(names.index("cancel_verified"), names.index("gateway_close"))
+        self.assertLess(names.index("admin_control_close"), names.index("gateway_close"))
         self.assertLess(names.index("gateway_close"), names.index("engine_drain"))
         self.assertLess(names.index("engine_drain"), names.index("oms_stop"))
         self.assertLess(names.index("oms_stop"), names.index("engine_stop"))
@@ -650,6 +680,145 @@ class MainShutdownLatchOrderStaticTests(unittest.TestCase):
 
 
 class AdminControlStartupTests(unittest.TestCase):
+    def test_atomic_json_write_retries_transient_replace_conflict(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = os.path.join(tmpdir, "state.json")
+            real_replace = os.replace
+            attempts = []
+
+            def replace_after_transient_conflict(source, destination):
+                attempts.append((source, destination))
+                if len(attempts) == 1:
+                    raise PermissionError(13, "transient sharing conflict")
+                return real_replace(source, destination)
+
+            with (
+                patch(
+                    "infrastructure.admin_control.os.replace",
+                    side_effect=replace_after_transient_conflict,
+                ),
+                patch(
+                    "infrastructure.admin_control."
+                    "_sleep_before_atomic_replace_retry"
+                ) as sleep,
+            ):
+                admin_control_module._atomic_write_json(
+                    target,
+                    {"ready": True},
+                )
+
+            with open(target, "r", encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle), {"ready": True})
+            self.assertEqual(len(attempts), 2)
+            sleep.assert_called_once_with(0.01)
+
+    def test_atomic_json_write_exhausts_retry_budget_and_cleans_temp(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = os.path.join(tmpdir, "state.json")
+            with (
+                patch(
+                    "infrastructure.admin_control.os.replace",
+                    side_effect=PermissionError(13, "persistent access denied"),
+                ) as replace,
+                patch(
+                    "infrastructure.admin_control."
+                    "_sleep_before_atomic_replace_retry"
+                ) as sleep,
+                self.assertRaises(PermissionError),
+            ):
+                admin_control_module._atomic_write_json(
+                    target,
+                    {"ready": False},
+                )
+
+            attempts = admin_control_module.ATOMIC_REPLACE_MAX_ATTEMPTS
+            self.assertEqual(replace.call_count, attempts)
+            self.assertEqual(sleep.call_count, attempts - 1)
+            self.assertEqual(os.listdir(tmpdir), [])
+
+    def test_admin_session_heartbeat_is_throttled_below_expiry_window(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = {
+                "system": {
+                    "admin_control": {
+                        "path": tmpdir,
+                        "session_max_age_sec": 2.0,
+                    }
+                }
+            }
+            with (
+                patch(
+                    "infrastructure.admin_control.time.perf_counter",
+                    side_effect=[100.0, 100.1, 100.6],
+                ),
+                patch(
+                    "infrastructure.admin_control._atomic_write_json"
+                ) as write_json,
+            ):
+                server = admin_control_module.AdminControlServer(
+                    object(),
+                    config,
+                )
+                server.poll_once()
+                server.poll_once()
+
+            self.assertEqual(server.session_heartbeat_interval_sec, 0.5)
+            self.assertEqual(write_json.call_count, 2)
+
+    def test_admin_close_withdraws_only_its_owned_session(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = {
+                "system": {
+                    "admin_control": {
+                        "path": tmpdir,
+                        "session_max_age_sec": 2.0,
+                    }
+                }
+            }
+            server = admin_control_module.AdminControlServer(
+                object(),
+                config,
+            )
+            session_path = server.paths["session_path"]
+            self.assertTrue(os.path.exists(session_path))
+
+            self.assertTrue(server.close())
+
+            self.assertFalse(os.path.exists(session_path))
+            self.assertFalse(server.poll_once())
+
+    def test_admin_close_does_not_delete_a_replacement_session(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = {
+                "system": {
+                    "admin_control": {
+                        "path": tmpdir,
+                        "session_max_age_sec": 2.0,
+                    }
+                }
+            }
+            server = admin_control_module.AdminControlServer(
+                object(),
+                config,
+            )
+            replacement = {
+                "schema": admin_control_module.ADMIN_SESSION_SCHEMA,
+                "session_id": "replacement",
+            }
+            admin_control_module._atomic_write_json(
+                server.paths["session_path"],
+                replacement,
+            )
+
+            self.assertTrue(server.close())
+
+            with open(
+                server.paths["session_path"],
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                self.assertEqual(json.load(handle), replacement)
+
     def test_admin_cli_bypasses_full_live_config_loader(self):
         minimal_config = {
             "live_launch": {"deployment_id": "canary-test-001"},
@@ -896,6 +1065,7 @@ class CommissionConfigStartupTests(unittest.TestCase):
         expected = {
             "connect_gateway_with_risk_heartbeat",
             "synchronize_commission_config",
+            "wait_for_initial_market_data_readiness",
             "bootstrap_or_rearm",
         }
         for node in ast.walk(source):
@@ -910,6 +1080,10 @@ class CommissionConfigStartupTests(unittest.TestCase):
         )
         self.assertLess(
             call_lines["synchronize_commission_config"],
+            call_lines["wait_for_initial_market_data_readiness"],
+        )
+        self.assertLess(
+            call_lines["wait_for_initial_market_data_readiness"],
             call_lines["bootstrap_or_rearm"],
         )
 

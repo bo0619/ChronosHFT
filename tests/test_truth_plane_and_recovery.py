@@ -715,6 +715,60 @@ class GatewayRecoveryTests(unittest.TestCase):
         self.assertEqual(mark.dispatch_timestamp, 1_700_000_000.006)
         self.assertEqual(mark.dispatch_monotonic, 60.003)
 
+    def test_stale_live_depth_is_rejected_before_book_and_closes_transport(self):
+        engine = DummyEngine()
+        gateway = BinanceGateway.__new__(BinanceGateway)
+        gateway.event_engine = engine
+        gateway.gateway_name = "BINANCE"
+        gateway._book_lock = threading.RLock()
+        gateway._book_generation = 1
+        gateway.max_market_event_ingress_age_ms = 1200.0
+        gateway.latency_stats = {"rest_rtt": 0.0, "ws_delay": 0.0}
+        gateway.active = True
+        gateway.state = GatewayState.READY
+        gateway.set_state = lambda state: setattr(gateway, "state", state)
+        closed = []
+        gateway.ws = SimpleNamespace(close=lambda: closed.append(True))
+        gateway._process_book = lambda *_args, **_kwargs: self.fail(
+            "stale depth reached the local order book"
+        )
+        message = {
+            "stream": "btcusdt@depth@100ms",
+            "data": {
+                "E": 1_997_000,
+                "T": 1_997_000,
+                "s": "BTCUSDT",
+                "U": 1,
+                "u": 2,
+                "pu": 0,
+                "b": [],
+                "a": [],
+            },
+        }
+
+        gateway._handle_market_update(
+            message,
+            received_timestamp=2000.0,
+            received_monotonic=70.0,
+            corrected_received_timestamp=2000.0,
+            clock_offset_ms=0.0,
+            expected_generation=1,
+        )
+
+        self.assertFalse(gateway.active)
+        self.assertEqual(gateway.state, GatewayState.ERROR)
+        self.assertEqual(closed, [True])
+        self.assertTrue(
+            any(
+                event.type == EVENT_SYSTEM_HEALTH
+                and str(event.data).startswith(
+                    "FREEZE_VENUE:BINANCE:"
+                    "MARKET_DATA_STALE: PUBLIC_DEPTH:"
+                )
+                for event in engine.events
+            )
+        )
+
     def test_transport_drop_fault_freezes_venue(self):
         engine = DummyEngine()
         gateway = BinanceGateway.__new__(BinanceGateway)
