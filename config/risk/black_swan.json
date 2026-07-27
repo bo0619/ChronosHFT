@@ -1,0 +1,7 @@
+{
+  "risk": {
+    "black_swan": {
+      "volatility_halt_threshold": 0.05
+    }
+  }
+}

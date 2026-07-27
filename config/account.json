@@ -1,0 +1,8 @@
+{
+  "account": {
+    "leverage": 8,
+    "margin_type": "ISOLATED",
+    "position_mode": "ONE_WAY",
+    "use_bnb_fees": false
+  }
+}

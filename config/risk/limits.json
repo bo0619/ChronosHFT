@@ -1,0 +1,7 @@
+{
+  "risk": {
+    "limits": {
+      "max_drawdown_pct": 0.05
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "oms": {
+    "reconcile_min_interval_sec": 5.0,
+    "reconcile_api_failure_threshold": 3,
+    "reconcile_api_cooldown_sec": 10.0,
+    "trade_recovery_lookback_ms": 86400000,
+    "trade_recovery_overlap_ms": 60000,
+    "trade_recovery_id_overlap": 100,
+    "trade_tail_verification_delay_sec": 0.25,
+    "trade_tail_verification_retry_sec": 0.5,
+    "trade_tail_verification_attempts": 4,
+    "outbound_gate_drain_timeout_sec": 10.0,
+    "shutdown_cancel_timeout_sec": 30.0,
+    "shutdown_empty_snapshots_required": 2,
+    "shutdown_cancel_settle_interval_sec": 0.25,
+    "ack_timeout_sec": 5.0,
+    "ack_timeout_recheck_sec": 60.0,
+    "monitor_check_interval_sec": 1.0,
+    "tombstone_max": 2000
+  }
+}

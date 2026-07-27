@@ -1,0 +1,16 @@
+{
+  "strategy": {
+    "avellaneda_stoikov": {
+      "_comment": "Registered explanatory baseline and manually selected fallback; not a concurrent execution strategy.",
+      "gamma": 0.05,
+      "k": 1.5,
+      "vol_window": 60,
+      "cycle_interval": 1.0,
+      "horizon_s": 1.0,
+      "min_sigma_bps": 0.1,
+      "max_tick_gap_sec": 2.0,
+      "inventory_lot_notional_usdt": 8.0,
+      "min_spread_ratio": 0.0002
+    }
+  }
+}

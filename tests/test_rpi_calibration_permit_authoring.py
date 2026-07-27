@@ -22,6 +22,10 @@ from scripts.create_rpi_calibration_permit import (
     generate_key,
     sign_permit,
 )
+from tests.test_live_config_guard import (
+    safe_rpi_calibration_config,
+    safe_rpi_target_config,
+)
 
 
 def _read_json(path: Path) -> dict:
@@ -354,10 +358,9 @@ def test_generate_sign_and_revalidate_permit_offline(tmp_path, monkeypatch):
     assert private_key.read_bytes().startswith(b"-----BEGIN ENCRYPTED PRIVATE KEY-----")
     trust = _read_json(trust_output)
 
-    calibration = _read_json(
-        PROJECT_ROOT / "config.live.rpi-calibration.example.json"
-    )
-    target = _read_json(PROJECT_ROOT / "config.live.canary.example.json")
+    calibration = safe_rpi_calibration_config()
+    calibration.pop("_validated_rpi_calibration_permit", None)
+    target = safe_rpi_target_config()
     calibration_path = tmp_path / "calibration.json"
     target_path = tmp_path / "target.json"
     permit_path = tmp_path / "permit.json"

@@ -246,6 +246,7 @@ class OMSExchangeEventProcessor(OMSComponent):
             for field in (
                 "wallet_balance",
                 "available_balance",
+                "cross_wallet_balance",
                 "balance_change",
             ):
                 raw_value = payload.get(field)

@@ -1,0 +1,9 @@
+{
+  "risk": {
+    "tech_health": {
+      "max_latency_ms": 1200,
+      "max_order_count_per_sec": 15,
+      "consecutive_error_limit": 10
+    }
+  }
+}

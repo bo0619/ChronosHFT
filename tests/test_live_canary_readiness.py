@@ -26,13 +26,13 @@ from infrastructure.live_config_guard import (
     sign_live_canary_evidence,
     validate_live_canary_local_evidence,
 )
+from tests.test_live_config_guard import (
+    safe_live_config,
+    safe_rpi_calibration_config,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXAMPLE_CONFIG = ROOT / "config.live.canary.example.json"
-EXAMPLE_CALIBRATION_CONFIG = (
-    ROOT / "config.live.rpi-calibration.example.json"
-)
 FIXED_NOW = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
 
 
@@ -40,12 +40,38 @@ def _check_by_id(report, check_id):
     return next(check for check in report["checks"] if check["id"] == check_id)
 
 
-def _example_config():
-    raw = EXAMPLE_CONFIG.read_text(encoding="utf-8").replace(
-        "EDIT-ME-rpi-canary-001",
-        "canary-2026-07-24-001",
-    )
-    return json.loads(raw)
+def _replace_deployment_id(value, previous, replacement):
+    if isinstance(value, dict):
+        return {
+            key: _replace_deployment_id(item, previous, replacement)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _replace_deployment_id(item, previous, replacement)
+            for item in value
+        ]
+    if isinstance(value, str):
+        return value.replace(previous, replacement)
+    return value
+
+
+def _live_config_fixture(deployment_id="canary-2026-07-24-001"):
+    config = safe_live_config()
+    previous = config["live_launch"]["deployment_id"]
+    config = _replace_deployment_id(config, previous, deployment_id)
+    config.pop("api_key", None)
+    config.pop("api_secret", None)
+    supervisor = config["risk"]["independent_supervisor"]
+    supervisor.pop("api_key", None)
+    supervisor.pop("api_secret", None)
+    config["strategy"]["model_readiness"]["live_approval"] = {
+        "manifest_path": "approval.json",
+        "min_data_duration_sec": 604800,
+        "min_oos_samples": 10000,
+        "trusted_signers": {},
+    }
+    return config
 
 
 def _passing_evidence(config):
@@ -219,11 +245,15 @@ class LiveCanaryReadinessTests(unittest.TestCase):
             }
         )
 
-    def test_blocked_example_rejects_placeholder_deployment_id(self):
-        report = assess_live_canary_readiness(
-            EXAMPLE_CONFIG,
-            now_utc=FIXED_NOW,
-        )
+    def test_blocked_fixture_rejects_placeholder_deployment_id(self):
+        config = _live_config_fixture("EDIT-ME-rpi-canary-001")
+        evidence = _passing_evidence(config)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = _write_case(temp_dir, config, evidence)
+            report = assess_live_canary_readiness(
+                config_path,
+                now_utc=FIXED_NOW,
+            )
 
         self.assertEqual(report["status"], BLOCKED)
         guard = _check_by_id(report, "config.live_guard")
@@ -240,11 +270,21 @@ class LiveCanaryReadinessTests(unittest.TestCase):
         self.assertEqual(report["network_requests"], 0)
         self.assertEqual(report["order_paths_exercised"], 0)
 
-    def test_calibration_example_uses_independent_permit_path_offline(self):
-        report = assess_live_canary_readiness(
-            EXAMPLE_CALIBRATION_CONFIG,
-            now_utc=FIXED_NOW,
-        )
+    def test_calibration_fixture_uses_independent_permit_path_offline(self):
+        config = safe_rpi_calibration_config()
+        config.pop("_validated_rpi_calibration_permit", None)
+        config.pop("api_key", None)
+        config.pop("api_secret", None)
+        supervisor = config["risk"]["independent_supervisor"]
+        supervisor.pop("api_key", None)
+        supervisor.pop("api_secret", None)
+        evidence = _passing_evidence(config)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = _write_case(temp_dir, config, evidence)
+            report = assess_live_canary_readiness(
+                config_path,
+                now_utc=FIXED_NOW,
+            )
 
         self.assertEqual(report["status"], BLOCKED)
         self.assertEqual(
@@ -261,7 +301,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
         self.assertEqual(report["order_paths_exercised"], 0)
 
     def test_complete_local_evidence_can_pass_offline_prerequisites(self):
-        config = _example_config()
+        config = _live_config_fixture()
         evidence = _passing_evidence(config)
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = _write_case(temp_dir, config, evidence)
@@ -289,7 +329,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
         )
         for field in critical_attestations:
             with self.subTest(field=field):
-                config = _example_config()
+                config = _live_config_fixture()
                 evidence = _passing_evidence(config)
                 evidence["operator_attestations"][field] = False
                 with tempfile.TemporaryDirectory() as temp_dir:
@@ -312,7 +352,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
                 self.assertIn(field, check["message"])
 
     def test_runtime_local_gate_binds_evidence_to_primary_api_key(self):
-        config = _example_config()
+        config = _live_config_fixture()
         config["api_key"] = "primary-key"
         config["api_secret"] = "primary-secret"
         config["risk"]["independent_supervisor"]["api_key"] = "risk-key"
@@ -352,7 +392,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
                 )
 
     def test_dual_key_account_truth_must_match_flat_start_balances(self):
-        config = _example_config()
+        config = _live_config_fixture()
         config["api_key"] = "primary-key"
         config["api_secret"] = "primary-secret"
         config["risk"]["independent_supervisor"]["api_key"] = "risk-key"
@@ -373,7 +413,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
                 )
 
     def test_runtime_local_gate_rejects_evidence_tampering(self):
-        config = _example_config()
+        config = _live_config_fixture()
         config["api_key"] = "primary-key"
         config["api_secret"] = "primary-secret"
         supervisor = config["risk"]["independent_supervisor"]
@@ -391,7 +431,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
                 )
 
     def test_runtime_local_gate_rejects_outside_evidence_path(self):
-        config = _example_config()
+        config = _live_config_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config_directory = root / "config"
@@ -409,7 +449,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
                 )
 
     def test_api_permission_truth_fails_closed(self):
-        config = _example_config()
+        config = _live_config_fixture()
         evidence = _passing_evidence(config)
         cases = (
             ("enableFutures", False),
@@ -444,7 +484,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
     def test_nonzero_account_rpi_rate_blocks_zero_fee_policy(self):
         for nonzero_rate in ("0.00001", "1e-400"):
             with self.subTest(nonzero_rate=nonzero_rate):
-                config = _example_config()
+                config = _live_config_fixture()
                 evidence = _passing_evidence(config)
                 evidence["rpi_truth"]["rpiCommissionRate"] = nonzero_rate
                 with tempfile.TemporaryDirectory() as temp_dir:
@@ -471,7 +511,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
         )
         for field, value, expected in cases:
             with self.subTest(field=field):
-                config = _example_config()
+                config = _live_config_fixture()
                 evidence = _passing_evidence(config)
                 evidence["rpi_truth"][field] = value
                 with tempfile.TemporaryDirectory() as temp_dir:
@@ -491,7 +531,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
                 self.assertIn(expected, check["message"])
 
     def test_state_paths_must_be_bound_to_deployment(self):
-        config = _example_config()
+        config = _live_config_fixture()
         config["oms"]["journal_path"] = "storage/live/shared/oms_journal.jsonl"
         evidence = _passing_evidence(config)
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -511,7 +551,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
         self.assertIn("deployment_id", check["message"])
 
     def test_state_path_parent_traversal_is_rejected_before_resolution(self):
-        config = _example_config()
+        config = _live_config_fixture()
         deployment_id = config["live_launch"]["deployment_id"]
         journal = (
             f"storage/live/{deployment_id}/../shared/oms_journal.jsonl"
@@ -537,7 +577,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows path identity requirement")
     def test_windows_case_alias_between_state_files_is_rejected(self):
-        config = _example_config()
+        config = _live_config_fixture()
         journal = config["oms"]["journal_path"]
         config["risk"]["independent_supervisor"]["state_path"] = (
             journal.upper()
@@ -560,7 +600,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
         self.assertIn("different files", check["message"])
 
     def test_declared_equity_cannot_exceed_fresh_account_truth(self):
-        config = _example_config()
+        config = _live_config_fixture()
         evidence = _passing_evidence(config)
         evidence["account_truth"]["totalWalletBalance"] = "9999.99"
         evidence["account_truth"]["totalMarginBalance"] = "9999.99"
@@ -581,7 +621,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
         self.assertIn("declared_account_equity_usdt", check["message"])
 
     def test_evidence_path_parent_traversal_is_rejected(self):
-        config = _example_config()
+        config = _live_config_fixture()
         evidence = _passing_evidence(config)
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = _write_case(temp_dir, config, evidence)
@@ -601,7 +641,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
         self.assertEqual(check["status"], BLOCKED)
 
     def test_inline_secret_is_blocked_and_never_echoed(self):
-        config = _example_config()
+        config = _live_config_fixture()
         secret = "DO-NOT-ECHO-THIS-SECRET"
         config["api_key"] = secret
         evidence = _passing_evidence(config)
@@ -622,8 +662,12 @@ class LiveCanaryReadinessTests(unittest.TestCase):
         self.assertNotIn(secret, json.dumps(report))
 
     def test_cli_json_is_machine_readable_and_blocked_exit_is_two(self):
-        with patch("builtins.print") as print_mock:
-            exit_code = main(["--config", str(EXAMPLE_CONFIG), "--json"])
+        config = _live_config_fixture("EDIT-ME-rpi-canary-001")
+        evidence = _passing_evidence(config)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = _write_case(temp_dir, config, evidence)
+            with patch("builtins.print") as print_mock:
+                exit_code = main(["--config", str(config_path), "--json"])
 
         self.assertEqual(exit_code, 2)
         output = print_mock.call_args.args[0]

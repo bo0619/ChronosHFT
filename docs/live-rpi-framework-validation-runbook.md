@@ -97,8 +97,9 @@ after both deployment configurations are final.
 
 ## Prepare deployment files
 
-1. Copy `config.live.rpi-calibration.example.json` and
-   `config.live.canary.example.json` to operator-owned files.
+1. Create operator-owned `config.live.rpi-calibration.json` and
+   `config.live.canary.json` files when Live deployment work resumes. These
+   files are intentionally ignored by Git.
 2. Set one fresh, matching `deployment_id` in both files.
 3. From the allowed host, inspect current symbol metadata, RPI eligibility,
    account-specific commission, tick size, spread, and minimum notional. Select

@@ -60,6 +60,8 @@ from event.type import (
     OrderBook,
     OrderIntent,
     OrderRequest,
+    OrderStateSnapshot,
+    OrderStatus,
     Side,
     EVENT_ACCOUNT_UPDATE,
     EVENT_EXCHANGE_ACCOUNT_UPDATE,
@@ -79,6 +81,7 @@ from risk.independent_supervisor import (
     run_sidecar_loop,
 )
 from risk.manager import RiskManager
+from strategy.base import StrategyTemplate
 
 
 class DummyEngine:
@@ -123,6 +126,18 @@ class DummyGateway:
 
     def get_open_orders(self):
         return self.open_orders
+
+
+class DummyStrategyOms:
+    def __init__(self, cancel_result=True):
+        self.cancel_result = cancel_result
+        self.cancelled_symbols = []
+
+    def cancel_all_orders(self, symbol):
+        self.cancelled_symbols.append(symbol)
+        if isinstance(self.cancel_result, BaseException):
+            raise self.cancel_result
+        return self.cancel_result
 
 
 class DummyOMS:
@@ -450,6 +465,71 @@ class ExchangeTruthTests(unittest.TestCase):
             },
         }
 
+    @staticmethod
+    def make_strategy(cancel_result=True):
+        oms = DummyStrategyOms(cancel_result)
+        strategy = StrategyTemplate(DummyEngine(), oms, name="test")
+        strategy.active_orders = {
+            "btc-1": OrderIntent("test", "BTCUSDT", Side.BUY, 100.0, 1.0),
+            "btc-2": OrderIntent("test", "BTCUSDT", Side.SELL, 101.0, 1.0),
+            "eth-1": OrderIntent("test", "ETHUSDT", Side.BUY, 50.0, 1.0),
+        }
+        return strategy, oms
+
+    def test_strategy_cancel_all_waits_for_terminal_updates(self):
+        strategy, oms = self.make_strategy()
+
+        self.assertTrue(strategy.cancel_all("BTCUSDT"))
+
+        self.assertEqual(oms.cancelled_symbols, ["BTCUSDT"])
+        self.assertEqual(
+            set(strategy.active_orders),
+            {"btc-1", "btc-2", "eth-1"},
+        )
+        self.assertEqual(strategy.orders_cancelling, {"btc-1", "btc-2"})
+
+        strategy.on_order(
+            OrderStateSnapshot(
+                client_oid="btc-1",
+                exchange_oid="exchange-1",
+                symbol="BTCUSDT",
+                status=OrderStatus.CANCELLED,
+                price=100.0,
+                volume=1.0,
+                filled_volume=0.0,
+                avg_price=0.0,
+                update_time=1.0,
+            )
+        )
+
+        self.assertNotIn("btc-1", strategy.active_orders)
+        self.assertNotIn("btc-1", strategy.orders_cancelling)
+        self.assertIn("btc-2", strategy.active_orders)
+
+    def test_strategy_cancel_all_rejection_rolls_back_new_state(self):
+        strategy, _oms = self.make_strategy(cancel_result=False)
+        strategy.orders_cancelling.add("btc-1")
+
+        self.assertFalse(strategy.cancel_all("BTCUSDT"))
+
+        self.assertEqual(
+            set(strategy.active_orders),
+            {"btc-1", "btc-2", "eth-1"},
+        )
+        self.assertEqual(strategy.orders_cancelling, {"btc-1"})
+
+    def test_strategy_cancel_all_exception_rolls_back_new_state(self):
+        strategy, _oms = self.make_strategy(cancel_result=RuntimeError("failed"))
+
+        with self.assertRaisesRegex(RuntimeError, "failed"):
+            strategy.cancel_all("BTCUSDT")
+
+        self.assertEqual(
+            set(strategy.active_orders),
+            {"btc-1", "btc-2", "eth-1"},
+        )
+        self.assertEqual(strategy.orders_cancelling, set())
+
     def test_exchange_fill_uses_realized_pnl_and_commission(self):
         gateway = DummyGateway()
         oms = OMS(DummyEngine(), gateway, self.make_config())
@@ -539,6 +619,47 @@ class ExchangeTruthTests(unittest.TestCase):
         finally:
             oms.stop()
 
+    def test_ws_balance_delta_preserves_rest_available_balance(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            oms.account.force_sync(
+                1000.0,
+                900.0,
+                100.0,
+                balances={
+                    "USDT": {
+                        "wallet_balance": 1000.0,
+                        "available_balance": 100.0,
+                    }
+                },
+            )
+            update = ExchangeAccountUpdate(
+                asset="USDT",
+                wallet_balance=1000.0,
+                available_balance=None,
+                balances={
+                    "USDT": {
+                        "wallet_balance": 1000.0,
+                        "available_balance": None,
+                        "cross_wallet_balance": 1000.0,
+                    }
+                },
+                positions={},
+                reason="ORDER",
+                event_time=1.0,
+            )
+
+            oms.on_exchange_account_update(
+                Event(EVENT_EXCHANGE_ACCOUNT_UPDATE, update)
+            )
+
+            self.assertAlmostEqual(oms.account.used_margin, 900.0)
+            self.assertAlmostEqual(oms.account.available, 100.0)
+            self.assertAlmostEqual(oms.account.budget_available, 100.0)
+            self.assertEqual(oms.account.available_balances["USDT"], 100.0)
+        finally:
+            oms.stop()
+
     def test_gateway_parses_user_stream_realized_and_account_updates(self):
         engine = DummyEngine()
         gateway = BinanceGateway.__new__(BinanceGateway)
@@ -588,9 +709,13 @@ class ExchangeTruthTests(unittest.TestCase):
         self.assertEqual(order_event.data.trade_id, 987)
         self.assertEqual(order_event.data.seq, 0)
         self.assertEqual(account_event.data.wallet_balance, 980.5)
-        self.assertEqual(account_event.data.available_balance, 950.0)
+        self.assertIsNone(account_event.data.available_balance)
         self.assertEqual(account_event.data.balances["USDT"]["wallet_balance"], 980.5)
-        self.assertEqual(account_event.data.balances["USDC"]["available_balance"], 205.5)
+        self.assertIsNone(account_event.data.balances["USDC"]["available_balance"])
+        self.assertEqual(
+            account_event.data.balances["USDC"]["cross_wallet_balance"],
+            205.5,
+        )
         self.assertIn("BTCUSDT", account_event.data.positions)
 
     def test_gateway_ws_parse_failure_emits_system_health_event(self):

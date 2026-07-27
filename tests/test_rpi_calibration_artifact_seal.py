@@ -15,6 +15,7 @@ from scripts.build_rpi_calibration_artifact import (
     _CalibrationJournalReplay,
 )
 from strategy import model_readiness
+from tests.test_live_config_guard import safe_rpi_calibration_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -161,11 +162,8 @@ def test_approval_graph_keeps_writer_fence_held(tmp_path, monkeypatch):
     seed_fence.release()
 
     calibration_path = tmp_path / "calibration.json"
-    calibration = json.loads(
-        (ROOT / "config.live.rpi-calibration.example.json").read_text(
-            encoding="utf-8"
-        )
-    )
+    calibration = safe_rpi_calibration_config()
+    calibration.pop("_validated_rpi_calibration_permit", None)
     calibration["oms"]["journal_path"] = journal.name
     calibration["oms"]["single_writer_fence"]["path"] = lock_path.name
     calibration_path.write_text(

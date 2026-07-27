@@ -1,0 +1,17 @@
+{
+  "paper_trade": {
+    "enabled": true,
+    "market_data_environment": "production",
+    "maker_fee": 0.0002,
+    "taker_fee": 0.0005,
+    "rpi_commission_rate": 0.0,
+    "rpi_commission_rates": {},
+    "rpi_fill_model": "disabled",
+    "public_trade_proxy": false,
+    "reset_on_start": true,
+    "cancel_ahead_fraction": 0.0,
+    "maintenance_margin_rate": 0.005,
+    "command_timeout_sec": 2.0,
+    "command_queue_size": 10000
+  }
+}

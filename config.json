@@ -1,0 +1,28 @@
+{
+  "schema": "chronoshft.config_manifest.v1",
+  "includes": [
+    "config/execution.json",
+    "config/paper_trade.json",
+    "config/symbols.json",
+    "config/data_recording.json",
+    "config/system/logging.json",
+    "config/system/rate_limit.json",
+    "config/system/dashboard.json",
+    "config/system/market_data.json",
+    "config/system/time_sync.json",
+    "config/account.json",
+    "config/risk/core.json",
+    "config/risk/limits.json",
+    "config/risk/price_sanity.json",
+    "config/risk/technical_health.json",
+    "config/risk/black_swan.json",
+    "config/alerts.json",
+    "config/backtest.json",
+    "config/oms.json",
+    "config/strategy/core.json",
+    "config/strategy/capital_scaling.json",
+    "config/strategy/model_readiness.json",
+    "config/strategy/glft.json",
+    "config/strategy/avellaneda_stoikov.json"
+  ]
+}

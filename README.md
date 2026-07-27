@@ -3,7 +3,8 @@ An institutional-grade high-frequency trading framework for cryptocurrencies wri
 
 ## Paper Trade: production public data, local execution
 
-`config.example.json` defaults to Paper mode. It consumes Binance USDⓈ-M
+The tracked `config.json` manifest composes the single-purpose JSON fragments
+under `config/` and defaults to Paper mode. It consumes Binance USDⓈ-M
 **production public** market data (not Binance Testnet), while balances, orders,
 fills, fees and PnL are produced by the local simulator. Paper mode does not
 require an API key or secret and must not call private order, account, user-data
@@ -21,18 +22,14 @@ The local dashboard must display `PAPER · LIVE DATA`. In this mode:
 
 Paper RPI fills are model assumptions only. They do not prove that Binance
 accepted a real RPI order, that it joined a real RPI queue, or that a Binance
-App/Web retail counterparty traded against it. The example therefore keeps
+App/Web retail counterparty traded against it. The Paper configuration keeps
 `paper_trade.rpi_fill_model` set to `disabled` until an explicit, calibrated
 local RPI fill model is chosen.
 
 ## Start the engine and local dashboard
 
-For a first Paper run, create `config.json` from the safe example, then start
-the main program. No credential environment variables are needed:
-
-```powershell
-Copy-Item config.example.json config.json
-```
+The repository already contains the Paper manifest and fragments. No
+credential environment variables or configuration copy step is needed.
 
 Run the offline configuration gate before starting any runtime component:
 
@@ -267,22 +264,21 @@ or exception text. A complete host or process loss still requires an
 independent infrastructure heartbeat monitor; the exchange dead-man switch
 remains responsible for cancelling orders after such a loss.
 
-Use the blocked canary template and offline checker before moving any file to a
-deployment host:
+When Live work resumes, create the operator-owned `config.live.canary.json`
+and run the offline checker before moving it to a deployment host:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\check_live_canary_readiness.py --config config.live.canary.example.json
+.\.venv\Scripts\python.exe scripts\check_live_canary_readiness.py --config config.live.canary.json
 ```
 
-The checked-in example is expected to report `BLOCKED`: its model manifest,
-account attestations, and RPI truth are intentionally empty. The checker reads
-only local JSON, never reads credential values, constructs no gateway or OMS,
-performs no network request, and exercises no order path. A `PASS` is only an
-offline prerequisite; startup still refreshes exchange and account truth and
-can fail closed.
+Live deployment JSON is intentionally operator-owned and ignored by Git. The
+checker reads only local JSON, never reads credential values, constructs no
+gateway or OMS, performs no network request, and exercises no order path. A
+`PASS` is only an offline prerequisite; startup still refreshes exchange and
+account truth and can fail closed.
 
-The accompanying blocked templates document the exact evidence contracts:
-`config.live.canary.calibration.example.json` uses calibration artifact v3 and
+The runtime validators define the exact evidence contracts.
+`config.live.canary.calibration.json` uses calibration artifact v3 and
 accepts only genuine `LIVE_BINANCE_RPI_ACK` exposure bins. Source evidence v4
 binds the artifact digest, exact redacted deployment-config digest, validated
 calibration journal, raw OMS and market-evidence journal digests, and canonical
@@ -400,17 +396,16 @@ their OMS anchors, requires flat start/end boundaries and no external
 transfers, and recomputes funding, fees, net PnL, drawdown, and markout. It
 performs no network or order operation.
 
-The blocked template is
-`config.live.rpi-calibration.example.json`. Its permit path intentionally does
-not exist and its trusted-signer set is empty. Check it without making a
+Create the operator-owned `config.live.rpi-calibration.json` only when the
+deployment permit and trusted signer are available. Check it without making a
 network request or constructing a Gateway/OMS:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\check_live_canary_readiness.py --config config.live.rpi-calibration.example.json
+.\.venv\Scripts\python.exe scripts\check_live_canary_readiness.py --config config.live.rpi-calibration.json
 ```
 
-The expected result is `BLOCKED`. Even a future offline `PASS` is only a local
-prerequisite: startup must still re-fetch flat account state, RPI eligibility,
+An offline `PASS` is only a local prerequisite: startup must still re-fetch
+flat account state, RPI eligibility,
 and account-specific commission truth on an allowed deployment host. This
 stage must not be run from mainland China or any environment where Binance
 access or account use is not permitted.

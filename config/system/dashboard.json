@@ -1,0 +1,16 @@
+{
+  "system": {
+    "web_dashboard": {
+      "_comment": "Loopback-only read-only monitoring UI. It never exposes API credentials or accepts trading commands.",
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 8765,
+      "open_browser": true,
+      "refresh_interval_ms": 1000,
+      "history_limit": 600,
+      "orders_limit": 100,
+      "trades_limit": 100,
+      "logs_limit": 200
+    }
+  }
+}

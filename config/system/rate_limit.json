@@ -1,0 +1,14 @@
+{
+  "system": {
+    "binance_rest_rate_limit": {
+      "_comment": "One host/IP budget shared by the main process and independent risk sidecar. Background queries cannot consume the trading or emergency reserves.",
+      "enabled": true,
+      "request_weight_limit": 2400,
+      "trading_reserve": 300,
+      "emergency_reserve": 300,
+      "state_path": "storage/binance_rate_limit_budget.sqlite3",
+      "sqlite_timeout_sec": 2.0,
+      "full_open_orders_audit_interval_sec": 60.0
+    }
+  }
+}

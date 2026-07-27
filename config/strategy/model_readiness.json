@@ -1,0 +1,25 @@
+{
+  "strategy": {
+    "model_readiness": {
+      "_comment": "Paper collects samples in OBSERVE_ONLY until each symbol is ready. Live additionally requires hashed genuine-RPI exposure and OOS evidence; live approval remains intentionally disabled.",
+      "enabled": true,
+      "min_volatility_samples": 50,
+      "min_model_samples": 30,
+      "models": {
+        "glft": {
+          "min_volatility_samples": 50,
+          "min_model_samples": 30
+        },
+        "avellaneda_stoikov": {
+          "min_volatility_samples": 50,
+          "min_model_samples": 60
+        }
+      },
+      "live_approval": {
+        "manifest_path": "",
+        "min_data_duration_sec": 604800,
+        "min_oos_samples": 10000
+      }
+    }
+  }
+}

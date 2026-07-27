@@ -1,0 +1,8 @@
+{
+  "risk": {
+    "price_sanity": {
+      "max_deviation_pct": 0.03,
+      "max_spread_pct": 0.015
+    }
+  }
+}

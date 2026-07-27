@@ -328,11 +328,16 @@ class StrategyTemplate:
         return accepted
 
     def cancel_all(self, symbol: str):
-        self.oms.cancel_all_orders(symbol)
-
-        to_remove = [
+        to_cancel = {
             oid for oid, intent in self.active_orders.items() if intent.symbol == symbol
-        ]
-        for oid in to_remove:
-            del self.active_orders[oid]
-            self.orders_cancelling.discard(oid)
+        }
+        newly_cancelling = to_cancel.difference(self.orders_cancelling)
+        self.orders_cancelling.update(newly_cancelling)
+        try:
+            accepted = bool(self.oms.cancel_all_orders(symbol))
+        except BaseException:
+            self.orders_cancelling.difference_update(newly_cancelling)
+            raise
+        if not accepted:
+            self.orders_cancelling.difference_update(newly_cancelling)
+        return accepted

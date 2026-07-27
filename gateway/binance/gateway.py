@@ -855,11 +855,9 @@ class BinanceGateway(BaseGateway):
                 if balance_entry
                 else 0.0
             ),
-            available_balance=(
-                self._parse_optional_float(balance_entry.get("cw"))
-                if balance_entry
-                else None
-            ),
+            # ACCOUNT_UPDATE does not publish availableBalance. Its `cw`
+            # field is crossWalletBalance and must not replace REST truth.
+            available_balance=None,
             balances=balance_snapshot,
             positions=positions,
             reason=payload.get("m", ""),
@@ -1515,7 +1513,10 @@ class BinanceGateway(BaseGateway):
                 continue
             snapshot[asset] = {
                 "wallet_balance": float(entry.get("wb", 0.0) or 0.0),
-                "available_balance": self._parse_optional_float(entry.get("cw")),
+                "available_balance": None,
+                "cross_wallet_balance": self._parse_optional_float(
+                    entry.get("cw")
+                ),
                 "balance_change": self._parse_optional_float(entry.get("bc")),
             }
         return snapshot

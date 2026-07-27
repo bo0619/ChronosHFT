@@ -3,13 +3,14 @@
 # 1. 忽略 Python 编译缓存 (垃圾文件)
 __pycache__/
 *.py[cod]
+.tmp/
 
 # 2. [绝对禁止上传] 配置文件 (含 API Key)
-config.json
 config.live.canary.json
 config.live.rpi-calibration.json
 config.live.rpi-calibration.permit.json
 config.live.canary.evidence.json
+config/local/
 *.pem
 *.key
 

@@ -102,15 +102,10 @@ def _validate_admin_control_path(value, *, base_dir: str = "") -> str:
 
 def load_admin_control_config(path: str = "config.json") -> dict:
     """Read only the admin inbox location without loading Live credentials."""
+    from infrastructure.config_scaling import load_config_document
+
     config_path = os.path.abspath(os.fspath(path))
-    try:
-        raw = _load_strict_json_object(config_path, "admin root config")
-    except ValueError as exc:
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(
-                f"admin root config file not found: {config_path}"
-            ) from exc
-        raise
+    raw = load_config_document(config_path)
 
     system = raw.get("system", {})
     if system is None:

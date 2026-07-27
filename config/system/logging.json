@@ -1,0 +1,9 @@
+{
+  "system": {
+    "log_level": "INFO",
+    "log_path": "logs",
+    "log_console": false,
+    "web_port": 8000,
+    "hdf5_flush_threshold": 1000
+  }
+}

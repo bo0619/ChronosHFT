@@ -61,6 +61,7 @@ from strategy.model_readiness import (
     validate_live_calibration_approval,
     verify_ed25519_signature,
 )
+from tests.test_live_config_guard import safe_live_config
 
 
 def _canonical_json(value):
@@ -679,12 +680,7 @@ class ModelReadinessTests(unittest.TestCase):
         )
 
     def test_deployment_digest_redacts_secrets_and_binds_safety_policy(self):
-        root = Path(__file__).resolve().parents[1]
-        config = json.loads(
-            (root / "config.live.canary.example.json").read_text(
-                encoding="utf-8"
-            )
-        )
+        config = safe_live_config()
         config["system"]["event_engine"] = {"queue_size": 10_000}
         config["system"]["strategy_runtime"] = {"cycle_timeout_ms": 250}
         config["system"]["watchdog"] = {"stall_timeout_ms": 1_000}

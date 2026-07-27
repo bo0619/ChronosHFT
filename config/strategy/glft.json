@@ -1,0 +1,37 @@
+{
+  "strategy": {
+    "glft": {
+      "_comment": "Paper uses configured A/k only as a labeled proxy. Live ignores public aggTrade and requires a hashed LIVE_BINANCE_RPI_ACK exposure artifact.",
+      "gamma": 0.1,
+      "cycle_interval": 1.0,
+      "alpha": {
+        "enabled": false
+      },
+      "target_inventory_notional_usdt": 0.0,
+      "inventory_lot_notional_usdt": 8.0,
+      "rpi_intensity": {
+        "min_sample_count": 30,
+        "min_depth_level_count": 3,
+        "min_total_exposure_seconds": 60.0,
+        "min_fill_count": 10,
+        "min_depth_span_bps": 0.5,
+        "min_k_per_bps": 0.000001,
+        "max_k_per_bps": 100.0
+      },
+      "calibrator": {
+        "window": 1000,
+        "min_samples": 50,
+        "initial_sigma_bps": 10.0,
+        "initial_A": 10.0,
+        "initial_k": 0.8,
+        "learning_rate": 0.005,
+        "sigma_max_bps": 100.0,
+        "sigma_ema_alpha": 0.1,
+        "max_tick_gap_sec": 2.0
+      },
+      "execution": {
+        "min_spread_bps": 5.0
+      }
+    }
+  }
+}

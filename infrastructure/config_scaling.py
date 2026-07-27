@@ -1,6 +1,7 @@
 import json
 import os
 from copy import deepcopy
+from pathlib import Path
 
 from infrastructure.live_config_guard import (
     CANARY_STAGE,
@@ -19,6 +20,8 @@ from strategy.model_readiness import (
 
 
 QUOTE_ASSET_SUFFIXES = ("USDT", "USDC", "BUSD", "FDUSD")
+CONFIG_MANIFEST_SCHEMA = "chronoshft.config_manifest.v1"
+_CONFIG_MANIFEST_KEYS = frozenset({"schema", "includes"})
 TIME_SYNC_DEFAULTS = {
     "startup_required": True,
     "require_healthy_for_trading": True,
@@ -179,6 +182,179 @@ def _reject_duplicate_json_keys(pairs):
                 f"duplicate JSON object key {key!r} is not allowed"
             )
         payload[key] = value
+    return payload
+
+
+def _read_config_json_object(path: str, *, root: bool) -> dict:
+    label = "root config" if root else "config fragment"
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(
+                handle,
+                parse_constant=_reject_json_constant,
+                object_pairs_hook=_reject_duplicate_json_keys,
+            )
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"{label} file not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{label} JSON is malformed at "
+            f"{path}:{exc.lineno}:{exc.colno}: {exc.msg}"
+        ) from exc
+    except ValueError as exc:
+        raise ValueError(f"{label} JSON is invalid at {path}: {exc}") from exc
+    except (OSError, UnicodeError) as exc:
+        raise OSError(f"{label} file is not readable: {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must be a JSON object: {path}")
+    if not payload:
+        raise ValueError(f"{label} must not be an empty JSON object: {path}")
+    return payload
+
+
+def _is_config_manifest(payload: dict) -> bool:
+    return payload.get("schema") == CONFIG_MANIFEST_SCHEMA or "includes" in payload
+
+
+def _resolve_config_fragment_path(manifest_path: str, include: object) -> str:
+    if not isinstance(include, str) or not include or include != include.strip():
+        raise ValueError("config manifest includes must be non-empty relative paths")
+    include_path = Path(include)
+    if include_path.is_absolute() or ".." in include_path.parts:
+        raise ValueError(
+            f"config manifest include must stay below the manifest directory: {include!r}"
+        )
+    if include_path.suffix.lower() != ".json":
+        raise ValueError(f"config manifest include must be a JSON file: {include!r}")
+
+    manifest_dir = os.path.dirname(manifest_path)
+    resolved = os.path.abspath(os.path.join(manifest_dir, os.fspath(include_path)))
+    try:
+        common = os.path.commonpath((manifest_dir, resolved))
+    except ValueError as exc:
+        raise ValueError(
+            f"config manifest include is outside the manifest directory: {include!r}"
+        ) from exc
+    if os.path.normcase(common) != os.path.normcase(manifest_dir):
+        raise ValueError(
+            f"config manifest include is outside the manifest directory: {include!r}"
+        )
+    if os.path.normcase(os.path.realpath(resolved)) != os.path.normcase(resolved):
+        raise ValueError(
+            f"config manifest include must not traverse a symlink: {include!r}"
+        )
+    return resolved
+
+
+def _record_config_paths(
+    value: object,
+    *,
+    path: tuple[str, ...],
+    source: str,
+    owners: dict[tuple[str, ...], str],
+) -> None:
+    owners[path] = source
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _record_config_paths(
+                item,
+                path=(*path, str(key)),
+                source=source,
+                owners=owners,
+            )
+
+
+def _merge_config_fragment(
+    merged: dict,
+    fragment: dict,
+    *,
+    source: str,
+    owners: dict[tuple[str, ...], str],
+    path: tuple[str, ...] = (),
+) -> None:
+    for key, value in fragment.items():
+        field_path = (*path, str(key))
+        if key not in merged:
+            merged[key] = deepcopy(value)
+            _record_config_paths(
+                value,
+                path=field_path,
+                source=source,
+                owners=owners,
+            )
+            continue
+
+        current = merged[key]
+        if isinstance(current, dict) and isinstance(value, dict):
+            _merge_config_fragment(
+                current,
+                value,
+                source=source,
+                owners=owners,
+                path=field_path,
+            )
+            continue
+
+        rendered_path = ".".join(field_path)
+        previous_source = owners.get(field_path, "an earlier fragment")
+        raise ValueError(
+            f"duplicate config field across fragments: {rendered_path} "
+            f"is defined by {previous_source} and {source}"
+        )
+
+
+def _compose_config_manifest(payload: dict, manifest_path: str) -> dict:
+    if set(payload) != _CONFIG_MANIFEST_KEYS:
+        unexpected = sorted(set(payload) - _CONFIG_MANIFEST_KEYS)
+        raise ValueError(
+            "config manifest must contain only schema and includes"
+            + (f"; unexpected keys: {unexpected}" if unexpected else "")
+        )
+    if payload.get("schema") != CONFIG_MANIFEST_SCHEMA:
+        raise ValueError(
+            f"config manifest schema must be {CONFIG_MANIFEST_SCHEMA!r}"
+        )
+    includes = payload.get("includes")
+    if not isinstance(includes, list) or not includes:
+        raise ValueError("config manifest includes must be a non-empty array")
+    if len(includes) > 128:
+        raise ValueError("config manifest includes must contain no more than 128 files")
+
+    merged = {}
+    owners: dict[tuple[str, ...], str] = {}
+    included_paths = set()
+    for include in includes:
+        fragment_path = _resolve_config_fragment_path(manifest_path, include)
+        normalized_path = os.path.normcase(fragment_path)
+        if normalized_path in included_paths:
+            raise ValueError(f"duplicate config manifest include: {include!r}")
+        included_paths.add(normalized_path)
+        fragment = _read_config_json_object(fragment_path, root=False)
+        if _is_config_manifest(fragment):
+            raise ValueError(
+                f"nested config manifests are not supported: {fragment_path}"
+            )
+        _merge_config_fragment(
+            merged,
+            fragment,
+            source=fragment_path,
+            owners=owners,
+        )
+    return merged
+
+
+def _load_config_document(path: str) -> tuple[dict, bool]:
+    config_path = os.path.abspath(os.fspath(path))
+    payload = _read_config_json_object(config_path, root=True)
+    is_manifest = _is_config_manifest(payload)
+    if is_manifest:
+        payload = _compose_config_manifest(payload, config_path)
+    return payload, is_manifest
+
+
+def load_config_document(path: str = "config.json") -> dict:
+    """Load strict JSON and compose a Paper config manifest without normalization."""
+    payload, _is_manifest = _load_config_document(path)
     return payload
 
 
@@ -758,40 +934,14 @@ def normalize_root_config_preapproval(raw: dict) -> dict:
 
 def load_root_config(path: str = "config.json") -> dict:
     config_path = os.path.abspath(os.fspath(path))
-    try:
-        with open(config_path, "r", encoding="utf-8") as handle:
-            raw = json.load(
-                handle,
-                parse_constant=_reject_json_constant,
-                object_pairs_hook=_reject_duplicate_json_keys,
-            )
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(
-            f"root config file not found: {config_path}"
-        ) from exc
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            "root config JSON is malformed at "
-            f"{config_path}:{exc.lineno}:{exc.colno}: {exc.msg}"
-        ) from exc
-    except ValueError as exc:
-        raise ValueError(
-            f"root config JSON is invalid at {config_path}: {exc}"
-        ) from exc
-    except (OSError, UnicodeError) as exc:
-        raise OSError(
-            f"root config file is not readable: {config_path}: {exc}"
-        ) from exc
-    if not isinstance(raw, dict):
-        raise ValueError(
-            f"root config must be a JSON object: {config_path}"
-        )
-    if not raw:
-        raise ValueError(
-            f"root config must not be an empty JSON object: {config_path}"
-        )
+    raw, is_manifest = _load_config_document(config_path)
     _reject_live_inline_secrets(raw)
     configured = normalize_root_config_preapproval(raw)
+    if is_manifest and not is_paper_trade(configured):
+        raise ValueError(
+            "fragmented config manifests are Paper-only until Live evidence "
+            "digests explicitly bind every fragment"
+        )
     if not is_paper_trade(configured):
         stage = live_launch_stage(configured)
         if stage == RPI_CALIBRATION_CANARY_STAGE:

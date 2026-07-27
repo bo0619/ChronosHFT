@@ -1,11 +1,14 @@
 import copy
 import json
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import mock_open, patch
 
 from infrastructure.config_scaling import (
+    CONFIG_MANIFEST_SCHEMA,
+    load_config_document,
     load_root_config,
     normalize_root_config_preapproval,
 )
@@ -22,6 +25,7 @@ from strategy.model_readiness import strategy_policy_sha256
 def safe_live_config():
     return {
         "execution": {"mode": "live"},
+        "paper_trade": {"enabled": False},
         "testnet": False,
         "api_key_env": "BINANCE_API_KEY",
         "api_secret_env": "BINANCE_API_SECRET",
@@ -219,6 +223,12 @@ def safe_live_config():
                         "min_model_samples": 30,
                     }
                 },
+                "live_approval": {
+                    "manifest_path": "approval.json",
+                    "min_data_duration_sec": 604800,
+                    "min_oos_samples": 10000,
+                    "trusted_signers": {},
+                },
             },
             "glft": {
                 "gamma": 0.1,
@@ -327,6 +337,35 @@ def safe_rpi_calibration_config():
         "target_deployment_config_sha256": digest_b,
     }
     return config
+
+
+def safe_rpi_target_config():
+    config = safe_rpi_calibration_config()
+    config.pop("_validated_rpi_calibration_permit", None)
+    live_launch = config["live_launch"]
+    live_launch["stage"] = "canary"
+    for field in (
+        "calibration_permit_path",
+        "target_deployment_config_path",
+        "calibration_permit_trusted_signers",
+    ):
+        live_launch.pop(field, None)
+
+    deployment_root = f"storage/live/{live_launch['deployment_id']}/"
+
+    def relocate_target_state(value):
+        if isinstance(value, dict):
+            return {
+                key: relocate_target_state(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [relocate_target_state(item) for item in value]
+        if isinstance(value, str) and value.startswith(deployment_root):
+            return deployment_root + "target/" + value[len(deployment_root):]
+        return value
+
+    return relocate_target_state(config)
 
 
 def validate_rpi_calibration_guard(config):
@@ -674,27 +713,114 @@ class LiveConfigGuardTests(unittest.TestCase):
             normalized["strategy"]["glft"],
         )
 
-    def test_calibration_and_target_examples_share_glft_policy(self):
-        root = Path(__file__).resolve().parents[1]
+    def test_calibration_and_target_fixtures_share_glft_policy(self):
         calibration = normalize_root_config_preapproval(
-            json.loads(
-                (root / "config.live.rpi-calibration.example.json").read_text(
-                    encoding="utf-8"
-                )
-            )
+            safe_rpi_calibration_config()
         )
-        target = normalize_root_config_preapproval(
-            json.loads(
-                (root / "config.live.canary.example.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-        )
+        target = normalize_root_config_preapproval(safe_rpi_target_config())
 
         self.assertEqual(
             strategy_policy_sha256(calibration, "glft"),
             strategy_policy_sha256(target, "glft"),
         )
+
+    def test_config_manifest_merges_single_owner_fragments(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "execution.json").write_text(
+                json.dumps({"execution": {"mode": "paper"}}),
+                encoding="utf-8",
+            )
+            (root / "system.json").write_text(
+                json.dumps({"system": {"log_level": "INFO"}}),
+                encoding="utf-8",
+            )
+            (root / "dashboard.json").write_text(
+                json.dumps({"system": {"web_dashboard": {"port": 8765}}}),
+                encoding="utf-8",
+            )
+            manifest = root / "config.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema": CONFIG_MANIFEST_SCHEMA,
+                        "includes": [
+                            "execution.json",
+                            "system.json",
+                            "dashboard.json",
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = load_config_document(manifest)
+
+        self.assertEqual(loaded["execution"]["mode"], "paper")
+        self.assertEqual(loaded["system"]["log_level"], "INFO")
+        self.assertEqual(loaded["system"]["web_dashboard"]["port"], 8765)
+
+    def test_config_manifest_rejects_duplicate_leaf_and_traversal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "one.json").write_text(
+                json.dumps({"system": {"log_level": "INFO"}}),
+                encoding="utf-8",
+            )
+            (root / "two.json").write_text(
+                json.dumps({"system": {"log_level": "DEBUG"}}),
+                encoding="utf-8",
+            )
+            manifest = root / "config.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema": CONFIG_MANIFEST_SCHEMA,
+                        "includes": ["one.json", "two.json"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "duplicate config field"):
+                load_config_document(manifest)
+
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema": CONFIG_MANIFEST_SCHEMA,
+                        "includes": ["../outside.json"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "manifest directory"):
+                load_config_document(manifest)
+
+    def test_fragmented_live_config_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "live.json").write_text(
+                json.dumps(
+                    {
+                        "execution": {"mode": "live"},
+                        "live_launch": {"stage": "canary"},
+                        "symbols": ["BTCUSDT"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest = root / "config.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema": CONFIG_MANIFEST_SCHEMA,
+                        "includes": ["live.json"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "Paper-only"):
+                load_root_config(manifest)
 
     def test_resolved_state_paths_reject_parent_traversal_and_aliases(self):
         deployment_id = safe_live_config()["live_launch"]["deployment_id"]

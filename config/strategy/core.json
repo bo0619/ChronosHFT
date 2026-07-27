@@ -1,0 +1,21 @@
+{
+  "strategy": {
+    "name": "GLFT_MultiScale",
+    "primary_model": "glft",
+    "registered_models": [
+      "glft",
+      "avellaneda_stoikov"
+    ],
+    "execution_policy": "single_primary",
+    "_comment_model_policy": "GLFT is the sole Paper execution primary. A-S is the registered alternative; switching requires config change and restart.",
+    "_comment_rpi": "Live startup requires every configured symbol to expose RPI permission and account-specific commission truth.",
+    "use_rpi": true,
+    "use_rpi_for_avellaneda_stoikov": true,
+    "use_rpi_for_glft": true,
+    "use_rpi_for_passive_exit": false,
+    "rpi_fallback_to_gtx": false,
+    "rpi_live_policy": {
+      "require_zero_commission": true
+    }
+  }
+}

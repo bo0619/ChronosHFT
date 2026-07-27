@@ -1,0 +1,22 @@
+{
+  "strategy": {
+    "_comment_capital_scaling": "Only change capital_multiplier. Risk limits and capital scale together.",
+    "capital_multiplier": 1.0,
+    "capital_scaling": {
+      "enabled": true,
+      "reference_capital_usdt": 100.0,
+      "target_order_notional": 8.0,
+      "order_notional_limit_factor": 1.5,
+      "target_total_risk_notional": 36.0,
+      "target_concurrent_symbols": 2,
+      "target_daily_loss": 4.0,
+      "max_order_qty": 10000.0,
+      "budget_asset_weights": {
+        "USDT": 1.0
+      },
+      "position_buffer_orders": 2.0,
+      "reference_min_notional": 5.0,
+      "notional_buffer": 1.1
+    }
+  }
+}

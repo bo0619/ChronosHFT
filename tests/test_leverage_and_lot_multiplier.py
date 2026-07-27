@@ -68,6 +68,7 @@ from infrastructure.config_scaling import (
     apply_capital_scaling,
     apply_production_safety_defaults,
     finalize_strategy_risk_budgets,
+    load_config_document,
     normalize_strategy_registration,
     normalize_root_config_preapproval,
     resolve_runtime_secrets,
@@ -365,14 +366,13 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
         self.assertEqual(supervisor["api_key"], "risk-only-key")
         self.assertEqual(supervisor["api_secret"], "risk-only-secret")
 
-    def test_example_config_does_not_embed_api_credentials(self):
-        with open("config.example.json", "r", encoding="utf-8") as handle:
-            example = json.load(handle)
+    def test_paper_manifest_does_not_embed_api_credentials(self):
+        configured = load_config_document("config.json")
 
-        self.assertNotIn("api_key", example)
-        self.assertNotIn("api_secret", example)
-        self.assertEqual(example["api_key_env"], "BINANCE_API_KEY")
-        self.assertEqual(example["api_secret_env"], "BINANCE_API_SECRET")
+        self.assertNotIn("api_key", configured)
+        self.assertNotIn("api_secret", configured)
+        self.assertNotIn("api_key_env", configured)
+        self.assertNotIn("api_secret_env", configured)
 
     def test_root_config_injects_outbound_message_budget_defaults(self):
         payload = {"symbols": ["BTCUSDT"], "oms": {}, "risk": {}}
