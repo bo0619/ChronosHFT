@@ -497,18 +497,32 @@ class ExchangeTruthTests(unittest.TestCase):
         finally:
             oms.stop()
 
-    def test_exchange_account_update_syncs_wallet_balance(self):
+    def test_exchange_account_update_merges_partial_balance_delta(self):
         engine = DummyEngine()
         gateway = DummyGateway()
         oms = OMS(engine, gateway, self.make_config())
         try:
+            oms.account.force_sync(
+                1125.0,
+                0.0,
+                1050.0,
+                balances={
+                    "USDT": {
+                        "wallet_balance": 1000.0,
+                        "available_balance": 950.0,
+                    },
+                    "USDC": {
+                        "wallet_balance": 125.0,
+                        "available_balance": 100.0,
+                    },
+                },
+            )
             update = ExchangeAccountUpdate(
                 asset="USDT",
                 wallet_balance=950.0,
                 available_balance=900.0,
                 balances={
                     "USDT": {"wallet_balance": 950.0, "available_balance": 900.0},
-                    "USDC": {"wallet_balance": 125.0, "available_balance": 100.0},
                 },
                 positions={},
                 reason="ORDER",
@@ -516,8 +530,8 @@ class ExchangeTruthTests(unittest.TestCase):
             )
             oms.on_exchange_account_update(Event(EVENT_EXCHANGE_ACCOUNT_UPDATE, update))
 
-            self.assertAlmostEqual(oms.account.balance, 950.0)
-            self.assertAlmostEqual(oms.account.available, 900.0)
+            self.assertAlmostEqual(oms.account.balance, 1075.0)
+            self.assertAlmostEqual(oms.account.available, 1000.0)
             self.assertEqual(oms.account.balances["USDT"], 950.0)
             self.assertEqual(oms.account.balances["USDC"], 125.0)
             self.assertEqual(oms.account.available_balances["USDC"], 100.0)

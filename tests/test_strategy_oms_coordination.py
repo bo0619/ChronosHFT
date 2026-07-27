@@ -124,6 +124,7 @@ class PassiveQuoteOMS:
 
     def cancel_order(self, client_oid):
         self.cancelled.append(client_oid)
+        return True
 
 
 class StrategyMonotonicTimingTests(unittest.TestCase):
@@ -498,6 +499,32 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             status="TRADING",
             permissions=frozenset({"RPI"}) if supports_rpi else frozenset(),
         )
+
+    def test_rejected_cancel_does_not_suppress_retry(self):
+        class RejectingCancelOMS:
+            def __init__(self):
+                self.cancelled = []
+
+            def cancel_order(self, client_oid):
+                self.cancelled.append(client_oid)
+                return False
+
+        oms = RejectingCancelOMS()
+        strategy = DummyStrategy(DispatchingEngine(), oms)
+        intent = OrderIntent(
+            "test",
+            "BTCUSDT",
+            Side.BUY,
+            100.0,
+            1.0,
+        )
+        strategy.active_orders["cancel-retry"] = intent
+
+        self.assertFalse(strategy.cancel_order("cancel-retry"))
+        self.assertFalse(strategy.cancel_order("cancel-retry"))
+
+        self.assertEqual(oms.cancelled, ["cancel-retry", "cancel-retry"])
+        self.assertNotIn("cancel-retry", strategy.orders_cancelling)
 
     def test_passive_router_is_symbol_gated_and_accounts_for_rpi_fee(self):
         engine = DispatchingEngine()

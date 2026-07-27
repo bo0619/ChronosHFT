@@ -23,6 +23,7 @@ from event.type import (
     ExecutionPolicy,
     EVENT_EXCHANGE_ORDER_UPDATE,
     EVENT_ACCOUNT_UPDATE,
+    EVENT_ORDER_UPDATE,
     LifecycleState,
     OMSCapabilityMode,
     OrderIntent,
@@ -42,6 +43,7 @@ from oms.journal import (
     OMSJournal,
 )
 from oms.order import Order
+from strategy.base import StrategyTemplate
 
 
 class DummyEngine:
@@ -765,8 +767,42 @@ class OMSSurvivabilityTests(unittest.TestCase):
 
     def test_manual_rearm_requires_explicit_reset_path(self):
         gateway = DummyGateway()
-        oms = OMS(DummyEngine(), gateway, self.make_config())
+        gateway.account = {
+            "totalWalletBalance": "1125",
+            "totalInitialMargin": "0",
+            "availableBalance": "1050",
+            "assets": [
+                {
+                    "asset": "USDT",
+                    "walletBalance": "1000",
+                    "availableBalance": "950",
+                },
+                {
+                    "asset": "USDC",
+                    "walletBalance": "125",
+                    "availableBalance": "100",
+                },
+            ],
+        }
+        engine = DummyEngine()
+        oms = OMS(engine, gateway, self.make_config())
         try:
+            intent = OrderIntent(
+                "test",
+                "BTCUSDT",
+                Side.BUY,
+                100.0,
+                1.0,
+            )
+            order = Order("rearm-order", intent)
+            order.mark_submitting()
+            order.mark_pending_ack("exchange-rearm-order")
+            order.mark_new("exchange-rearm-order")
+            oms.orders[order.client_oid] = order
+            oms.exchange_id_map[order.exchange_oid] = order
+
+            strategy = StrategyTemplate(engine, oms, name="test")
+            strategy.active_orders[order.client_oid] = intent
             oms.halt_system("operator_test")
 
             self.assertEqual(oms.state, LifecycleState.HALTED)
@@ -777,6 +813,22 @@ class OMSSurvivabilityTests(unittest.TestCase):
             self.assertTrue(rearmed)
             self.assertEqual(oms.state, LifecycleState.LIVE)
             self.assertFalse(oms.manual_rearm_required)
+            terminal_updates = [
+                event.data
+                for event in engine.events
+                if event.type == EVENT_ORDER_UPDATE
+                and event.data.client_oid == order.client_oid
+            ]
+            self.assertEqual(len(terminal_updates), 1)
+            self.assertEqual(terminal_updates[0].status, OrderStatus.CANCELLED)
+            strategy.on_order(terminal_updates[0])
+            self.assertNotIn(order.client_oid, strategy.active_orders)
+            self.assertIn(order.client_oid, oms.terminated_oids)
+            self.assertIn(order.exchange_oid, oms.terminated_oids)
+            self.assertEqual(
+                oms.account.balances,
+                {"USDT": 1000.0, "USDC": 125.0},
+            )
         finally:
             oms.stop()
 

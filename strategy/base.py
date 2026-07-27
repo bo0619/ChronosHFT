@@ -313,12 +313,19 @@ class StrategyTemplate:
 
     def cancel_order(self, client_oid: str):
         if client_oid not in self.active_orders:
-            return
+            return False
         if client_oid in self.orders_cancelling:
-            return
+            return False
 
         self.orders_cancelling.add(client_oid)
-        self.oms.cancel_order(client_oid)
+        try:
+            accepted = bool(self.oms.cancel_order(client_oid))
+        except BaseException:
+            self.orders_cancelling.discard(client_oid)
+            raise
+        if not accepted:
+            self.orders_cancelling.discard(client_oid)
+        return accepted
 
     def cancel_all(self, symbol: str):
         self.oms.cancel_all_orders(symbol)

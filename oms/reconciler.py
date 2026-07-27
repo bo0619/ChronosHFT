@@ -82,6 +82,43 @@ class OMSReconciler(OMSComponent):
             )
         return normalized
 
+    def _normalize_remote_account_balances(self, account) -> dict:
+        raw_assets = account.get("assets", []) or []
+        if not isinstance(raw_assets, (list, tuple)):
+            raise ValueError("remote account assets snapshot must be a list")
+
+        balances = {}
+        for index, entry in enumerate(raw_assets):
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"remote account asset {index} must be an object"
+                )
+            asset = str(entry.get("asset", "") or "").upper().strip()
+            if not asset:
+                raise ValueError(
+                    f"remote account asset {index} is missing asset"
+                )
+            if asset in balances:
+                raise ValueError(
+                    f"remote account assets snapshot contains duplicate {asset}"
+                )
+            available_balance = entry.get("availableBalance")
+            balances[asset] = {
+                "wallet_balance": self._finite_snapshot_float(
+                    entry.get("walletBalance", 0.0),
+                    f"assets.{asset}.walletBalance",
+                ),
+                "available_balance": (
+                    self._finite_snapshot_float(
+                        available_balance,
+                        f"assets.{asset}.availableBalance",
+                    )
+                    if available_balance is not None
+                    else None
+                ),
+            }
+        return balances
+
     def _normalize_remote_positions(self, positions):
         if not isinstance(positions, (list, tuple)):
             raise ValueError("remote positions snapshot must be a list")
@@ -1049,6 +1086,7 @@ class OMSReconciler(OMSComponent):
             }
             account_snapshot_floor = snapshot["account_floor"]
             positions_snapshot_floor = snapshot["positions_floor"]
+            account_balances = self._normalize_remote_account_balances(account)
 
             residual_orders = self._normalize_remote_open_orders(remote_orders)
             if residual_orders:
@@ -1058,6 +1096,21 @@ class OMSReconciler(OMSComponent):
 
             with self.lock:
                 previously_tracked_symbols = set(self.exposure.net_positions.keys())
+                reset_terminal_orders = []
+                reset_time = time.time()
+                for order in self.orders.values():
+                    if not order.is_active():
+                        continue
+                    order.mark_cancelled(
+                        update_time=reset_time,
+                        exchange_status="CANCELED",
+                    )
+                    self._record_order_snapshot(
+                        order,
+                        "full_reset_terminalized",
+                    )
+                    self._write_tombstone(order)
+                    reset_terminal_orders.append(order)
                 self.orders.clear()
                 self._submit_settlement_inflight_oids.clear()
                 self._submit_cancel_requested_oids.clear()
@@ -1101,6 +1154,7 @@ class OMSReconciler(OMSComponent):
                     float(account["totalWalletBalance"]),
                     float(account["totalInitialMargin"]),
                     float(available_balance) if available_balance is not None else None,
+                    balances=account_balances,
                     maintenance_margin=account.get("totalMaintMargin"),
                     margin_balance=account.get("totalMarginBalance"),
                     margin_snapshot_time=time.time(),
@@ -1115,6 +1169,10 @@ class OMSReconciler(OMSComponent):
                     account_snapshot_floor,
                 )
                 self.order_monitor.monitored_orders.clear()
+
+            for order in reset_terminal_orders:
+                self.order_monitor.on_order_update(order.client_oid, order.status)
+                self._emit_order_update(order)
 
             for symbol in snapshot_symbols:
                 self._emit_position_update(symbol)

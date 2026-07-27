@@ -7,6 +7,8 @@ from event.type import AccountData, Event, EVENT_ACCOUNT_UPDATE
 
 
 class AccountManager:
+    _USD_EQUIVALENT_ASSETS = frozenset({"USDT", "USDC", "BUSD", "FDUSD"})
+
     def __init__(self, engine, exposure_manager, config):
         self.engine = engine
         self.exposure = exposure_manager
@@ -71,7 +73,13 @@ class AccountManager:
         balances = self._normalize_balance_payload(balances)
         self.balance = balance
         self.exchange_balance_synced = True
-        self._sync_balance_maps(asset=asset, balance=balance, available=available, balances=balances)
+        self._sync_balance_maps(
+            asset=asset,
+            balance=balance,
+            available=available,
+            balances=balances,
+            replace=True,
+        )
         self._set_margin_health(
             maintenance_margin,
             margin_balance,
@@ -90,9 +98,17 @@ class AccountManager:
         balance = self._require_finite(balance, "balance")
         available = self._optional_finite(available, "available")
         balances = self._normalize_balance_payload(balances)
-        self.balance = balance
+        self._sync_balance_maps(
+            asset=asset,
+            balance=balance,
+            available=available,
+            balances=balances,
+        )
+        aggregate_balance, aggregate_available = self._stable_balance_totals()
+        self.balance = balance if aggregate_balance is None else aggregate_balance
+        if aggregate_available is not None:
+            available = aggregate_available
         self.exchange_balance_synced = True
-        self._sync_balance_maps(asset=asset, balance=balance, available=available, balances=balances)
         self.calculate(available_override=available)
 
     def sync_margin_health(
@@ -314,17 +330,31 @@ class AccountManager:
         )
         return wall_time, monotonic_time
 
-    def _sync_balance_maps(self, asset: str = "", balance: float = None, available: float = None, balances: dict = None):
-        if balances:
-            self.balances = {
-                str(key).upper(): float((payload or {}).get("wallet_balance", 0.0) or 0.0)
+    def _sync_balance_maps(
+        self,
+        asset: str = "",
+        balance: float = None,
+        available: float = None,
+        balances: dict = None,
+        *,
+        replace: bool = False,
+    ):
+        if balances is not None and (balances or replace):
+            wallet_updates = {
+                str(key).upper(): float(payload.get("wallet_balance", 0.0) or 0.0)
                 for key, payload in balances.items()
             }
-            self.available_balances = {
+            available_updates = {
                 str(key).upper(): float(payload.get("available_balance", 0.0) or 0.0)
                 for key, payload in balances.items()
                 if payload.get("available_balance") is not None
             }
+            if replace:
+                self.balances = wallet_updates
+                self.available_balances = available_updates
+            else:
+                self.balances.update(wallet_updates)
+                self.available_balances.update(available_updates)
             return
 
         if asset:
@@ -332,6 +362,17 @@ class AccountManager:
             self.balances[asset] = float(balance or 0.0)
             if available is not None:
                 self.available_balances[asset] = float(available)
+
+    def _stable_balance_totals(self) -> tuple[float | None, float | None]:
+        assets = sorted(self._USD_EQUIVALENT_ASSETS.intersection(self.balances))
+        if not assets:
+            return None, None
+
+        balance = sum(self.balances[asset] for asset in assets)
+        available = None
+        if all(asset in self.available_balances for asset in assets):
+            available = sum(self.available_balances[asset] for asset in assets)
+        return balance, available
 
     @classmethod
     def _normalize_balance_payload(cls, balances):

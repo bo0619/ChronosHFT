@@ -77,47 +77,16 @@ class OMSLifecycleController(OMSComponent):
                 account,
                 require_initial_margin=True,
             )
-            raw_assets = account.get("assets", []) or []
-            if not isinstance(raw_assets, (list, tuple)):
-                raise ValueError(
-                    "remote account assets snapshot must be a list"
-                )
-            balances = {}
-            for index, entry in enumerate(raw_assets):
-                if not isinstance(entry, dict):
-                    raise ValueError(
-                        f"remote account asset {index} must be an object"
-                    )
-                asset = str(entry.get("asset", "") or "").upper()
-                if not asset:
-                    raise ValueError(
-                        f"remote account asset {index} is missing asset"
-                    )
-                wallet_balance = (
-                    self.reconciler._finite_snapshot_float(
-                        entry.get("walletBalance", 0.0),
-                        f"assets.{asset}.walletBalance",
-                    )
-                )
-                available_balance = entry.get("availableBalance")
-                if available_balance is not None:
-                    available_balance = (
-                        self.reconciler._finite_snapshot_float(
-                            available_balance,
-                            f"assets.{asset}.availableBalance",
-                        )
-                    )
-                balances[asset] = {
-                    "wallet_balance": wallet_balance,
-                    "available_balance": available_balance,
-                }
+            balances = self.reconciler._normalize_remote_account_balances(
+                account
+            )
 
             available_balance = account.get("availableBalance")
             self.account.force_sync(
                 account["totalWalletBalance"],
                 account["totalInitialMargin"],
                 available_balance,
-                balances=balances or None,
+                balances=balances,
                 maintenance_margin=account.get("totalMaintMargin"),
                 margin_balance=account.get("totalMarginBalance"),
                 margin_snapshot_time=time.time(),
