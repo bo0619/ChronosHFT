@@ -125,13 +125,28 @@ class OMSAccountTruth(OMSComponent):
 
     def _resolve_order_truth(self, client_oid: str, reason: str = ""):
         try:
+            terminal_status = ""
             with self.lock:
                 order = self.orders.get(client_oid)
-                if not order or order.is_terminal():
+                if not order:
                     return
                 symbol = order.intent.symbol
+                if order.is_terminal():
+                    terminal_status = order.status.value
                 target_id = order.exchange_oid or order.client_oid
                 local_status = order.status
+
+            if terminal_status:
+                self._unknown_not_found_counts.pop(client_oid, None)
+                self._audit(
+                    "order_truth_resolved_by_terminal_update",
+                    client_oid=client_oid,
+                    symbol=symbol,
+                    terminal_status=terminal_status,
+                    reason=reason,
+                )
+                self._clear_order_truth_guard(symbol, client_oid)
+                return
 
             remote = self.query_order(symbol, target_id)
             if remote is None:

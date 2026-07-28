@@ -117,6 +117,10 @@ class PassiveQuoteOMS:
         self.account = SimpleNamespace(equity=1000.0, used_margin=0.0)
         self.submitted = []
         self.cancelled = []
+        self.submit_allowed = True
+
+    def can_submit_for_strategy(self, _strategy_id, _symbol=""):
+        return self.submit_allowed
 
     def submit_order(self, intent):
         self.submitted.append(intent)
@@ -988,6 +992,26 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             strategy._update_quotes("LTCUSDT", 98.5, 101.5, 0.1)
             self.assertEqual(len(oms.submitted), 4)
             self.assertTrue(all(order.time_in_force == TIF_RPI for order in oms.submitted))
+
+    def test_glft_does_not_generate_quote_intents_while_oms_is_gated(self):
+        oms = PassiveQuoteOMS()
+        oms.submit_allowed = False
+        strategy = GLFTStrategy(
+            DispatchingEngine(),
+            oms,
+            strategy_config={"execution": {"min_spread_bps": 5.0}},
+        )
+        strategy.cooldown_ms = 0
+
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"LTCUSDT": self.make_contract("LTCUSDT", supports_rpi=False)},
+            clear=True,
+        ):
+            strategy._update_quotes("LTCUSDT", 99.0, 101.0, 0.1)
+
+        self.assertEqual(oms.submitted, [])
+        self.assertEqual(oms.cancelled, [])
 
     def test_glft_cancels_a_same_price_side_when_inventory_disables_it(self):
         oms = PassiveQuoteOMS()

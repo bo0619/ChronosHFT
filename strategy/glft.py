@@ -1605,6 +1605,8 @@ class GLFTStrategy(StrategyTemplate):
         ask_volume=None,
     ):
         state = self.quote_state[symbol]
+        if not self.can_submit_orders(symbol):
+            return
         info = ref_data_manager.get_info(symbol)
         if info is None:
             return

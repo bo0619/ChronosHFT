@@ -264,6 +264,7 @@ class OMSCancellationManager(OMSComponent):
             )
             return True
 
+        terminal_status = ""
         try:
             with self.lock:
                 order = self.orders.get(client_oid)
@@ -283,11 +284,25 @@ class OMSCancellationManager(OMSComponent):
                     )
                     self._emit_order_update(order)
                     self.order_monitor.on_order_update(order.client_oid, order.status)
+                elif order and order.is_terminal():
+                    terminal_status = order.status.value
         except JournalError as exc:
             self._fail_closed_on_journal_error(exc, "snapshot_cancel_unknown", request.symbol)
             self._on_order_truth_check(
                 "Cancel result could not be persisted",
                 suspicious_oid=client_oid,
+            )
+            return True
+
+        if terminal_status:
+            self._audit(
+                "cancel_response_superseded_by_terminal_update",
+                client_oid=client_oid,
+                target_id=target_id,
+                symbol=request.symbol,
+                terminal_status=terminal_status,
+                error_code=error_code,
+                error_message=error_message,
             )
             return True
 

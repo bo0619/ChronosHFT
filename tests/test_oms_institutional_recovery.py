@@ -904,6 +904,64 @@ class InstitutionalRecoveryTests(unittest.TestCase):
         finally:
             oms.stop()
 
+    def test_terminal_fill_arriving_before_cancel_error_does_not_freeze_symbol(self):
+        oms, gateway = self.make_live_oms()
+        try:
+            order = self.add_active_order(oms)
+            oms._schedule_trade_tail_verification = lambda *_args, **_kwargs: True
+
+            def fill_before_cancel_error(_request):
+                oms.on_exchange_update(
+                    Event(
+                        EVENT_EXCHANGE_ORDER_UPDATE,
+                        ExchangeOrderUpdate(
+                            client_oid=order.client_oid,
+                            exchange_oid=order.exchange_oid,
+                            symbol="BTCUSDT",
+                            status="FILLED",
+                            filled_qty=1.0,
+                            filled_price=100.0,
+                            cum_filled_qty=1.0,
+                            update_time=2.0,
+                            trade_id=17,
+                        ),
+                    )
+                )
+                return DummyResponse(
+                    404,
+                    {"code": -2011, "msg": "Unknown order sent."},
+                )
+
+            gateway.cancel_order = fill_before_cancel_error
+
+            self.assertTrue(oms.cancel_order(order.client_oid))
+
+            self.assertEqual(order.status, OrderStatus.FILLED)
+            self.assertEqual(oms.get_symbol_freeze_reason("BTCUSDT"), "")
+            self.assertEqual(oms.state, LifecycleState.LIVE)
+            self.assertFalse(oms.manual_rearm_required)
+        finally:
+            oms.stop()
+
+    def test_terminal_update_clears_existing_order_truth_guard(self):
+        oms, _gateway = self.make_live_oms()
+        try:
+            order = self.add_active_order(oms)
+            order.add_fill(1.0, 100.0, update_time=2.0)
+            oms.freeze_symbol(
+                "BTCUSDT",
+                f"order_truth:cancel_unknown:{order.client_oid}",
+                cancel_active_orders=False,
+            )
+
+            oms._resolve_order_truth(order.client_oid, "terminal update raced truth check")
+
+            self.assertEqual(order.status, OrderStatus.FILLED)
+            self.assertEqual(oms.get_symbol_freeze_reason("BTCUSDT"), "")
+            self.assertTrue(oms.can_open_new_risk())
+        finally:
+            oms.stop()
+
     def test_terminal_snapshot_waits_for_exact_trade_history(self):
         oms, gateway = self.make_live_oms()
         try:
