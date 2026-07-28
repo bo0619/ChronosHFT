@@ -1,6 +1,67 @@
 # ChronosHFT
 An institutional-grade high-frequency trading framework for cryptocurrencies written in Python.
 
+## AWS Paper quick start
+
+The tracked configuration is Paper-only and requires no Binance API key. The
+bootstrap script installs a project-local, pinned `uv` and CPython, restores
+the exact runtime dependency lock, creates local runtime directories, and runs
+the offline configuration gate. It does not modify the host Python installation
+or start a Live session.
+
+On a fresh Ubuntu host, install the bootstrap prerequisites and clone the
+repository:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl git
+git clone https://github.com/bo0619/ChronosHFT.git
+cd ChronosHFT
+bash scripts/bootstrap_aws.sh
+```
+
+Amazon Linux 2023 uses `dnf` for the prerequisite step:
+
+```bash
+sudo dnf install -y ca-certificates curl git
+```
+
+Start the Paper watchdog from the repository root:
+
+```bash
+.venv/bin/python launcher.py
+```
+
+The watchdog resolves `main.py` and `config.json` from the cloned repository,
+refuses Live configuration, and restarts a failed Paper process with a bounded
+retry budget. Stop it with `Ctrl+C`. The runtime uses production Binance public
+market data but all balances, orders and fills remain local simulations.
+
+The dashboard deliberately listens only on EC2 loopback. Do not open port
+`8765` in the security group. From the local computer, create an SSH tunnel
+(use `ec2-user` instead of `ubuntu` on Amazon Linux):
+
+```bash
+ssh -N -L 8765:127.0.0.1:8765 ubuntu@EC2_PUBLIC_IP
+```
+
+Then open `http://127.0.0.1:8765/` locally. A headless EC2 host may print that
+it could not open a browser; this is expected and does not stop the runtime.
+
+Dependency metadata has one canonical source: direct constraints live in
+`pyproject.toml`, while `uv.lock` pins the complete transitive environment.
+`.python-version` pins CPython. After pulling a dependency update, rerun the
+same bootstrap command; `--frozen` prevents an AWS host from silently resolving
+a dependency set different from the committed lock.
+
+For development tools and tests, install the separate development group:
+
+```bash
+.tools/uv sync --frozen --dev
+.venv/bin/python -m ruff check .
+.venv/bin/python -m pytest -q
+```
+
 ## Paper Trade: production public data, local execution
 
 The tracked `config.json` manifest composes the single-purpose JSON fragments
@@ -25,6 +86,67 @@ accepted a real RPI order, that it joined a real RPI queue, or that a Binance
 App/Web retail counterparty traded against it. The Paper configuration keeps
 `paper_trade.rpi_fill_model` set to `disabled` until an explicit, calibrated
 local RPI fill model is chosen.
+
+## Configuration architecture
+
+`config.json` is a tracked Paper-only manifest, not a runtime settings bucket.
+Its `includes` array composes 23 single-purpose fragments from `config/` into
+one effective configuration. Include paths are resolved relative to the
+manifest rather than the process working directory.
+
+| File | Owns |
+| --- | --- |
+| `config/execution.json` | Runtime mode, exchange environment, and private API policy |
+| `config/paper_trade.json` | Local simulator balances, fills, fees, latency, and reset policy |
+| `config/symbols.json` | Traded instrument list |
+| `config/data_recording.json` | Market-data recording switch |
+| `config/account.json` | Account asset, margin mode, leverage, and configuration policy |
+| `config/oms.json` | OMS identity, persistence, order limits, and lifecycle policy |
+| `config/alerts.json` | External alert transport and failure handling |
+| `config/backtest.json` | Backtest-only starting state and costs |
+| `config/system/logging.json` | Log level and sinks |
+| `config/system/dashboard.json` | Local monitoring server |
+| `config/system/market_data.json` | Order-book depth, freshness, and stream handling |
+| `config/system/rate_limit.json` | Runtime request-rate controls |
+| `config/system/time_sync.json` | Exchange-clock calibration and health limits |
+| `config/risk/core.json` | Risk engine switch, checks, and kill/freeze behavior |
+| `config/risk/limits.json` | Order, position, exposure, drawdown, and loss limits |
+| `config/risk/price_sanity.json` | Fat-finger and reference-price validation |
+| `config/risk/technical_health.json` | Technical-health thresholds and recovery policy |
+| `config/risk/black_swan.json` | Tail-risk detection and emergency actions |
+| `config/strategy/core.json` | Strategy registry, primary model, routing, and common quoting policy |
+| `config/strategy/capital_scaling.json` | Capital multiplier and all capital-derived targets |
+| `config/strategy/model_readiness.json` | Model approval and evidence requirements |
+| `config/strategy/glft.json` | GLFT parameters |
+| `config/strategy/avellaneda_stoikov.json` | Avellaneda-Stoikov parameters |
+
+Configuration leaf paths must have exactly one owner. The loader rejects an
+empty fragment, duplicate include, duplicate leaf path, nested manifest,
+absolute path, parent traversal, symlink, or more than 128 fragments. Do not
+repeat a setting in another file to override it; edit the owning fragment.
+
+For capital changes, edit only `strategy.capital_multiplier` in
+`config/strategy/capital_scaling.json`. The loader derives the Paper, account,
+and backtest starting capital; order, position, exposure, and daily-loss
+limits; `lot_multiplier`; `target_order_notional`; and `max_pos_usdt` from that
+single source. Do not declare these derived fields in fragments; the loader
+always computes their effective values.
+
+After any configuration edit, run the offline gate before starting the engine:
+
+```powershell
+.\.venv\Scripts\python.exe main.py --config config.json --check-config
+```
+
+A valid tracked configuration currently reports:
+
+```text
+CONFIG_OK mode=paper symbols=12 primary_model=glft
+```
+
+Live deployment files remain operator-owned, single-file JSON documents and
+are ignored by Git. Fragmented manifests intentionally fail closed in Live
+mode until the deployment evidence digest can bind every included fragment.
 
 ## Start the engine and local dashboard
 
@@ -139,9 +261,9 @@ Useful filters and export formats:
 
 ## Live canary configuration gate
 
-Paper and live state must remain separate. Do not turn the Paper example into
-a live file in place. A future live launch must use a dedicated config and
-must pass the offline configuration gate before any gateway is constructed.
+Paper and live state must remain separate. Do not turn the tracked Paper
+manifest into a live file in place. A future live launch must use a dedicated
+config and must pass the offline configuration gate before any gateway is constructed.
 For Live, start the process from the directory containing that config; the
 guard rejects a config in another working directory so the runtime and offline
 reconstruction tool cannot resolve durable relative paths differently.
