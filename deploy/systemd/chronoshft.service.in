@@ -1,0 +1,46 @@
+[Unit]
+Description=ChronosHFT Paper Trading Engine
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+StartLimitIntervalSec=3600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@ROOT_DIR@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStartPre="@PYTHON_BIN@" "@ROOT_DIR@/main.py" --config "@CONFIG_PATH@" --check-config
+ExecStart="@PYTHON_BIN@" "@ROOT_DIR@/main.py" --config "@CONFIG_PATH@"
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=2
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=120
+UMask=0077
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

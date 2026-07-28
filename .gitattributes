@@ -1,4 +1,5 @@
 *.sh text eol=lf
+*.service.in text eol=lf
 *.toml text eol=lf
 *.lock text eol=lf
 .python-version text eol=lf

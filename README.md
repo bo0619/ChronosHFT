@@ -26,16 +26,35 @@ Amazon Linux 2023 uses `dnf` for the prerequisite step:
 sudo dnf install -y ca-certificates curl git
 ```
 
-Start the Paper watchdog from the repository root:
+Install, enable, and start the Paper service from the repository root:
 
 ```bash
-.venv/bin/python launcher.py
+sudo bash scripts/install_systemd_service.sh --start
+sudo systemctl status chronoshft
 ```
 
-The watchdog resolves `main.py` and `config.json` from the cloned repository,
-refuses Live configuration, and restarts a failed Paper process with a bounded
-retry budget. Stop it with `Ctrl+C`. The runtime uses production Binance public
-market data but all balances, orders and fills remain local simulations.
+The installer uses the non-root `SUDO_USER` as the service account, validates
+that `config.json` is Paper configuration, installs the rendered unit under
+`/etc/systemd/system/`, and enables it at boot. It refuses to start a second
+project Python process blindly. When invoking the installer directly as root,
+pass `--user ubuntu` explicitly.
+
+`systemd` runs `main.py` directly, limits process starts to 10 per hour, and
+does not retry the non-recoverable startup exit code `2`. A normal
+`systemctl stop` sends `SIGINT`, allowing the existing verified shutdown path to
+cancel orders, persist state, and stop the independent supervisor before the
+service timeout. Follow and control the service with:
+
+```bash
+sudo journalctl -u chronoshft -f
+sudo systemctl stop chronoshft
+sudo systemctl start chronoshft
+sudo systemctl restart chronoshft
+```
+
+The runtime uses production Binance public market data but all balances,
+orders, and fills remain local simulations. The SSH session and EC2 web console
+may be closed after the service is active.
 
 The tracked AWS Paper profile is intentionally sized for a `t3.small`: it
 subscribes only `SNDKUSDT` and `SOXLUSDT`, matching the two concurrent-symbol
@@ -186,12 +205,17 @@ Run the offline configuration gate before starting any runtime component:
 .\.venv\Scripts\python.exe main.py --config config.json
 ```
 
-For an automatically restarted Paper process, `launcher.py` resolves both
-files from its own directory and refuses Live configuration:
+For an interactive development watchdog, `launcher.py` resolves both files
+from its own directory and refuses Live configuration:
 
 ```powershell
 .\.venv\Scripts\python.exe launcher.py
 ```
+
+Do not use the interactive watchdog as long-term AWS process supervision: it is
+attached to its terminal unless separately detached. Use the `systemd` service
+described in the AWS quick start so an SSH disconnect cannot terminate the
+engine.
 
 The read-only monitoring page starts with the engine at
 `http://127.0.0.1:8765/`. It covers account, PnL, positions, market data,

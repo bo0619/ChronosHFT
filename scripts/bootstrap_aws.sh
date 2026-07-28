@@ -59,7 +59,8 @@ main() {
     "${python_bin}" main.py --config config.json --check-config
 
     printf '\nAWS Paper environment is ready.\n'
-    printf 'Start: %s launcher.py\n' "${python_bin}"
+    printf 'Install service: sudo bash scripts/install_systemd_service.sh --start\n'
+    printf 'Interactive fallback: %s launcher.py\n' "${python_bin}"
     printf 'Dashboard: http://127.0.0.1:8765/ (use an SSH tunnel)\n'
 }
 
