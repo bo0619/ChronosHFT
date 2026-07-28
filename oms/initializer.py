@@ -627,6 +627,11 @@ class OMSInitializer(OMSComponent):
             float(oms_cfg.get("duplicate_intent_window_ms", 250.0) or 0.0)
             / 1000.0,
         )
+        self.risk_rejection_log_interval_sec = max(
+            0.0,
+            float(oms_cfg.get("risk_rejection_log_interval_sec", 5.0) or 0.0),
+        )
+        self._risk_rejection_log_state = {}
         outbound_budget = oms_cfg.get("outbound_message_budget", {})
         self._outbound_budget = OutboundMessageBudget(outbound_budget)
         self.outbound_message_budget_enabled = self._outbound_budget.enabled

@@ -37,6 +37,17 @@ refuses Live configuration, and restarts a failed Paper process with a bounded
 retry budget. Stop it with `Ctrl+C`. The runtime uses production Binance public
 market data but all balances, orders and fills remain local simulations.
 
+The tracked AWS Paper profile is intentionally sized for a `t3.small`: it
+subscribes only `XAUUSDT` and `XAGUSDT`, matching the two concurrent-symbol
+slots derived from capital scaling. A broader symbol universe requires both a
+larger instance and coordinated capital/risk changes; adding symbols alone
+causes the OMS to reject repeated quote attempts at the concurrency boundary.
+
+The 1-second Binance mark-price stream has a Paper-only public REST safety net.
+After 1.5 seconds without a WebSocket mark, one batch `premiumIndex` request
+refreshes all stale configured symbols. The 3-second market-freshness circuit
+breaker remains unchanged and still fails closed if both sources are stale.
+
 The dashboard deliberately listens only on EC2 loopback. Do not open port
 `8765` in the security group. From the local computer, create an SSH tunnel
 (use `ec2-user` instead of `ubuntu` on Amazon Linux):
@@ -141,7 +152,7 @@ After any configuration edit, run the offline gate before starting the engine:
 A valid tracked configuration currently reports:
 
 ```text
-CONFIG_OK mode=paper symbols=12 primary_model=glft
+CONFIG_OK mode=paper symbols=2 primary_model=glft
 ```
 
 Live deployment files remain operator-owned, single-file JSON documents and

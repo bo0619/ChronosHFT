@@ -444,8 +444,8 @@ class PaperGatewayTests(unittest.TestCase):
 
         with patch.object(
             gateway.rest,
-            "get_premium_index",
-            return_value=make_mark_payload(),
+            "get_all_premium_indexes",
+            return_value=[make_mark_payload()],
         ) as premium_index:
             gateway._start_mark_fallback(generation)
             self.assertTrue(
@@ -464,6 +464,40 @@ class PaperGatewayTests(unittest.TestCase):
                 for event in self.engine.events
             )
         )
+
+    def test_rest_mark_fallback_refreshes_all_stale_symbols_in_one_batch(self):
+        gateway = self.start_offline()
+        second_symbol = "XAUUSDT"
+        gateway.symbols = [SYMBOL, second_symbol]
+        gateway.mark_rest_poll_interval_sec = 0.1
+        gateway.mark_ws_stale_after_sec = 0.01
+        generation = gateway._book_generation
+        payloads = [
+            make_mark_payload(),
+            make_mark_payload(symbol=second_symbol, mark_price="200.5"),
+        ]
+
+        with patch.object(
+            gateway.rest,
+            "get_all_premium_indexes",
+            return_value=payloads,
+        ) as premium_indexes, patch.object(
+            gateway.rest,
+            "get_premium_index",
+        ) as single_premium_index:
+            gateway._start_mark_fallback(generation)
+            self.assertTrue(
+                wait_until(
+                    lambda: gateway._marks.get(SYMBOL) == 100.5
+                    and gateway._marks.get(second_symbol) == 200.5
+                )
+            )
+            gateway._mark_fallback_stop.set()
+
+        premium_indexes.assert_called_once_with(
+            timeout_sec=gateway.mark_rest_request_timeout_sec,
+        )
+        single_premium_index.assert_not_called()
 
     def test_public_ws_fault_uses_supervisor_recoverable_reason(self):
         gateway = self.start_offline()

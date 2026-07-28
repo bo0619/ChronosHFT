@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 
 from infrastructure.logger import logger
@@ -22,6 +23,33 @@ from .order import Order
 
 class OMSOrderSubmission(OMSComponent):
     """Own prepare, fence, dispatch and durable submit settlement."""
+
+    def _log_risk_rejection(self, risk_reason: str) -> None:
+        if not str(risk_reason).startswith("Concurrent Symbol Limit:"):
+            logger.warning(f"[OMS] Risk rejected: {risk_reason}")
+            return
+
+        now = time.monotonic()
+        state = self._risk_rejection_log_state.get("concurrent_symbol_limit")
+        if (
+            state is not None
+            and now - float(state["last_log_at"])
+            < self.risk_rejection_log_interval_sec
+        ):
+            state["suppressed"] = int(state["suppressed"]) + 1
+            return
+
+        suppressed = int(state["suppressed"]) if state is not None else 0
+        suffix = (
+            f" (suppressed {suppressed} similar rejections)"
+            if suppressed
+            else ""
+        )
+        logger.warning(f"[OMS] Risk rejected: {risk_reason}{suffix}")
+        self._risk_rejection_log_state["concurrent_symbol_limit"] = {
+            "last_log_at": now,
+            "suppressed": 0,
+        }
 
     def _reject_intent_locally(
         self,
@@ -921,7 +949,7 @@ class OMSOrderSubmission(OMSComponent):
                             self.max_concurrent_symbols,
                         )
                         if not ok:
-                            logger.warning(f"[OMS] Risk rejected: {risk_reason}")
+                            self._log_risk_rejection(risk_reason)
                             rejection_reason = f"exposure_limit:{risk_reason}"
 
                 if not rejection_reason:

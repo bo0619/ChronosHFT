@@ -120,6 +120,16 @@ class _PublicBinanceRest:
             attempts=1,
         )
 
+    def get_all_premium_indexes(self, *, timeout_sec: float = None):
+        return self._get_json(
+            EP_PREMIUM_INDEX,
+            {},
+            minimum_interval=0.05,
+            timeout_sec=timeout_sec,
+            attempts=1,
+            response_type=list,
+        )
+
     def _get_json(
         self,
         endpoint: str,
@@ -129,6 +139,7 @@ class _PublicBinanceRest:
         rpi: bool = False,
         timeout_sec: float = None,
         attempts: int = 2,
+        response_type: type | tuple[type, ...] = dict,
     ):
         attempts = max(1, int(attempts or 1))
         request_timeout = (
@@ -155,7 +166,7 @@ class _PublicBinanceRest:
                 )
                 if response.status_code == 200:
                     payload = response.json()
-                    return payload if isinstance(payload, dict) else None
+                    return payload if isinstance(payload, response_type) else None
                 logger.error(
                     "[BINANCE_PAPER] Public REST error "
                     f"endpoint={endpoint} status={response.status_code}"
@@ -1009,22 +1020,29 @@ class BinancePaperGateway(BaseGateway):
                     "using public premiumIndex fallback"
                 )
                 fallback_logged = True
+            payloads = self.rest.get_all_premium_indexes(
+                timeout_sec=self.mark_rest_request_timeout_sec,
+            )
+            if not payloads:
+                continue
+            payload_by_symbol = {
+                str(payload.get("symbol", "") or "").upper(): payload
+                for payload in payloads
+                if isinstance(payload, dict)
+            }
             for symbol in stale_symbols:
                 if stop_event.is_set():
                     return
-                payload = self.rest.get_premium_index(
-                    symbol,
-                    timeout_sec=self.mark_rest_request_timeout_sec,
-                )
-                if not payload:
-                    break
-                if not self._publish_rest_mark(
+                payload = payload_by_symbol.get(symbol)
+                if payload is None:
+                    continue
+                if self._publish_rest_mark(
                     payload,
                     expected_generation=generation,
                 ):
-                    if not self._book_generation_is_current(generation):
-                        return
-                    break
+                    continue
+                if not self._book_generation_is_current(generation):
+                    return
 
     @staticmethod
     def _stamp_market_dispatch(data):

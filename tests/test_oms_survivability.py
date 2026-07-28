@@ -6,6 +6,7 @@ import threading
 import time
 import types
 import unittest
+from unittest.mock import patch
 
 from data.cache import data_cache
 
@@ -2866,6 +2867,32 @@ class OMSSurvivabilityTests(unittest.TestCase):
             self.assertTrue(first.accepted)
             self.assertFalse(second.accepted)
             self.assertIn("duplicate_active_intent", second.reason)
+        finally:
+            oms.stop()
+
+    def test_concurrent_symbol_rejection_logs_are_throttled(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            component = oms.order_submission
+            reasons = [
+                "Concurrent Symbol Limit: active=2>=2 target=ETHUSDT",
+                "Concurrent Symbol Limit: active=2>=2 target=SOLUSDT",
+                "Concurrent Symbol Limit: active=2>=2 target=XAUUSDT",
+            ]
+            with patch(
+                "oms.order_submission.time.monotonic",
+                side_effect=[100.0, 101.0, 106.0],
+            ), patch("oms.order_submission.logger.warning") as warning:
+                for reason in reasons:
+                    component._log_risk_rejection(reason)
+
+            self.assertEqual(warning.call_count, 2)
+            self.assertIn(reasons[0], warning.call_args_list[0].args[0])
+            self.assertIn(reasons[2], warning.call_args_list[1].args[0])
+            self.assertIn(
+                "suppressed 1 similar rejections",
+                warning.call_args_list[1].args[0],
+            )
         finally:
             oms.stop()
 

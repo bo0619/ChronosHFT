@@ -16,6 +16,7 @@
     "ack_timeout_sec": 5.0,
     "ack_timeout_recheck_sec": 60.0,
     "monitor_check_interval_sec": 1.0,
+    "risk_rejection_log_interval_sec": 5.0,
     "tombstone_max": 2000
   }
 }

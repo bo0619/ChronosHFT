@@ -11,6 +11,9 @@
     "reset_on_start": true,
     "cancel_ahead_fraction": 0.0,
     "maintenance_margin_rate": 0.005,
+    "mark_rest_poll_interval_sec": 0.25,
+    "mark_ws_stale_after_sec": 1.5,
+    "mark_rest_request_timeout_sec": 0.75,
     "command_timeout_sec": 2.0,
     "command_queue_size": 10000
   }
