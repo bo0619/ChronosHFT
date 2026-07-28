@@ -38,7 +38,7 @@ retry budget. Stop it with `Ctrl+C`. The runtime uses production Binance public
 market data but all balances, orders and fills remain local simulations.
 
 The tracked AWS Paper profile is intentionally sized for a `t3.small`: it
-subscribes only `XAUUSDT` and `XAGUSDT`, matching the two concurrent-symbol
+subscribes only `SNDKUSDT` and `SOXLUSDT`, matching the two concurrent-symbol
 slots derived from capital scaling. A broader symbol universe requires both a
 larger instance and coordinated capital/risk changes; adding symbols alone
 causes the OMS to reject repeated quote attempts at the concurrency boundary.
@@ -95,13 +95,15 @@ The local dashboard must display `PAPER · LIVE DATA`. In this mode:
 Paper RPI fills are model assumptions only. They do not prove that Binance
 accepted a real RPI order, that it joined a real RPI queue, or that a Binance
 App/Web retail counterparty traded against it. The Paper configuration keeps
-`paper_trade.rpi_fill_model` set to `disabled` until an explicit, calibrated
-local RPI fill model is chosen.
+`paper_trade.rpi_fill_model=public_trade_proxy`: a public aggregate trade at or
+through a resting RPI quote is treated as simulated fill evidence. This proxy
+does not observe the private RPI queue or retail-only counterparty eligibility,
+so its fills and PnL must not be interpreted as expected Live performance.
 
 ## Configuration architecture
 
 `config.json` is a tracked Paper-only manifest, not a runtime settings bucket.
-Its `includes` array composes 23 single-purpose fragments from `config/` into
+Its `includes` array composes 24 single-purpose fragments from `config/` into
 one effective configuration. Include paths are resolved relative to the
 manifest rather than the process working directory.
 
@@ -127,6 +129,7 @@ manifest rather than the process working directory.
 | `config/risk/black_swan.json` | Tail-risk detection and emergency actions |
 | `config/strategy/core.json` | Strategy registry, primary model, routing, and common quoting policy |
 | `config/strategy/capital_scaling.json` | Capital multiplier and all capital-derived targets |
+| `config/strategy/order_sizing.json` | Paper quote quantity mode and fixed order quantity |
 | `config/strategy/model_readiness.json` | Model approval and evidence requirements |
 | `config/strategy/glft.json` | GLFT parameters |
 | `config/strategy/avellaneda_stoikov.json` | Avellaneda-Stoikov parameters |
@@ -142,6 +145,15 @@ and backtest starting capital; order, position, exposure, and daily-loss
 limits; `lot_multiplier`; `target_order_notional`; and `max_pos_usdt` from that
 single source. Do not declare these derived fields in fragments; the loader
 always computes their effective values.
+
+The tracked observation profile sets `strategy.order_sizing` to a Paper-only
+fixed quantity of `30`. Every normal bid and ask is therefore submitted for 30
+contract units or is suppressed when the remaining risk capacity cannot fit the
+whole order. Exchange lot-step rounding still fails closed, and safety exits may
+use a smaller residual quantity to avoid reversing an existing position. With
+recent prices, 30 SNDK units are roughly 38,900 USDT notional, so the tracked
+`capital_multiplier=5000` deliberately creates a 500,000 USDT simulated balance
+and matching Paper risk limits. These are simulation settings, not Live sizing.
 
 After any configuration edit, run the offline gate before starting the engine:
 

@@ -860,6 +860,40 @@ class PaperTradeConfigTests(unittest.TestCase):
                 }
             )
 
+    def test_paper_mode_validates_and_normalizes_fixed_quantity_sizing(self):
+        configured = apply_paper_trade_mode(
+            {
+                "execution": {"mode": "paper"},
+                "paper_trade": {"enabled": True},
+                "strategy": {
+                    "order_sizing": {
+                        "mode": "FIXED_QUANTITY",
+                        "fixed_quantity": "30",
+                    }
+                },
+            }
+        )
+
+        self.assertEqual(
+            configured["strategy"]["order_sizing"],
+            {"mode": "fixed_quantity", "fixed_quantity": 30.0},
+        )
+
+    def test_paper_mode_rejects_invalid_fixed_quantity(self):
+        with self.assertRaisesRegex(ValueError, "positive and finite"):
+            apply_paper_trade_mode(
+                {
+                    "execution": {"mode": "paper"},
+                    "paper_trade": {"enabled": True},
+                    "strategy": {
+                        "order_sizing": {
+                            "mode": "fixed_quantity",
+                            "fixed_quantity": 0,
+                        }
+                    },
+                }
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

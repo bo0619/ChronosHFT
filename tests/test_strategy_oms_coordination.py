@@ -743,6 +743,84 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
                 0.16,
             )
 
+    def test_paper_market_makers_submit_only_full_fixed_quantity(self):
+        sizing_config = {
+            "target_order_notional": 40_000.0,
+            "max_pos_usdt": 90_000.0,
+            "order_sizing": {
+                "mode": "fixed_quantity",
+                "fixed_quantity": 30.0,
+            },
+        }
+        strategies = (
+            GLFTStrategy(
+                DispatchingEngine(),
+                PassiveQuoteOMS(),
+                strategy_config=sizing_config,
+            ),
+            AvellanedaStoikovStrategy(
+                DispatchingEngine(),
+                PassiveQuoteOMS(),
+                strategy_config=sizing_config,
+            ),
+        )
+
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"LTCUSDT": self.make_contract("LTCUSDT", supports_rpi=False)},
+            clear=True,
+        ):
+            for strategy in strategies:
+                with self.subTest(strategy=strategy.name):
+                    self.assertEqual(
+                        strategy._calculate_safe_vol("LTCUSDT", 1_000.0),
+                        30.0,
+                    )
+                    self.assertEqual(
+                        strategy._calculate_safe_vol(
+                            "LTCUSDT",
+                            1_000.0,
+                            side=Side.BUY,
+                            current_position=60.0,
+                            reference_price=1_000.0,
+                        ),
+                        30.0,
+                    )
+                    self.assertEqual(
+                        strategy._calculate_safe_vol(
+                            "LTCUSDT",
+                            1_000.0,
+                            side=Side.BUY,
+                            current_position=75.0,
+                            reference_price=1_000.0,
+                        ),
+                        0.0,
+                    )
+                    self.assertEqual(
+                        strategy._calculate_safe_vol(
+                            "LTCUSDT",
+                            1_000.0,
+                            side=Side.SELL,
+                            current_position=75.0,
+                            reference_price=1_000.0,
+                        ),
+                        30.0,
+                    )
+
+    def test_fixed_quantity_sizing_is_rejected_outside_paper(self):
+        oms = PassiveQuoteOMS()
+        oms.config = {"execution": {"mode": "live"}}
+
+        with self.assertRaisesRegex(ValueError, "Paper-only"):
+            DummyStrategy(DispatchingEngine(), oms).configure_quote_sizing(
+                {
+                    "order_sizing": {
+                        "mode": "fixed_quantity",
+                        "fixed_quantity": 30.0,
+                    }
+                }
+            )
+
     @patch("oms.validator.ref_data_manager.get_info", return_value=None)
     @patch("oms.validator.data_cache.get_best_quote", return_value=(99.9, 100.1))
     @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)

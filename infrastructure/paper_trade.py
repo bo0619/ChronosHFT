@@ -1,3 +1,4 @@
+import math
 from copy import deepcopy
 
 
@@ -87,6 +88,36 @@ def apply_paper_trade_mode(config: dict) -> dict:
             "paper_trade.reset_on_start must be true"
         )
     paper_trade["reset_on_start"] = True
+
+    strategy = configured.get("strategy")
+    if not isinstance(strategy, dict):
+        strategy = {}
+        configured["strategy"] = strategy
+    order_sizing = strategy.get("order_sizing")
+    if order_sizing is not None:
+        if not isinstance(order_sizing, dict):
+            raise ValueError("strategy.order_sizing must be an object")
+        sizing_mode = str(
+            order_sizing.get("mode", "notional") or "notional"
+        ).strip().lower()
+        if sizing_mode not in {"notional", "fixed_quantity"}:
+            raise ValueError(
+                "strategy.order_sizing.mode must be notional or fixed_quantity"
+            )
+        order_sizing["mode"] = sizing_mode
+        if sizing_mode == "fixed_quantity":
+            quantity = order_sizing.get("fixed_quantity")
+            if isinstance(quantity, bool):
+                quantity = None
+            try:
+                quantity = float(quantity)
+            except (TypeError, ValueError):
+                quantity = math.nan
+            if not math.isfinite(quantity) or quantity <= 0.0:
+                raise ValueError(
+                    "strategy.order_sizing.fixed_quantity must be positive and finite"
+                )
+            order_sizing["fixed_quantity"] = quantity
 
     # `testnet` historically controls every Binance connection. Paper execution
     # intentionally uses production public market data and owns no private venue

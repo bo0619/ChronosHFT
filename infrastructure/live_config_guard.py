@@ -2377,6 +2377,11 @@ def validate_live_runtime_config(
     admin_control = _section(system, "admin_control")
     account = _section(config, "account")
     root_strategy = _section(config, "strategy")
+    order_sizing = _section(root_strategy, "order_sizing")
+    if str(order_sizing.get("mode", "notional") or "notional").strip().lower() == (
+        "fixed_quantity"
+    ):
+        violations.append("strategy.order_sizing.fixed_quantity is Paper-only")
     try:
         strategy = effective_primary_strategy_config(config)
     except (TypeError, ValueError) as exc:

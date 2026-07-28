@@ -21,6 +21,7 @@
     "config/oms.json",
     "config/strategy/core.json",
     "config/strategy/capital_scaling.json",
+    "config/strategy/order_sizing.json",
     "config/strategy/model_readiness.json",
     "config/strategy/glft.json",
     "config/strategy/avellaneda_stoikov.json"

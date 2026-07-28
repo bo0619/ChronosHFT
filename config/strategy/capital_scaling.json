@@ -1,7 +1,7 @@
 {
   "strategy": {
     "_comment_capital_scaling": "Only change capital_multiplier. Risk limits and capital scale together.",
-    "capital_multiplier": 1.0,
+    "capital_multiplier": 5000.0,
     "capital_scaling": {
       "enabled": true,
       "reference_capital_usdt": 100.0,

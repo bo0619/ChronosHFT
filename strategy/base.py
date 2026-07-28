@@ -42,6 +42,7 @@ class StrategyTemplate:
         self.lot_multiplier = 1.0
         self.target_order_notional = 0.0
         self.max_pos_usdt = 0.0
+        self.fixed_order_quantity = 0.0
 
     @staticmethod
     def _positive_finite(value, default: float = 0.0) -> float:
@@ -66,6 +67,28 @@ class StrategyTemplate:
     def configure_quote_sizing(self, strategy_config: dict | None):
         """Load quote sizing while keeping legacy lot_multiplier configs valid."""
         config = strategy_config if isinstance(strategy_config, dict) else {}
+        order_sizing = config.get("order_sizing", {})
+        if not isinstance(order_sizing, dict):
+            raise ValueError("strategy.order_sizing must be an object")
+        sizing_mode = str(
+            order_sizing.get("mode", "notional") or "notional"
+        ).lower()
+        if sizing_mode not in {"notional", "fixed_quantity"}:
+            raise ValueError(
+                "strategy.order_sizing.mode must be notional or fixed_quantity"
+            )
+        if sizing_mode == "fixed_quantity":
+            if not is_paper_trade(getattr(self.oms, "config", {}) or {}):
+                raise ValueError("fixed_quantity order sizing is Paper-only")
+            self.fixed_order_quantity = self._positive_finite(
+                order_sizing.get("fixed_quantity", 0.0)
+            )
+            if self.fixed_order_quantity <= 0.0:
+                raise ValueError(
+                    "strategy.order_sizing.fixed_quantity must be positive and finite"
+                )
+        else:
+            self.fixed_order_quantity = 0.0
         self.lot_multiplier = self._positive_finite(
             config.get("lot_multiplier", 1.0),
             1.0,
@@ -122,18 +145,21 @@ class StrategyTemplate:
             return 0.0
 
         min_notional = max(5.0, float(info.min_notional or 0.0))
+        fixed_quantity = self.fixed_order_quantity > 0.0
         explicit_notional = self.target_order_notional > 0.0
-        if explicit_notional:
-            target_notional = self.target_order_notional
+        if fixed_quantity:
+            target_qty = self.fixed_order_quantity
         else:
-            target_notional = min_notional * 1.1 * self.lot_multiplier
-        if self.max_pos_usdt > 0.0:
-            target_notional = min(target_notional, self.max_pos_usdt)
-
-        target_qty = target_notional / price
+            if explicit_notional:
+                target_notional = self.target_order_notional
+            else:
+                target_notional = min_notional * 1.1 * self.lot_multiplier
+            if self.max_pos_usdt > 0.0:
+                target_notional = min(target_notional, self.max_pos_usdt)
+            target_qty = target_notional / price
         min_qty = max(0.0, float(info.min_qty or 0.0))
         if min_qty > target_qty:
-            if explicit_notional or self.max_pos_usdt > 0.0:
+            if fixed_quantity or explicit_notional or self.max_pos_usdt > 0.0:
                 return 0.0
             target_qty = min_qty
 
@@ -144,9 +170,18 @@ class StrategyTemplate:
             else:
                 remaining_notional = self.max_pos_usdt + current_notional
             capacity_qty = max(0.0, remaining_notional) / reference_price
+            if fixed_quantity and capacity_qty + 1e-12 < target_qty:
+                return 0.0
             target_qty = min(target_qty, capacity_qty)
 
         rounded_qty = ref_data_manager.round_qty(symbol, target_qty)
+        if fixed_quantity and not math.isclose(
+            rounded_qty,
+            target_qty,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            return 0.0
         if rounded_qty < min_qty or rounded_qty <= 0.0:
             return 0.0
         if rounded_qty * price + 1e-9 < min_notional:

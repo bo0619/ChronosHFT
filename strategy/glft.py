@@ -745,7 +745,9 @@ class GLFTStrategy(StrategyTemplate):
         if reference_order_volume <= 0.0:
             return
         inventory_lot_notional = (
-            self.inventory_lot_notional_usdt
+            reference_order_volume * mid
+            if self.fixed_order_quantity > 0.0
+            else self.inventory_lot_notional_usdt
             or reference_order_volume * mid
         )
         if inventory_lot_notional <= 0.0:
