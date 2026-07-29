@@ -2776,6 +2776,7 @@ class BinancePaperGateway(BaseGateway):
                 trade_id=int(trade_id),
                 order_type=order.request.order_type,
                 time_in_force=order.request.time_in_force,
+                fill_model=order.fill_model,
             )
         )
 

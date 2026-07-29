@@ -64,3 +64,4 @@ tests/*
 !tests/test_live_canary_evidence_collector.py
 !tests/test_rpi_terminal_truth_static.py
 !tests/test_systemd_deployment.py
+!tests/test_paper_trade_database.py

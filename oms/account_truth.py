@@ -69,36 +69,46 @@ class OMSAccountTruth(OMSComponent):
         if execution_id in self.execution_ids:
             return False
 
-        self.audit_logger.audit(
-            "execution_record",
-            {
-                "execution_id": execution_id,
-                "venue": str(
-                    getattr(self.gateway, "gateway_name", "UNKNOWN") or "UNKNOWN"
-                ).upper(),
-                "client_oid": order.client_oid,
-                "exchange_oid": update.exchange_oid or order.exchange_oid,
-                "strategy_id": order.intent.strategy_id,
-                "symbol": order.intent.symbol,
-                "side": order.intent.side.value,
-                "fill_qty": fill_qty,
-                "fill_price": update.filled_price,
-                "cum_filled_qty": update.cum_filled_qty,
-                "exchange_status": update.status,
-                "exchange_time": update.update_time,
-                "trade_id": update.trade_id,
-                "commission": update.commission,
-                "commission_asset": update.commission_asset,
-                "booked_fee": fee,
-                "realized_pnl": update.realized_pnl,
-                "is_maker": update.is_maker,
-                "order_type": order.intent.order_type,
-                "time_in_force": order.intent.time_in_force,
-                "is_rpi": order.intent.is_rpi,
-                "reduce_only": order.intent.reduce_only,
-                "pre_status": order.status.value,
-            },
-        )
+        payload = {
+            "execution_id": execution_id,
+            "venue": str(
+                getattr(self.gateway, "gateway_name", "UNKNOWN") or "UNKNOWN"
+            ).upper(),
+            "client_oid": order.client_oid,
+            "exchange_oid": update.exchange_oid or order.exchange_oid,
+            "strategy_id": order.intent.strategy_id,
+            "symbol": order.intent.symbol,
+            "side": order.intent.side.value,
+            "fill_qty": fill_qty,
+            "fill_price": update.filled_price,
+            "cum_filled_qty": update.cum_filled_qty,
+            "exchange_status": update.status,
+            "exchange_time": update.update_time,
+            "trade_id": update.trade_id,
+            "commission": update.commission,
+            "commission_asset": update.commission_asset,
+            "booked_fee": fee,
+            "realized_pnl": update.realized_pnl,
+            "is_maker": update.is_maker,
+            "order_type": order.intent.order_type,
+            "time_in_force": order.intent.time_in_force,
+            "is_rpi": order.intent.is_rpi,
+            "reduce_only": order.intent.reduce_only,
+            "pre_status": order.status.value,
+        }
+        paper_database = getattr(self, "paper_trade_database", None)
+        if paper_database is not None:
+            payload["paper_run_id"] = paper_database.run_id
+            payload["fill_model"] = str(update.fill_model or "unknown")
+        committed_seq = self.audit_logger.audit("execution_record", payload)
+        if paper_database is not None:
+            metadata = self.journal.commit_metadata(committed_seq) or {}
+            paper_database.record_execution(
+                committed_seq,
+                payload,
+                journal_ts=str(metadata.get("ts", "") or ""),
+                journal_hash=str(metadata.get("hash", "") or ""),
+            )
         self.execution_ids.add(execution_id)
         return True
 
@@ -587,6 +597,7 @@ class OMSAccountTruth(OMSComponent):
             realized_pnl=realized_pnl,
             is_maker=bool(trade.get("maker")) if "maker" in trade else None,
             trade_id=trade_id,
+            fill_model=str(trade.get("_fillModel", "") or ""),
         )
         self._apply_event(Event(EVENT_EXCHANGE_ORDER_UPDATE, update))
         if order.filled_volume + 1e-9 < cumulative:

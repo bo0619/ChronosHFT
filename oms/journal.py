@@ -2,6 +2,7 @@
 import hashlib
 import os
 import threading
+from collections import deque
 from datetime import datetime
 from enum import Enum
 
@@ -54,6 +55,8 @@ class OMSJournal:
         self.lock = threading.RLock()
         self._next_seq = 1
         self._last_hash = ""
+        self._recent_commits = {}
+        self._recent_commit_order = deque()
 
         if self.enabled:
             parent = os.path.dirname(os.path.abspath(self.path))
@@ -107,6 +110,7 @@ class OMSJournal:
             last_hash = self._last_hash
             lines = []
             committed_sequences = []
+            committed_metadata = []
             try:
                 for kind, payload in records:
                     unsigned_record = {
@@ -127,6 +131,13 @@ class OMSJournal:
                     record["hash"] = record_hash
                     lines.append(self._canonical_json(record))
                     committed_sequences.append(next_seq)
+                    committed_metadata.append(
+                        {
+                            "seq": next_seq,
+                            "ts": unsigned_record["ts"],
+                            "hash": record_hash,
+                        }
+                    )
                     next_seq += 1
                     last_hash = record_hash
             except (TypeError, ValueError) as exc:
@@ -149,10 +160,30 @@ class OMSJournal:
 
             self._next_seq = next_seq
             self._last_hash = last_hash
+            for metadata in committed_metadata:
+                sequence = int(metadata["seq"])
+                self._recent_commits[sequence] = metadata
+                self._recent_commit_order.append(sequence)
+                if len(self._recent_commit_order) > 4096:
+                    expired = self._recent_commit_order.popleft()
+                    self._recent_commits.pop(expired, None)
             return committed_sequences
+
+    def commit_metadata(self, sequence: int):
+        """Return immutable metadata for one recent in-process commit."""
+        with self.lock:
+            metadata = self._recent_commits.get(int(sequence))
+            return dict(metadata) if metadata is not None else None
 
     def load(self):
         if not self.enabled or not self.replay_on_startup or not os.path.exists(self.path):
+            return []
+
+        return self.read_all()
+
+    def read_all(self):
+        """Read and verify every record regardless of OMS replay policy."""
+        if not self.enabled or not os.path.exists(self.path):
             return []
 
         with self.lock:

@@ -107,6 +107,7 @@ The local dashboard must display `PAPER · LIVE DATA`. In this mode:
 - `LOCAL_SIMULATOR` means funds, order acknowledgements, cancels and fills are simulated.
 - `private_api_enabled=false` means no private Binance session is permitted.
 - Paper OMS journals and locks live under `storage/paper/`, separate from live state.
+- Paper runs and fills are projected into `storage/paper/trades.sqlite3`.
 - The current simulator uses `reset_on_start=true`: balances, positions and
   venue orders start fresh on every process launch, and older Paper OMS
   journals are retained for audit but are not replayed into the fresh ledger.
@@ -119,10 +120,38 @@ through a resting RPI quote is treated as simulated fill evidence. This proxy
 does not observe the private RPI queue or retail-only counterparty eligibility,
 so its fills and PnL must not be interpreted as expected Live performance.
 
+## Paper execution database
+
+Paper execution history uses local SQLite in WAL mode. `paper_runs` separates
+every process launch with a random `run_id`; `paper_fills` stores one immutable
+row for every partial or complete fill, including journal sequence, order IDs,
+strategy, side, quantity, price, notional, fees, realized PnL, maker/RPI flags,
+and the Paper fill model. `reset_on_start=true` resets the simulated venue and
+account but never deletes this historical database.
+
+The fsync-backed OMS JSONL journal remains the audit truth. SQLite is a
+query-oriented projection written after the journal commit, outside the OMS hot
+path. Missing SQLite rows are idempotently backfilled from the verified journal
+on the next start. Do not delete `storage/paper/oms_journal.jsonl` after a fill
+has been recorded merely because it also appears in SQLite.
+
+Query recent fills or aggregate them by run and symbol:
+
+```bash
+.venv/bin/python scripts/query_paper_trades.py --limit 100
+.venv/bin/python scripts/query_paper_trades.py --summary
+.venv/bin/python scripts/query_paper_trades.py --symbol SNDKUSDT --summary
+```
+
+The query tool opens SQLite read-only and is safe while the service is running.
+For a raw file-level backup, stop `chronoshft` first or use SQLite's online
+backup API; copying only the main `.sqlite3` file while WAL writes are active
+can produce an incomplete backup.
+
 ## Configuration architecture
 
 `config.json` is a tracked Paper-only manifest, not a runtime settings bucket.
-Its `includes` array composes 24 single-purpose fragments from `config/` into
+Its `includes` array composes 25 single-purpose fragments from `config/` into
 one effective configuration. Include paths are resolved relative to the
 manifest rather than the process working directory.
 
@@ -130,6 +159,7 @@ manifest rather than the process working directory.
 | --- | --- |
 | `config/execution.json` | Runtime mode, exchange environment, and private API policy |
 | `config/paper_trade.json` | Local simulator balances, fills, fees, latency, and reset policy |
+| `config/paper_trade_database.json` | Queryable Paper run and fill persistence |
 | `config/symbols.json` | Traded instrument list |
 | `config/data_recording.json` | Market-data recording switch |
 | `config/account.json` | Account asset, margin mode, leverage, and configuration policy |

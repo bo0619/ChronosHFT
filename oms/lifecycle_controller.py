@@ -1143,6 +1143,15 @@ class OMSLifecycleController(OMSComponent):
             and self._shutdown_cancel_verified
         )
         audit_ok = True
+        paper_database = getattr(self, "paper_trade_database", None)
+        paper_run_id = (
+            str(getattr(paper_database, "run_id", "") or "")
+            if paper_database is not None
+            else ""
+        )
+        paper_audit_fields = (
+            {"paper_run_id": paper_run_id} if paper_run_id else {}
+        )
         try:
             if clean_shutdown:
                 self._audit(
@@ -1155,6 +1164,7 @@ class OMSLifecycleController(OMSComponent):
                     venue_guard_count=len(self.venue_guards),
                     strategy_guard_count=len(self.strategy_guards),
                     strategy_symbol_guard_count=len(self.strategy_symbol_guards),
+                    **paper_audit_fields,
                 )
             else:
                 self._audit(
@@ -1163,6 +1173,7 @@ class OMSLifecycleController(OMSComponent):
                     reason=reason or self._shutdown_reason or "oms_stop_without_verification",
                     drain_completed=drained,
                     cancel_verified=self._shutdown_cancel_verified,
+                    **paper_audit_fields,
                 )
         except Exception as exc:
             audit_ok = False
@@ -1185,6 +1196,22 @@ class OMSLifecycleController(OMSComponent):
                 f"{type(exc).__name__}:{exc}"
             )
 
+        paper_database_stopped = True
+        if paper_database is not None:
+            try:
+                paper_database_stopped = bool(
+                    paper_database.close(
+                        clean_shutdown=bool(clean_shutdown and audit_ok),
+                        reason=reason or self._shutdown_reason or "oms_stop",
+                    )
+                )
+            except Exception as exc:
+                paper_database_stopped = False
+                logger.critical(
+                    "[OMS] Paper trade database did not stop cleanly: "
+                    f"{type(exc).__name__}:{exc}"
+                )
+
         fence_released = True
         if (
             self.single_writer_fence is not None
@@ -1203,11 +1230,13 @@ class OMSLifecycleController(OMSComponent):
         stopped = bool(
             background_tasks_stopped
             and order_monitor_stopped
+            and paper_database_stopped
             and fence_released
         )
         return {
             "stopped": stopped,
             "drained": bool(drained),
             "background_tasks_stopped": bool(background_tasks_stopped),
+            "paper_trade_database_stopped": bool(paper_database_stopped),
             "clean": bool(clean_shutdown and audit_ok and stopped),
         }

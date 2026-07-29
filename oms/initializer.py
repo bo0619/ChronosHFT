@@ -26,6 +26,7 @@ from .order_manager import OrderManager
 from .order_policy import OMSOrderPolicy
 from .order_submission import OMSOrderSubmission
 from .outbound_budget import OutboundMessageBudget
+from .paper_trade_database import PaperTradeDatabase
 from .reconciler import OMSReconciler
 from .rpi_calibration_manager import RpiCalibrationManager
 from .rpi_calibration_replay import RpiCalibrationReplay
@@ -48,7 +49,25 @@ class OMSInitializer(OMSComponent):
         self._configure_account_and_risk(config, oms_cfg, target_position_mode)
         self._initialize_components(self._owner, event_engine, gateway, config)
         self._configure_recovery_and_outbound(config, oms_cfg)
-        self._initialize_background_tasks(oms_cfg)
+        self._initialize_paper_trade_database(config)
+        try:
+            self._initialize_background_tasks(oms_cfg)
+        except Exception:
+            paper_database = getattr(self, "paper_trade_database", None)
+            if paper_database is not None:
+                paper_database.close(
+                    clean_shutdown=False,
+                    reason="oms_initialization_failed",
+                )
+            raise
+
+    def _initialize_paper_trade_database(self, config) -> None:
+        self.paper_trade_database = None
+        database_config = config.get("paper_trade_database", {}) or {}
+        if not isinstance(database_config, dict):
+            raise ValueError("paper_trade_database must be an object")
+        if bool(database_config.get("enabled", False)):
+            self.paper_trade_database = PaperTradeDatabase(config, self.journal)
 
     def _configure_order_controls(self, config, oms_cfg) -> str:
         target_position_mode = str(

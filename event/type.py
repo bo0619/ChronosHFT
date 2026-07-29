@@ -335,6 +335,7 @@ class ExchangeOrderUpdate:
     trade_id: int = -1
     order_type: str = ""
     time_in_force: str = ""
+    fill_model: str = ""
     received_timestamp: float = 0.0
     received_monotonic: float = 0.0
     dispatch_timestamp: float = 0.0

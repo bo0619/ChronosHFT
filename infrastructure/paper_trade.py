@@ -1,5 +1,6 @@
 import math
 from copy import deepcopy
+from pathlib import Path
 
 
 PAPER_EXECUTION_MODE = "paper"
@@ -59,6 +60,79 @@ def is_paper_trade(config: dict) -> bool:
     if explicit_mode:
         return explicit_mode == PAPER_EXECUTION_MODE
     return legacy_enabled
+
+
+def validate_paper_trade_database_config(config: dict) -> dict:
+    """Validate the optional durable Paper fill projection settings."""
+    database = config.get("paper_trade_database")
+    if database is None:
+        return {}
+    if not isinstance(database, dict):
+        raise ValueError("paper_trade_database must be an object")
+
+    enabled = database.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("paper_trade_database.enabled must be a JSON boolean")
+    if not enabled:
+        return database
+    if not is_paper_trade(config):
+        raise ValueError("paper_trade_database is Paper-only")
+
+    configured_path = database.get("path", "storage/paper/trades.sqlite3")
+    if not isinstance(configured_path, str) or not configured_path.strip():
+        raise ValueError("paper_trade_database.path must be a non-empty string")
+
+    for field, default in (
+        ("sqlite_timeout_sec", 5.0),
+        ("close_timeout_sec", 10.0),
+    ):
+        value = database.get(field, default)
+        if isinstance(value, bool):
+            raise ValueError(f"paper_trade_database.{field} must be positive")
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"paper_trade_database.{field} must be positive"
+            ) from exc
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"paper_trade_database.{field} must be positive")
+
+    queue_capacity = database.get("queue_capacity", 10_000)
+    if (
+        isinstance(queue_capacity, bool)
+        or not isinstance(queue_capacity, int)
+        or queue_capacity < 100
+    ):
+        raise ValueError(
+            "paper_trade_database.queue_capacity must be an integer of at least 100"
+        )
+
+    oms = config.get("oms", {}) or {}
+    if not isinstance(oms, dict):
+        raise ValueError("oms must be an object")
+    for field in (
+        "journal_enabled",
+        "journal_fsync",
+        "journal_integrity_check",
+    ):
+        if oms.get(field, True) is not True:
+            raise ValueError(
+                "paper_trade_database requires oms."
+                f"{field} to be the JSON boolean true"
+            )
+    journal_path = str(
+        oms.get("journal_path", PAPER_OMS_JOURNAL_PATH) or ""
+    ).strip()
+    if not journal_path:
+        raise ValueError(
+            "paper_trade_database requires a non-empty oms.journal_path"
+        )
+    if Path(configured_path).resolve() == Path(journal_path).resolve():
+        raise ValueError(
+            "paper_trade_database.path must differ from oms.journal_path"
+        )
+    return database
 
 
 def apply_paper_trade_mode(config: dict) -> dict:
@@ -153,6 +227,8 @@ def apply_paper_trade_mode(config: dict) -> dict:
         single_writer_fence = {}
         oms["single_writer_fence"] = single_writer_fence
     single_writer_fence["path"] = PAPER_OMS_FENCE_PATH
+
+    validate_paper_trade_database_config(configured)
 
     # Prevent later secret resolution from rehydrating credentials from the
     # process environment. Paper runtime must not even hand credentials to a

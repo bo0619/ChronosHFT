@@ -1537,6 +1537,12 @@ class PaperGatewayTests(unittest.TestCase):
         self.assertTrue(trade["maker"])
         self.assertTrue(trade["_simulated"])
         self.assertEqual(trade["_fillModel"], "rpi_public_trade_proxy")
+        fill_update = next(
+            update
+            for update in reversed(self.order_updates("rpi-proxy"))
+            if update.status == "FILLED"
+        )
+        self.assertEqual(fill_update.fill_model, "rpi_public_trade_proxy")
         self.assertAlmostEqual(float(trade["commission"]), 0.003)
         self.assertAlmostEqual(
             float(gateway.get_account_info()["totalWalletBalance"]),
