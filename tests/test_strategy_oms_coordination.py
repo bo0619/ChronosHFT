@@ -43,6 +43,10 @@ from oms.engine import OMS
 from strategy.avellaneda_stoikov import AvellanedaStoikovStrategy
 from strategy.base import StrategyTemplate
 from strategy.glft import GLFTStrategy
+from strategy.quote_math import (
+    ADAPTIVE_GLFT_FORMULA_VERSION,
+    PORTFOLIO_GLFT_FORMULA_VERSION,
+)
 from strategy.registry import (
     canonical_model_key,
     create_primary_strategy,
@@ -349,6 +353,114 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
         self.assertFalse(telemetry[0]["recent_fill_defense"])
         self.assertTrue(telemetry[1]["recent_fill_defense"])
         self.assertFalse(telemetry[2]["recent_fill_defense"])
+
+    def test_glft_portfolio_risk_requires_fresh_full_universe(self):
+        engine = DispatchingEngine()
+        oms = PassiveQuoteOMS()
+        oms.config["symbols"] = ["BTCUSDT", "ETHUSDT"]
+        oms.exposure.net_positions["ETHUSDT"] = 2.0
+        strategy = GLFTStrategy(
+            engine,
+            oms,
+            strategy_config={
+                "glft": {
+                    "portfolio_risk": {
+                        "enabled": True,
+                        "require_full_universe": True,
+                        "max_state_age_sec": 5.0,
+                        "correlations": {"BTCUSDT|ETHUSDT": 0.8},
+                    }
+                }
+            },
+        )
+        common = {
+            "mid_price": 100.0,
+            "fair_mid": 100.0,
+            "sigma_bps_sqrt_s": 1.0,
+            "gamma_per_bps": 0.05,
+            "A_per_s": 2.0,
+            "k_per_bps": 0.5,
+            "order_size_lots": 1.0,
+            "inventory_lot_notional_usdt": 100.0,
+            "target_position_notional_usdt": 0.0,
+        }
+
+        with self.assertRaisesRegex(ValueError, "ETHUSDT"):
+            strategy._calculate_formula_quote(
+                symbol="BTCUSDT",
+                inventory_lots=0.0,
+                now_monotonic=1.0,
+                **common,
+            )
+        strategy._calculate_formula_quote(
+            symbol="ETHUSDT",
+            inventory_lots=2.0,
+            now_monotonic=1.1,
+            **common,
+        )
+        quote, portfolio = strategy._calculate_formula_quote(
+            symbol="BTCUSDT",
+            inventory_lots=0.0,
+            now_monotonic=1.2,
+            **common,
+        )
+
+        self.assertEqual(
+            portfolio["formula_version"],
+            PORTFOLIO_GLFT_FORMULA_VERSION,
+        )
+        self.assertEqual(portfolio["symbols"], ["BTCUSDT", "ETHUSDT"])
+        self.assertLess(quote.center_offset_bps, 0.0)
+        self.assertGreater(
+            portfolio["marginal_inventory_risk_bps"]["BTCUSDT"],
+            0.0,
+        )
+
+    def test_glft_adaptive_quote_is_paper_only_and_reports_robust_scenario(self):
+        engine = DispatchingEngine()
+        oms = PassiveQuoteOMS()
+        oms.config["symbols"] = ["BTCUSDT"]
+        strategy = GLFTStrategy(
+            engine,
+            oms,
+            strategy_config={
+                "glft": {
+                    "adaptive": {
+                        "enabled": True,
+                        "finite_horizon_s": 0.5,
+                    }
+                }
+            },
+        )
+        quote, risk = strategy._calculate_formula_quote(
+            symbol="BTCUSDT",
+            mid_price=100.0,
+            fair_mid=100.0,
+            inventory_lots=1.0,
+            sigma_bps_sqrt_s=2.0,
+            gamma_per_bps=0.05,
+            A_per_s=2.0,
+            k_per_bps=0.5,
+            order_size_lots=1.0,
+            inventory_lot_notional_usdt=100.0,
+            target_position_notional_usdt=0.0,
+            now_monotonic=1.0,
+            adaptive_context={
+                "bid_A_per_s": 2.2,
+                "ask_A_per_s": 1.8,
+                "bid_k_per_bps": 0.45,
+                "ask_k_per_bps": 0.55,
+                "bid_adverse_cost_bps": 0.5,
+                "ask_adverse_cost_bps": 0.75,
+            },
+        )
+
+        self.assertEqual(risk["formula_version"], ADAPTIVE_GLFT_FORMULA_VERSION)
+        self.assertTrue(risk["adaptive_enabled"])
+        self.assertEqual(risk["scenario_count"], 12)
+        self.assertGreater(quote.bid_depth_bps, 0.0)
+        self.assertGreater(quote.ask_depth_bps, 0.0)
+        self.assertLess(quote.bid_price, quote.ask_price)
 
     def test_glft_calibrator_prefers_event_clocks_then_monotonic(self):
         cases = (

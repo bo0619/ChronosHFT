@@ -3292,6 +3292,30 @@ def validate_live_runtime_config(
         violations.append(
             "live_launch canary requires strategy.glft.alpha.enabled=false"
         )
+    portfolio_risk_value = _model_value(
+        strategy,
+        glft,
+        "portfolio_risk",
+        {},
+    )
+    portfolio_risk = (
+        portfolio_risk_value
+        if isinstance(portfolio_risk_value, Mapping)
+        else {}
+    )
+    if _enabled(portfolio_risk.get("enabled")):
+        violations.append(
+            "live_launch canary requires "
+            "strategy.glft.portfolio_risk.enabled=false until separately "
+            "approved"
+        )
+    adaptive_value = _model_value(strategy, glft, "adaptive", {})
+    adaptive = adaptive_value if isinstance(adaptive_value, Mapping) else {}
+    if _enabled(adaptive.get("enabled")):
+        violations.append(
+            "live_launch canary requires "
+            "strategy.glft.adaptive.enabled=false until separately approved"
+        )
     target_inventory = _model_value(
         strategy,
         glft,

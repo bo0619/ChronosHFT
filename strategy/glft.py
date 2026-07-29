@@ -12,6 +12,13 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from alpha.engine import FeatureEngine
 from alpha.factors import GLFTCalibrator
 from alpha.gate import AlphaGate
+from alpha.glft_adaptive import (
+    DynamicCovarianceEstimator,
+    FillMarkoutEstimator,
+    HawkesFlowIntensity,
+    QueueLatencyEstimator,
+    optimize_quote_size,
+)
 from alpha.rpi_intensity import (
     RPIExposureBin,
     RPIIntensityAccumulator,
@@ -43,10 +50,15 @@ from strategy.model_readiness import (
     readiness_requirements,
 )
 from strategy.quote_math import (
+    ADAPTIVE_GLFT_FORMULA_VERSION,
     GLFT_FORMULA_VERSION,
+    PORTFOLIO_GLFT_FORMULA_VERSION,
+    GLFTQuoteScenario,
     UNITS_VERSION,
     depths_bps_to_prices,
     glft_quote_offsets,
+    portfolio_glft_quote_offsets,
+    robust_adaptive_portfolio_glft_quote_offsets,
 )
 
 
@@ -73,6 +85,26 @@ class _AcknowledgedRPIQuote:
             self.censor_reason = str(reason or "unspecified_censor").strip()
         if self.exposure is not None:
             self.exposure.mark_censored(self.censor_reason)
+
+
+@dataclass(frozen=True, slots=True)
+class _PortfolioAssetState:
+    mid_price: float
+    fair_mid: float
+    sigma_bps_sqrt_s: float
+    gamma_per_bps: float
+    A_per_s: float
+    k_per_bps: float
+    bid_A_per_s: float
+    ask_A_per_s: float
+    bid_k_per_bps: float
+    ask_k_per_bps: float
+    bid_adverse_cost_bps: float
+    ask_adverse_cost_bps: float
+    order_size_lots: float
+    inventory_lot_notional_usdt: float
+    target_position_notional_usdt: float
+    updated_at_monotonic: float
 
 
 class GLFTStrategy(StrategyTemplate):
@@ -264,6 +296,186 @@ class GLFTStrategy(StrategyTemplate):
                 "alpha.long_pos_weight",
             ),
         }
+        raw_portfolio_config = self.glft_conf.get("portfolio_risk", {})
+        self.portfolio_risk_config = (
+            dict(raw_portfolio_config)
+            if isinstance(raw_portfolio_config, dict)
+            else {}
+        )
+        self.portfolio_risk_enabled = bool(
+            self.portfolio_risk_config.get("enabled", False)
+        )
+        self.portfolio_state_max_age_sec = self._positive_finite(
+            self.portfolio_risk_config.get("max_state_age_sec", 5.0),
+            5.0,
+        )
+        self.portfolio_require_full_universe = bool(
+            self.portfolio_risk_config.get("require_full_universe", True)
+        )
+        raw_portfolio_symbols = root_config.get("symbols", ())
+        if not isinstance(raw_portfolio_symbols, (list, tuple)):
+            raw_portfolio_symbols = ()
+        normalized_portfolio_symbols = tuple(
+            str(value or "").strip().upper()
+            for value in raw_portfolio_symbols
+            if str(value or "").strip()
+        )
+        if len(set(normalized_portfolio_symbols)) != len(
+            normalized_portfolio_symbols
+        ):
+            raise ValueError("portfolio_risk requires unique symbols")
+        self.portfolio_symbols = normalized_portfolio_symbols
+        self.portfolio_correlations = self._parse_portfolio_correlations(
+            self.portfolio_risk_config.get("correlations", {})
+        )
+        self.portfolio_asset_states: dict[str, _PortfolioAssetState] = {}
+
+        self.adaptive_config = self._config_mapping(
+            self.glft_conf.get("adaptive", {}),
+            "glft.adaptive",
+        )
+        self.adaptive_enabled = bool(self.adaptive_config.get("enabled", False))
+        self.adaptive_horizon_s = self._positive_finite(
+            self.adaptive_config.get("finite_horizon_s", 5.0),
+            5.0,
+        )
+        side_intensity_config = self._config_mapping(
+            self.adaptive_config.get("side_intensity", {}),
+            "glft.adaptive.side_intensity",
+        )
+        self.adaptive_bid_A_multiplier = self._positive_finite(
+            side_intensity_config.get("bid_A_multiplier", 1.0),
+            1.0,
+        )
+        self.adaptive_ask_A_multiplier = self._positive_finite(
+            side_intensity_config.get("ask_A_multiplier", 1.0),
+            1.0,
+        )
+        self.adaptive_bid_k_multiplier = self._positive_finite(
+            side_intensity_config.get("bid_k_multiplier", 1.0),
+            1.0,
+        )
+        self.adaptive_ask_k_multiplier = self._positive_finite(
+            side_intensity_config.get("ask_k_multiplier", 1.0),
+            1.0,
+        )
+
+        hawkes_config = self._config_mapping(
+            self.adaptive_config.get("hawkes", {}),
+            "glft.adaptive.hawkes",
+        )
+        self.adaptive_hawkes = HawkesFlowIntensity(
+            decay_rate_per_s=hawkes_config.get("decay_rate_per_s", 2.0),
+            self_excitation=hawkes_config.get("self_excitation", 0.12),
+            cross_excitation=hawkes_config.get("cross_excitation", 0.03),
+            max_multiplier=hawkes_config.get("max_multiplier", 3.0),
+        )
+        markout_config = self._config_mapping(
+            self.adaptive_config.get("markout", {}),
+            "glft.adaptive.markout",
+        )
+        self.adaptive_markout = FillMarkoutEstimator(
+            horizons_ms=markout_config.get("horizons_ms", (100, 500, 1000)),
+            min_samples=markout_config.get("min_samples", 20),
+            confidence_z=markout_config.get("confidence_z", 1.645),
+            max_pending=markout_config.get("max_pending", 5000),
+        )
+        covariance_config = self._config_mapping(
+            self.adaptive_config.get("dynamic_covariance", {}),
+            "glft.adaptive.dynamic_covariance",
+        )
+        self.adaptive_covariance = DynamicCovarianceEstimator(
+            self.portfolio_symbols,
+            sample_interval_s=covariance_config.get("sample_interval_s", 1.0),
+            max_state_age_s=covariance_config.get("max_state_age_s", 3.0),
+            max_sync_skew_s=covariance_config.get("max_sync_skew_s", 0.25),
+            ewma_alpha=covariance_config.get("ewma_alpha", 0.05),
+            diagonal_shrinkage=covariance_config.get(
+                "diagonal_shrinkage",
+                0.15,
+            ),
+            min_samples=covariance_config.get("min_samples", 30),
+        )
+        queue_config = self._config_mapping(
+            self.adaptive_config.get("queue_latency", {}),
+            "glft.adaptive.queue_latency",
+        )
+        self.adaptive_queue = QueueLatencyEstimator(
+            rate_ewma_alpha=queue_config.get("rate_ewma_alpha", 0.15),
+            default_service_rate_qty_per_s=queue_config.get(
+                "default_service_rate_qty_per_s",
+                1.0,
+            ),
+            max_queue_delay_s=queue_config.get("max_queue_delay_s", 5.0),
+            network_latency_ms=queue_config.get("network_latency_ms", 30.0),
+            queue_risk_time_weight=queue_config.get(
+                "queue_risk_time_weight",
+                0.02,
+            ),
+            confidence_z=queue_config.get("confidence_z", 1.0),
+        )
+        robust_config = self._config_mapping(
+            self.adaptive_config.get("robust", {}),
+            "glft.adaptive.robust",
+        )
+        self.adaptive_intensity_uncertainty_ratio = self._ratio_at_least_one(
+            robust_config.get("intensity_ratio", 1.5),
+            "glft.adaptive.robust.intensity_ratio",
+        )
+        self.adaptive_k_uncertainty_ratio = self._ratio_at_least_one(
+            robust_config.get("k_ratio", 1.25),
+            "glft.adaptive.robust.k_ratio",
+        )
+        self.adaptive_volatility_uncertainty_ratio = self._ratio_at_least_one(
+            robust_config.get("volatility_ratio", 1.2),
+            "glft.adaptive.robust.volatility_ratio",
+        )
+        size_config = self._config_mapping(
+            self.adaptive_config.get("size_optimization", {}),
+            "glft.adaptive.size_optimization",
+        )
+        raw_size_candidates = size_config.get(
+            "candidate_multipliers",
+            (0.0, 0.25, 0.5, 1.0),
+        )
+        if not isinstance(raw_size_candidates, (list, tuple)):
+            raise ValueError(
+                "glft.adaptive.size_optimization.candidate_multipliers "
+                "must be an array"
+            )
+        self.adaptive_size_candidates = tuple(
+            self._finite_float(
+                value,
+                "glft.adaptive.size_optimization.candidate_multipliers",
+            )
+            for value in raw_size_candidates
+        )
+        if (
+            not self.adaptive_size_candidates
+            or min(self.adaptive_size_candidates) < 0.0
+            or max(self.adaptive_size_candidates) > 1.0
+            or 0.0 not in self.adaptive_size_candidates
+        ):
+            raise ValueError(
+                "adaptive size multipliers must be in [0, 1] and include zero"
+            )
+        self.adaptive_size_penalty_bps = self._nonnegative_finite(
+            size_config.get("size_penalty_bps", 0.05),
+            0.05,
+        )
+        self.adaptive_size_utility_horizon_s = self._positive_finite(
+            size_config.get("utility_horizon_s", 1.0),
+            1.0,
+        )
+        self.formula_version = (
+            ADAPTIVE_GLFT_FORMULA_VERSION
+            if self.adaptive_enabled
+            else (
+                PORTFOLIO_GLFT_FORMULA_VERSION
+                if self.portfolio_risk_enabled
+                else GLFT_FORMULA_VERSION
+            )
+        )
         if self.live_mode:
             if not callable(
                 getattr(self.oms, "record_strategy_evidence", None)
@@ -276,6 +488,16 @@ class GLFTStrategy(StrategyTemplate):
             if self.target_inventory_notional_usdt != 0.0:
                 raise ValueError(
                     "Live GLFT requires target_inventory_notional_usdt=0"
+                )
+            if self.portfolio_risk_enabled:
+                raise ValueError(
+                    "Live GLFT requires portfolio_risk.enabled=false until "
+                    "the portfolio formula has its own approved evidence"
+                )
+            if self.adaptive_enabled:
+                raise ValueError(
+                    "Live GLFT requires adaptive.enabled=false until the "
+                    "adaptive formula has separately approved evidence"
                 )
             if not self.use_rpi or self.rpi_fallback_to_gtx:
                 raise ValueError(
@@ -431,6 +653,62 @@ class GLFTStrategy(StrategyTemplate):
         return parsed
 
     @staticmethod
+    def _config_mapping(value, field: str) -> dict:
+        if not isinstance(value, dict):
+            raise ValueError(f"{field} must be an object")
+        return dict(value)
+
+    @classmethod
+    def _ratio_at_least_one(cls, value, field: str) -> float:
+        parsed = cls._finite_float(value, field)
+        if parsed < 1.0:
+            raise ValueError(f"{field} must be at least one")
+        return parsed
+
+    def _parse_portfolio_correlations(
+        self,
+        raw_correlations,
+    ) -> dict[tuple[str, str], float]:
+        if not isinstance(raw_correlations, dict):
+            raise ValueError("portfolio_risk.correlations must be an object")
+        configured_symbols = set(self.portfolio_symbols)
+        correlations: dict[tuple[str, str], float] = {}
+        for raw_pair, raw_value in raw_correlations.items():
+            pair_parts = str(raw_pair or "").split("|")
+            if len(pair_parts) != 2:
+                raise ValueError(
+                    "portfolio_risk correlation keys must use SYMBOL|SYMBOL"
+                )
+            left, right = (
+                part.strip().upper() for part in pair_parts
+            )
+            if not left or not right or left == right:
+                raise ValueError(
+                    "portfolio_risk correlation keys require two symbols"
+                )
+            if configured_symbols and (
+                left not in configured_symbols or right not in configured_symbols
+            ):
+                raise ValueError(
+                    "portfolio_risk correlation references an unknown symbol"
+                )
+            correlation = self._finite_float(
+                raw_value,
+                f"portfolio_risk.correlations.{raw_pair}",
+            )
+            if correlation < -1.0 or correlation > 1.0:
+                raise ValueError(
+                    "portfolio_risk correlations must be between -1 and 1"
+                )
+            normalized_pair = tuple(sorted((left, right)))
+            if normalized_pair in correlations:
+                raise ValueError(
+                    "portfolio_risk correlation pair is configured twice"
+                )
+            correlations[normalized_pair] = correlation
+        return correlations
+
+    @staticmethod
     def _sha256_identity(value) -> str:
         normalized = str(value or "").strip().lower()
         if len(normalized) != 64 or any(
@@ -547,6 +825,35 @@ class GLFTStrategy(StrategyTemplate):
             reference_price=reference_price,
         )
 
+    @staticmethod
+    def _scale_safe_volume(
+        symbol: str,
+        safe_volume: float,
+        multiplier: float,
+        price: float,
+    ) -> float:
+        """Scale a pre-validated volume down without expanding its risk bound."""
+
+        if safe_volume <= 0.0:
+            return 0.0
+        bounded_multiplier = min(1.0, max(0.0, float(multiplier)))
+        if bounded_multiplier >= 1.0:
+            return safe_volume
+        info = ref_data_manager.get_info(symbol)
+        if info is None:
+            return 0.0
+        scaled = ref_data_manager.round_qty(symbol, safe_volume * bounded_multiplier)
+        min_qty = max(0.0, float(info.min_qty or 0.0))
+        min_notional = max(5.0, float(info.min_notional or 0.0))
+        if (
+            scaled <= 0.0
+            or scaled > safe_volume + 1e-12
+            or scaled < min_qty
+            or scaled * price + 1e-9 < min_notional
+        ):
+            return 0.0
+        return scaled
+
     def _approved_rpi_intensity(self, symbol):
         return estimate_rpi_intensity(
             self.validated_prior_bins.get(symbol, ()),
@@ -651,10 +958,345 @@ class GLFTStrategy(StrategyTemplate):
         self.latest_rpi_mid[symbol] = mid
         self.latest_rpi_book_monotonic[symbol] = book_monotonic
 
+    def _calculate_formula_quote(
+        self,
+        *,
+        symbol: str,
+        mid_price: float,
+        fair_mid: float,
+        inventory_lots: float,
+        sigma_bps_sqrt_s: float,
+        gamma_per_bps: float,
+        A_per_s: float,
+        k_per_bps: float,
+        order_size_lots: float,
+        inventory_lot_notional_usdt: float,
+        target_position_notional_usdt: float,
+        now_monotonic: float,
+        adaptive_context: dict | None = None,
+    ):
+        if not self.portfolio_risk_enabled and not self.adaptive_enabled:
+            return (
+                glft_quote_offsets(
+                    mid_price=fair_mid,
+                    inventory_lots=inventory_lots,
+                    sigma_bps_sqrt_s=sigma_bps_sqrt_s,
+                    gamma_per_bps=gamma_per_bps,
+                    A_per_s=A_per_s,
+                    k_per_bps=k_per_bps,
+                    order_size_lots=order_size_lots,
+                ),
+                {
+                    "enabled": False,
+                    "formula_version": GLFT_FORMULA_VERSION,
+                },
+            )
+
+        adaptive_context = (
+            adaptive_context if isinstance(adaptive_context, dict) else {}
+        )
+
+        self.portfolio_asset_states[symbol] = _PortfolioAssetState(
+            mid_price=mid_price,
+            fair_mid=fair_mid,
+            sigma_bps_sqrt_s=sigma_bps_sqrt_s,
+            gamma_per_bps=gamma_per_bps,
+            A_per_s=A_per_s,
+            k_per_bps=k_per_bps,
+            bid_A_per_s=float(adaptive_context.get("bid_A_per_s", A_per_s)),
+            ask_A_per_s=float(adaptive_context.get("ask_A_per_s", A_per_s)),
+            bid_k_per_bps=float(adaptive_context.get("bid_k_per_bps", k_per_bps)),
+            ask_k_per_bps=float(adaptive_context.get("ask_k_per_bps", k_per_bps)),
+            bid_adverse_cost_bps=float(
+                adaptive_context.get("bid_adverse_cost_bps", 0.0)
+            ),
+            ask_adverse_cost_bps=float(
+                adaptive_context.get("ask_adverse_cost_bps", 0.0)
+            ),
+            order_size_lots=order_size_lots,
+            inventory_lot_notional_usdt=inventory_lot_notional_usdt,
+            target_position_notional_usdt=target_position_notional_usdt,
+            updated_at_monotonic=now_monotonic,
+        )
+        universe = (
+            self.portfolio_symbols
+            if self.portfolio_risk_enabled
+            else (symbol,)
+        ) or tuple(sorted(self.portfolio_asset_states))
+        if symbol not in universe:
+            raise ValueError(
+                f"portfolio GLFT symbol {symbol} is outside configured universe"
+            )
+
+        active_symbols = []
+        unavailable_symbols = []
+        for portfolio_symbol in universe:
+            state = self.portfolio_asset_states.get(portfolio_symbol)
+            if state is None or (
+                now_monotonic - state.updated_at_monotonic
+                > self.portfolio_state_max_age_sec
+            ):
+                unavailable_symbols.append(portfolio_symbol)
+                continue
+            active_symbols.append(portfolio_symbol)
+
+        if (
+            unavailable_symbols
+            and self.portfolio_risk_enabled
+            and self.portfolio_require_full_universe
+        ):
+            raise ValueError(
+                "portfolio GLFT state unavailable for "
+                + ",".join(unavailable_symbols)
+            )
+        if unavailable_symbols:
+            open_unavailable = [
+                unavailable_symbol
+                for unavailable_symbol in unavailable_symbols
+                if abs(
+                    float(
+                        self.oms.exposure.net_positions.get(
+                            unavailable_symbol,
+                            0.0,
+                        )
+                        or 0.0
+                    )
+                )
+                > 1e-12
+            ]
+            if open_unavailable:
+                raise ValueError(
+                    "portfolio GLFT cannot omit open inventory for "
+                    + ",".join(open_unavailable)
+                )
+        if symbol not in active_symbols:
+            raise ValueError(f"portfolio GLFT current state is unavailable for {symbol}")
+
+        states = [
+            self.portfolio_asset_states[portfolio_symbol]
+            for portfolio_symbol in active_symbols
+        ]
+        lot_notionals = [
+            state.inventory_lot_notional_usdt for state in states
+        ]
+        reference_lot_notional = lot_notionals[0]
+        if any(
+            not math.isclose(
+                lot_notional,
+                reference_lot_notional,
+                rel_tol=1e-10,
+                abs_tol=1e-10,
+            )
+            for lot_notional in lot_notionals[1:]
+        ):
+            raise ValueError(
+                "portfolio GLFT requires one common inventory lot notional"
+            )
+        portfolio_gamma = max(state.gamma_per_bps for state in states)
+        portfolio_inventory = []
+        for portfolio_symbol, state in zip(
+            active_symbols,
+            states,
+            strict=True,
+        ):
+            position_qty = float(
+                self.oms.exposure.net_positions.get(portfolio_symbol, 0.0)
+                or 0.0
+            )
+            effective_position_notional = (
+                position_qty * state.mid_price
+                - state.target_position_notional_usdt
+            )
+            portfolio_inventory.append(
+                effective_position_notional
+                / state.inventory_lot_notional_usdt
+            )
+
+        covariance = []
+        for row_symbol, row_state in zip(
+            active_symbols,
+            states,
+            strict=True,
+        ):
+            row = []
+            for column_symbol, column_state in zip(
+                active_symbols,
+                states,
+                strict=True,
+            ):
+                if row_symbol == column_symbol:
+                    correlation = 1.0
+                else:
+                    correlation = self.portfolio_correlations.get(
+                        tuple(sorted((row_symbol, column_symbol))),
+                        0.0,
+                    )
+                row.append(
+                    correlation
+                    * row_state.sigma_bps_sqrt_s
+                    * column_state.sigma_bps_sqrt_s
+                )
+            covariance.append(row)
+
+        covariance_source = "STATIC_CONFIGURED_CORRELATION"
+        if self.adaptive_enabled:
+            covariance, covariance_source = self.adaptive_covariance.covariance(
+                active_symbols,
+                covariance,
+            )
+
+            bid_A = [state.bid_A_per_s for state in states]
+            ask_A = [state.ask_A_per_s for state in states]
+            bid_k = [state.bid_k_per_bps for state in states]
+            ask_k = [state.ask_k_per_bps for state in states]
+            bid_adverse = [state.bid_adverse_cost_bps for state in states]
+            ask_adverse = [state.ask_adverse_cost_bps for state in states]
+            intensity_ratio = self.adaptive_intensity_uncertainty_ratio
+            k_ratio = self.adaptive_k_uncertainty_ratio
+            volatility_ratio = self.adaptive_volatility_uncertainty_ratio
+            high_covariance = [
+                [value * volatility_ratio * volatility_ratio for value in row]
+                for row in covariance
+            ]
+            scenarios = []
+            intensity_bounds = (
+                ("BASE_A", 1.0),
+                ("LOW_A", 1.0 / intensity_ratio),
+            )
+            k_bounds = (
+                ("LOW_K", 1.0 / k_ratio),
+                ("BASE_K", 1.0),
+                ("HIGH_K", k_ratio),
+            )
+            volatility_bounds = (
+                ("BASE_VOL", covariance),
+                ("HIGH_VOL", high_covariance),
+            )
+            for intensity_name, intensity_multiplier in intensity_bounds:
+                for k_name, k_multiplier in k_bounds:
+                    for volatility_name, scenario_covariance in volatility_bounds:
+                        scenario_name = "_".join(
+                            (intensity_name, k_name, volatility_name)
+                        )
+                        if scenario_name == "BASE_A_BASE_K_BASE_VOL":
+                            scenario_name = "BASELINE"
+                        scenarios.append(
+                            GLFTQuoteScenario(
+                                name=scenario_name,
+                                bid_A_per_s=[
+                                    value * intensity_multiplier for value in bid_A
+                                ],
+                                ask_A_per_s=[
+                                    value * intensity_multiplier for value in ask_A
+                                ],
+                                bid_k_per_bps=[
+                                    value * k_multiplier for value in bid_k
+                                ],
+                                ask_k_per_bps=[
+                                    value * k_multiplier for value in ask_k
+                                ],
+                                covariance_bps2_per_s=scenario_covariance,
+                                bid_adverse_cost_bps=bid_adverse,
+                                ask_adverse_cost_bps=ask_adverse,
+                            )
+                        )
+            scenarios.sort(key=lambda item: item.name != "BASELINE")
+            robust_solution = robust_adaptive_portfolio_glft_quote_offsets(
+                mid_prices=[state.fair_mid for state in states],
+                inventory_lots=portfolio_inventory,
+                gamma_per_bps=portfolio_gamma,
+                order_size_lots=[state.order_size_lots for state in states],
+                horizon_s=self.adaptive_horizon_s,
+                scenarios=scenarios,
+            )
+            current_index = active_symbols.index(symbol)
+            baseline_solution = robust_solution.scenario_solutions[0]
+            return (
+                robust_solution.quotes[current_index],
+                {
+                    "enabled": self.portfolio_risk_enabled,
+                    "adaptive_enabled": True,
+                    "formula_version": ADAPTIVE_GLFT_FORMULA_VERSION,
+                    "symbols": list(active_symbols),
+                    "finite_horizon_s": self.adaptive_horizon_s,
+                    "covariance_source": covariance_source,
+                    "covariance": [list(row) for row in covariance],
+                    "dynamic_covariance": self.adaptive_covariance.summary(),
+                    "scenario_count": len(scenarios),
+                    "selected_bid_scenario": robust_solution.selected_bid_scenario[
+                        current_index
+                    ],
+                    "selected_ask_scenario": robust_solution.selected_ask_scenario[
+                        current_index
+                    ],
+                    "common_gamma_per_bps": portfolio_gamma,
+                    "common_inventory_lot_notional_usdt": reference_lot_notional,
+                    "inventory_lots": dict(
+                        zip(active_symbols, portfolio_inventory, strict=True)
+                    ),
+                    "marginal_inventory_risk_bps": dict(
+                        zip(
+                            active_symbols,
+                            baseline_solution.marginal_inventory_risk_bps,
+                            strict=True,
+                        )
+                    ),
+                    "current_risk_curvature_bps": dict(
+                        zip(
+                            active_symbols,
+                            baseline_solution.risk_curvature_bps[current_index],
+                            strict=True,
+                        )
+                    ),
+                    "inventory_penalty_bps": baseline_solution.inventory_penalty_bps,
+                },
+            )
+
+        solution = portfolio_glft_quote_offsets(
+            mid_prices=[state.fair_mid for state in states],
+            inventory_lots=portfolio_inventory,
+            covariance_bps2_per_s=covariance,
+            gamma_per_bps=portfolio_gamma,
+            A_per_s=[state.A_per_s for state in states],
+            k_per_bps=[state.k_per_bps for state in states],
+            order_size_lots=[state.order_size_lots for state in states],
+        )
+        current_index = active_symbols.index(symbol)
+        return (
+            solution.quotes[current_index],
+            {
+                "enabled": True,
+                "formula_version": PORTFOLIO_GLFT_FORMULA_VERSION,
+                "symbols": list(active_symbols),
+                "common_gamma_per_bps": portfolio_gamma,
+                "common_inventory_lot_notional_usdt": (
+                    reference_lot_notional
+                ),
+                "inventory_lots": dict(
+                    zip(active_symbols, portfolio_inventory, strict=True)
+                ),
+                "marginal_inventory_risk_bps": dict(
+                    zip(
+                        active_symbols,
+                        solution.marginal_inventory_risk_bps,
+                        strict=True,
+                    )
+                ),
+                "current_risk_curvature_bps": dict(
+                    zip(
+                        active_symbols,
+                        solution.risk_curvature_bps[current_index],
+                        strict=True,
+                    )
+                ),
+                "inventory_penalty_bps": solution.inventory_penalty_bps,
+            },
+        )
+
     def on_orderbook(self, ob: OrderBook):
         symbol = ob.symbol
-        bid_1, _ = ob.get_best_bid()
-        ask_1, _ = ob.get_best_ask()
+        bid_1, bid_1_volume = ob.get_best_bid()
+        ask_1, ask_1_volume = ob.get_best_ask()
         if (
             not math.isfinite(bid_1)
             or not math.isfinite(ask_1)
@@ -672,6 +1314,17 @@ class GLFTStrategy(StrategyTemplate):
             callback_monotonic=now,
         )
         self.latest_mid[symbol] = mid
+        if self.adaptive_enabled:
+            self.adaptive_markout.observe_mid(
+                symbol=symbol,
+                mid_price=mid,
+                observed_at_monotonic=now,
+            )
+            self.adaptive_covariance.observe_mid(
+                symbol=symbol,
+                mid_price=mid,
+                observed_at_monotonic=now,
+            )
 
         if self.rpi_calibration_mode:
             self._run_rpi_calibration_cycle(
@@ -825,15 +1478,93 @@ class GLFTStrategy(StrategyTemplate):
             k = float(calibrator.k)
             intensity_source = "CONFIGURED_PAPER_PROXY"
 
+        adaptive_context = None
+        adaptive_runtime = {"enabled": False}
+        bid_queue_estimate = None
+        ask_queue_estimate = None
+        bid_markout = None
+        ask_markout = None
+        if self.adaptive_enabled:
+            bid_hawkes, ask_hawkes = self.adaptive_hawkes.multipliers(
+                symbol,
+                now,
+            )
+            bid_markout = self.adaptive_markout.estimate(symbol, Side.BUY)
+            ask_markout = self.adaptive_markout.estimate(symbol, Side.SELL)
+            bid_queue_estimate = self.adaptive_queue.estimate(
+                symbol=symbol,
+                quote_side=Side.BUY,
+                queue_ahead_qty=max(0.0, float(bid_1_volume or 0.0)),
+                sigma_bps_sqrt_s=sigma,
+            )
+            ask_queue_estimate = self.adaptive_queue.estimate(
+                symbol=symbol,
+                quote_side=Side.SELL,
+                queue_ahead_qty=max(0.0, float(ask_1_volume or 0.0)),
+                sigma_bps_sqrt_s=sigma,
+            )
+            adaptive_context = {
+                "bid_A_per_s": A
+                * self.adaptive_bid_A_multiplier
+                * bid_hawkes,
+                "ask_A_per_s": A
+                * self.adaptive_ask_A_multiplier
+                * ask_hawkes,
+                "bid_k_per_bps": k * self.adaptive_bid_k_multiplier,
+                "ask_k_per_bps": k * self.adaptive_ask_k_multiplier,
+                "bid_adverse_cost_bps": (
+                    bid_markout.adverse_cost_bps
+                    + bid_queue_estimate.latency_cost_bps
+                ),
+                "ask_adverse_cost_bps": (
+                    ask_markout.adverse_cost_bps
+                    + ask_queue_estimate.latency_cost_bps
+                ),
+            }
+            adaptive_runtime = {
+                "enabled": True,
+                "hawkes": self.adaptive_hawkes.summary(symbol, now),
+                "markout": self.adaptive_markout.summary(symbol),
+                "bid_queue": {
+                    "queue_ahead_qty": bid_queue_estimate.queue_ahead_qty,
+                    "service_rate_qty_per_s": (
+                        bid_queue_estimate.service_rate_qty_per_s
+                    ),
+                    "expected_delay_s": bid_queue_estimate.expected_delay_s,
+                    "latency_cost_bps": bid_queue_estimate.latency_cost_bps,
+                },
+                "ask_queue": {
+                    "queue_ahead_qty": ask_queue_estimate.queue_ahead_qty,
+                    "service_rate_qty_per_s": (
+                        ask_queue_estimate.service_rate_qty_per_s
+                    ),
+                    "expected_delay_s": ask_queue_estimate.expected_delay_s,
+                    "latency_cost_bps": ask_queue_estimate.latency_cost_bps,
+                },
+                "parameter_bounds": {
+                    "intensity_ratio": self.adaptive_intensity_uncertainty_ratio,
+                    "k_ratio": self.adaptive_k_uncertainty_ratio,
+                    "volatility_ratio": (
+                        self.adaptive_volatility_uncertainty_ratio
+                    ),
+                },
+            }
+
         try:
-            formula_quote = glft_quote_offsets(
-                mid_price=fair_mid,
+            formula_quote, portfolio_risk = self._calculate_formula_quote(
+                symbol=symbol,
+                mid_price=mid,
+                fair_mid=fair_mid,
                 inventory_lots=inventory_lots,
                 sigma_bps_sqrt_s=sigma,
                 gamma_per_bps=gamma,
                 A_per_s=A,
                 k_per_bps=k,
                 order_size_lots=order_size_lots,
+                inventory_lot_notional_usdt=inventory_lot_notional,
+                target_position_notional_usdt=target_pos_usdt,
+                now_monotonic=now,
+                adaptive_context=adaptive_context,
             )
         except ValueError as exc:
             self._publish_formula_invalid(
@@ -911,6 +1642,81 @@ class GLFTStrategy(StrategyTemplate):
             current_position=current_pos,
             reference_price=mid,
         )
+        size_optimization = {"enabled": False}
+        if (
+            self.adaptive_enabled
+            and adaptive_context is not None
+            and bid_queue_estimate is not None
+            and ask_queue_estimate is not None
+        ):
+            bid_size = optimize_quote_size(
+                side=Side.BUY,
+                candidate_multipliers=self.adaptive_size_candidates,
+                base_order_size_lots=order_size_lots,
+                inventory_lots=inventory_lots,
+                depth_bps=formula_quote.bid_depth_bps,
+                A_per_s=adaptive_context["bid_A_per_s"],
+                k_per_bps=adaptive_context["bid_k_per_bps"],
+                sigma_bps_sqrt_s=sigma,
+                gamma_per_bps=gamma,
+                fee_bps=passive_fee_bps,
+                adverse_cost_bps=adaptive_context[
+                    "bid_adverse_cost_bps"
+                ],
+                expected_queue_delay_s=bid_queue_estimate.expected_delay_s,
+                utility_horizon_s=self.adaptive_size_utility_horizon_s,
+                size_penalty_bps=self.adaptive_size_penalty_bps,
+            )
+            ask_size = optimize_quote_size(
+                side=Side.SELL,
+                candidate_multipliers=self.adaptive_size_candidates,
+                base_order_size_lots=order_size_lots,
+                inventory_lots=inventory_lots,
+                depth_bps=formula_quote.ask_depth_bps,
+                A_per_s=adaptive_context["ask_A_per_s"],
+                k_per_bps=adaptive_context["ask_k_per_bps"],
+                sigma_bps_sqrt_s=sigma,
+                gamma_per_bps=gamma,
+                fee_bps=passive_fee_bps,
+                adverse_cost_bps=adaptive_context[
+                    "ask_adverse_cost_bps"
+                ],
+                expected_queue_delay_s=ask_queue_estimate.expected_delay_s,
+                utility_horizon_s=self.adaptive_size_utility_horizon_s,
+                size_penalty_bps=self.adaptive_size_penalty_bps,
+            )
+            bid_order_vol = self._scale_safe_volume(
+                symbol,
+                bid_order_vol,
+                bid_size.multiplier,
+                target_bid,
+            )
+            ask_order_vol = self._scale_safe_volume(
+                symbol,
+                ask_order_vol,
+                ask_size.multiplier,
+                target_ask,
+            )
+            size_optimization = {
+                "enabled": True,
+                "candidate_multipliers": list(
+                    bid_size.evaluated_multipliers
+                ),
+                "bid_multiplier": bid_size.multiplier,
+                "ask_multiplier": ask_size.multiplier,
+                "bid_expected_utility_bps_lots_per_s": (
+                    bid_size.expected_utility_bps_lots_per_s
+                ),
+                "ask_expected_utility_bps_lots_per_s": (
+                    ask_size.expected_utility_bps_lots_per_s
+                ),
+                "bid_effective_fill_intensity_per_s": (
+                    bid_size.effective_fill_intensity_per_s
+                ),
+                "ask_effective_fill_intensity_per_s": (
+                    ask_size.effective_fill_intensity_per_s
+                ),
+            }
         self._update_quotes(
             symbol,
             target_bid,
@@ -985,8 +1791,11 @@ class GLFTStrategy(StrategyTemplate):
             "runtime_rpi_intensity": self._intensity_summary(
                 runtime_intensity
             ),
+            "adaptive": adaptive_runtime,
+            "size_optimization": size_optimization,
+            "portfolio_risk": portfolio_risk,
             "units_version": UNITS_VERSION,
-            "formula_version": GLFT_FORMULA_VERSION,
+            "formula_version": self.formula_version,
             "State": "QUOTING",
             "Mode": passive_tif,
             "Spread": f"{quote_spread_bps:.1f}",
@@ -1564,7 +2373,7 @@ class GLFTStrategy(StrategyTemplate):
                 else "CONFIGURED_PAPER_PROXY"
             ),
             "units_version": UNITS_VERSION,
-            "formula_version": GLFT_FORMULA_VERSION,
+            "formula_version": self.formula_version,
             "readiness": readiness_params,
         }
         self.engine.put(
@@ -1707,6 +2516,24 @@ class GLFTStrategy(StrategyTemplate):
         self.imbalance_ewma[trade.symbol] = (
             (1.0 - self.of_lambda) * previous + self.of_lambda * sign
         )
+        if self.adaptive_enabled:
+            event_monotonic = self._positive_snapshot_time(
+                trade.received_monotonic
+            ) or time.perf_counter()
+            aggressor_side = (
+                Side.SELL if trade.maker_is_buyer else Side.BUY
+            )
+            self.adaptive_hawkes.record_trade(
+                symbol=trade.symbol,
+                aggressor_side=aggressor_side,
+                observed_at_monotonic=event_monotonic,
+            )
+            self.adaptive_queue.record_trade(
+                symbol=trade.symbol,
+                aggressor_side=aggressor_side,
+                quantity=trade.quantity,
+                observed_at_monotonic=event_monotonic,
+            )
 
     def _rpi_depth_bps(
         self,
@@ -1996,7 +2823,15 @@ class GLFTStrategy(StrategyTemplate):
                 state["ask_volume"] = None
 
     def on_trade(self, trade: TradeData):
-        self.last_fill_time[trade.symbol] = time.perf_counter()
+        now_monotonic = time.perf_counter()
+        self.last_fill_time[trade.symbol] = now_monotonic
+        if self.adaptive_enabled:
+            self.adaptive_markout.record_fill(
+                symbol=trade.symbol,
+                side=trade.side,
+                fill_price=trade.price,
+                observed_at_monotonic=now_monotonic,
+            )
         if not self.live_mode:
             return
         quote = self.rpi_acknowledged_quotes.get(trade.order_id)

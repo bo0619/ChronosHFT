@@ -1346,6 +1346,16 @@ class LiveConfigGuardTests(unittest.TestCase):
                 "target_inventory_notional_usdt=0",
             ),
             (
+                ("strategy", "glft", "portfolio_risk"),
+                {"enabled": True},
+                "portfolio_risk.enabled=false",
+            ),
+            (
+                ("strategy", "glft", "adaptive"),
+                {"enabled": True},
+                "adaptive.enabled=false",
+            ),
+            (
                 ("strategy", "target_order_notional"),
                 8.01,
                 "8 USDT",

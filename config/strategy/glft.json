@@ -8,6 +8,60 @@
         "enabled": false
       },
       "target_inventory_notional_usdt": 0.0,
+      "portfolio_risk": {
+        "enabled": true,
+        "require_full_universe": true,
+        "max_state_age_sec": 5.0,
+        "correlations": {}
+      },
+      "adaptive": {
+        "enabled": true,
+        "finite_horizon_s": 5.0,
+        "side_intensity": {
+          "bid_A_multiplier": 1.0,
+          "ask_A_multiplier": 1.0,
+          "bid_k_multiplier": 1.0,
+          "ask_k_multiplier": 1.0
+        },
+        "hawkes": {
+          "decay_rate_per_s": 2.0,
+          "self_excitation": 0.12,
+          "cross_excitation": 0.03,
+          "max_multiplier": 3.0
+        },
+        "markout": {
+          "horizons_ms": [100, 500, 1000],
+          "min_samples": 20,
+          "confidence_z": 1.645,
+          "max_pending": 5000
+        },
+        "dynamic_covariance": {
+          "sample_interval_s": 1.0,
+          "max_state_age_s": 3.0,
+          "max_sync_skew_s": 0.25,
+          "ewma_alpha": 0.05,
+          "diagonal_shrinkage": 0.15,
+          "min_samples": 30
+        },
+        "robust": {
+          "intensity_ratio": 1.5,
+          "k_ratio": 1.25,
+          "volatility_ratio": 1.2
+        },
+        "queue_latency": {
+          "rate_ewma_alpha": 0.15,
+          "default_service_rate_qty_per_s": 1.0,
+          "max_queue_delay_s": 5.0,
+          "network_latency_ms": 30.0,
+          "queue_risk_time_weight": 0.02,
+          "confidence_z": 1.0
+        },
+        "size_optimization": {
+          "candidate_multipliers": [0.0, 0.25, 0.5, 1.0],
+          "utility_horizon_s": 1.0,
+          "size_penalty_bps": 0.05
+        }
+      },
       "rpi_intensity": {
         "min_sample_count": 30,
         "min_depth_level_count": 3,
