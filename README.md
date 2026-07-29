@@ -56,11 +56,12 @@ The runtime uses production Binance public market data but all balances,
 orders, and fills remain local simulations. The SSH session and EC2 web console
 may be closed after the service is active.
 
-The tracked AWS Paper profile is intentionally sized for a `t3.small`: it
-subscribes only `SNDKUSDT` and `SOXLUSDT`, matching the two concurrent-symbol
-slots derived from capital scaling. A broader symbol universe requires both a
-larger instance and coordinated capital/risk changes; adding symbols alone
-causes the OMS to reject repeated quote attempts at the concurrency boundary.
+The tracked AWS Paper profile is intentionally sized for a `t3.small` and a
+10,000 USDT simulated account. It subscribes only `SNDKUSDT`, matching the one
+concurrent-symbol slot derived from capital scaling. A broader symbol universe
+requires correlation-aware capital allocation and coordinated risk changes;
+adding symbols alone causes the OMS to reject repeated quote attempts at the
+concurrency boundary.
 
 The 1-second Binance mark-price stream has a Paper-only public REST safety net.
 After 1.5 seconds without a WebSocket mark, one batch `premiumIndex` request
@@ -178,7 +179,7 @@ manifest rather than the process working directory.
 | `config/risk/black_swan.json` | Tail-risk detection and emergency actions |
 | `config/strategy/core.json` | Strategy registry, primary model, routing, and common quoting policy |
 | `config/strategy/capital_scaling.json` | Capital multiplier and all capital-derived targets |
-| `config/strategy/order_sizing.json` | Paper quote quantity mode and fixed order quantity |
+| `config/strategy/order_sizing.json` | Paper quote quantity mode |
 | `config/strategy/model_readiness.json` | Model approval and evidence requirements |
 | `config/strategy/glft.json` | GLFT parameters |
 | `config/strategy/avellaneda_stoikov.json` | Avellaneda-Stoikov parameters |
@@ -195,14 +196,28 @@ limits; `lot_multiplier`; `target_order_notional`; and `max_pos_usdt` from that
 single source. Do not declare these derived fields in fragments; the loader
 always computes their effective values.
 
-The tracked observation profile sets `strategy.order_sizing` to a Paper-only
-fixed quantity of `30`. Every normal bid and ask is therefore submitted for 30
-contract units or is suppressed when the remaining risk capacity cannot fit the
-whole order. Exchange lot-step rounding still fails closed, and safety exits may
-use a smaller residual quantity to avoid reversing an existing position. With
-recent prices, 30 SNDK units are roughly 38,900 USDT notional, so the tracked
-`capital_multiplier=5000` deliberately creates a 500,000 USDT simulated balance
-and matching Paper risk limits. These are simulation settings, not Live sizing.
+The tracked Paper profile uses notional sizing for a 10,000 USDT simulated
+account. Each normal bid or ask targets 100 USDT (1% of capital), then converts
+that notional to contract quantity and rounds down to the exchange lot step.
+The one-symbol inventory and account gross-notional caps are both 500 USDT
+(5%); the daily-loss cap is 100 USDT (1%). At the last locally recorded SNDK
+price of 1296.56 USDT and a 0.01 quantity step, a normal quote is approximately
+0.07 SNDK, not a fixed 30 units. Remaining inventory capacity can reduce or
+suppress a quote, and safety exits may use the residual position quantity.
+
+No market-making paper prescribes one universal contract count for a 10,000
+USDT account. The profile applies the common result that quote size must be
+expressed relative to capital and bounded by inventory risk. The original
+[GLFT inventory model](https://arxiv.org/abs/1105.3115), the 2025
+[AAAI inventory-constrained online-learning result](https://doi.org/10.1609/aaai.v39i20.35492),
+and the 2024 [adaptive partial-fill model](https://arxiv.org/abs/2405.11444)
+all support explicit inventory constraints and state-dependent execution. A
+2026 [perpetual-futures preprint](https://arxiv.org/abs/2607.11888) further
+shows that multi-pair diversification saturates as pair correlation rises. In
+the local 2026-07-27/28 sample, SNDK and SOXL one-minute returns had 0.9961
+correlation, while SNDK recorded roughly three times as many trades per second;
+the tracked profile therefore keeps SNDK only rather than treating the pair as
+independent diversification.
 
 After any configuration edit, run the offline gate before starting the engine:
 
@@ -213,7 +228,7 @@ After any configuration edit, run the offline gate before starting the engine:
 A valid tracked configuration currently reports:
 
 ```text
-CONFIG_OK mode=paper symbols=2 primary_model=glft
+CONFIG_OK mode=paper symbols=1 primary_model=glft capital_usdt=10000 order_notional_usdt=100 max_position_usdt=500 max_gross_usdt=500 max_daily_loss_usdt=100
 ```
 
 Live deployment files remain operator-owned, single-file JSON documents and

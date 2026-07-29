@@ -69,6 +69,7 @@ from infrastructure.config_scaling import (
     apply_production_safety_defaults,
     finalize_strategy_risk_budgets,
     load_config_document,
+    load_root_config,
     normalize_strategy_registration,
     normalize_root_config_preapproval,
     resolve_runtime_secrets,
@@ -788,6 +789,35 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
 
 
 class PaperTradeConfigTests(unittest.TestCase):
+    def test_tracked_paper_profile_uses_inventory_bounded_10k_sizing(self):
+        configured = load_root_config("config.json")
+
+        self.assertEqual(configured["symbols"], ["SNDKUSDT"])
+        self.assertEqual(configured["account"]["initial_balance_usdt"], 10_000.0)
+        self.assertEqual(configured["account"]["trading_budget_total"], 10_000.0)
+        self.assertEqual(
+            configured["strategy"]["order_sizing"],
+            {"mode": "notional"},
+        )
+        self.assertEqual(configured["strategy"]["target_order_notional"], 100.0)
+        self.assertEqual(configured["strategy"]["max_pos_usdt"], 500.0)
+        self.assertNotIn(
+            "inventory_lot_notional_usdt",
+            configured["strategy"]["glft"],
+        )
+        self.assertNotIn(
+            "inventory_lot_notional_usdt",
+            configured["strategy"]["avellaneda_stoikov"],
+        )
+        self.assertEqual(configured["risk"]["limits"]["max_order_notional"], 110.0)
+        self.assertEqual(configured["risk"]["limits"]["max_pos_notional"], 500.0)
+        self.assertEqual(
+            configured["risk"]["limits"]["max_account_gross_notional"],
+            500.0,
+        )
+        self.assertEqual(configured["risk"]["limits"]["max_daily_loss"], 100.0)
+        self.assertEqual(configured["risk"]["limits"]["max_concurrent_symbols"], 1)
+
     def test_paper_mode_is_type_selected_and_scrubs_every_private_credential(self):
         raw = {
             "execution": {"mode": "paper"},

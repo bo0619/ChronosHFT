@@ -747,6 +747,40 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
                 0.16,
             )
 
+    def test_tracked_notional_sizing_maps_100_usdt_to_sndk_lot_step(self):
+        strategy = GLFTStrategy(
+            DispatchingEngine(),
+            PassiveQuoteOMS(),
+            strategy_config={
+                "target_order_notional": 100.0,
+                "max_pos_usdt": 500.0,
+                "order_sizing": {"mode": "notional"},
+                "glft": {},
+            },
+        )
+        contract = ContractInfo(
+            symbol="SNDKUSDT",
+            tick_size=0.01,
+            step_size=0.01,
+            min_qty=0.01,
+            min_notional=5.0,
+            price_precision=2,
+            qty_precision=2,
+            status="TRADING",
+            permissions=frozenset(),
+        )
+
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"SNDKUSDT": contract},
+            clear=True,
+        ):
+            self.assertEqual(
+                strategy._calculate_safe_vol("SNDKUSDT", 1296.56),
+                0.07,
+            )
+            self.assertEqual(strategy.inventory_lot_notional_usdt, 100.0)
+
     def test_paper_market_makers_submit_only_full_fixed_quantity(self):
         sizing_config = {
             "target_order_notional": 40_000.0,

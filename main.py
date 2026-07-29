@@ -921,12 +921,19 @@ def _run_main(argv=None, runtime=None):
 
     if args.check_config:
         strategy = config.get("strategy", {}) or {}
+        account = config.get("account", {}) or {}
+        limits = (config.get("risk", {}) or {}).get("limits", {}) or {}
         mode = "paper" if paper_trade else "live"
         print(
             "CONFIG_OK "
             f"mode={mode} "
             f"symbols={len(config.get('symbols', []) or [])} "
-            f"primary_model={strategy.get('primary_model', '')}",
+            f"primary_model={strategy.get('primary_model', '')} "
+            f"capital_usdt={float(account.get('trading_budget_total', 0.0)):g} "
+            f"order_notional_usdt={float(strategy.get('target_order_notional', 0.0)):g} "
+            f"max_position_usdt={float(limits.get('max_pos_notional', 0.0)):g} "
+            f"max_gross_usdt={float(limits.get('max_account_gross_notional', 0.0)):g} "
+            f"max_daily_loss_usdt={float(limits.get('max_daily_loss', 0.0)):g}",
             flush=True,
         )
         return 0

@@ -1,8 +1,7 @@
 {
   "strategy": {
     "order_sizing": {
-      "mode": "fixed_quantity",
-      "fixed_quantity": 30.0
+      "mode": "notional"
     }
   }
 }

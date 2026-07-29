@@ -8,7 +8,6 @@
         "enabled": false
       },
       "target_inventory_notional_usdt": 0.0,
-      "inventory_lot_notional_usdt": 8.0,
       "rpi_intensity": {
         "min_sample_count": 30,
         "min_depth_level_count": 3,
