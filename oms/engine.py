@@ -192,6 +192,195 @@ class OMS:
     def __init__(self, event_engine, gateway, config):
         OMSInitializer(self).initialize(event_engine, gateway, config)
 
+    def record_paper_order_event(self, snapshot) -> bool:
+        database = getattr(self, "paper_trade_database", None)
+        if database is None:
+            return False
+        client_oid = str(getattr(snapshot, "client_oid", "") or "")
+        with self.lock:
+            order = self.orders.get(client_oid)
+            intent = order.intent if order is not None else None
+            strategy_id = str(intent.strategy_id or "") if intent else ""
+            order_type = str(intent.order_type or "") if intent else ""
+            reduce_only = bool(intent.reduce_only) if intent else False
+            tag = str(intent.tag or "") if intent else ""
+        status = getattr(snapshot, "status", "")
+        side = getattr(snapshot, "side", "")
+        return database.record_order_event(
+            {
+                "client_oid": client_oid,
+                "exchange_oid": str(
+                    getattr(snapshot, "exchange_oid", "") or ""
+                ),
+                "symbol": str(getattr(snapshot, "symbol", "") or ""),
+                "strategy_id": strategy_id,
+                "side": getattr(side, "value", side) or "",
+                "status": getattr(status, "value", status) or "",
+                "price": getattr(snapshot, "price", 0.0),
+                "quantity": getattr(snapshot, "volume", 0.0),
+                "filled_quantity": getattr(snapshot, "filled_volume", 0.0),
+                "average_price": getattr(snapshot, "avg_price", 0.0),
+                "time_in_force": str(
+                    getattr(snapshot, "time_in_force", "") or ""
+                ),
+                "is_post_only": bool(
+                    getattr(snapshot, "is_post_only", False)
+                ),
+                "is_rpi": bool(getattr(snapshot, "is_rpi", False)),
+                "order_type": order_type,
+                "reduce_only": reduce_only,
+                "tag": tag,
+                "created_monotonic": getattr(
+                    snapshot,
+                    "created_monotonic",
+                    None,
+                ),
+                "updated_monotonic": getattr(
+                    snapshot,
+                    "updated_monotonic",
+                    None,
+                ),
+                "event_time": getattr(snapshot, "update_time", None),
+                "error_message": str(
+                    getattr(snapshot, "error_msg", "") or ""
+                ),
+            }
+        )
+
+    def record_paper_strategy_sample(self, strategy_data) -> bool:
+        database = getattr(self, "paper_trade_database", None)
+        if database is None:
+            return False
+        return database.record_strategy_sample(
+            {
+                "sample_time": getattr(strategy_data, "timestamp", None),
+                "symbol": str(getattr(strategy_data, "symbol", "") or ""),
+                "fair_value": getattr(strategy_data, "fair_value", None),
+                "alpha_bps": getattr(strategy_data, "alpha_bps", None),
+                "params": dict(getattr(strategy_data, "params", {}) or {}),
+            }
+        )
+
+    def record_paper_markout(self, payload: dict) -> bool:
+        database = getattr(self, "paper_trade_database", None)
+        if database is None:
+            return False
+        return database.record_markout(payload)
+
+    def record_paper_account_sample(self, account_data) -> bool:
+        database = getattr(self, "paper_trade_database", None)
+        if database is None:
+            return False
+        sample_datetime = getattr(account_data, "datetime", None)
+        timestamp_method = getattr(sample_datetime, "timestamp", None)
+        sample_time = (
+            timestamp_method() if callable(timestamp_method) else time.time()
+        )
+        balance = getattr(account_data, "balance", 0.0)
+        equity = getattr(account_data, "equity", 0.0)
+        return database.record_account_sample(
+            {
+                "sample_time": sample_time,
+                "balance": balance,
+                "equity": equity,
+                "unrealized_pnl": float(equity) - float(balance),
+                "available": getattr(account_data, "available", 0.0),
+                "used_margin": getattr(account_data, "used_margin", 0.0),
+                "budget_balance": getattr(
+                    account_data,
+                    "budget_balance",
+                    0.0,
+                ),
+                "budget_available": getattr(
+                    account_data,
+                    "budget_available",
+                    0.0,
+                ),
+                "maintenance_margin": getattr(
+                    account_data,
+                    "maintenance_margin",
+                    0.0,
+                ),
+                "margin_balance": getattr(
+                    account_data,
+                    "margin_balance",
+                    0.0,
+                ),
+                "maintenance_margin_ratio": getattr(
+                    account_data,
+                    "maintenance_margin_ratio",
+                    0.0,
+                ),
+                "margin_snapshot_time": getattr(
+                    account_data,
+                    "margin_snapshot_time",
+                    None,
+                ),
+                "margin_snapshot_synced": bool(
+                    getattr(account_data, "margin_snapshot_synced", False)
+                ),
+                "external_cash_flow_total": getattr(
+                    account_data,
+                    "external_cash_flow_total",
+                    0.0,
+                ),
+                "cash_flow_snapshot_time": getattr(
+                    account_data,
+                    "cash_flow_snapshot_time",
+                    None,
+                ),
+                "cash_flow_snapshot_synced": bool(
+                    getattr(account_data, "cash_flow_snapshot_synced", False)
+                ),
+            }
+        )
+
+    def record_paper_system_event(self, event_kind: str, data) -> bool:
+        database = getattr(self, "paper_trade_database", None)
+        if database is None:
+            return False
+        event_kind = str(event_kind or "system_health")
+        message = data if isinstance(data, str) else getattr(data, "msg", "")
+        message = str(message or "")
+        severity = str(getattr(data, "level", "") or "").upper()
+        if not severity:
+            if message.startswith(("HALT:", "KILL:", "MARKET_DATA_STALE:")):
+                severity = "CRITICAL"
+            elif message.startswith(
+                (
+                    "FREEZE_",
+                    "WS_",
+                    "USER_STREAM_",
+                    "PAPER_DMS_",
+                )
+            ):
+                severity = "ERROR"
+            else:
+                severity = "INFO"
+        state = getattr(data, "state", "")
+        state = getattr(state, "value", state) or ""
+        return database.record_system_event(
+            {
+                "event_time": getattr(data, "timestamp", None) or time.time(),
+                "event_kind": event_kind,
+                "severity": severity,
+                "message": message,
+                "state": str(state),
+                "total_exposure": getattr(data, "total_exposure", None),
+                "margin_ratio": getattr(data, "margin_ratio", None),
+                "order_count_local": getattr(data, "order_count_local", None),
+                "order_count_remote": getattr(data, "order_count_remote", None),
+                "cancelling_count": getattr(data, "cancelling_count", None),
+                "fill_ratio": getattr(data, "fill_ratio", None),
+                "api_weight": getattr(
+                    data,
+                    "api_weight",
+                    getattr(data, "weight_used_1m", None),
+                ),
+                "is_sync_error": getattr(data, "is_sync_error", None),
+            }
+        )
+
     _canonical_json = staticmethod(RpiCalibrationManager._canonical_json)
     _require_exact_mapping_keys = staticmethod(
         RpiCalibrationManager._require_exact_mapping_keys

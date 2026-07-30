@@ -119,16 +119,42 @@ App/Web retail counterparty traded against it. The Paper configuration keeps
 `paper_trade.rpi_fill_model=public_trade_proxy`: a public aggregate trade at or
 through a resting RPI quote is treated as simulated fill evidence. This proxy
 does not observe the private RPI queue or retail-only counterparty eligibility,
-so its fills and PnL must not be interpreted as expected Live performance.
+so its fills and PnL must not be interpreted as expected Live performance. The
+simulator deliberately retains through-price fills as a stress assumption; it
+does not discard adverse fills merely to manufacture positive Paper PnL.
 
 ## Paper execution database
 
-Paper execution history uses local SQLite in WAL mode. `paper_runs` separates
-every process launch with a random `run_id`; `paper_fills` stores one immutable
-row for every partial or complete fill, including journal sequence, order IDs,
-strategy, side, quantity, price, notional, fees, realized PnL, maker/RPI flags,
-and the Paper fill model. `reset_on_start=true` resets the simulated venue and
-account but never deletes this historical database.
+Paper execution history uses local SQLite in WAL mode. Schema v3 upgrades an
+existing v1 or v2 database in place without deleting historical rows.
+`paper_runs` separates every process launch with a random `run_id`, and six
+fact datasets share that identity:
+
+- `paper_fills` stores every partial or complete fill, its durable journal
+  identity, price/quantity/PnL, trigger relation (`at_price`, `through`, or
+  `orderbook`), triggering public trade, its transport/local matching age,
+  queue-ahead estimate, fill-time L1 book, and quote age;
+- `paper_order_events` stores every observed order lifecycle state, including
+  unfilled cancels, expires, and rejects, so fill intensity has an exposure
+  denominator rather than fills alone;
+- `paper_strategy_samples` stores structured mid/fair/quote, L1 size,
+  inventory, volatility, A/k, markout, flow, queue, stale-quote, and size
+  decisions. It also separates exchange transport, gateway processing,
+  strategy-queue, callback-age, clock-offset, and calculation latency;
+- `paper_fill_markouts` stores exact 100/500/1000 ms signed post-fill markout
+  observations together with actual sampling lag and fill identity;
+- `paper_account_samples` stores balance, equity, unrealized PnL, available
+  funds, budget usage, margin health, and external-cash-flow truth;
+- `paper_system_events` stores system-health, freeze/recovery, alert, reconnect,
+  watchdog, and API-weight observations.
+
+Strategy telemetry is downsampled to one row per symbol per second by
+`paper_trade_database.strategy_sample_interval_sec`. Account telemetry uses
+`paper_trade_database.account_sample_interval_sec`, also one second by default.
+Order events, fills, markouts, and abnormal system events are not downsampled.
+The observation tables use typed columns instead of duplicate raw JSON
+payloads. `reset_on_start=true` resets the simulated venue and account but never
+deletes this historical database.
 
 The fsync-backed OMS JSONL journal remains the audit truth. SQLite is a
 query-oriented projection written after the journal commit, outside the OMS hot
@@ -142,6 +168,11 @@ Query recent fills or aggregate them by run and symbol:
 .venv/bin/python scripts/query_paper_trades.py --limit 100
 .venv/bin/python scripts/query_paper_trades.py --summary
 .venv/bin/python scripts/query_paper_trades.py --symbol SNDKUSDT --summary
+.venv/bin/python scripts/query_paper_trades.py --dataset orders --limit 100
+.venv/bin/python scripts/query_paper_trades.py --dataset strategy --limit 100
+.venv/bin/python scripts/query_paper_trades.py --dataset markouts --limit 100
+.venv/bin/python scripts/query_paper_trades.py --dataset accounts --limit 100
+.venv/bin/python scripts/query_paper_trades.py --dataset system --limit 100
 ```
 
 The query tool opens SQLite read-only and is safe while the service is running.
@@ -368,9 +399,16 @@ The adaptive Paper layer also adds bounded online controls:
 
 - public aggressive trades drive side-specific, exponentially decaying Hawkes
   multipliers with a hard cap; these are Paper proxies, never Live RPI evidence;
+- a time-decayed signed trade imbalance and L1 microprice add a capped adverse
+  cost only to the side currently under pressure; the signal decays when flow
+  stops instead of leaving a stale directional bias;
 - private Paper fills are evaluated at 100/500/1000 ms signed markouts, and a
   one-sided confidence bound becomes a side-specific adverse-selection cost
-  only after the minimum sample count;
+  only after the minimum sample count; each side/horizon uses a finite rolling
+  window so a recent toxic regime is not diluted by the entire process history;
+- a Paper-only stale-quote guard checks every order-book callback and requests
+  cancellation when either resting quote moves within the configured minimum
+  depth of mid, without waiting for the next full strategy cycle;
 - L1 queue volume and side-specific trade service rates estimate queue delay;
   queue and configured network latency become a volatility-scaled quote cost;
 - each cycle evaluates all 12 corners of the configured intensity, `k`, and
@@ -382,7 +420,12 @@ The adaptive Paper layer also adds bounded online controls:
 
 All parameters live under `strategy.glft.adaptive` in
 `config/strategy/glft.json`. The tracked one-symbol profile exercises the same
-math with a scalar covariance. Both `adaptive.enabled` and
+math with a scalar covariance. Its Paper overrides use a 0.5-second quote cycle,
+an 8 bps minimum total spread, a 1.5 bps stale-side cancellation threshold, and
+a 200-observation markout window with 12 samples required before activation.
+The 1-second cycle and 5 bps minimum remain the Live baselines; Paper overrides
+do not alter them. These settings reduce selection risk but do not guarantee a
+positive expected value. Both `adaptive.enabled` and
 `portfolio_risk.enabled` are Paper-only; the Live gate requires them to be
 false until separate RPI calibration, side-specific markout, OOS, and formula
 approval artifacts exist.

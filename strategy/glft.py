@@ -17,6 +17,7 @@ from alpha.glft_adaptive import (
     FillMarkoutEstimator,
     HawkesFlowIntensity,
     QueueLatencyEstimator,
+    estimate_flow_adverse_costs,
     optimize_quote_size,
 )
 from alpha.rpi_intensity import (
@@ -228,11 +229,20 @@ class GLFTStrategy(StrategyTemplate):
             0.1,
         )
         self.configure_quote_sizing(self.strat_conf)
+        configured_cycle_interval = self.strat_conf.get(
+            "cycle_interval",
+            self.glft_conf.get("cycle_interval", 1.0),
+        )
+        if not self.live_mode:
+            configured_cycle_interval = self.strat_conf.get(
+                "paper_cycle_interval",
+                self.glft_conf.get(
+                    "paper_cycle_interval",
+                    configured_cycle_interval,
+                ),
+            )
         self.cycle_interval = self._nonnegative_finite(
-            self.strat_conf.get(
-                "cycle_interval",
-                self.glft_conf.get("cycle_interval", 1.0),
-            ),
+            configured_cycle_interval,
             1.0,
         )
         raw_execution = self.strat_conf.get(
@@ -242,8 +252,14 @@ class GLFTStrategy(StrategyTemplate):
         model_execution = (
             raw_execution if isinstance(raw_execution, dict) else {}
         )
+        configured_min_spread_bps = model_execution.get("min_spread_bps", 5.0)
+        if not self.live_mode:
+            configured_min_spread_bps = model_execution.get(
+                "paper_min_spread_bps",
+                configured_min_spread_bps,
+            )
         self.min_spread_bps = self._positive_finite(
-            model_execution.get("min_spread_bps", 5.0),
+            configured_min_spread_bps,
             5.0,
         )
         self.readiness_requirements = readiness_requirements(
@@ -379,6 +395,41 @@ class GLFTStrategy(StrategyTemplate):
             min_samples=markout_config.get("min_samples", 20),
             confidence_z=markout_config.get("confidence_z", 1.645),
             max_pending=markout_config.get("max_pending", 5000),
+            window_size=markout_config.get("window_size", 500),
+        )
+        flow_config = self._config_mapping(
+            self.adaptive_config.get("flow_toxicity", {}),
+            "glft.adaptive.flow_toxicity",
+        )
+        self.adaptive_flow_toxicity_enabled = bool(
+            flow_config.get("enabled", False)
+        )
+        self.flow_half_life_s = self._positive_finite(
+            flow_config.get("half_life_s", 0.75),
+            0.75,
+        )
+        self.flow_trade_cost_bps = self._nonnegative_finite(
+            flow_config.get("trade_imbalance_cost_bps", 0.0),
+            0.0,
+        )
+        self.flow_microprice_weight = self._nonnegative_finite(
+            flow_config.get("microprice_weight", 0.0),
+            0.0,
+        )
+        self.flow_max_adverse_cost_bps = self._nonnegative_finite(
+            flow_config.get("max_adverse_cost_bps", 0.0),
+            0.0,
+        )
+        stale_guard_config = self._config_mapping(
+            self.adaptive_config.get("stale_quote_guard", {}),
+            "glft.adaptive.stale_quote_guard",
+        )
+        self.stale_quote_guard_enabled = bool(
+            stale_guard_config.get("enabled", False)
+        ) and not self.live_mode
+        self.stale_quote_min_depth_bps = self._nonnegative_finite(
+            stale_guard_config.get("min_depth_bps", 0.0),
+            0.0,
         )
         covariance_config = self._config_mapping(
             self.adaptive_config.get("dynamic_covariance", {}),
@@ -611,6 +662,7 @@ class GLFTStrategy(StrategyTemplate):
 
         self.of_lambda = 0.2
         self.imbalance_ewma = defaultdict(float)
+        self.imbalance_updated_at = defaultdict(_negative_infinity)
         self.last_fill_time = defaultdict(_negative_infinity)
         self.latest_mid = defaultdict(float)
         self.latest_rpi_mid = defaultdict(float)
@@ -636,6 +688,8 @@ class GLFTStrategy(StrategyTemplate):
         self.last_run_times = defaultdict(_negative_infinity)
         self.last_calibration_status_at = defaultdict(_negative_infinity)
         self.last_calibration_status_signature = {}
+        self.latest_stale_guard = defaultdict(dict)
+        self.latest_market_timing = defaultdict(dict)
 
         print(
             f"[{self.name}] GLFT initialized: gamma={self.gamma_base}, "
@@ -912,6 +966,97 @@ class GLFTStrategy(StrategyTemplate):
             if math.isfinite(value) and value > 0.0:
                 return value
         return None
+
+    @staticmethod
+    def _market_timing_snapshot(
+        ob: OrderBook,
+        callback_monotonic: float,
+    ) -> dict:
+        def optional_finite(field_name: str) -> float | None:
+            try:
+                value = float(getattr(ob, field_name, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return None
+            return value if math.isfinite(value) and value > 0.0 else None
+
+        exchange_time = optional_finite("exchange_timestamp")
+        received_time = optional_finite("received_timestamp")
+        corrected_received_time = optional_finite(
+            "corrected_received_timestamp"
+        )
+        received_monotonic = optional_finite("received_monotonic")
+        dispatch_time = optional_finite("dispatch_timestamp")
+        dispatch_monotonic = optional_finite("dispatch_monotonic")
+        try:
+            clock_offset_ms = float(ob.clock_offset_ms)
+        except (TypeError, ValueError):
+            clock_offset_ms = None
+        if clock_offset_ms is not None and not math.isfinite(clock_offset_ms):
+            clock_offset_ms = None
+
+        transport_latency_ms = None
+        if exchange_time is not None and corrected_received_time is not None:
+            transport_latency_ms = (
+                corrected_received_time - exchange_time
+            ) * 1000.0
+        gateway_processing_latency_ms = None
+        if (
+            received_monotonic is not None
+            and dispatch_monotonic is not None
+            and dispatch_monotonic >= received_monotonic
+        ):
+            gateway_processing_latency_ms = (
+                dispatch_monotonic - received_monotonic
+            ) * 1000.0
+        strategy_queue_latency_ms = None
+        if (
+            dispatch_monotonic is not None
+            and callback_monotonic >= dispatch_monotonic
+        ):
+            strategy_queue_latency_ms = (
+                callback_monotonic - dispatch_monotonic
+            ) * 1000.0
+        callback_age_ms = None
+        if (
+            received_monotonic is not None
+            and callback_monotonic >= received_monotonic
+        ):
+            callback_age_ms = (
+                callback_monotonic - received_monotonic
+            ) * 1000.0
+
+        return {
+            "exchange_timestamp": exchange_time,
+            "received_timestamp": received_time,
+            "corrected_received_timestamp": corrected_received_time,
+            "dispatch_timestamp": dispatch_time,
+            "received_monotonic": received_monotonic,
+            "dispatch_monotonic": dispatch_monotonic,
+            "callback_monotonic": callback_monotonic,
+            "clock_offset_ms": clock_offset_ms,
+            "transport_latency_ms": transport_latency_ms,
+            "gateway_processing_latency_ms": gateway_processing_latency_ms,
+            "strategy_queue_latency_ms": strategy_queue_latency_ms,
+            "callback_age_ms": callback_age_ms,
+            "best_bid_qty": float(ob.get_best_bid()[1] or 0.0),
+            "best_ask_qty": float(ob.get_best_ask()[1] or 0.0),
+        }
+
+    def _published_market_timing(self, symbol: str) -> dict:
+        if self.live_mode:
+            return {}
+        timing = dict(self.latest_market_timing[symbol])
+        callback_monotonic = timing.get("callback_monotonic")
+        if callback_monotonic is not None:
+            timing["strategy_compute_latency_ms"] = max(
+                0.0,
+                (
+                    time.perf_counter_ns() / 1_000_000_000.0
+                    - float(callback_monotonic)
+                )
+                * 1000.0,
+            )
+        return timing
 
     def _observe_rpi_orderbook(
         self,
@@ -1306,6 +1451,13 @@ class GLFTStrategy(StrategyTemplate):
             return
 
         now = time.perf_counter()
+        if not self.live_mode:
+            self.latest_market_timing[symbol] = (
+                self._market_timing_snapshot(
+                    ob,
+                    now,
+                )
+            )
         mid = (bid_1 + ask_1) / 2.0
         self._observe_rpi_orderbook(
             symbol=symbol,
@@ -1320,11 +1472,16 @@ class GLFTStrategy(StrategyTemplate):
                 mid_price=mid,
                 observed_at_monotonic=now,
             )
+            self._record_resolved_paper_markouts()
             self.adaptive_covariance.observe_mid(
                 symbol=symbol,
                 mid_price=mid,
                 observed_at_monotonic=now,
             )
+        self.latest_stale_guard[symbol] = self._guard_stale_quotes(
+            symbol=symbol,
+            mid_price=mid,
+        )
 
         if self.rpi_calibration_mode:
             self._run_rpi_calibration_cycle(
@@ -1462,7 +1619,11 @@ class GLFTStrategy(StrategyTemplate):
             margin_usage = account.used_margin / account.equity
             gamma *= 1.0 + max(0.0, (margin_usage - 0.5) * 4.0)
 
-        orderflow_imbalance = abs(self.imbalance_ewma[symbol])
+        signed_orderflow_imbalance = self._decayed_orderflow_imbalance(
+            symbol,
+            now,
+        )
+        orderflow_imbalance = abs(signed_orderflow_imbalance)
         gamma *= 1.0 + 3.0 * orderflow_imbalance
         recent_fill_defense = now - self.last_fill_time[symbol] < 2.0
         if recent_fill_defense:
@@ -1484,6 +1645,7 @@ class GLFTStrategy(StrategyTemplate):
         ask_queue_estimate = None
         bid_markout = None
         ask_markout = None
+        flow_adverse = None
         if self.adaptive_enabled:
             bid_hawkes, ask_hawkes = self.adaptive_hawkes.multipliers(
                 symbol,
@@ -1503,6 +1665,28 @@ class GLFTStrategy(StrategyTemplate):
                 queue_ahead_qty=max(0.0, float(ask_1_volume or 0.0)),
                 sigma_bps_sqrt_s=sigma,
             )
+            if self.adaptive_flow_toxicity_enabled:
+                flow_adverse = estimate_flow_adverse_costs(
+                    mid_price=mid,
+                    best_bid=bid_1,
+                    best_ask=ask_1,
+                    bid_quantity=max(0.0, float(bid_1_volume or 0.0)),
+                    ask_quantity=max(0.0, float(ask_1_volume or 0.0)),
+                    signed_trade_imbalance=signed_orderflow_imbalance,
+                    trade_imbalance_cost_bps=self.flow_trade_cost_bps,
+                    microprice_weight=self.flow_microprice_weight,
+                    max_adverse_cost_bps=self.flow_max_adverse_cost_bps,
+                )
+            bid_flow_cost = (
+                flow_adverse.bid_adverse_cost_bps
+                if flow_adverse is not None
+                else 0.0
+            )
+            ask_flow_cost = (
+                flow_adverse.ask_adverse_cost_bps
+                if flow_adverse is not None
+                else 0.0
+            )
             adaptive_context = {
                 "bid_A_per_s": A
                 * self.adaptive_bid_A_multiplier
@@ -1515,10 +1699,12 @@ class GLFTStrategy(StrategyTemplate):
                 "bid_adverse_cost_bps": (
                     bid_markout.adverse_cost_bps
                     + bid_queue_estimate.latency_cost_bps
+                    + bid_flow_cost
                 ),
                 "ask_adverse_cost_bps": (
                     ask_markout.adverse_cost_bps
                     + ask_queue_estimate.latency_cost_bps
+                    + ask_flow_cost
                 ),
             }
             adaptive_runtime = {
@@ -1540,6 +1726,17 @@ class GLFTStrategy(StrategyTemplate):
                     ),
                     "expected_delay_s": ask_queue_estimate.expected_delay_s,
                     "latency_cost_bps": ask_queue_estimate.latency_cost_bps,
+                },
+                "flow_toxicity": {
+                    "enabled": flow_adverse is not None,
+                    "signed_trade_imbalance": signed_orderflow_imbalance,
+                    "microprice_offset_bps": (
+                        flow_adverse.microprice_offset_bps
+                        if flow_adverse is not None
+                        else 0.0
+                    ),
+                    "bid_adverse_cost_bps": bid_flow_cost,
+                    "ask_adverse_cost_bps": ask_flow_cost,
                 },
                 "parameter_bounds": {
                     "intensity_ratio": self.adaptive_intensity_uncertainty_ratio,
@@ -1763,7 +1960,7 @@ class GLFTStrategy(StrategyTemplate):
             "sigma_bps": sigma,
             "sigma_units": "bps/sqrt(second)",
             "margin_usage": margin_usage,
-            "orderflow_imbalance": self.imbalance_ewma[symbol],
+            "orderflow_imbalance": signed_orderflow_imbalance,
             "recent_fill_defense": recent_fill_defense,
             "readiness": readiness.as_params(),
             "signals": {
@@ -1793,6 +1990,8 @@ class GLFTStrategy(StrategyTemplate):
             ),
             "adaptive": adaptive_runtime,
             "size_optimization": size_optimization,
+            "stale_quote_guard": dict(self.latest_stale_guard[symbol]),
+            "market_data_timing": self._published_market_timing(symbol),
             "portfolio_risk": portfolio_risk,
             "units_version": UNITS_VERSION,
             "formula_version": self.formula_version,
@@ -2261,6 +2460,7 @@ class GLFTStrategy(StrategyTemplate):
                 or 0.0
             ),
             "data_source": "LIVE_BINANCE_RPI_ACK",
+            "market_data_timing": self._published_market_timing(symbol),
             "units_version": UNITS_VERSION,
             "formula_version": GLFT_FORMULA_VERSION,
             "State": state,
@@ -2375,6 +2575,7 @@ class GLFTStrategy(StrategyTemplate):
             "units_version": UNITS_VERSION,
             "formula_version": self.formula_version,
             "readiness": readiness_params,
+            "market_data_timing": self._published_market_timing(symbol),
         }
         self.engine.put(
             Event(
@@ -2387,6 +2588,103 @@ class GLFTStrategy(StrategyTemplate):
                 ),
             )
         )
+
+    def _decayed_orderflow_imbalance(
+        self,
+        symbol: str,
+        now_monotonic: float,
+    ) -> float:
+        raw = max(-1.0, min(1.0, float(self.imbalance_ewma[symbol])))
+        if self.live_mode:
+            return raw
+        updated_at = float(self.imbalance_updated_at[symbol])
+        if not math.isfinite(updated_at) or now_monotonic <= updated_at:
+            return raw
+        age_s = now_monotonic - updated_at
+        decay = math.exp(-math.log(2.0) * age_s / self.flow_half_life_s)
+        return raw * decay
+
+    def _record_resolved_paper_markouts(self) -> None:
+        resolved = self.adaptive_markout.drain_resolved()
+        if not resolved or self.live_mode:
+            return
+        recorder = getattr(self.oms, "record_paper_markout", None)
+        if not callable(recorder):
+            return
+        for observation in resolved:
+            recorder(
+                {
+                    "client_oid": observation.client_oid,
+                    "trade_id": observation.trade_id,
+                    "symbol": observation.symbol,
+                    "side": observation.side.value,
+                    "fill_price": observation.fill_price,
+                    "horizon_ms": observation.horizon_ms,
+                    "mid_price": observation.mid_price,
+                    "signed_markout_bps": observation.signed_markout_bps,
+                    "fill_observed_monotonic": (
+                        observation.fill_observed_monotonic
+                    ),
+                    "mid_observed_monotonic": observation.mid_observed_monotonic,
+                    "observation_lag_ms": observation.observation_lag_ms,
+                }
+            )
+
+    def _guard_stale_quotes(
+        self,
+        *,
+        symbol: str,
+        mid_price: float,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
+            "enabled": self.stale_quote_guard_enabled,
+            "min_depth_bps": self.stale_quote_min_depth_bps,
+            "bid_depth_bps": None,
+            "ask_depth_bps": None,
+            "bid_at_risk": False,
+            "ask_at_risk": False,
+            "bid_cancel_requested": False,
+            "ask_cancel_requested": False,
+        }
+        if not self.stale_quote_guard_enabled or mid_price <= 0.0:
+            return result
+
+        state = self.quote_state[symbol]
+        for key, depth in (
+            (
+                "bid",
+                (
+                    math.log(mid_price / float(state["bid_price"])) * 10_000.0
+                    if state["bid_price"] is not None
+                    and float(state["bid_price"]) > 0.0
+                    else None
+                ),
+            ),
+            (
+                "ask",
+                (
+                    math.log(float(state["ask_price"]) / mid_price) * 10_000.0
+                    if state["ask_price"] is not None
+                    and float(state["ask_price"]) > 0.0
+                    else None
+                ),
+            ),
+        ):
+            result[f"{key}_depth_bps"] = depth
+            client_oid = state[f"{key}_oid"]
+            at_risk = (
+                client_oid is not None
+                and depth is not None
+                and depth < self.stale_quote_min_depth_bps
+            )
+            result[f"{key}_at_risk"] = at_risk
+            if not at_risk:
+                continue
+            accepted = self.cancel_order(client_oid)
+            result[f"{key}_cancel_requested"] = bool(
+                accepted or client_oid in self.orders_cancelling
+            )
+        return result
 
     def _cancel_symbol_quotes(self, symbol: str) -> None:
         state = self.quote_state[symbol]
@@ -2512,14 +2810,18 @@ class GLFTStrategy(StrategyTemplate):
     def on_market_trade(self, trade: AggTradeData):
         self.feature_engine.on_trade(trade)
         sign = -1.0 if trade.maker_is_buyer else 1.0
-        previous = self.imbalance_ewma[trade.symbol]
+        event_monotonic = self._positive_snapshot_time(
+            trade.received_monotonic
+        ) or time.perf_counter()
+        previous = self._decayed_orderflow_imbalance(
+            trade.symbol,
+            event_monotonic,
+        )
         self.imbalance_ewma[trade.symbol] = (
             (1.0 - self.of_lambda) * previous + self.of_lambda * sign
         )
+        self.imbalance_updated_at[trade.symbol] = event_monotonic
         if self.adaptive_enabled:
-            event_monotonic = self._positive_snapshot_time(
-                trade.received_monotonic
-            ) or time.perf_counter()
             aggressor_side = (
                 Side.SELL if trade.maker_is_buyer else Side.BUY
             )
@@ -2831,6 +3133,8 @@ class GLFTStrategy(StrategyTemplate):
                 side=trade.side,
                 fill_price=trade.price,
                 observed_at_monotonic=now_monotonic,
+                client_oid=trade.order_id,
+                trade_id=trade.trade_id,
             )
         if not self.live_mode:
             return

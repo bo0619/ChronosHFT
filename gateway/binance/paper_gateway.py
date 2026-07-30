@@ -193,6 +193,7 @@ class _PaperOrder:
     request: OrderRequest
     accept_seq: int
     created_ms: int
+    created_monotonic: float
     update_ms: int
     status: str = "STAGED"
     committed: bool = False
@@ -1866,6 +1867,7 @@ class BinancePaperGateway(BaseGateway):
         self._exchange_sequence += 1
         exchange_oid = f"PAPER-{self._exchange_sequence:020d}"
         now_ms = int(time.time() * 1000)
+        now_monotonic = time.perf_counter()
         if request.time_in_force == TIF_RPI:
             fill_model = (
                 "rpi_public_trade_proxy"
@@ -1880,6 +1882,7 @@ class BinancePaperGateway(BaseGateway):
             request=request,
             accept_seq=self._accept_sequence,
             created_ms=now_ms,
+            created_monotonic=now_monotonic,
             update_ms=now_ms,
             fill_model=fill_model,
             cancel_generation_at_stage=self._cancel_generations.get(
@@ -2169,10 +2172,10 @@ class BinancePaperGateway(BaseGateway):
             if self._reduce_only_fill_cap(order) <= 1e-12:
                 self._expire_order(order, "PAPER_REDUCE_ONLY_EXHAUSTED")
                 continue
+            ahead_before = max(0.0, order.queue_ahead)
             if price_relation == "through":
                 quantity = min(order.remaining, self._reduce_only_fill_cap(order))
             else:
-                ahead_before = max(0.0, order.queue_ahead)
                 order.queue_ahead = max(0.0, ahead_before - float(trade.quantity))
                 eligible_quantity = max(0.0, float(trade.quantity) - ahead_before)
                 quantity = min(
@@ -2183,7 +2186,52 @@ class BinancePaperGateway(BaseGateway):
             if quantity > 1e-12:
                 # A passive limit executes at its resting price.  A trade
                 # through that price proves the order would already have filled.
-                self._apply_fill(order, quantity, float(order.request.price), is_maker=True)
+                self._apply_fill(
+                    order,
+                    quantity,
+                    float(order.request.price),
+                    is_maker=True,
+                    fill_context={
+                        "fill_trigger": price_relation,
+                        "market_trade_id": int(trade.trade_id),
+                        "market_trade_price": float(trade.price),
+                        "market_trade_qty": float(trade.quantity),
+                        "market_trade_exchange_time": float(
+                            trade.exchange_timestamp or 0.0
+                        ),
+                        "market_trade_received_time": float(
+                            trade.received_timestamp or 0.0
+                        ),
+                        "market_trade_clock_offset_ms": (
+                            float(trade.clock_offset_ms)
+                            if trade.clock_offset_ms is not None
+                            else None
+                        ),
+                        "market_trade_transport_latency_ms": (
+                            (
+                                float(trade.corrected_received_timestamp)
+                                - float(trade.exchange_timestamp)
+                            )
+                            * 1000.0
+                            if trade.corrected_received_timestamp > 0.0
+                            and trade.exchange_timestamp > 0.0
+                            else None
+                        ),
+                        "market_trade_local_age_ms": (
+                            max(
+                                0.0,
+                                (
+                                    time.perf_counter()
+                                    - float(trade.received_monotonic)
+                                )
+                                * 1000.0,
+                            )
+                            if trade.received_monotonic > 0.0
+                            else None
+                        ),
+                        "queue_ahead_before": ahead_before,
+                    },
+                )
         return True
 
     def _on_book(self, book: OrderBook):
@@ -2204,11 +2252,28 @@ class BinancePaperGateway(BaseGateway):
         price: float,
         *,
         is_maker: bool,
+        fill_context: dict | None = None,
     ):
         quantity = min(float(quantity), order.remaining, self._reduce_only_fill_cap(order))
         if quantity <= 1e-12:
             return False
         transaction_time = time.time()
+        context = dict(fill_context) if isinstance(fill_context, dict) else {}
+        book = self._books.get(order.request.symbol)
+        best_bid_at_fill = None
+        best_ask_at_fill = None
+        if book is not None:
+            best_bid_at_fill = float(book.get_best_bid()[0] or 0.0) or None
+            best_ask_at_fill = float(book.get_best_ask()[0] or 0.0) or None
+        mid_at_fill = (
+            (best_bid_at_fill + best_ask_at_fill) / 2.0
+            if best_bid_at_fill is not None and best_ask_at_fill is not None
+            else None
+        )
+        quote_age_ms = max(
+            0.0,
+            (time.perf_counter() - order.created_monotonic) * 1000.0,
+        )
         realized_pnl = self._apply_position_fill(
             order.request.symbol,
             order.request.side,
@@ -2257,6 +2322,36 @@ class BinancePaperGateway(BaseGateway):
             realized_pnl=realized_pnl,
             is_maker=is_maker,
             trade_id=paper_trade_id,
+            fill_trigger=str(
+                context.get(
+                    "fill_trigger",
+                    "orderbook" if not is_maker else "",
+                )
+                or ""
+            ),
+            market_trade_id=int(context.get("market_trade_id", -1) or -1),
+            market_trade_price=context.get("market_trade_price"),
+            market_trade_qty=context.get("market_trade_qty"),
+            market_trade_exchange_time=context.get(
+                "market_trade_exchange_time"
+            ),
+            market_trade_received_time=context.get(
+                "market_trade_received_time"
+            ),
+            market_trade_clock_offset_ms=context.get(
+                "market_trade_clock_offset_ms"
+            ),
+            market_trade_transport_latency_ms=context.get(
+                "market_trade_transport_latency_ms"
+            ),
+            market_trade_local_age_ms=context.get(
+                "market_trade_local_age_ms"
+            ),
+            queue_ahead_before=context.get("queue_ahead_before"),
+            best_bid_at_fill=best_bid_at_fill,
+            best_ask_at_fill=best_ask_at_fill,
+            mid_at_fill=mid_at_fill,
+            quote_age_ms=quote_age_ms,
         )
         self._emit_account_update(
             order.request.symbol,
@@ -2756,6 +2851,20 @@ class BinancePaperGateway(BaseGateway):
         realized_pnl: float | None = None,
         is_maker: bool | None = None,
         trade_id: int = -1,
+        fill_trigger: str = "",
+        market_trade_id: int = -1,
+        market_trade_price: float | None = None,
+        market_trade_qty: float | None = None,
+        market_trade_exchange_time: float | None = None,
+        market_trade_received_time: float | None = None,
+        market_trade_clock_offset_ms: float | None = None,
+        market_trade_transport_latency_ms: float | None = None,
+        market_trade_local_age_ms: float | None = None,
+        queue_ahead_before: float | None = None,
+        best_bid_at_fill: float | None = None,
+        best_ask_at_fill: float | None = None,
+        mid_at_fill: float | None = None,
+        quote_age_ms: float | None = None,
     ):
         self._event_sequence += 1
         self.on_order_update(
@@ -2777,6 +2886,22 @@ class BinancePaperGateway(BaseGateway):
                 order_type=order.request.order_type,
                 time_in_force=order.request.time_in_force,
                 fill_model=order.fill_model,
+                fill_trigger=fill_trigger,
+                market_trade_id=market_trade_id,
+                market_trade_price=market_trade_price,
+                market_trade_qty=market_trade_qty,
+                market_trade_exchange_time=market_trade_exchange_time,
+                market_trade_received_time=market_trade_received_time,
+                market_trade_clock_offset_ms=market_trade_clock_offset_ms,
+                market_trade_transport_latency_ms=(
+                    market_trade_transport_latency_ms
+                ),
+                market_trade_local_age_ms=market_trade_local_age_ms,
+                queue_ahead_before=queue_ahead_before,
+                best_bid_at_fill=best_bid_at_fill,
+                best_ask_at_fill=best_ask_at_fill,
+                mid_at_fill=mid_at_fill,
+                quote_age_ms=quote_age_ms,
             )
         )
 

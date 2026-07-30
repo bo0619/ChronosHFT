@@ -4,6 +4,7 @@
       "_comment": "Paper uses configured A/k only as a labeled proxy. Live ignores public aggTrade and requires a hashed LIVE_BINANCE_RPI_ACK exposure artifact.",
       "gamma": 0.1,
       "cycle_interval": 1.0,
+      "paper_cycle_interval": 0.5,
       "alpha": {
         "enabled": false
       },
@@ -31,9 +32,21 @@
         },
         "markout": {
           "horizons_ms": [100, 500, 1000],
-          "min_samples": 20,
+          "min_samples": 12,
           "confidence_z": 1.645,
-          "max_pending": 5000
+          "max_pending": 5000,
+          "window_size": 200
+        },
+        "flow_toxicity": {
+          "enabled": true,
+          "half_life_s": 0.75,
+          "trade_imbalance_cost_bps": 2.0,
+          "microprice_weight": 1.0,
+          "max_adverse_cost_bps": 3.0
+        },
+        "stale_quote_guard": {
+          "enabled": true,
+          "min_depth_bps": 1.5
         },
         "dynamic_covariance": {
           "sample_interval_s": 1.0,
@@ -83,7 +96,8 @@
         "max_tick_gap_sec": 2.0
       },
       "execution": {
-        "min_spread_bps": 5.0
+        "min_spread_bps": 5.0,
+        "paper_min_spread_bps": 8.0
       }
     }
   }

@@ -85,6 +85,8 @@ def validate_paper_trade_database_config(config: dict) -> dict:
     for field, default in (
         ("sqlite_timeout_sec", 5.0),
         ("close_timeout_sec", 10.0),
+        ("strategy_sample_interval_sec", 1.0),
+        ("account_sample_interval_sec", 1.0),
     ):
         value = database.get(field, default)
         if isinstance(value, bool):
@@ -97,6 +99,14 @@ def validate_paper_trade_database_config(config: dict) -> dict:
             ) from exc
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError(f"paper_trade_database.{field} must be positive")
+        if field in {
+            "strategy_sample_interval_sec",
+            "account_sample_interval_sec",
+        } and value < 0.1:
+            raise ValueError(
+                f"paper_trade_database.{field} "
+                "must be at least 0.1"
+            )
 
     queue_capacity = database.get("queue_capacity", 10_000)
     if (

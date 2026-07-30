@@ -11,6 +11,7 @@ from oms.journal import OMSJournal
 from oms.order import Order
 from oms.paper_trade_database import LEGACY_RUN_ID, PaperTradeDatabase
 from scripts.query_paper_trades import main as query_main
+from scripts.query_paper_trades import query_observations
 from scripts.query_paper_trades import query_rows
 
 
@@ -78,6 +79,20 @@ def execution_payload(*, run_id=""):
         "time_in_force": "RPI",
         "is_rpi": True,
         "fill_model": "rpi_public_trade_proxy",
+        "fill_trigger": "through",
+        "market_trade_id": 700,
+        "market_trade_price": 1249.5,
+        "market_trade_qty": 3.0,
+        "market_trade_exchange_time": 1234.48,
+        "market_trade_received_time": 1234.49,
+        "market_trade_clock_offset_ms": -1.0,
+        "market_trade_transport_latency_ms": 9.0,
+        "market_trade_local_age_ms": 4.0,
+        "queue_ahead_before": 1.5,
+        "best_bid_at_fill": 1249.9,
+        "best_ask_at_fill": 1250.1,
+        "mid_at_fill": 1250.0,
+        "quote_age_ms": 275.0,
         "reduce_only": False,
         "pre_status": "NEW",
     }
@@ -120,6 +135,13 @@ def test_async_projection_records_run_and_fill(tmp_path):
     assert fill["journal_hash"] == metadata["hash"]
     assert fill["journal_ts_utc"] == metadata["ts"]
     assert fill["is_maker"] == 1
+    assert fill["fill_trigger"] == "through"
+    assert fill["market_trade_id"] == 700
+    assert fill["market_trade_transport_latency_ms"] == 9.0
+    assert fill["market_trade_local_age_ms"] == 4.0
+    assert fill["queue_ahead_before"] == 1.5
+    assert fill["mid_at_fill"] == 1250.0
+    assert fill["quote_age_ms"] == 275.0
     assert fill["raw_payload_json"]
 
     run = fetch_one(
@@ -153,6 +175,348 @@ def test_journal_backfill_is_idempotent_when_oms_replay_is_disabled(tmp_path):
     assert fill["run_id"] == LEGACY_RUN_ID
     count = fetch_one(database_path, "SELECT COUNT(*) AS count FROM paper_fills")
     assert count["count"] == 1
+
+
+def test_database_records_calibration_observations_as_structured_rows(tmp_path):
+    config = make_config(tmp_path)
+    journal = OMSJournal(config)
+    database = PaperTradeDatabase(config, journal)
+
+    assert database.record_order_event(
+        {
+            "client_oid": "order-1",
+            "exchange_oid": "exchange-1",
+            "symbol": "SNDKUSDT",
+            "strategy_id": "GLFT_MultiScale",
+            "side": "BUY",
+            "status": "NEW",
+            "price": 100.0,
+            "quantity": 0.1,
+            "filled_quantity": 0.0,
+            "average_price": 0.0,
+            "time_in_force": "RPI",
+            "is_post_only": True,
+            "is_rpi": True,
+            "order_type": "LIMIT",
+            "reduce_only": False,
+            "tag": "glft_quote",
+            "created_monotonic": 10.0,
+            "updated_monotonic": 10.1,
+            "event_time": 1000.0,
+            "error_message": "",
+        }
+    )
+    assert database.record_strategy_sample(
+        {
+            "sample_time": 1000.2,
+            "symbol": "SNDKUSDT",
+            "fair_value": 100.05,
+            "alpha_bps": 0.0,
+            "params": {
+                "strategy": "GLFT_MultiScale",
+                "state": "QUOTING",
+                "mode": "RPI",
+                "mid_price": 100.0,
+                "best_bid": 99.9,
+                "best_ask": 100.1,
+                "target_bid": 99.8,
+                "target_ask": 100.2,
+                "market_spread_bps": 20.0,
+                "quote_spread_bps": 40.0,
+                "bid_quote_qty": 0.1,
+                "ask_quote_qty": 0.1,
+                "position_qty": 0.0,
+                "position_notional": 0.0,
+                "sigma_bps": 2.5,
+                "A_per_s": 1.2,
+                "k_per_bps": 0.8,
+                "adaptive": {
+                    "markout": {
+                        "sides": {
+                            "BUY": {"adverse_cost_bps": 1.1},
+                            "SELL": {"adverse_cost_bps": 1.3},
+                        }
+                    },
+                    "flow_toxicity": {
+                        "signed_trade_imbalance": -0.4,
+                        "microprice_offset_bps": -0.7,
+                        "bid_adverse_cost_bps": 1.5,
+                        "ask_adverse_cost_bps": 0.0,
+                    },
+                    "bid_queue": {"latency_cost_bps": 0.2},
+                    "ask_queue": {"latency_cost_bps": 0.3},
+                },
+                "stale_quote_guard": {
+                    "bid_depth_bps": 2.0,
+                    "ask_depth_bps": 2.5,
+                    "bid_at_risk": False,
+                    "ask_at_risk": True,
+                },
+                "size_optimization": {
+                    "bid_multiplier": 0.5,
+                    "ask_multiplier": 0.25,
+                },
+                "market_data_timing": {
+                    "exchange_timestamp": 1000.0,
+                    "received_timestamp": 1000.01,
+                    "corrected_received_timestamp": 1000.009,
+                    "dispatch_timestamp": 1000.011,
+                    "received_monotonic": 10.0,
+                    "dispatch_monotonic": 10.002,
+                    "callback_monotonic": 10.006,
+                    "clock_offset_ms": -1.0,
+                    "transport_latency_ms": 9.0,
+                    "gateway_processing_latency_ms": 2.0,
+                    "strategy_queue_latency_ms": 4.0,
+                    "callback_age_ms": 6.0,
+                    "strategy_compute_latency_ms": 0.5,
+                    "best_bid_qty": 12.0,
+                    "best_ask_qty": 13.0,
+                },
+            },
+        }
+    )
+    assert database.record_markout(
+        {
+            "client_oid": "order-1",
+            "trade_id": "7",
+            "symbol": "SNDKUSDT",
+            "side": "BUY",
+            "fill_price": 100.0,
+            "horizon_ms": 500,
+            "mid_price": 99.98,
+            "signed_markout_bps": -2.0002,
+            "fill_observed_monotonic": 10.2,
+            "mid_observed_monotonic": 10.71,
+            "observation_lag_ms": 10.0,
+        }
+    )
+    assert database.record_account_sample(
+        {
+            "sample_time": 1000.2,
+            "balance": 10_000.0,
+            "equity": 10_005.0,
+            "available": 9_500.0,
+            "used_margin": 505.0,
+            "budget_balance": 10_000.0,
+            "budget_available": 9_495.0,
+            "maintenance_margin": 50.0,
+            "margin_balance": 10_005.0,
+            "maintenance_margin_ratio": 0.0049975,
+            "margin_snapshot_time": 1000.1,
+            "margin_snapshot_synced": True,
+            "external_cash_flow_total": 0.0,
+            "cash_flow_snapshot_time": 999.0,
+            "cash_flow_snapshot_synced": True,
+        }
+    )
+    assert database.record_account_sample(
+        {
+            "sample_time": 1000.5,
+            "balance": 10_000.0,
+            "equity": 10_006.0,
+        }
+    )
+    assert database.record_system_event(
+        {
+            "event_time": 1000.3,
+            "event_kind": "system_health",
+            "severity": "ERROR",
+            "message": "FREEZE_VENUE:BINANCE:WS_TRANSPORT_DROP",
+            "state": "FROZEN",
+            "api_weight": 12,
+        }
+    )
+    assert database.record_strategy_sample(
+        {
+            "sample_time": 1000.5,
+            "symbol": "SNDKUSDT",
+            "fair_value": 100.0,
+            "alpha_bps": 0.0,
+            "params": {},
+        }
+    )
+    assert database.health_snapshot()["throttled_strategy_sample_count"] == 1
+    assert database.health_snapshot()["throttled_account_sample_count"] == 1
+    assert database.close(clean_shutdown=True, reason="observation_test")
+
+    path = Path(config["paper_trade_database"]["path"])
+    order = fetch_one(path, "SELECT * FROM paper_order_events")
+    strategy = fetch_one(path, "SELECT * FROM paper_strategy_samples")
+    markout = fetch_one(path, "SELECT * FROM paper_fill_markouts")
+    account = fetch_one(path, "SELECT * FROM paper_account_samples")
+    system_event = fetch_one(path, "SELECT * FROM paper_system_events")
+    assert order["client_oid"] == "order-1"
+    assert order["is_rpi"] == 1
+    assert order["order_type"] == "LIMIT"
+    assert order["tag"] == "glft_quote"
+    assert strategy["bid_markout_cost_bps"] == 1.1
+    assert strategy["bid_flow_cost_bps"] == 1.5
+    assert strategy["ask_stale_at_risk"] == 1
+    assert strategy["bid_size_multiplier"] == 0.5
+    assert strategy["best_bid_qty"] == 12.0
+    assert strategy["transport_latency_ms"] == 9.0
+    assert strategy["strategy_queue_latency_ms"] == 4.0
+    strategy_count = fetch_one(
+        path,
+        "SELECT COUNT(*) AS count FROM paper_strategy_samples",
+    )
+    assert strategy_count["count"] == 1
+    assert markout["horizon_ms"] == 500
+    assert markout["observation_lag_ms"] == 10.0
+    assert account["unrealized_pnl"] == 5.0
+    assert account["margin_snapshot_synced"] == 1
+    assert system_event["event_kind"] == "system_health"
+    assert system_event["api_weight"] == 12
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        queried = query_observations(
+            connection,
+            dataset="markouts",
+            symbol="SNDKUSDT",
+            run_id=database.run_id,
+            limit=10,
+        )
+        queried_accounts = query_observations(
+            connection,
+            dataset="accounts",
+            symbol="",
+            run_id=database.run_id,
+            limit=10,
+        )
+        queried_system = query_observations(
+            connection,
+            dataset="system",
+            symbol="",
+            run_id=database.run_id,
+            limit=10,
+        )
+    assert queried[0]["client_oid"] == "order-1"
+    assert queried[0]["signed_markout_bps"] == -2.0002
+    assert queried_accounts[0]["equity"] == 10_005.0
+    assert queried_system[0]["severity"] == "ERROR"
+
+
+def test_schema_v1_is_migrated_in_place_without_losing_runs(tmp_path):
+    config = make_config(tmp_path)
+    journal = OMSJournal(config)
+    first = PaperTradeDatabase(config, journal)
+    first_run_id = first.run_id
+    assert first.close(clean_shutdown=True, reason="before_migration")
+
+    path = Path(config["paper_trade_database"]["path"])
+    upgraded_fill_columns = (
+        "fill_trigger",
+        "market_trade_id",
+        "market_trade_price",
+        "market_trade_qty",
+        "market_trade_exchange_time",
+        "market_trade_received_time",
+        "market_trade_clock_offset_ms",
+        "market_trade_transport_latency_ms",
+        "market_trade_local_age_ms",
+        "queue_ahead_before",
+        "best_bid_at_fill",
+        "best_ask_at_fill",
+        "mid_at_fill",
+        "quote_age_ms",
+    )
+    with sqlite3.connect(path) as connection:
+        for column in upgraded_fill_columns:
+            connection.execute(f"ALTER TABLE paper_fills DROP COLUMN {column}")
+        connection.execute("PRAGMA user_version=1")
+        connection.execute(
+            "UPDATE projection_metadata SET value='1' WHERE key='schema_version'"
+        )
+
+    second = PaperTradeDatabase(config, journal)
+    assert second.close(clean_shutdown=True, reason="after_migration")
+    with sqlite3.connect(path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(paper_fills)")
+        }
+        recovered_run = connection.execute(
+            "SELECT run_id FROM paper_runs WHERE run_id = ?",
+            (first_run_id,),
+        ).fetchone()
+    assert version == 3
+    assert set(upgraded_fill_columns) <= columns
+    assert recovered_run == (first_run_id,)
+
+
+def test_schema_v2_adds_telemetry_tables_and_columns(tmp_path):
+    config = make_config(tmp_path)
+    journal = OMSJournal(config)
+    first = PaperTradeDatabase(config, journal)
+    assert first.close(clean_shutdown=True, reason="before_v3_migration")
+
+    path = Path(config["paper_trade_database"]["path"])
+    fill_columns = (
+        "market_trade_exchange_time",
+        "market_trade_received_time",
+        "market_trade_clock_offset_ms",
+        "market_trade_transport_latency_ms",
+        "market_trade_local_age_ms",
+    )
+    order_columns = ("order_type", "reduce_only", "tag")
+    strategy_columns = (
+        "best_bid_qty",
+        "best_ask_qty",
+        "orderbook_exchange_time",
+        "orderbook_received_time",
+        "orderbook_corrected_received_time",
+        "orderbook_dispatch_time",
+        "orderbook_received_monotonic",
+        "orderbook_dispatch_monotonic",
+        "strategy_callback_monotonic",
+        "clock_offset_ms",
+        "transport_latency_ms",
+        "gateway_processing_latency_ms",
+        "strategy_queue_latency_ms",
+        "callback_age_ms",
+        "strategy_compute_latency_ms",
+    )
+    with sqlite3.connect(path) as connection:
+        for table, columns in (
+            ("paper_fills", fill_columns),
+            ("paper_order_events", order_columns),
+            ("paper_strategy_samples", strategy_columns),
+        ):
+            for column in columns:
+                connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+        connection.execute("DROP TABLE paper_account_samples")
+        connection.execute("DROP TABLE paper_system_events")
+        connection.execute("PRAGMA user_version=2")
+        connection.execute(
+            "UPDATE projection_metadata SET value='2' WHERE key='schema_version'"
+        )
+
+    second = PaperTradeDatabase(config, journal)
+    assert second.close(clean_shutdown=True, reason="after_v3_migration")
+    with sqlite3.connect(path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        restored = {}
+        for table in (
+            "paper_fills",
+            "paper_order_events",
+            "paper_strategy_samples",
+        ):
+            restored[table] = {
+                row[1]
+                for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+    assert version == 3
+    assert set(fill_columns) <= restored["paper_fills"]
+    assert set(order_columns) <= restored["paper_order_events"]
+    assert set(strategy_columns) <= restored["paper_strategy_samples"]
+    assert {"paper_account_samples", "paper_system_events"} <= tables
 
 
 def test_backfill_repairs_missing_run_start_sequence(tmp_path):

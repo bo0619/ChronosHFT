@@ -100,6 +100,38 @@ class OMSAccountTruth(OMSComponent):
         if paper_database is not None:
             payload["paper_run_id"] = paper_database.run_id
             payload["fill_model"] = str(update.fill_model or "unknown")
+            payload.update(
+                {
+                    "fill_trigger": str(update.fill_trigger or ""),
+                    "market_trade_id": (
+                        int(update.market_trade_id)
+                        if update.market_trade_id >= 0
+                        else None
+                    ),
+                    "market_trade_price": update.market_trade_price,
+                    "market_trade_qty": update.market_trade_qty,
+                    "market_trade_exchange_time": (
+                        update.market_trade_exchange_time
+                    ),
+                    "market_trade_received_time": (
+                        update.market_trade_received_time
+                    ),
+                    "market_trade_clock_offset_ms": (
+                        update.market_trade_clock_offset_ms
+                    ),
+                    "market_trade_transport_latency_ms": (
+                        update.market_trade_transport_latency_ms
+                    ),
+                    "market_trade_local_age_ms": (
+                        update.market_trade_local_age_ms
+                    ),
+                    "queue_ahead_before": update.queue_ahead_before,
+                    "best_bid_at_fill": update.best_bid_at_fill,
+                    "best_ask_at_fill": update.best_ask_at_fill,
+                    "mid_at_fill": update.mid_at_fill,
+                    "quote_age_ms": update.quote_age_ms,
+                }
+            )
         committed_seq = self.audit_logger.audit("execution_record", payload)
         if paper_database is not None:
             metadata = self.journal.commit_metadata(committed_seq) or {}

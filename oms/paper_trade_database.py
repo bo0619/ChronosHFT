@@ -16,7 +16,7 @@ from infrastructure.logger import logger
 from infrastructure.paper_trade import validate_paper_trade_database_config
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 LEGACY_RUN_ID = "legacy-journal-import"
 
 
@@ -64,6 +64,15 @@ def _integer(value, default=-1):
         return int(default)
 
 
+def _nullable_integer(value):
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class PaperTradeDatabase:
     """Maintain an idempotent, query-oriented projection of Paper fills."""
 
@@ -107,6 +116,20 @@ class PaperTradeDatabase:
             100,
             int(database_config.get("queue_capacity", 10_000) or 10_000),
         )
+        self.strategy_sample_interval_sec = max(
+            0.1,
+            float(
+                database_config.get("strategy_sample_interval_sec", 1.0)
+                or 1.0
+            ),
+        )
+        self.account_sample_interval_sec = max(
+            0.1,
+            float(
+                database_config.get("account_sample_interval_sec", 1.0)
+                or 1.0
+            ),
+        )
         self.run_id = uuid.uuid4().hex
         self.started_at_utc = _utc_now()
         self.config_sha256 = hashlib.sha256(
@@ -133,14 +156,25 @@ class PaperTradeDatabase:
         self._queue = queue.Queue(maxsize=queue_capacity)
         self._health_lock = threading.Lock()
         self._close_lock = threading.Lock()
+        self._sample_lock = threading.Lock()
+        self._last_strategy_sample_time: dict[str, float] = {}
+        self._last_account_sample_time: float | None = None
         self._accepting = True
         self._closed = False
         self._close_result = False
         self._healthy = True
         self._last_error = ""
         self._committed_fill_count = 0
+        self._committed_order_event_count = 0
+        self._committed_strategy_sample_count = 0
+        self._committed_markout_count = 0
+        self._committed_account_sample_count = 0
+        self._committed_system_event_count = 0
+        self._throttled_strategy_sample_count = 0
+        self._throttled_account_sample_count = 0
         self._backfilled_fill_count = 0
         self._failed_fill_count = 0
+        self._failed_observation_count = 0
         self._thread = None
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -183,7 +217,7 @@ class PaperTradeDatabase:
 
     def _create_schema(self, connection) -> None:
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if version not in {0, SCHEMA_VERSION}:
+        if version not in {0, 1, 2, SCHEMA_VERSION}:
             raise PaperTradeDatabaseError(
                 f"Unsupported Paper trade database schema version: {version}"
             )
@@ -239,7 +273,162 @@ class PaperTradeDatabase:
                 fill_model TEXT NOT NULL,
                 reduce_only INTEGER NOT NULL,
                 pre_status TEXT NOT NULL,
+                fill_trigger TEXT NOT NULL DEFAULT '',
+                market_trade_id INTEGER,
+                market_trade_price REAL,
+                market_trade_qty REAL,
+                market_trade_exchange_time REAL,
+                market_trade_received_time REAL,
+                market_trade_clock_offset_ms REAL,
+                market_trade_transport_latency_ms REAL,
+                market_trade_local_age_ms REAL,
+                queue_ahead_before REAL,
+                best_bid_at_fill REAL,
+                best_ask_at_fill REAL,
+                mid_at_fill REAL,
+                quote_age_ms REAL,
                 raw_payload_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS paper_order_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at_utc TEXT NOT NULL,
+                run_id TEXT NOT NULL REFERENCES paper_runs(run_id),
+                client_oid TEXT NOT NULL,
+                exchange_oid TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                strategy_id TEXT NOT NULL,
+                side TEXT NOT NULL,
+                status TEXT NOT NULL,
+                price REAL NOT NULL,
+                quantity REAL NOT NULL,
+                filled_quantity REAL NOT NULL,
+                average_price REAL NOT NULL,
+                time_in_force TEXT NOT NULL,
+                is_post_only INTEGER NOT NULL,
+                is_rpi INTEGER NOT NULL,
+                order_type TEXT NOT NULL DEFAULT '',
+                reduce_only INTEGER NOT NULL DEFAULT 0,
+                tag TEXT NOT NULL DEFAULT '',
+                created_monotonic REAL,
+                updated_monotonic REAL,
+                event_time REAL,
+                error_message TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS paper_strategy_samples (
+                sample_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at_utc TEXT NOT NULL,
+                run_id TEXT NOT NULL REFERENCES paper_runs(run_id),
+                sample_time REAL,
+                symbol TEXT NOT NULL,
+                strategy_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                mid_price REAL,
+                best_bid REAL,
+                best_ask REAL,
+                best_bid_qty REAL,
+                best_ask_qty REAL,
+                fair_value REAL,
+                alpha_bps REAL,
+                target_bid REAL,
+                target_ask REAL,
+                market_spread_bps REAL,
+                quote_spread_bps REAL,
+                bid_quote_qty REAL,
+                ask_quote_qty REAL,
+                position_qty REAL,
+                position_notional REAL,
+                sigma_bps REAL,
+                A_per_s REAL,
+                k_per_bps REAL,
+                bid_markout_cost_bps REAL,
+                ask_markout_cost_bps REAL,
+                bid_flow_cost_bps REAL,
+                ask_flow_cost_bps REAL,
+                signed_trade_imbalance REAL,
+                microprice_offset_bps REAL,
+                bid_queue_latency_cost_bps REAL,
+                ask_queue_latency_cost_bps REAL,
+                bid_stale_depth_bps REAL,
+                ask_stale_depth_bps REAL,
+                bid_stale_at_risk INTEGER,
+                ask_stale_at_risk INTEGER,
+                bid_size_multiplier REAL,
+                ask_size_multiplier REAL,
+                orderbook_exchange_time REAL,
+                orderbook_received_time REAL,
+                orderbook_corrected_received_time REAL,
+                orderbook_dispatch_time REAL,
+                orderbook_received_monotonic REAL,
+                orderbook_dispatch_monotonic REAL,
+                strategy_callback_monotonic REAL,
+                clock_offset_ms REAL,
+                transport_latency_ms REAL,
+                gateway_processing_latency_ms REAL,
+                strategy_queue_latency_ms REAL,
+                callback_age_ms REAL,
+                strategy_compute_latency_ms REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS paper_fill_markouts (
+                markout_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at_utc TEXT NOT NULL,
+                run_id TEXT NOT NULL REFERENCES paper_runs(run_id),
+                client_oid TEXT NOT NULL,
+                trade_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                fill_price REAL NOT NULL,
+                horizon_ms INTEGER NOT NULL,
+                mid_price REAL NOT NULL,
+                signed_markout_bps REAL NOT NULL,
+                fill_observed_monotonic REAL NOT NULL,
+                mid_observed_monotonic REAL NOT NULL,
+                observation_lag_ms REAL NOT NULL,
+                UNIQUE(run_id, client_oid, trade_id, horizon_ms)
+            );
+
+            CREATE TABLE IF NOT EXISTS paper_account_samples (
+                sample_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at_utc TEXT NOT NULL,
+                run_id TEXT NOT NULL REFERENCES paper_runs(run_id),
+                sample_time REAL,
+                balance REAL NOT NULL,
+                equity REAL NOT NULL,
+                unrealized_pnl REAL NOT NULL,
+                available REAL NOT NULL,
+                used_margin REAL NOT NULL,
+                budget_balance REAL NOT NULL,
+                budget_available REAL NOT NULL,
+                maintenance_margin REAL NOT NULL,
+                margin_balance REAL NOT NULL,
+                maintenance_margin_ratio REAL NOT NULL,
+                margin_snapshot_time REAL,
+                margin_snapshot_synced INTEGER NOT NULL,
+                external_cash_flow_total REAL NOT NULL,
+                cash_flow_snapshot_time REAL,
+                cash_flow_snapshot_synced INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS paper_system_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at_utc TEXT NOT NULL,
+                run_id TEXT NOT NULL REFERENCES paper_runs(run_id),
+                event_time REAL,
+                event_kind TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                message TEXT NOT NULL,
+                state TEXT NOT NULL,
+                total_exposure REAL,
+                margin_ratio REAL,
+                order_count_local INTEGER,
+                order_count_remote INTEGER,
+                cancelling_count INTEGER,
+                fill_ratio REAL,
+                api_weight INTEGER,
+                is_sync_error INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_paper_fills_run_seq
@@ -250,8 +439,21 @@ class PaperTradeDatabase:
                 ON paper_fills(execution_id);
             CREATE INDEX IF NOT EXISTS idx_paper_fills_client_oid
                 ON paper_fills(client_oid);
+            CREATE INDEX IF NOT EXISTS idx_paper_order_events_run_symbol
+                ON paper_order_events(run_id, symbol, event_id);
+            CREATE INDEX IF NOT EXISTS idx_paper_order_events_client_oid
+                ON paper_order_events(run_id, client_oid, event_id);
+            CREATE INDEX IF NOT EXISTS idx_paper_strategy_samples_run_symbol_time
+                ON paper_strategy_samples(run_id, symbol, sample_time);
+            CREATE INDEX IF NOT EXISTS idx_paper_markouts_run_symbol_horizon
+                ON paper_fill_markouts(run_id, symbol, horizon_ms);
+            CREATE INDEX IF NOT EXISTS idx_paper_account_samples_run_time
+                ON paper_account_samples(run_id, sample_time);
+            CREATE INDEX IF NOT EXISTS idx_paper_system_events_run_time
+                ON paper_system_events(run_id, event_time);
             """
         )
+        self._migrate_to_v3(connection)
         connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
         metadata = dict(
@@ -277,6 +479,71 @@ class PaperTradeDatabase:
                 ("journal_path", str(self.journal_path)),
             ),
         )
+
+    @staticmethod
+    def _migrate_to_v3(connection) -> None:
+        fill_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(paper_fills)")
+        }
+        fill_additions = {
+            "fill_trigger": "TEXT NOT NULL DEFAULT ''",
+            "market_trade_id": "INTEGER",
+            "market_trade_price": "REAL",
+            "market_trade_qty": "REAL",
+            "market_trade_exchange_time": "REAL",
+            "market_trade_received_time": "REAL",
+            "market_trade_clock_offset_ms": "REAL",
+            "market_trade_transport_latency_ms": "REAL",
+            "market_trade_local_age_ms": "REAL",
+            "queue_ahead_before": "REAL",
+            "best_bid_at_fill": "REAL",
+            "best_ask_at_fill": "REAL",
+            "mid_at_fill": "REAL",
+            "quote_age_ms": "REAL",
+        }
+        for column, declaration in fill_additions.items():
+            if column in fill_columns:
+                continue
+            connection.execute(
+                f"ALTER TABLE paper_fills ADD COLUMN {column} {declaration}"
+            )
+
+        additions_by_table = {
+            "paper_order_events": {
+                "order_type": "TEXT NOT NULL DEFAULT ''",
+                "reduce_only": "INTEGER NOT NULL DEFAULT 0",
+                "tag": "TEXT NOT NULL DEFAULT ''",
+            },
+            "paper_strategy_samples": {
+                "best_bid_qty": "REAL",
+                "best_ask_qty": "REAL",
+                "orderbook_exchange_time": "REAL",
+                "orderbook_received_time": "REAL",
+                "orderbook_corrected_received_time": "REAL",
+                "orderbook_dispatch_time": "REAL",
+                "orderbook_received_monotonic": "REAL",
+                "orderbook_dispatch_monotonic": "REAL",
+                "strategy_callback_monotonic": "REAL",
+                "clock_offset_ms": "REAL",
+                "transport_latency_ms": "REAL",
+                "gateway_processing_latency_ms": "REAL",
+                "strategy_queue_latency_ms": "REAL",
+                "callback_age_ms": "REAL",
+                "strategy_compute_latency_ms": "REAL",
+            },
+        }
+        for table, additions in additions_by_table.items():
+            existing = {
+                str(row[1])
+                for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            for column, declaration in additions.items():
+                if column in existing:
+                    continue
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+                )
 
     def _bootstrap(self, records) -> None:
         detected_at = self.started_at_utc
@@ -444,10 +711,20 @@ class PaperTradeDatabase:
                 fill_notional, cum_filled_qty, exchange_status, exchange_time,
                 commission, commission_asset, booked_fee, realized_pnl,
                 is_maker, order_type, time_in_force, is_rpi, fill_model,
-                reduce_only, pre_status, raw_payload_json
+                reduce_only, pre_status, fill_trigger, market_trade_id,
+                market_trade_price, market_trade_qty,
+                market_trade_exchange_time, market_trade_received_time,
+                market_trade_clock_offset_ms,
+                market_trade_transport_latency_ms,
+                market_trade_local_age_ms, queue_ahead_before,
+                best_bid_at_fill, best_ask_at_fill, mid_at_fill, quote_age_ms,
+                raw_payload_json
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?
             )
             ON CONFLICT(journal_seq) DO NOTHING
             """,
@@ -482,7 +759,291 @@ class PaperTradeDatabase:
                 str(payload.get("fill_model", "") or "unknown"),
                 int(bool(payload.get("reduce_only", False))),
                 str(payload.get("pre_status", "") or ""),
+                str(payload.get("fill_trigger", "") or ""),
+                _integer(payload.get("market_trade_id"), -1)
+                if payload.get("market_trade_id") is not None
+                else None,
+                _finite_float(payload.get("market_trade_price")),
+                _finite_float(payload.get("market_trade_qty")),
+                _finite_float(payload.get("market_trade_exchange_time")),
+                _finite_float(payload.get("market_trade_received_time")),
+                _finite_float(payload.get("market_trade_clock_offset_ms")),
+                _finite_float(
+                    payload.get("market_trade_transport_latency_ms")
+                ),
+                _finite_float(payload.get("market_trade_local_age_ms")),
+                _finite_float(payload.get("queue_ahead_before")),
+                _finite_float(payload.get("best_bid_at_fill")),
+                _finite_float(payload.get("best_ask_at_fill")),
+                _finite_float(payload.get("mid_at_fill")),
+                _finite_float(payload.get("quote_age_ms")),
                 _canonical_json(payload),
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def _insert_order_event(self, connection, payload: dict) -> bool:
+        cursor = connection.execute(
+            """
+            INSERT INTO paper_order_events(
+                recorded_at_utc, run_id, client_oid, exchange_oid, symbol,
+                strategy_id, side, status, price, quantity, filled_quantity,
+                average_price, time_in_force, is_post_only, is_rpi,
+                order_type, reduce_only, tag, created_monotonic,
+                updated_monotonic, event_time,
+                error_message
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?
+            )
+            """,
+            (
+                _utc_now(),
+                self.run_id,
+                str(payload.get("client_oid", "") or ""),
+                str(payload.get("exchange_oid", "") or ""),
+                str(payload.get("symbol", "") or "").upper(),
+                str(payload.get("strategy_id", "") or ""),
+                str(payload.get("side", "") or "").upper(),
+                str(payload.get("status", "") or "").upper(),
+                _finite_float(payload.get("price"), 0.0),
+                _finite_float(payload.get("quantity"), 0.0),
+                _finite_float(payload.get("filled_quantity"), 0.0),
+                _finite_float(payload.get("average_price"), 0.0),
+                str(payload.get("time_in_force", "") or ""),
+                int(bool(payload.get("is_post_only", False))),
+                int(bool(payload.get("is_rpi", False))),
+                str(payload.get("order_type", "") or ""),
+                int(bool(payload.get("reduce_only", False))),
+                str(payload.get("tag", "") or ""),
+                _finite_float(payload.get("created_monotonic")),
+                _finite_float(payload.get("updated_monotonic")),
+                _finite_float(payload.get("event_time")),
+                str(payload.get("error_message", "") or ""),
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def _insert_strategy_sample(self, connection, payload: dict) -> bool:
+        params = payload.get("params", {})
+        params = params if isinstance(params, dict) else {}
+        adaptive = params.get("adaptive", {})
+        adaptive = adaptive if isinstance(adaptive, dict) else {}
+        markout = adaptive.get("markout", {})
+        markout = markout if isinstance(markout, dict) else {}
+        markout_sides = markout.get("sides", {})
+        markout_sides = markout_sides if isinstance(markout_sides, dict) else {}
+        bid_markout = markout_sides.get("BUY", {})
+        bid_markout = bid_markout if isinstance(bid_markout, dict) else {}
+        ask_markout = markout_sides.get("SELL", {})
+        ask_markout = ask_markout if isinstance(ask_markout, dict) else {}
+        flow = adaptive.get("flow_toxicity", {})
+        flow = flow if isinstance(flow, dict) else {}
+        bid_queue = adaptive.get("bid_queue", {})
+        bid_queue = bid_queue if isinstance(bid_queue, dict) else {}
+        ask_queue = adaptive.get("ask_queue", {})
+        ask_queue = ask_queue if isinstance(ask_queue, dict) else {}
+        stale = params.get("stale_quote_guard", {})
+        stale = stale if isinstance(stale, dict) else {}
+        sizing = params.get("size_optimization", {})
+        sizing = sizing if isinstance(sizing, dict) else {}
+        timing = params.get("market_data_timing", {})
+        timing = timing if isinstance(timing, dict) else {}
+
+        cursor = connection.execute(
+            """
+            INSERT INTO paper_strategy_samples(
+                recorded_at_utc, run_id, sample_time, symbol, strategy_id,
+                state, mode, mid_price, best_bid, best_ask,
+                best_bid_qty, best_ask_qty, fair_value,
+                alpha_bps, target_bid, target_ask, market_spread_bps,
+                quote_spread_bps, bid_quote_qty, ask_quote_qty, position_qty,
+                position_notional, sigma_bps, A_per_s, k_per_bps,
+                bid_markout_cost_bps, ask_markout_cost_bps,
+                bid_flow_cost_bps, ask_flow_cost_bps,
+                signed_trade_imbalance, microprice_offset_bps,
+                bid_queue_latency_cost_bps, ask_queue_latency_cost_bps,
+                bid_stale_depth_bps, ask_stale_depth_bps,
+                bid_stale_at_risk, ask_stale_at_risk,
+                bid_size_multiplier, ask_size_multiplier,
+                orderbook_exchange_time, orderbook_received_time,
+                orderbook_corrected_received_time,
+                orderbook_dispatch_time, orderbook_received_monotonic,
+                orderbook_dispatch_monotonic, strategy_callback_monotonic,
+                clock_offset_ms, transport_latency_ms,
+                gateway_processing_latency_ms, strategy_queue_latency_ms,
+                callback_age_ms, strategy_compute_latency_ms
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?
+            )
+            """,
+            (
+                _utc_now(),
+                self.run_id,
+                _finite_float(payload.get("sample_time")),
+                str(payload.get("symbol", "") or "").upper(),
+                str(params.get("strategy", "") or ""),
+                str(params.get("state", params.get("State", "")) or ""),
+                str(params.get("mode", params.get("Mode", "")) or ""),
+                _finite_float(params.get("mid_price")),
+                _finite_float(params.get("best_bid")),
+                _finite_float(params.get("best_ask")),
+                _finite_float(timing.get("best_bid_qty")),
+                _finite_float(timing.get("best_ask_qty")),
+                _finite_float(payload.get("fair_value", params.get("fair_value"))),
+                _finite_float(payload.get("alpha_bps", params.get("alpha_bps"))),
+                _finite_float(params.get("target_bid")),
+                _finite_float(params.get("target_ask")),
+                _finite_float(params.get("market_spread_bps")),
+                _finite_float(params.get("quote_spread_bps")),
+                _finite_float(params.get("bid_quote_qty")),
+                _finite_float(params.get("ask_quote_qty")),
+                _finite_float(params.get("position_qty")),
+                _finite_float(params.get("position_notional")),
+                _finite_float(params.get("sigma_bps")),
+                _finite_float(params.get("A_per_s")),
+                _finite_float(params.get("k_per_bps")),
+                _finite_float(bid_markout.get("adverse_cost_bps")),
+                _finite_float(ask_markout.get("adverse_cost_bps")),
+                _finite_float(flow.get("bid_adverse_cost_bps")),
+                _finite_float(flow.get("ask_adverse_cost_bps")),
+                _finite_float(flow.get("signed_trade_imbalance")),
+                _finite_float(flow.get("microprice_offset_bps")),
+                _finite_float(bid_queue.get("latency_cost_bps")),
+                _finite_float(ask_queue.get("latency_cost_bps")),
+                _finite_float(stale.get("bid_depth_bps")),
+                _finite_float(stale.get("ask_depth_bps")),
+                _nullable_bool(stale.get("bid_at_risk")),
+                _nullable_bool(stale.get("ask_at_risk")),
+                _finite_float(sizing.get("bid_multiplier")),
+                _finite_float(sizing.get("ask_multiplier")),
+                _finite_float(timing.get("exchange_timestamp")),
+                _finite_float(timing.get("received_timestamp")),
+                _finite_float(timing.get("corrected_received_timestamp")),
+                _finite_float(timing.get("dispatch_timestamp")),
+                _finite_float(timing.get("received_monotonic")),
+                _finite_float(timing.get("dispatch_monotonic")),
+                _finite_float(timing.get("callback_monotonic")),
+                _finite_float(timing.get("clock_offset_ms")),
+                _finite_float(timing.get("transport_latency_ms")),
+                _finite_float(
+                    timing.get("gateway_processing_latency_ms")
+                ),
+                _finite_float(timing.get("strategy_queue_latency_ms")),
+                _finite_float(timing.get("callback_age_ms")),
+                _finite_float(timing.get("strategy_compute_latency_ms")),
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def _insert_markout(self, connection, payload: dict) -> bool:
+        cursor = connection.execute(
+            """
+            INSERT INTO paper_fill_markouts(
+                recorded_at_utc, run_id, client_oid, trade_id, symbol, side,
+                fill_price, horizon_ms, mid_price, signed_markout_bps,
+                fill_observed_monotonic, mid_observed_monotonic,
+                observation_lag_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id, client_oid, trade_id, horizon_ms) DO NOTHING
+            """,
+            (
+                _utc_now(),
+                self.run_id,
+                str(payload.get("client_oid", "") or ""),
+                str(payload.get("trade_id", "") or ""),
+                str(payload.get("symbol", "") or "").upper(),
+                str(payload.get("side", "") or "").upper(),
+                _finite_float(payload.get("fill_price"), 0.0),
+                _integer(payload.get("horizon_ms"), 0),
+                _finite_float(payload.get("mid_price"), 0.0),
+                _finite_float(payload.get("signed_markout_bps"), 0.0),
+                _finite_float(payload.get("fill_observed_monotonic"), 0.0),
+                _finite_float(payload.get("mid_observed_monotonic"), 0.0),
+                _finite_float(payload.get("observation_lag_ms"), 0.0),
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def _insert_account_sample(self, connection, payload: dict) -> bool:
+        balance = _finite_float(payload.get("balance"), 0.0)
+        equity = _finite_float(payload.get("equity"), 0.0)
+        cursor = connection.execute(
+            """
+            INSERT INTO paper_account_samples(
+                recorded_at_utc, run_id, sample_time, balance, equity,
+                unrealized_pnl, available, used_margin, budget_balance,
+                budget_available, maintenance_margin, margin_balance,
+                maintenance_margin_ratio, margin_snapshot_time,
+                margin_snapshot_synced, external_cash_flow_total,
+                cash_flow_snapshot_time, cash_flow_snapshot_synced
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                _utc_now(),
+                self.run_id,
+                _finite_float(payload.get("sample_time")),
+                balance,
+                equity,
+                _finite_float(
+                    payload.get("unrealized_pnl"),
+                    equity - balance,
+                ),
+                _finite_float(payload.get("available"), 0.0),
+                _finite_float(payload.get("used_margin"), 0.0),
+                _finite_float(payload.get("budget_balance"), 0.0),
+                _finite_float(payload.get("budget_available"), 0.0),
+                _finite_float(payload.get("maintenance_margin"), 0.0),
+                _finite_float(payload.get("margin_balance"), 0.0),
+                _finite_float(
+                    payload.get("maintenance_margin_ratio"),
+                    0.0,
+                ),
+                _finite_float(payload.get("margin_snapshot_time")),
+                int(bool(payload.get("margin_snapshot_synced", False))),
+                _finite_float(
+                    payload.get("external_cash_flow_total"),
+                    0.0,
+                ),
+                _finite_float(payload.get("cash_flow_snapshot_time")),
+                int(bool(payload.get("cash_flow_snapshot_synced", False))),
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def _insert_system_event(self, connection, payload: dict) -> bool:
+        cursor = connection.execute(
+            """
+            INSERT INTO paper_system_events(
+                recorded_at_utc, run_id, event_time, event_kind, severity,
+                message, state, total_exposure, margin_ratio,
+                order_count_local, order_count_remote, cancelling_count,
+                fill_ratio, api_weight, is_sync_error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _utc_now(),
+                self.run_id,
+                _finite_float(payload.get("event_time")),
+                str(payload.get("event_kind", "") or ""),
+                str(payload.get("severity", "") or ""),
+                str(payload.get("message", "") or ""),
+                str(payload.get("state", "") or ""),
+                _finite_float(payload.get("total_exposure")),
+                _finite_float(payload.get("margin_ratio")),
+                _nullable_integer(payload.get("order_count_local")),
+                _nullable_integer(payload.get("order_count_remote")),
+                _nullable_integer(payload.get("cancelling_count")),
+                _finite_float(payload.get("fill_ratio")),
+                _nullable_integer(payload.get("api_weight")),
+                _nullable_bool(payload.get("is_sync_error")),
             ),
         )
         return cursor.rowcount == 1
@@ -538,6 +1099,7 @@ class PaperTradeDatabase:
             if not self._accepting or self._closed:
                 return False
             item = (
+                "execution",
                 int(journal_seq),
                 str(journal_ts or "") or _utc_now(),
                 str(journal_hash or "") or None,
@@ -553,6 +1115,69 @@ class PaperTradeDatabase:
                     "OMS journal will be backfilled on the next start"
                 )
                 return False
+
+    def _record_observation(self, kind: str, payload: dict) -> bool:
+        with self._close_lock:
+            if not self._accepting or self._closed:
+                return False
+            try:
+                self._queue.put_nowait((str(kind), dict(payload)))
+                return True
+            except queue.Full:
+                self._set_failure(f"{kind}_projection_queue_full", observation=True)
+                logger.error(
+                    "[PaperTradeDatabase] Observation projection queue is full: "
+                    f"kind={kind}"
+                )
+                return False
+
+    def record_order_event(self, payload: dict) -> bool:
+        return self._record_observation("order_event", payload)
+
+    def record_strategy_sample(self, payload: dict) -> bool:
+        normalized = dict(payload)
+        symbol = str(normalized.get("symbol", "") or "").upper()
+        sample_time = _finite_float(normalized.get("sample_time"))
+        with self._sample_lock:
+            previous = self._last_strategy_sample_time.get(symbol)
+            if (
+                sample_time is not None
+                and previous is not None
+                and sample_time >= previous
+                and sample_time - previous < self.strategy_sample_interval_sec
+            ):
+                with self._health_lock:
+                    self._throttled_strategy_sample_count += 1
+                return True
+            accepted = self._record_observation("strategy_sample", normalized)
+            if accepted and sample_time is not None:
+                self._last_strategy_sample_time[symbol] = sample_time
+            return accepted
+
+    def record_markout(self, payload: dict) -> bool:
+        return self._record_observation("markout", payload)
+
+    def record_account_sample(self, payload: dict) -> bool:
+        normalized = dict(payload)
+        sample_time = _finite_float(normalized.get("sample_time"))
+        with self._sample_lock:
+            previous = self._last_account_sample_time
+            if (
+                sample_time is not None
+                and previous is not None
+                and sample_time >= previous
+                and sample_time - previous < self.account_sample_interval_sec
+            ):
+                with self._health_lock:
+                    self._throttled_account_sample_count += 1
+                return True
+            accepted = self._record_observation("account_sample", normalized)
+            if accepted and sample_time is not None:
+                self._last_account_sample_time = sample_time
+            return accepted
+
+    def record_system_event(self, payload: dict) -> bool:
+        return self._record_observation("system_event", payload)
 
     def _writer_main(self) -> None:
         try:
@@ -572,25 +1197,60 @@ class PaperTradeDatabase:
                 try:
                     if item is self._STOP:
                         return
-                    journal_seq, journal_ts, journal_hash, payload = item
+                    kind = item[0]
+                    inserted = False
                     with connection:
-                        inserted = self._insert_fill(
-                            connection,
-                            journal_seq=journal_seq,
-                            journal_hash=journal_hash,
-                            journal_ts=journal_ts,
-                            payload=payload,
-                        )
-                    if inserted:
-                        with self._health_lock:
+                        if kind == "execution":
+                            _, journal_seq, journal_ts, journal_hash, payload = item
+                            inserted = self._insert_fill(
+                                connection,
+                                journal_seq=journal_seq,
+                                journal_hash=journal_hash,
+                                journal_ts=journal_ts,
+                                payload=payload,
+                            )
+                        elif kind == "order_event":
+                            inserted = self._insert_order_event(connection, item[1])
+                        elif kind == "strategy_sample":
+                            inserted = self._insert_strategy_sample(connection, item[1])
+                        elif kind == "markout":
+                            inserted = self._insert_markout(connection, item[1])
+                        elif kind == "account_sample":
+                            inserted = self._insert_account_sample(
+                                connection,
+                                item[1],
+                            )
+                        elif kind == "system_event":
+                            inserted = self._insert_system_event(
+                                connection,
+                                item[1],
+                            )
+                        else:
+                            raise ValueError(f"unsupported projection kind: {kind}")
+                    if not inserted:
+                        continue
+                    with self._health_lock:
+                        if kind == "execution":
                             self._committed_fill_count += 1
+                        elif kind == "order_event":
+                            self._committed_order_event_count += 1
+                        elif kind == "strategy_sample":
+                            self._committed_strategy_sample_count += 1
+                        elif kind == "markout":
+                            self._committed_markout_count += 1
+                        elif kind == "account_sample":
+                            self._committed_account_sample_count += 1
+                        elif kind == "system_event":
+                            self._committed_system_event_count += 1
                 except Exception as exc:
+                    kind = item[0] if isinstance(item, tuple) and item else "unknown"
                     self._set_failure(
-                        f"fill_projection_failed:{type(exc).__name__}:{exc}"
+                        f"{kind}_projection_failed:{type(exc).__name__}:{exc}",
+                        observation=kind != "execution",
                     )
                     logger.critical(
-                        "[PaperTradeDatabase] Fill projection failed; the OMS "
-                        "journal remains authoritative and will be backfilled: "
+                        "[PaperTradeDatabase] Projection failed: "
+                        f"kind={kind} "
                         f"{type(exc).__name__}:{exc}"
                     )
                 finally:
@@ -605,15 +1265,21 @@ class PaperTradeDatabase:
                 if item is self._STOP:
                     return
                 with self._health_lock:
-                    self._failed_fill_count += 1
+                    if isinstance(item, tuple) and item and item[0] == "execution":
+                        self._failed_fill_count += 1
+                    else:
+                        self._failed_observation_count += 1
             finally:
                 self._queue.task_done()
 
-    def _set_failure(self, reason: str) -> None:
+    def _set_failure(self, reason: str, *, observation: bool = False) -> None:
         with self._health_lock:
             self._healthy = False
             self._last_error = str(reason)
-            self._failed_fill_count += 1
+            if observation:
+                self._failed_observation_count += 1
+            else:
+                self._failed_fill_count += 1
 
     def close(self, *, clean_shutdown: bool, reason: str = "") -> bool:
         with self._close_lock:
@@ -674,8 +1340,26 @@ class PaperTradeDatabase:
                 "run_id": self.run_id,
                 "queue_depth": self._queue.qsize(),
                 "committed_fill_count": self._committed_fill_count,
+                "committed_order_event_count": self._committed_order_event_count,
+                "committed_strategy_sample_count": (
+                    self._committed_strategy_sample_count
+                ),
+                "throttled_strategy_sample_count": (
+                    self._throttled_strategy_sample_count
+                ),
+                "committed_markout_count": self._committed_markout_count,
+                "committed_account_sample_count": (
+                    self._committed_account_sample_count
+                ),
+                "throttled_account_sample_count": (
+                    self._throttled_account_sample_count
+                ),
+                "committed_system_event_count": (
+                    self._committed_system_event_count
+                ),
                 "backfilled_fill_count": self._backfilled_fill_count,
                 "failed_fill_count": self._failed_fill_count,
+                "failed_observation_count": self._failed_observation_count,
                 "last_error": self._last_error,
                 "closed": self._closed,
             }

@@ -4,6 +4,8 @@
     "path": "storage/paper/trades.sqlite3",
     "sqlite_timeout_sec": 5.0,
     "queue_capacity": 10000,
-    "close_timeout_sec": 10.0
+    "close_timeout_sec": 10.0,
+    "strategy_sample_interval_sec": 1.0,
+    "account_sample_interval_sec": 1.0
   }
 }

@@ -1251,7 +1251,13 @@ def _run_main(argv=None, runtime=None):
         if web_dashboard is not None:
             web_dashboard.update_market_trade(event.data)
 
+    def record_paper_observation(method_name, *args):
+        recorder = getattr(oms_system, method_name, None)
+        if callable(recorder):
+            recorder(*args)
+
     def on_order_cold(event):
+        record_paper_observation("record_paper_order_event", event.data)
         strategy_runtime.on_order(event.data)
         if web_dashboard is not None:
             web_dashboard.update_order(event.data)
@@ -1267,20 +1273,38 @@ def _run_main(argv=None, runtime=None):
             web_dashboard.update_position(event.data)
 
     def on_account_cold(event):
+        record_paper_observation(
+            "record_paper_account_sample",
+            event.data,
+        )
         strategy_runtime.on_account_update(event.data)
         if web_dashboard is not None:
             web_dashboard.update_account(event.data)
 
     def on_strategy_cold(event):
+        record_paper_observation(
+            "record_paper_strategy_sample",
+            event.data,
+        )
         if web_dashboard is not None:
             web_dashboard.update_strategy(event.data)
 
     def on_system_health_cold(event):
+        record_paper_observation(
+            "record_paper_system_event",
+            "system_health",
+            event.data,
+        )
         strategy_runtime.on_system_health(event.data)
         if web_dashboard is not None:
             web_dashboard.update_system_health(event.data)
 
     def on_alert_cold(event):
+        record_paper_observation(
+            "record_paper_system_event",
+            "alert",
+            event.data,
+        )
         if web_dashboard is not None:
             web_dashboard.update_alert(event.data)
         if external_alerts is not None:
@@ -1302,10 +1326,17 @@ def _run_main(argv=None, runtime=None):
     register_cold(EVENT_ACCOUNT_UPDATE, on_account_cold)
     register_cold(EVENT_STRATEGY_UPDATE, on_strategy_cold)
     register_cold(EVENT_SYSTEM_HEALTH, on_system_health_cold)
-    register_cold(
-        EVENT_API_LIMIT,
-        lambda e: web_dashboard.update_api_limit(e.data) if web_dashboard else None,
-    )
+
+    def on_api_limit_cold(event):
+        record_paper_observation(
+            "record_paper_system_event",
+            "api_limit",
+            event.data,
+        )
+        if web_dashboard is not None:
+            web_dashboard.update_api_limit(event.data)
+
+    register_cold(EVENT_API_LIMIT, on_api_limit_cold)
     register_cold(EVENT_ALERT, on_alert_cold)
     register_cold(
         EVENT_LOG,

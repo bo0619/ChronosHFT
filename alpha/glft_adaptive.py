@@ -18,24 +18,37 @@ import numpy as np
 from event.type import Side
 
 
-@dataclass(slots=True)
-class _RunningMoments:
-    count: int = 0
-    mean: float = 0.0
-    m2: float = 0.0
+class _RollingMoments:
+    def __init__(self, max_samples: int) -> None:
+        self.max_samples = _positive_int(max_samples)
+        self.values: deque[float] = deque()
+        self.total = 0.0
+        self.total_squared = 0.0
 
     def update(self, value: float) -> None:
-        value = _finite(value, "observation")
-        self.count += 1
-        delta = value - self.mean
-        self.mean += delta / self.count
-        self.m2 += delta * (value - self.mean)
+        parsed = _finite(value, "observation")
+        if len(self.values) >= self.max_samples:
+            removed = self.values.popleft()
+            self.total -= removed
+            self.total_squared -= removed * removed
+        self.values.append(parsed)
+        self.total += parsed
+        self.total_squared += parsed * parsed
+
+    @property
+    def count(self) -> int:
+        return len(self.values)
+
+    @property
+    def mean(self) -> float:
+        return self.total / self.count if self.count else 0.0
 
     @property
     def variance(self) -> float:
         if self.count < 2:
             return 0.0
-        return max(0.0, self.m2 / (self.count - 1))
+        centered_sum = self.total_squared - self.total * self.total / self.count
+        return max(0.0, centered_sum / (self.count - 1))
 
     @property
     def standard_error(self) -> float:
@@ -53,8 +66,88 @@ class MarkoutEstimate:
     standard_error_bps: float | None
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedFillMarkout:
+    client_oid: str
+    trade_id: str
+    symbol: str
+    side: Side
+    fill_price: float
+    horizon_ms: int
+    mid_price: float
+    signed_markout_bps: float
+    fill_observed_monotonic: float
+    mid_observed_monotonic: float
+    observation_lag_ms: float
+
+
+@dataclass(frozen=True, slots=True)
+class FlowAdverseCostEstimate:
+    microprice_offset_bps: float
+    signed_trade_imbalance: float
+    bid_adverse_cost_bps: float
+    ask_adverse_cost_bps: float
+
+
+def estimate_flow_adverse_costs(
+    *,
+    mid_price: float,
+    best_bid: float,
+    best_ask: float,
+    bid_quantity: float,
+    ask_quantity: float,
+    signed_trade_imbalance: float,
+    trade_imbalance_cost_bps: float,
+    microprice_weight: float,
+    max_adverse_cost_bps: float,
+) -> FlowAdverseCostEstimate:
+    """Convert directional book and trade pressure into side-specific cost."""
+
+    mid = _positive(mid_price, "mid_price")
+    bid = _positive(best_bid, "best_bid")
+    ask = _positive(best_ask, "best_ask")
+    if not bid < mid < ask:
+        raise ValueError("best_bid < mid_price < best_ask is required")
+    bid_qty = _nonnegative(bid_quantity, "bid_quantity")
+    ask_qty = _nonnegative(ask_quantity, "ask_quantity")
+    imbalance = max(
+        -1.0,
+        min(1.0, _finite(signed_trade_imbalance, "signed_trade_imbalance")),
+    )
+    trade_cost = _nonnegative(
+        trade_imbalance_cost_bps,
+        "trade_imbalance_cost_bps",
+    )
+    book_weight = _nonnegative(microprice_weight, "microprice_weight")
+    cost_cap = _nonnegative(max_adverse_cost_bps, "max_adverse_cost_bps")
+
+    total_quantity = bid_qty + ask_qty
+    microprice = (
+        (ask * bid_qty + bid * ask_qty) / total_quantity
+        if total_quantity > 0.0
+        else mid
+    )
+    microprice_offset = math.log(microprice / mid) * 10_000.0
+    bid_cost = (
+        trade_cost * max(0.0, -imbalance)
+        + book_weight * max(0.0, -microprice_offset)
+    )
+    ask_cost = (
+        trade_cost * max(0.0, imbalance)
+        + book_weight * max(0.0, microprice_offset)
+    )
+    return FlowAdverseCostEstimate(
+        microprice_offset_bps=microprice_offset,
+        signed_trade_imbalance=imbalance,
+        bid_adverse_cost_bps=min(cost_cap, bid_cost),
+        ask_adverse_cost_bps=min(cost_cap, ask_cost),
+    )
+
+
 @dataclass(slots=True)
 class _PendingFill:
+    client_oid: str
+    trade_id: str
     symbol: str
     side: Side
     price: float
@@ -72,6 +165,7 @@ class FillMarkoutEstimator:
         min_samples: int = 20,
         confidence_z: float = 1.645,
         max_pending: int = 5000,
+        window_size: int = 500,
     ) -> None:
         parsed_horizons = tuple(sorted({_positive_int(value) for value in horizons_ms}))
         if not parsed_horizons:
@@ -80,9 +174,13 @@ class FillMarkoutEstimator:
         self.min_samples = _positive_int(min_samples)
         self.confidence_z = _nonnegative(confidence_z, "confidence_z")
         self.max_pending = _positive_int(max_pending)
+        self.window_size = _positive_int(window_size)
+        if self.window_size < self.min_samples:
+            raise ValueError("window_size must be at least min_samples")
         self._pending: deque[_PendingFill] = deque()
-        self._moments: dict[tuple[str, Side, int], _RunningMoments] = defaultdict(
-            _RunningMoments
+        self._resolved: deque[ResolvedFillMarkout] = deque()
+        self._moments: dict[tuple[str, Side, int], _RollingMoments] = defaultdict(
+            lambda: _RollingMoments(self.window_size)
         )
 
     def record_fill(
@@ -92,12 +190,16 @@ class FillMarkoutEstimator:
         side: Side | str,
         fill_price: float,
         observed_at_monotonic: float,
+        client_oid: str = "",
+        trade_id: str = "",
     ) -> None:
         parsed_side = _side(side)
         price = _positive(fill_price, "fill_price")
         timestamp = _nonnegative(observed_at_monotonic, "observed_at_monotonic")
         self._pending.append(
             _PendingFill(
+                client_oid=str(client_oid or ""),
+                trade_id=str(trade_id or ""),
                 symbol=_symbol(symbol),
                 side=parsed_side,
                 price=price,
@@ -136,11 +238,31 @@ class FillMarkoutEstimator:
                 self._moments[
                     (pending.symbol, pending.side, horizon_ms)
                 ].update(signed_markout)
+                self._resolved.append(
+                    ResolvedFillMarkout(
+                        client_oid=pending.client_oid,
+                        trade_id=pending.trade_id,
+                        symbol=pending.symbol,
+                        side=pending.side,
+                        fill_price=pending.price,
+                        horizon_ms=horizon_ms,
+                        mid_price=mid,
+                        signed_markout_bps=signed_markout,
+                        fill_observed_monotonic=pending.observed_at_monotonic,
+                        mid_observed_monotonic=timestamp,
+                        observation_lag_ms=max(0.0, age_ms - horizon_ms),
+                    )
+                )
                 pending.unresolved_horizons_ms.remove(horizon_ms)
                 resolved += 1
             if pending.unresolved_horizons_ms:
                 retained.append(pending)
         self._pending = retained
+        return resolved
+
+    def drain_resolved(self) -> tuple[ResolvedFillMarkout, ...]:
+        resolved = tuple(self._resolved)
+        self._resolved.clear()
         return resolved
 
     def estimate(self, symbol: str, side: Side | str) -> MarkoutEstimate:
@@ -177,7 +299,11 @@ class FillMarkoutEstimator:
 
     def summary(self, symbol: str) -> dict[str, object]:
         normalized_symbol = _symbol(symbol)
-        result: dict[str, object] = {"pending_fill_count": 0, "sides": {}}
+        result: dict[str, object] = {
+            "pending_fill_count": 0,
+            "window_size": self.window_size,
+            "sides": {},
+        }
         result["pending_fill_count"] = sum(
             pending.symbol == normalized_symbol for pending in self._pending
         )

@@ -1526,6 +1526,11 @@ class PaperGatewayTests(unittest.TestCase):
                         1.0,
                         True,
                         datetime.now(),
+                        exchange_timestamp=1000.0,
+                        received_timestamp=1000.012,
+                        received_monotonic=time.perf_counter() - 0.01,
+                        clock_offset_ms=-2.0,
+                        corrected_received_timestamp=1000.01,
                     ),
                 ),
             )
@@ -1543,6 +1548,23 @@ class PaperGatewayTests(unittest.TestCase):
             if update.status == "FILLED"
         )
         self.assertEqual(fill_update.fill_model, "rpi_public_trade_proxy")
+        self.assertEqual(fill_update.fill_trigger, "through")
+        self.assertEqual(fill_update.market_trade_id, 11)
+        self.assertEqual(fill_update.market_trade_price, 99.0)
+        self.assertEqual(fill_update.market_trade_qty, 1.0)
+        self.assertEqual(fill_update.market_trade_exchange_time, 1000.0)
+        self.assertEqual(fill_update.market_trade_received_time, 1000.012)
+        self.assertEqual(fill_update.market_trade_clock_offset_ms, -2.0)
+        self.assertAlmostEqual(
+            fill_update.market_trade_transport_latency_ms,
+            10.0,
+        )
+        self.assertGreaterEqual(fill_update.market_trade_local_age_ms, 0.0)
+        self.assertIsNotNone(fill_update.queue_ahead_before)
+        self.assertIsNotNone(fill_update.best_bid_at_fill)
+        self.assertIsNotNone(fill_update.best_ask_at_fill)
+        self.assertIsNotNone(fill_update.mid_at_fill)
+        self.assertGreaterEqual(fill_update.quote_age_ms, 0.0)
         self.assertAlmostEqual(float(trade["commission"]), 0.003)
         self.assertAlmostEqual(
             float(gateway.get_account_info()["totalWalletBalance"]),

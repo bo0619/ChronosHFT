@@ -39,6 +39,7 @@ from event.type import (
 )
 from data.ref_data import ContractInfo, ref_data_manager
 from alpha.factors import GLFTCalibrator
+from alpha.glft_adaptive import FillMarkoutEstimator, estimate_flow_adverse_costs
 from oms.engine import OMS
 from strategy.avellaneda_stoikov import AvellanedaStoikovStrategy
 from strategy.base import StrategyTemplate
@@ -121,6 +122,7 @@ class PassiveQuoteOMS:
         self.account = SimpleNamespace(equity=1000.0, used_margin=0.0)
         self.submitted = []
         self.cancelled = []
+        self.paper_markouts = []
         self.submit_allowed = True
 
     def can_submit_for_strategy(self, _strategy_id, _symbol=""):
@@ -132,6 +134,10 @@ class PassiveQuoteOMS:
 
     def cancel_order(self, client_oid):
         self.cancelled.append(client_oid)
+        return True
+
+    def record_paper_markout(self, payload):
+        self.paper_markouts.append(dict(payload))
         return True
 
 
@@ -353,6 +359,192 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
         self.assertFalse(telemetry[0]["recent_fill_defense"])
         self.assertTrue(telemetry[1]["recent_fill_defense"])
         self.assertFalse(telemetry[2]["recent_fill_defense"])
+
+    def test_glft_paper_cycle_and_spread_overrides_apply(self):
+        strategy = GLFTStrategy(
+            DispatchingEngine(),
+            PassiveQuoteOMS(),
+            strategy_config={
+                "glft": {
+                    "cycle_interval": 1.0,
+                    "paper_cycle_interval": 0.5,
+                    "execution": {
+                        "min_spread_bps": 5.0,
+                        "paper_min_spread_bps": 8.0,
+                    },
+                }
+            },
+        )
+
+        self.assertEqual(strategy.cycle_interval, 0.5)
+        self.assertEqual(strategy.min_spread_bps, 8.0)
+
+    def test_glft_paper_stale_quote_guard_cancels_only_attacked_side(self):
+        engine = DispatchingEngine()
+        oms = PassiveQuoteOMS()
+        strategy = GLFTStrategy(
+            engine,
+            oms,
+            strategy_config={
+                "glft": {
+                    "adaptive": {
+                        "stale_quote_guard": {
+                            "enabled": True,
+                            "min_depth_bps": 1.5,
+                        }
+                    }
+                }
+            },
+        )
+        strategy.cooldown_ms = 0
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"LTCUSDT": self.make_contract()},
+            clear=True,
+        ):
+            strategy._update_quotes("LTCUSDT", 99.0, 101.0, 0.1)
+
+        result = strategy._guard_stale_quotes(
+            symbol="LTCUSDT",
+            mid_price=99.01,
+        )
+
+        self.assertTrue(result["bid_at_risk"])
+        self.assertTrue(result["bid_cancel_requested"])
+        self.assertFalse(result["ask_at_risk"])
+        self.assertEqual(oms.cancelled, ["passive-1"])
+
+    def test_glft_orderflow_imbalance_decays_by_elapsed_time(self):
+        strategy = GLFTStrategy(
+            DispatchingEngine(),
+            PassiveQuoteOMS(),
+            strategy_config={
+                "glft": {
+                    "adaptive": {
+                        "flow_toxicity": {"half_life_s": 1.0}
+                    }
+                }
+            },
+        )
+        strategy.imbalance_ewma["LTCUSDT"] = 0.8
+        strategy.imbalance_updated_at["LTCUSDT"] = 10.0
+
+        self.assertAlmostEqual(
+            strategy._decayed_orderflow_imbalance("LTCUSDT", 11.0),
+            0.4,
+        )
+        strategy.live_mode = True
+        self.assertEqual(
+            strategy._decayed_orderflow_imbalance("LTCUSDT", 11.0),
+            0.8,
+        )
+
+    def test_glft_markout_uses_only_the_configured_recent_window(self):
+        estimator = FillMarkoutEstimator(
+            horizons_ms=(100,),
+            min_samples=2,
+            confidence_z=0.0,
+            window_size=2,
+        )
+        for index, future_mid in enumerate((101.0, 101.0, 99.0, 99.0)):
+            timestamp = float(index)
+            estimator.record_fill(
+                symbol="LTCUSDT",
+                side=Side.BUY,
+                fill_price=100.0,
+                observed_at_monotonic=timestamp,
+            )
+            estimator.observe_mid(
+                symbol="LTCUSDT",
+                mid_price=future_mid,
+                observed_at_monotonic=timestamp + 0.1,
+            )
+
+        estimate = estimator.estimate("LTCUSDT", Side.BUY)
+        expected = -math.log(99.0 / 100.0) * 10_000.0
+        self.assertEqual(estimate.sample_count, 2)
+        self.assertAlmostEqual(estimate.adverse_cost_bps, expected)
+        self.assertEqual(estimator.summary("LTCUSDT")["window_size"], 2)
+
+    def test_glft_persists_resolved_markout_with_fill_identity(self):
+        oms = PassiveQuoteOMS()
+        strategy = GLFTStrategy(
+            DispatchingEngine(),
+            oms,
+            strategy_config={
+                "glft": {
+                    "adaptive": {
+                        "enabled": True,
+                        "markout": {
+                            "horizons_ms": [100],
+                            "min_samples": 1,
+                            "window_size": 10,
+                        },
+                    }
+                }
+            },
+        )
+        with patch("strategy.glft.time.perf_counter", return_value=10.0):
+            strategy.on_trade(
+                TradeData(
+                    symbol="LTCUSDT",
+                    order_id="client-1",
+                    trade_id="trade-1",
+                    side="BUY",
+                    price=100.0,
+                    volume=0.1,
+                    datetime=datetime.utcnow(),
+                )
+            )
+        strategy.adaptive_markout.observe_mid(
+            symbol="LTCUSDT",
+            mid_price=99.9,
+            observed_at_monotonic=10.11,
+        )
+        strategy._record_resolved_paper_markouts()
+
+        self.assertEqual(len(oms.paper_markouts), 1)
+        self.assertEqual(oms.paper_markouts[0]["client_oid"], "client-1")
+        self.assertEqual(oms.paper_markouts[0]["trade_id"], "trade-1")
+        self.assertEqual(oms.paper_markouts[0]["horizon_ms"], 100)
+        self.assertAlmostEqual(oms.paper_markouts[0]["observation_lag_ms"], 10.0)
+
+    def test_glft_flow_adverse_cost_targets_the_attacked_side(self):
+        sell_pressure = estimate_flow_adverse_costs(
+            mid_price=100.0,
+            best_bid=99.9,
+            best_ask=100.1,
+            bid_quantity=1.0,
+            ask_quantity=4.0,
+            signed_trade_imbalance=-0.8,
+            trade_imbalance_cost_bps=2.0,
+            microprice_weight=1.0,
+            max_adverse_cost_bps=2.5,
+        )
+        buy_pressure = estimate_flow_adverse_costs(
+            mid_price=100.0,
+            best_bid=99.9,
+            best_ask=100.1,
+            bid_quantity=4.0,
+            ask_quantity=1.0,
+            signed_trade_imbalance=0.8,
+            trade_imbalance_cost_bps=2.0,
+            microprice_weight=1.0,
+            max_adverse_cost_bps=2.5,
+        )
+
+        self.assertLess(sell_pressure.microprice_offset_bps, 0.0)
+        self.assertGreater(
+            sell_pressure.bid_adverse_cost_bps,
+            sell_pressure.ask_adverse_cost_bps,
+        )
+        self.assertGreater(buy_pressure.microprice_offset_bps, 0.0)
+        self.assertGreater(
+            buy_pressure.ask_adverse_cost_bps,
+            buy_pressure.bid_adverse_cost_bps,
+        )
+        self.assertLessEqual(sell_pressure.bid_adverse_cost_bps, 2.5)
+        self.assertLessEqual(buy_pressure.ask_adverse_cost_bps, 2.5)
 
     def test_glft_portfolio_risk_requires_fresh_full_universe(self):
         engine = DispatchingEngine()
