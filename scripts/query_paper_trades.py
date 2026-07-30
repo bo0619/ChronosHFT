@@ -30,6 +30,7 @@ def parse_args(argv=None):
             "markouts",
             "accounts",
             "system",
+            "markets",
         ),
         default="fills",
         help="Dataset to query (default: fills)",
@@ -173,7 +174,8 @@ def query_observations(
                 orderbook_dispatch_time, clock_offset_ms,
                 transport_latency_ms, gateway_processing_latency_ms,
                 strategy_queue_latency_ms, callback_age_ms,
-                strategy_compute_latency_ms, recorded_at_utc
+                strategy_compute_latency_ms, formula_version, units_version,
+                intensity_source, recorded_at_utc
             """,
             "sample_id",
             True,
@@ -213,6 +215,18 @@ def query_observations(
             """,
             "event_id",
             False,
+        ),
+        "markets": (
+            "paper_market_samples",
+            """
+                sample_id, run_id, sample_time, symbol, mark_price,
+                index_price, basis_bps, funding_rate, next_funding_time,
+                exchange_time, received_time, corrected_received_time,
+                dispatch_time, clock_offset_ms, transport_latency_ms,
+                gateway_processing_latency_ms, recorded_at_utc
+            """,
+            "sample_id",
+            True,
         ),
     }
     if dataset not in specs:

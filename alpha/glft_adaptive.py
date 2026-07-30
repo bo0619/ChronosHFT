@@ -550,7 +550,8 @@ class DynamicCovarianceEstimator:
 class _TradeRateState:
     buy_qty_per_s: float = 0.0
     sell_qty_per_s: float = 0.0
-    updated_at_monotonic: float | None = None
+    buy_updated_at_monotonic: float | None = None
+    sell_updated_at_monotonic: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -605,19 +606,27 @@ class QueueLatencyEstimator:
         qty = _positive(quantity, "quantity")
         timestamp = _nonnegative(observed_at_monotonic, "observed_at_monotonic")
         state = self._states[normalized_symbol]
-        if state.updated_at_monotonic is None:
-            instantaneous_rate = self.default_service_rate_qty_per_s
-        else:
-            elapsed = max(1e-3, timestamp - state.updated_at_monotonic)
-            instantaneous_rate = qty / elapsed
         alpha = self.rate_ewma_alpha
         if side == Side.BUY:
+            previous_time = state.buy_updated_at_monotonic
+            instantaneous_rate = (
+                self.default_service_rate_qty_per_s
+                if previous_time is None
+                else qty / max(1e-3, timestamp - previous_time)
+            )
             previous = state.buy_qty_per_s or self.default_service_rate_qty_per_s
             state.buy_qty_per_s = (1.0 - alpha) * previous + alpha * instantaneous_rate
+            state.buy_updated_at_monotonic = timestamp
         else:
+            previous_time = state.sell_updated_at_monotonic
+            instantaneous_rate = (
+                self.default_service_rate_qty_per_s
+                if previous_time is None
+                else qty / max(1e-3, timestamp - previous_time)
+            )
             previous = state.sell_qty_per_s or self.default_service_rate_qty_per_s
             state.sell_qty_per_s = (1.0 - alpha) * previous + alpha * instantaneous_rate
-        state.updated_at_monotonic = timestamp
+            state.sell_updated_at_monotonic = timestamp
 
     def estimate(
         self,

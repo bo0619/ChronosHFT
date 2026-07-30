@@ -1,6 +1,7 @@
 import sqlite3
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -106,6 +107,47 @@ def fetch_one(path: Path, sql: str, parameters=()):
         connection.row_factory = sqlite3.Row
         row = connection.execute(sql, parameters).fetchone()
         return dict(row) if row is not None else None
+
+
+def test_oms_market_sample_computes_basis_and_latency_components():
+    database = SimpleNamespace(record_market_sample=MagicMock(return_value=True))
+    oms = object.__new__(OMS)
+    oms.paper_trade_database = database
+    market_data = SimpleNamespace(
+        symbol="SNDKUSDT",
+        mark_price=100.2,
+        index_price=100.0,
+        funding_rate=0.0001,
+        next_funding_timestamp=2000.0,
+        exchange_timestamp=1000.0,
+        received_timestamp=1000.012,
+        corrected_received_timestamp=1000.010,
+        dispatch_timestamp=1000.013,
+        received_monotonic=20.0,
+        dispatch_monotonic=20.003,
+        clock_offset_ms=-2.0,
+    )
+
+    assert oms.record_paper_market_sample(market_data)
+
+    payload = database.record_market_sample.call_args.args[0]
+    assert payload["sample_time"] == pytest.approx(1000.010)
+    assert payload["basis_bps"] == pytest.approx(19.9800266)
+    assert payload["transport_latency_ms"] == pytest.approx(10.0)
+    assert payload["gateway_processing_latency_ms"] == pytest.approx(3.0)
+    assert payload["next_funding_time"] == 2000.0
+
+
+def test_oms_market_sample_rejects_invalid_prices_and_missing_database():
+    oms = object.__new__(OMS)
+    assert not oms.record_paper_market_sample(SimpleNamespace())
+
+    database = SimpleNamespace(record_market_sample=MagicMock(return_value=True))
+    oms.paper_trade_database = database
+    assert not oms.record_paper_market_sample(
+        SimpleNamespace(mark_price=float("nan"), index_price=100.0)
+    )
+    database.record_market_sample.assert_not_called()
 
 
 def test_async_projection_records_run_and_fill(tmp_path):
@@ -327,6 +369,28 @@ def test_database_records_calibration_observations_as_structured_rows(tmp_path):
             "api_weight": 12,
         }
     )
+    assert database.record_market_sample(
+        {
+            "sample_time": 1000.4,
+            "symbol": "SNDKUSDT",
+            "mark_price": 100.2,
+            "index_price": 100.0,
+            "basis_bps": 19.9800266,
+            "funding_rate": 0.0001,
+            "next_funding_time": 2000.0,
+            "exchange_time": 1000.38,
+            "received_time": 1000.4,
+            "transport_latency_ms": 20.0,
+        }
+    )
+    assert database.record_market_sample(
+        {
+            "sample_time": 1000.8,
+            "symbol": "SNDKUSDT",
+            "mark_price": 100.3,
+            "index_price": 100.0,
+        }
+    )
     assert database.record_strategy_sample(
         {
             "sample_time": 1000.5,
@@ -338,6 +402,7 @@ def test_database_records_calibration_observations_as_structured_rows(tmp_path):
     )
     assert database.health_snapshot()["throttled_strategy_sample_count"] == 1
     assert database.health_snapshot()["throttled_account_sample_count"] == 1
+    assert database.health_snapshot()["throttled_market_sample_count"] == 1
     assert database.close(clean_shutdown=True, reason="observation_test")
 
     path = Path(config["paper_trade_database"]["path"])
@@ -346,6 +411,12 @@ def test_database_records_calibration_observations_as_structured_rows(tmp_path):
     markout = fetch_one(path, "SELECT * FROM paper_fill_markouts")
     account = fetch_one(path, "SELECT * FROM paper_account_samples")
     system_event = fetch_one(path, "SELECT * FROM paper_system_events")
+    market = fetch_one(path, "SELECT * FROM paper_market_samples")
+    run = fetch_one(
+        path,
+        "SELECT * FROM paper_runs WHERE run_id = ?",
+        (database.run_id,),
+    )
     assert order["client_oid"] == "order-1"
     assert order["is_rpi"] == 1
     assert order["order_type"] == "LIMIT"
@@ -357,6 +428,7 @@ def test_database_records_calibration_observations_as_structured_rows(tmp_path):
     assert strategy["best_bid_qty"] == 12.0
     assert strategy["transport_latency_ms"] == 9.0
     assert strategy["strategy_queue_latency_ms"] == 4.0
+    assert strategy["formula_version"] == ""
     strategy_count = fetch_one(
         path,
         "SELECT COUNT(*) AS count FROM paper_strategy_samples",
@@ -368,6 +440,9 @@ def test_database_records_calibration_observations_as_structured_rows(tmp_path):
     assert account["margin_snapshot_synced"] == 1
     assert system_event["event_kind"] == "system_health"
     assert system_event["api_weight"] == 12
+    assert market["funding_rate"] == 0.0001
+    assert market["transport_latency_ms"] == 20.0
+    assert run["software_version"] == "0.1.0"
     with sqlite3.connect(path) as connection:
         connection.row_factory = sqlite3.Row
         queried = query_observations(
@@ -391,10 +466,18 @@ def test_database_records_calibration_observations_as_structured_rows(tmp_path):
             run_id=database.run_id,
             limit=10,
         )
+        queried_markets = query_observations(
+            connection,
+            dataset="markets",
+            symbol="SNDKUSDT",
+            run_id=database.run_id,
+            limit=10,
+        )
     assert queried[0]["client_oid"] == "order-1"
     assert queried[0]["signed_markout_bps"] == -2.0002
     assert queried_accounts[0]["equity"] == 10_005.0
     assert queried_system[0]["severity"] == "ERROR"
+    assert queried_markets[0]["basis_bps"] == 19.9800266
 
 
 def test_schema_v1_is_migrated_in_place_without_losing_runs(tmp_path):
@@ -424,6 +507,17 @@ def test_schema_v1_is_migrated_in_place_without_losing_runs(tmp_path):
     with sqlite3.connect(path) as connection:
         for column in upgraded_fill_columns:
             connection.execute(f"ALTER TABLE paper_fills DROP COLUMN {column}")
+        for column in ("software_version", "code_revision"):
+            connection.execute(f"ALTER TABLE paper_runs DROP COLUMN {column}")
+        for table in (
+            "paper_order_events",
+            "paper_strategy_samples",
+            "paper_fill_markouts",
+            "paper_account_samples",
+            "paper_system_events",
+            "paper_market_samples",
+        ):
+            connection.execute(f"DROP TABLE {table}")
         connection.execute("PRAGMA user_version=1")
         connection.execute(
             "UPDATE projection_metadata SET value='1' WHERE key='schema_version'"
@@ -436,20 +530,38 @@ def test_schema_v1_is_migrated_in_place_without_losing_runs(tmp_path):
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(paper_fills)")
         }
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        run_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(paper_runs)")
+        }
         recovered_run = connection.execute(
             "SELECT run_id FROM paper_runs WHERE run_id = ?",
             (first_run_id,),
         ).fetchone()
-    assert version == 3
+    assert version == 4
     assert set(upgraded_fill_columns) <= columns
+    assert {"software_version", "code_revision"} <= run_columns
+    assert {
+        "paper_order_events",
+        "paper_strategy_samples",
+        "paper_fill_markouts",
+        "paper_account_samples",
+        "paper_system_events",
+        "paper_market_samples",
+    } <= tables
     assert recovered_run == (first_run_id,)
 
 
-def test_schema_v2_adds_telemetry_tables_and_columns(tmp_path):
+def test_schema_v2_is_migrated_to_v4_with_all_telemetry(tmp_path):
     config = make_config(tmp_path)
     journal = OMSJournal(config)
     first = PaperTradeDatabase(config, journal)
-    assert first.close(clean_shutdown=True, reason="before_v3_migration")
+    assert first.close(clean_shutdown=True, reason="before_v4_migration")
 
     path = Path(config["paper_trade_database"]["path"])
     fill_columns = (
@@ -476,24 +588,30 @@ def test_schema_v2_adds_telemetry_tables_and_columns(tmp_path):
         "strategy_queue_latency_ms",
         "callback_age_ms",
         "strategy_compute_latency_ms",
+        "formula_version",
+        "units_version",
+        "intensity_source",
     )
+    run_columns = ("software_version", "code_revision")
     with sqlite3.connect(path) as connection:
         for table, columns in (
             ("paper_fills", fill_columns),
             ("paper_order_events", order_columns),
             ("paper_strategy_samples", strategy_columns),
+            ("paper_runs", run_columns),
         ):
             for column in columns:
                 connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
         connection.execute("DROP TABLE paper_account_samples")
         connection.execute("DROP TABLE paper_system_events")
+        connection.execute("DROP TABLE paper_market_samples")
         connection.execute("PRAGMA user_version=2")
         connection.execute(
             "UPDATE projection_metadata SET value='2' WHERE key='schema_version'"
         )
 
     second = PaperTradeDatabase(config, journal)
-    assert second.close(clean_shutdown=True, reason="after_v3_migration")
+    assert second.close(clean_shutdown=True, reason="after_v4_migration")
     with sqlite3.connect(path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         tables = {
@@ -507,16 +625,76 @@ def test_schema_v2_adds_telemetry_tables_and_columns(tmp_path):
             "paper_fills",
             "paper_order_events",
             "paper_strategy_samples",
+            "paper_runs",
         ):
             restored[table] = {
                 row[1]
                 for row in connection.execute(f"PRAGMA table_info({table})")
             }
-    assert version == 3
+    assert version == 4
     assert set(fill_columns) <= restored["paper_fills"]
     assert set(order_columns) <= restored["paper_order_events"]
     assert set(strategy_columns) <= restored["paper_strategy_samples"]
-    assert {"paper_account_samples", "paper_system_events"} <= tables
+    assert set(run_columns) <= restored["paper_runs"]
+    assert {
+        "paper_account_samples",
+        "paper_system_events",
+        "paper_market_samples",
+    } <= tables
+
+
+def test_schema_v3_is_migrated_to_v4_without_losing_runs(tmp_path):
+    config = make_config(tmp_path)
+    journal = OMSJournal(config)
+    first = PaperTradeDatabase(config, journal)
+    first_run_id = first.run_id
+    assert first.close(clean_shutdown=True, reason="before_v3_to_v4_migration")
+
+    path = Path(config["paper_trade_database"]["path"])
+    strategy_columns = ("formula_version", "units_version", "intensity_source")
+    run_columns = ("software_version", "code_revision")
+    with sqlite3.connect(path) as connection:
+        for column in strategy_columns:
+            connection.execute(
+                f"ALTER TABLE paper_strategy_samples DROP COLUMN {column}"
+            )
+        for column in run_columns:
+            connection.execute(f"ALTER TABLE paper_runs DROP COLUMN {column}")
+        connection.execute("DROP TABLE paper_market_samples")
+        connection.execute("PRAGMA user_version=3")
+        connection.execute(
+            "UPDATE projection_metadata SET value='3' WHERE key='schema_version'"
+        )
+
+    second = PaperTradeDatabase(config, journal)
+    assert second.close(clean_shutdown=True, reason="after_v3_to_v4_migration")
+    with sqlite3.connect(path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        restored_strategy = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(paper_strategy_samples)"
+            )
+        }
+        restored_runs = {
+            row[1] for row in connection.execute("PRAGMA table_info(paper_runs)")
+        }
+        recovered_run = connection.execute(
+            "SELECT run_id FROM paper_runs WHERE run_id = ?",
+            (first_run_id,),
+        ).fetchone()
+
+    assert version == 4
+    assert "paper_market_samples" in tables
+    assert set(strategy_columns) <= restored_strategy
+    assert set(run_columns) <= restored_runs
+    assert recovered_run == (first_run_id,)
 
 
 def test_backfill_repairs_missing_run_start_sequence(tmp_path):

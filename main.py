@@ -1311,10 +1311,16 @@ def _run_main(argv=None, runtime=None):
             external_alerts.enqueue_event(event.data)
 
     register_cold(EVENT_ORDERBOOK, on_orderbook_cold)
-    register_cold(
-        EVENT_MARK_PRICE,
-        lambda e: web_dashboard.update_mark_price(e.data) if web_dashboard else None,
-    )
+
+    def on_mark_price_cold(event):
+        record_paper_observation(
+            "record_paper_market_sample",
+            event.data,
+        )
+        if web_dashboard is not None:
+            web_dashboard.update_mark_price(event.data)
+
+    register_cold(EVENT_MARK_PRICE, on_mark_price_cold)
     register_cold(EVENT_AGG_TRADE, on_market_trade_cold)
     register_cold(
         EVENT_EXCHANGE_ORDER_UPDATE,

@@ -125,10 +125,10 @@ does not discard adverse fills merely to manufacture positive Paper PnL.
 
 ## Paper execution database
 
-Paper execution history uses local SQLite in WAL mode. Schema v3 upgrades an
-existing v1 or v2 database in place without deleting historical rows.
-`paper_runs` separates every process launch with a random `run_id`, and six
-fact datasets share that identity:
+Paper execution history uses local SQLite in WAL mode. Schema v4 upgrades an
+existing v1, v2, or v3 database in place without deleting historical rows.
+`paper_runs` separates every process launch with a random `run_id`, records the
+software version and Git revision, and seven fact datasets share that identity:
 
 - `paper_fills` stores every partial or complete fill, its durable journal
   identity, price/quantity/PnL, trigger relation (`at_price`, `through`, or
@@ -140,21 +140,27 @@ fact datasets share that identity:
 - `paper_strategy_samples` stores structured mid/fair/quote, L1 size,
   inventory, volatility, A/k, markout, flow, queue, stale-quote, and size
   decisions. It also separates exchange transport, gateway processing,
-  strategy-queue, callback-age, clock-offset, and calculation latency;
+  strategy-queue, callback-age, clock-offset, and calculation latency, and
+  identifies the formula, units, and intensity source used for each sample;
 - `paper_fill_markouts` stores exact 100/500/1000 ms signed post-fill markout
   observations together with actual sampling lag and fill identity;
 - `paper_account_samples` stores balance, equity, unrealized PnL, available
   funds, budget usage, margin health, and external-cash-flow truth;
 - `paper_system_events` stores system-health, freeze/recovery, alert, reconnect,
-  watchdog, and API-weight observations.
+  watchdog, and API-weight observations;
+- `paper_market_samples` stores mark/index prices, basis, funding rate and next
+  funding time together with exchange/receive/dispatch clocks, clock offset,
+  transport latency, and gateway processing latency.
 
 Strategy telemetry is downsampled to one row per symbol per second by
 `paper_trade_database.strategy_sample_interval_sec`. Account telemetry uses
 `paper_trade_database.account_sample_interval_sec`, also one second by default.
-Order events, fills, markouts, and abnormal system events are not downsampled.
-The observation tables use typed columns instead of duplicate raw JSON
-payloads. `reset_on_start=true` resets the simulated venue and account but never
-deletes this historical database.
+Mark-price telemetry uses `paper_trade_database.market_sample_interval_sec`,
+again one second by default and independently per symbol. Order events, fills,
+markouts, and abnormal system events are not downsampled. The observation
+tables use typed columns instead of duplicate raw JSON payloads.
+`reset_on_start=true` resets the simulated venue and account but never deletes
+this historical database.
 
 The fsync-backed OMS JSONL journal remains the audit truth. SQLite is a
 query-oriented projection written after the journal commit, outside the OMS hot
@@ -173,12 +179,39 @@ Query recent fills or aggregate them by run and symbol:
 .venv/bin/python scripts/query_paper_trades.py --dataset markouts --limit 100
 .venv/bin/python scripts/query_paper_trades.py --dataset accounts --limit 100
 .venv/bin/python scripts/query_paper_trades.py --dataset system --limit 100
+.venv/bin/python scripts/query_paper_trades.py --dataset markets --limit 100
 ```
 
 The query tool opens SQLite read-only and is safe while the service is running.
 For a raw file-level backup, stop `chronoshft` first or use SQLite's online
 backup API; copying only the main `.sqlite3` file while WAL writes are active
 can produce an incomplete backup.
+
+Build offline candidate estimates of fill intensity
+`lambda(delta)=A*exp(-k*delta)` and conditional post-fill markout from the
+database:
+
+```bash
+.venv/bin/python scripts/calibrate_paper_models.py \
+  --database storage/paper/trades.sqlite3 \
+  --output storage/paper/model-calibration.json
+```
+
+The intensity likelihood includes both time-to-first-fill and right-censored
+unfilled quote exposure. The report also contains time-block bootstrap
+intervals, chronological walk-forward comparison against a constant-intensity
+baseline, and chronological ridge markout results against a constant-mean
+baseline. The artifact is always marked `candidate_only=true` and
+`activation_permitted=false`; the script never edits strategy configuration.
+Paper public-trade-proxy observations cannot establish Live RPI queue position,
+counterparty eligibility, or fill probability, so this artifact is evidence
+for Paper iteration only and is not accepted by the Live calibration approval
+path.
+
+Databases upgraded from v1 or v2 begin collecting the new exposure, markout,
+strategy, account, system, and market observations after the upgrade. Legacy
+fills remain queryable, but fills alone cannot reconstruct observations that
+were never recorded.
 
 ## Configuration architecture
 

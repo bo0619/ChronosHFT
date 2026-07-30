@@ -1,3 +1,4 @@
+import math
 import time
 
 from .account_truth import OMSAccountTruth
@@ -378,6 +379,97 @@ class OMS:
                     getattr(data, "weight_used_1m", None),
                 ),
                 "is_sync_error": getattr(data, "is_sync_error", None),
+            }
+        )
+
+    def record_paper_market_sample(self, market_data) -> bool:
+        database = getattr(self, "paper_trade_database", None)
+        if database is None:
+            return False
+        try:
+            mark_price = float(getattr(market_data, "mark_price", 0.0))
+            index_price = float(getattr(market_data, "index_price", 0.0))
+        except (TypeError, ValueError):
+            return False
+        if (
+            not math.isfinite(mark_price)
+            or not math.isfinite(index_price)
+            or mark_price <= 0.0
+            or index_price <= 0.0
+        ):
+            return False
+
+        exchange_time = float(
+            getattr(market_data, "exchange_timestamp", 0.0) or 0.0
+        )
+        received_time = float(
+            getattr(market_data, "received_timestamp", 0.0) or 0.0
+        )
+        corrected_received_time = float(
+            getattr(
+                market_data,
+                "corrected_received_timestamp",
+                0.0,
+            )
+            or 0.0
+        )
+        received_monotonic = float(
+            getattr(market_data, "received_monotonic", 0.0) or 0.0
+        )
+        dispatch_monotonic = float(
+            getattr(market_data, "dispatch_monotonic", 0.0) or 0.0
+        )
+        transport_latency_ms = (
+            (corrected_received_time - exchange_time) * 1000.0
+            if corrected_received_time > 0.0 and exchange_time > 0.0
+            else None
+        )
+        gateway_processing_latency_ms = (
+            (dispatch_monotonic - received_monotonic) * 1000.0
+            if dispatch_monotonic >= received_monotonic > 0.0
+            else None
+        )
+        next_funding_time = getattr(
+            market_data,
+            "next_funding_timestamp",
+            0.0,
+        )
+        if not next_funding_time:
+            value = getattr(market_data, "next_funding_time", None)
+            timestamp_method = getattr(value, "timestamp", None)
+            next_funding_time = (
+                timestamp_method() if callable(timestamp_method) else None
+            )
+        return database.record_market_sample(
+            {
+                "sample_time": (
+                    corrected_received_time or received_time or time.time()
+                ),
+                "symbol": str(getattr(market_data, "symbol", "") or ""),
+                "mark_price": mark_price,
+                "index_price": index_price,
+                "basis_bps": math.log(mark_price / index_price) * 10_000.0,
+                "funding_rate": getattr(market_data, "funding_rate", 0.0),
+                "next_funding_time": next_funding_time,
+                "exchange_time": exchange_time or None,
+                "received_time": received_time or None,
+                "corrected_received_time": corrected_received_time or None,
+                "dispatch_time": getattr(
+                    market_data,
+                    "dispatch_timestamp",
+                    None,
+                ),
+                "received_monotonic": received_monotonic or None,
+                "dispatch_monotonic": dispatch_monotonic or None,
+                "clock_offset_ms": getattr(
+                    market_data,
+                    "clock_offset_ms",
+                    None,
+                ),
+                "transport_latency_ms": transport_latency_ms,
+                "gateway_processing_latency_ms": (
+                    gateway_processing_latency_ms
+                ),
             }
         )
 

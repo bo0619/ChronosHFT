@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import queue
 import sqlite3
 import threading
@@ -16,8 +17,9 @@ from infrastructure.logger import logger
 from infrastructure.paper_trade import validate_paper_trade_database_config
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 LEGACY_RUN_ID = "legacy-journal-import"
+SOFTWARE_VERSION = "0.1.0"
 
 
 class PaperTradeDatabaseError(RuntimeError):
@@ -71,6 +73,37 @@ def _nullable_integer(value):
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _code_revision(project_root: Path) -> str:
+    configured = str(os.environ.get("CHRONOSHFT_CODE_REVISION", "") or "").strip()
+    if configured:
+        return configured
+    git_path = project_root / ".git"
+    try:
+        if git_path.is_file():
+            marker = git_path.read_text(encoding="utf-8").strip()
+            if not marker.lower().startswith("gitdir:"):
+                return ""
+            git_path = (git_path.parent / marker.split(":", 1)[1].strip()).resolve()
+        head = (git_path / "HEAD").read_text(encoding="utf-8").strip()
+        if not head.startswith("ref:"):
+            return head
+        reference = head.split(":", 1)[1].strip()
+        loose_ref = git_path / reference
+        if loose_ref.is_file():
+            return loose_ref.read_text(encoding="utf-8").strip()
+        packed_refs = git_path / "packed-refs"
+        if packed_refs.is_file():
+            for line in packed_refs.read_text(encoding="utf-8").splitlines():
+                if not line or line.startswith(("#", "^")):
+                    continue
+                revision, name = line.split(" ", 1)
+                if name.strip() == reference:
+                    return revision.strip()
+    except (OSError, ValueError):
+        return ""
+    return ""
 
 
 class PaperTradeDatabase:
@@ -130,8 +163,17 @@ class PaperTradeDatabase:
                 or 1.0
             ),
         )
+        self.market_sample_interval_sec = max(
+            0.1,
+            float(
+                database_config.get("market_sample_interval_sec", 1.0)
+                or 1.0
+            ),
+        )
         self.run_id = uuid.uuid4().hex
         self.started_at_utc = _utc_now()
+        self.software_version = SOFTWARE_VERSION
+        self.code_revision = _code_revision(Path(__file__).resolve().parents[1])
         self.config_sha256 = hashlib.sha256(
             _canonical_json(config).encode("utf-8")
         ).hexdigest()
@@ -159,6 +201,7 @@ class PaperTradeDatabase:
         self._sample_lock = threading.Lock()
         self._last_strategy_sample_time: dict[str, float] = {}
         self._last_account_sample_time: float | None = None
+        self._last_market_sample_time: dict[str, float] = {}
         self._accepting = True
         self._closed = False
         self._close_result = False
@@ -170,8 +213,10 @@ class PaperTradeDatabase:
         self._committed_markout_count = 0
         self._committed_account_sample_count = 0
         self._committed_system_event_count = 0
+        self._committed_market_sample_count = 0
         self._throttled_strategy_sample_count = 0
         self._throttled_account_sample_count = 0
+        self._throttled_market_sample_count = 0
         self._backfilled_fill_count = 0
         self._failed_fill_count = 0
         self._failed_observation_count = 0
@@ -217,7 +262,7 @@ class PaperTradeDatabase:
 
     def _create_schema(self, connection) -> None:
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if version not in {0, 1, 2, SCHEMA_VERSION}:
+        if version not in {0, 1, 2, 3, SCHEMA_VERSION}:
             raise PaperTradeDatabaseError(
                 f"Unsupported Paper trade database schema version: {version}"
             )
@@ -238,6 +283,8 @@ class PaperTradeDatabase:
                 config_sha256 TEXT NOT NULL DEFAULT '',
                 symbols_json TEXT NOT NULL DEFAULT '[]',
                 initial_balance_usdt REAL NOT NULL DEFAULT 0.0,
+                software_version TEXT NOT NULL DEFAULT '',
+                code_revision TEXT NOT NULL DEFAULT '',
                 journal_path TEXT NOT NULL,
                 start_journal_seq INTEGER
             );
@@ -369,7 +416,10 @@ class PaperTradeDatabase:
                 gateway_processing_latency_ms REAL,
                 strategy_queue_latency_ms REAL,
                 callback_age_ms REAL,
-                strategy_compute_latency_ms REAL
+                strategy_compute_latency_ms REAL,
+                formula_version TEXT NOT NULL DEFAULT '',
+                units_version TEXT NOT NULL DEFAULT '',
+                intensity_source TEXT NOT NULL DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS paper_fill_markouts (
@@ -431,6 +481,28 @@ class PaperTradeDatabase:
                 is_sync_error INTEGER
             );
 
+            CREATE TABLE IF NOT EXISTS paper_market_samples (
+                sample_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at_utc TEXT NOT NULL,
+                run_id TEXT NOT NULL REFERENCES paper_runs(run_id),
+                sample_time REAL,
+                symbol TEXT NOT NULL,
+                mark_price REAL NOT NULL,
+                index_price REAL NOT NULL,
+                basis_bps REAL NOT NULL,
+                funding_rate REAL NOT NULL,
+                next_funding_time REAL,
+                exchange_time REAL,
+                received_time REAL,
+                corrected_received_time REAL,
+                dispatch_time REAL,
+                received_monotonic REAL,
+                dispatch_monotonic REAL,
+                clock_offset_ms REAL,
+                transport_latency_ms REAL,
+                gateway_processing_latency_ms REAL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_paper_fills_run_seq
                 ON paper_fills(run_id, journal_seq);
             CREATE INDEX IF NOT EXISTS idx_paper_fills_symbol_time
@@ -451,9 +523,11 @@ class PaperTradeDatabase:
                 ON paper_account_samples(run_id, sample_time);
             CREATE INDEX IF NOT EXISTS idx_paper_system_events_run_time
                 ON paper_system_events(run_id, event_time);
+            CREATE INDEX IF NOT EXISTS idx_paper_market_samples_run_symbol_time
+                ON paper_market_samples(run_id, symbol, sample_time);
             """
         )
-        self._migrate_to_v3(connection)
+        self._migrate_to_v4(connection)
         connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
         metadata = dict(
@@ -481,7 +555,7 @@ class PaperTradeDatabase:
         )
 
     @staticmethod
-    def _migrate_to_v3(connection) -> None:
+    def _migrate_to_v4(connection) -> None:
         fill_columns = {
             str(row[1])
             for row in connection.execute("PRAGMA table_info(paper_fills)")
@@ -510,6 +584,10 @@ class PaperTradeDatabase:
             )
 
         additions_by_table = {
+            "paper_runs": {
+                "software_version": "TEXT NOT NULL DEFAULT ''",
+                "code_revision": "TEXT NOT NULL DEFAULT ''",
+            },
             "paper_order_events": {
                 "order_type": "TEXT NOT NULL DEFAULT ''",
                 "reduce_only": "INTEGER NOT NULL DEFAULT 0",
@@ -531,6 +609,9 @@ class PaperTradeDatabase:
                 "strategy_queue_latency_ms": "REAL",
                 "callback_age_ms": "REAL",
                 "strategy_compute_latency_ms": "REAL",
+                "formula_version": "TEXT NOT NULL DEFAULT ''",
+                "units_version": "TEXT NOT NULL DEFAULT ''",
+                "intensity_source": "TEXT NOT NULL DEFAULT ''",
             },
         }
         for table, additions in additions_by_table.items():
@@ -576,8 +657,8 @@ class PaperTradeDatabase:
                 INSERT INTO paper_runs(
                     run_id, started_at_utc, status, clean_shutdown,
                     config_sha256, symbols_json, initial_balance_usdt,
-                    journal_path
-                ) VALUES (?, ?, 'running', NULL, ?, ?, ?, ?)
+                    software_version, code_revision, journal_path
+                ) VALUES (?, ?, 'running', NULL, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self.run_id,
@@ -585,6 +666,8 @@ class PaperTradeDatabase:
                     self.config_sha256,
                     _canonical_json(self.symbols),
                     self.initial_balance_usdt,
+                    self.software_version,
+                    self.code_revision,
                     str(self.journal_path),
                 ),
             )
@@ -666,8 +749,9 @@ class PaperTradeDatabase:
             INSERT INTO paper_runs(
                 run_id, started_at_utc, status, clean_shutdown,
                 config_sha256, symbols_json, initial_balance_usdt,
-                journal_path, start_journal_seq
-            ) VALUES (?, ?, 'interrupted', 0, ?, ?, ?, ?, ?)
+                software_version, code_revision, journal_path,
+                start_journal_seq
+            ) VALUES (?, ?, 'interrupted', 0, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id) DO UPDATE SET
                 start_journal_seq = COALESCE(
                     paper_runs.start_journal_seq,
@@ -680,6 +764,8 @@ class PaperTradeDatabase:
                 str(payload.get("config_sha256", "") or ""),
                 _canonical_json(payload.get("symbols", [])),
                 _finite_float(payload.get("initial_balance_usdt"), 0.0),
+                str(payload.get("software_version", "") or ""),
+                str(payload.get("code_revision", "") or ""),
                 str(self.journal_path),
                 start_journal_seq,
             ),
@@ -872,14 +958,15 @@ class PaperTradeDatabase:
                 orderbook_dispatch_monotonic, strategy_callback_monotonic,
                 clock_offset_ms, transport_latency_ms,
                 gateway_processing_latency_ms, strategy_queue_latency_ms,
-                callback_age_ms, strategy_compute_latency_ms
+                callback_age_ms, strategy_compute_latency_ms,
+                formula_version, units_version, intensity_source
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?
+                ?, ?, ?, ?, ?
             )
             """,
             (
@@ -937,6 +1024,9 @@ class PaperTradeDatabase:
                 _finite_float(timing.get("strategy_queue_latency_ms")),
                 _finite_float(timing.get("callback_age_ms")),
                 _finite_float(timing.get("strategy_compute_latency_ms")),
+                str(params.get("formula_version", "") or ""),
+                str(params.get("units_version", "") or ""),
+                str(params.get("intensity_source", "") or ""),
             ),
         )
         return cursor.rowcount == 1
@@ -1048,6 +1138,45 @@ class PaperTradeDatabase:
         )
         return cursor.rowcount == 1
 
+    def _insert_market_sample(self, connection, payload: dict) -> bool:
+        cursor = connection.execute(
+            """
+            INSERT INTO paper_market_samples(
+                recorded_at_utc, run_id, sample_time, symbol, mark_price,
+                index_price, basis_bps, funding_rate, next_funding_time,
+                exchange_time, received_time, corrected_received_time,
+                dispatch_time, received_monotonic, dispatch_monotonic,
+                clock_offset_ms, transport_latency_ms,
+                gateway_processing_latency_ms
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                _utc_now(),
+                self.run_id,
+                _finite_float(payload.get("sample_time")),
+                str(payload.get("symbol", "") or "").upper(),
+                _finite_float(payload.get("mark_price"), 0.0),
+                _finite_float(payload.get("index_price"), 0.0),
+                _finite_float(payload.get("basis_bps"), 0.0),
+                _finite_float(payload.get("funding_rate"), 0.0),
+                _finite_float(payload.get("next_funding_time")),
+                _finite_float(payload.get("exchange_time")),
+                _finite_float(payload.get("received_time")),
+                _finite_float(payload.get("corrected_received_time")),
+                _finite_float(payload.get("dispatch_time")),
+                _finite_float(payload.get("received_monotonic")),
+                _finite_float(payload.get("dispatch_monotonic")),
+                _finite_float(payload.get("clock_offset_ms")),
+                _finite_float(payload.get("transport_latency_ms")),
+                _finite_float(
+                    payload.get("gateway_processing_latency_ms")
+                ),
+            ),
+        )
+        return cursor.rowcount == 1
+
     def _set_start_journal_seq(self, sequence: int) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -1084,6 +1213,8 @@ class PaperTradeDatabase:
             "config_sha256": self.config_sha256,
             "symbols": list(self.symbols),
             "initial_balance_usdt": self.initial_balance_usdt,
+            "software_version": self.software_version,
+            "code_revision": self.code_revision,
             "database_path": str(self.path),
         }
 
@@ -1179,6 +1310,26 @@ class PaperTradeDatabase:
     def record_system_event(self, payload: dict) -> bool:
         return self._record_observation("system_event", payload)
 
+    def record_market_sample(self, payload: dict) -> bool:
+        normalized = dict(payload)
+        symbol = str(normalized.get("symbol", "") or "").upper()
+        sample_time = _finite_float(normalized.get("sample_time"))
+        with self._sample_lock:
+            previous = self._last_market_sample_time.get(symbol)
+            if (
+                sample_time is not None
+                and previous is not None
+                and sample_time >= previous
+                and sample_time - previous < self.market_sample_interval_sec
+            ):
+                with self._health_lock:
+                    self._throttled_market_sample_count += 1
+                return True
+            accepted = self._record_observation("market_sample", normalized)
+            if accepted and sample_time is not None:
+                self._last_market_sample_time[symbol] = sample_time
+            return accepted
+
     def _writer_main(self) -> None:
         try:
             connection = self._connect()
@@ -1225,6 +1376,11 @@ class PaperTradeDatabase:
                                 connection,
                                 item[1],
                             )
+                        elif kind == "market_sample":
+                            inserted = self._insert_market_sample(
+                                connection,
+                                item[1],
+                            )
                         else:
                             raise ValueError(f"unsupported projection kind: {kind}")
                     if not inserted:
@@ -1242,6 +1398,8 @@ class PaperTradeDatabase:
                             self._committed_account_sample_count += 1
                         elif kind == "system_event":
                             self._committed_system_event_count += 1
+                        elif kind == "market_sample":
+                            self._committed_market_sample_count += 1
                 except Exception as exc:
                     kind = item[0] if isinstance(item, tuple) and item else "unknown"
                     self._set_failure(
@@ -1356,6 +1514,12 @@ class PaperTradeDatabase:
                 ),
                 "committed_system_event_count": (
                     self._committed_system_event_count
+                ),
+                "committed_market_sample_count": (
+                    self._committed_market_sample_count
+                ),
+                "throttled_market_sample_count": (
+                    self._throttled_market_sample_count
                 ),
                 "backfilled_fill_count": self._backfilled_fill_count,
                 "failed_fill_count": self._failed_fill_count,
