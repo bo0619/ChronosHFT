@@ -10,6 +10,9 @@ from datetime import datetime, timezone
 DEFAULT_ADMIN_DIR = os.path.join("storage", "admin")
 DEFAULT_COMMAND_TTL_SEC = 10.0
 DEFAULT_SESSION_MAX_AGE_SEC = 2.0
+DEFAULT_MAX_RETAINED_RESULTS = 256
+DEFAULT_MAX_RETAINED_ARCHIVES = 256
+DEFAULT_RETENTION_MAX_AGE_SEC = 7 * 24 * 60 * 60.0
 ATOMIC_REPLACE_MAX_ATTEMPTS = 5
 ATOMIC_REPLACE_RETRY_BASE_SEC = 0.01
 TRANSIENT_WINDOWS_REPLACE_ERRORS = frozenset({5, 32, 33})
@@ -190,6 +193,73 @@ def _bounded_positive_float(value, *, field: str, maximum: float) -> float:
             f"{field} must be positive and no more than {maximum:g} seconds"
         )
     return parsed
+
+
+def _bounded_positive_int(value, *, field: str, maximum: int) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value <= 0
+        or value > maximum
+    ):
+        raise ValueError(
+            f"{field} must be a positive integer no more than {maximum}"
+        )
+    return value
+
+
+def _admin_retention_settings(config: dict | None) -> tuple[int, int, float]:
+    root = config or {}
+    system = root.get("system", {}) or {}
+    admin = system.get("admin_control", {}) if isinstance(system, dict) else {}
+    admin = admin if isinstance(admin, dict) else {}
+    max_results = _bounded_positive_int(
+        admin.get("max_retained_results", DEFAULT_MAX_RETAINED_RESULTS),
+        field="system.admin_control.max_retained_results",
+        maximum=4096,
+    )
+    max_archives = _bounded_positive_int(
+        admin.get("max_retained_archives", DEFAULT_MAX_RETAINED_ARCHIVES),
+        field="system.admin_control.max_retained_archives",
+        maximum=4096,
+    )
+    max_age_sec = _bounded_positive_float(
+        admin.get(
+            "retention_max_age_sec",
+            DEFAULT_RETENTION_MAX_AGE_SEC,
+        ),
+        field="system.admin_control.retention_max_age_sec",
+        maximum=31 * 24 * 60 * 60.0,
+    )
+    return max_results, max_archives, max_age_sec
+
+
+def _prune_json_directory(
+    directory: str,
+    *,
+    max_files: int,
+    max_age_sec: float,
+) -> int:
+    cutoff = time.time() - max_age_sec
+    retained = []
+    removed = 0
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if not entry.name.endswith(".json") or not entry.is_file(
+                follow_symlinks=False
+            ):
+                continue
+            stat = entry.stat(follow_symlinks=False)
+            if stat.st_mtime < cutoff:
+                os.remove(entry.path)
+                removed += 1
+            else:
+                retained.append((stat.st_mtime_ns, entry.name, entry.path))
+    retained.sort()
+    for _mtime_ns, _name, path in retained[:-max_files]:
+        os.remove(path)
+        removed += 1
+    return removed
 
 
 def _admin_settings(config: dict | None) -> tuple[str, float, float]:
@@ -447,9 +517,28 @@ class AdminControlServer:
             0.5,
             self.session_max_age_sec / 4.0,
         )
+        (
+            self.max_retained_results,
+            self.max_retained_archives,
+            self.retention_max_age_sec,
+        ) = _admin_retention_settings(self.config)
+        self.retention_evictions = 0
         self._closed = False
         self._last_session_publish_monotonic = 0.0
+        self._prune_history()
         self._publish_session()
+
+    def _prune_history(self) -> None:
+        self.retention_evictions += _prune_json_directory(
+            self.paths["results_dir"],
+            max_files=self.max_retained_results,
+            max_age_sec=self.retention_max_age_sec,
+        )
+        self.retention_evictions += _prune_json_directory(
+            self.paths["archive_dir"],
+            max_files=self.max_retained_archives,
+            max_age_sec=self.retention_max_age_sec,
+        )
 
     def _publish_session(self, now_monotonic=None):
         published_monotonic = (
@@ -647,6 +736,12 @@ class AdminControlServer:
             "last_freeze_reason": str(
                 getattr(self.oms, "last_freeze_reason", "") or ""
             ),
+            "admin_control_retention": {
+                "max_results": self.max_retained_results,
+                "max_archives": self.max_retained_archives,
+                "max_age_sec": self.retention_max_age_sec,
+                "evictions": self.retention_evictions,
+            },
         }
         capability_snapshot = getattr(self.oms, "get_capability_snapshot", None)
         if callable(capability_snapshot):
@@ -704,3 +799,4 @@ class AdminControlServer:
                 os.remove(command_path)
             except OSError:
                 pass
+        self._prune_history()

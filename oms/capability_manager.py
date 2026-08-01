@@ -810,6 +810,11 @@ class OMSCapabilityManager(OMSComponent):
                 }
                 for key, (mode, reason) in self.mode_constraints.items()
             }
+            event_log = {
+                "depth": len(self.event_log),
+                "capacity": self.event_log_max,
+                "evictions": self.event_log_evictions,
+            }
         return {
             "mode": capability_mode.value,
             "reason": capability_reason,
@@ -840,6 +845,7 @@ class OMSCapabilityManager(OMSComponent):
             "venue_dead_man_switch": self.get_venue_dead_man_switch_snapshot(),
             "outbound_message_budget": self.get_outbound_message_budget_snapshot(),
             "background_tasks": self.get_background_task_snapshot(),
+            "event_log": event_log,
             "outbound_gate": self.get_outbound_gate_snapshot(),
             "strategy_risk_budgets": self.get_strategy_risk_budget_snapshot(),
             "single_writer_fence": (

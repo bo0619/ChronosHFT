@@ -696,7 +696,16 @@ class RiskManager:
         if journal is None:
             return
         try:
-            records = journal.load()
+            latest = None
+            stream_records = getattr(journal, "iter_records", None)
+            records = (
+                stream_records(respect_replay_policy=True)
+                if callable(stream_records)
+                else iter(journal.load())
+            )
+            for record in records:
+                if record.get("kind") == "risk_state":
+                    latest = record.get("payload", {})
         except JournalError as exc:
             logger.critical(f"[Risk] Failed to restore durable risk state: {exc}")
             fail_closed = getattr(self.oms, "_fail_closed_on_journal_error", None)
@@ -704,10 +713,6 @@ class RiskManager:
                 fail_closed(exc, "restore_risk_state")
             return
 
-        latest = None
-        for record in records:
-            if record.get("kind") == "risk_state":
-                latest = record.get("payload", {})
         if not latest:
             return
 

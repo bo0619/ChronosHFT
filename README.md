@@ -36,14 +36,35 @@ sudo systemctl status chronoshft
 The installer uses the non-root `SUDO_USER` as the service account, validates
 that `config.json` is Paper configuration, installs the rendered unit under
 `/etc/systemd/system/`, and enables it at boot. It refuses to start a second
-project Python process blindly. When invoking the installer directly as root,
+project Python process blindly. After starting or restarting the service, it
+reads systemd's effective watchdog, task, memory-pressure, hard-memory, and
+swap limits and fails installation if they differ from the tracked unit. An
+install without `--start` deliberately leaves an already-running process on
+its old cgroup settings and reports that effective limits were not checked.
+When invoking the installer directly as root,
 pass `--user ubuntu` explicitly.
 
 `systemd` runs `main.py` directly, limits process starts to 10 per hour, and
 does not retry the non-recoverable startup exit code `2`. A normal
 `systemctl stop` sends `SIGINT`, allowing the existing verified shutdown path to
 cancel orders, persist state, and stop the independent supervisor before the
-service timeout. Follow and control the service with:
+service timeout. The unit also pins OpenBLAS, OpenMP, MKL, and NumExpr to one
+thread each; the strategy's small covariance matrices do not benefit from
+oversubscribing both `t3.small` vCPUs. glibc is limited to two malloc arenas to
+reduce long-lived per-thread heap fragmentation, and Python's fatal-signal
+handler emits all thread stacks to journald before a watchdog `SIGABRT`. The
+complete service cgroup is capped at
+128 tasks, enters memory pressure at 1,400 MiB, and cannot exceed 1,600 MiB;
+service swap and core dumps are disabled. The in-process 1.25 GiB
+sustained-RSS guard should
+freeze quoting first, while the cgroup remains the final defense if Python or a
+native library can no longer run that guard. A 60-second systemd watchdog is
+pulsed only by the Python main loop; if that loop stalls, the independent risk
+sidecar loses its faster parent heartbeat and cancels first, then systemd sends
+`SIGABRT` (with core dumps disabled) and applies the existing restart policy.
+The watchdog also covers read-only clock-blocked dashboard mode and does
+nothing outside a systemd watchdog environment. Follow and control the service
+with:
 
 ```bash
 sudo journalctl -u chronoshft -f
@@ -62,6 +83,74 @@ concurrent-symbol slot derived from capital scaling. A broader symbol universe
 requires correlation-aware capital allocation and coordinated risk changes;
 adding symbols alone causes the OMS to reject repeated quote attempts at the
 concurrency boundary.
+
+All three EventEngine lanes, the strategy control-truth queue, the Paper venue
+command queue, the async log queue, and the SQLite projection queue are
+bounded. Event queue
+overflow and strategy control queue overflow use the existing fail-closed OMS
+callbacks rather than growing memory indefinitely. The tracked strategy
+control capacity is 2,048 events; the EventEngine capacities are 2,048 market,
+1,024 execution, and 2,048 cold events. The logger retains at most 4,096
+redacted 16 KB records and exposes per-level drop counters. A sustained backlog
+freezes quoting before the trading-event hard limits are reached.
+The OMS also keeps only the most recent 2,048 exchange events as an in-memory
+diagnostic window and publishes its eviction count. Eviction does not skip
+state-machine processing or durable journal writes; the journal remains the
+authoritative audit source.
+Local dashboard/CLI admin artifacts are likewise diagnostic: `results/` and
+`archive/` retain at most 256 JSON files each and remove entries older than
+seven days. Cleanup runs at admin-server startup and after each handled
+command; these bounds do not alter the OMS journal or Paper trade database.
+The loopback Dashboard accepts at most eight concurrent request threads, gives
+each connection a five-second socket deadline, and caps the listen backlog at
+16. Active, peak, accepted, and rejected connection counters are published in
+`runtime.dashboard`, so a slow browser or SSH tunnel cannot silently consume
+unbounded threads on the AWS host.
+
+EventEngine shutdown first seals admission, then drains queued and in-flight
+hot work together with any resulting cold-lane handoff. Events submitted after
+the seal return `false`. A drain timeout leaves workers alive and the engine
+closed to new events so shutdown can be retried without silently abandoning
+the queue.
+
+Order-book memory is also bounded. A stream may buffer at most 2,048 deltas,
+retain at most 4,096 price levels per side, and accept at most 2,048 levels per
+side in one delta. Exceeding any cap invalidates the local book and starts a
+fresh snapshot synchronization. Live and Paper recovery workers share a
+four-thread cap, use interruptible retry waits, and are joined before their
+REST session is closed.
+
+Raw HDF5 recording runs in a separate process with an 8,192-command queue and
+500-row flush batches. On Linux that child is assigned niceness 10 so a
+Pandas/PyTables flush yields CPU to market data and OMS work. Every flush
+preserves 512 MiB of free disk; queue overflow, writer exit, or disk-reserve
+failure marks the recorder unhealthy instead of allowing unbounded memory or
+disk use. Application logging writes `logs/hft_trading.log` at `INFO`, rotates
+at 32 MiB, and retains seven backups, so daily service restarts do not bypass
+the storage bound.
+
+Current profiling does not justify a Rust rewrite. A reproducible local
+reference run measured a 2,000-level order-book delta at about 137
+microseconds, six-scenario A-S at 0.57 milliseconds, and twelve-scenario GLFT
+at 1.61 milliseconds. At 10 book events per second and a 0.5-second quote
+cycle, those paths consume about 0.14%, 0.11%, and 0.32% of one core. All five
+repeat ratios were below 1.14. These are
+development-host references, not AWS evidence. Rust remains appropriate if
+deployment profiles later identify a stable pure-compute hotspot, but moving
+OMS, persistence, or lifecycle code across an FFI boundary now would add more
+operational risk than performance.
+Re-run the offline benchmark on the actual EC2 instance after deployment:
+
+```bash
+.venv/bin/python scripts/benchmark_runtime_hot_paths.py \
+  --iterations 1000 --repeats 5 --book-event-rate-hz 10 --quote-cycle-sec 0.5
+```
+
+The JSON report estimates single-core utilization for the order-book delta,
+six-scenario A-S, and twelve-scenario GLFT paths. The default Rust candidate
+requires at least 10% of one core at the configured production frequency and
+a maximum-to-minimum repeat ratio no greater than 1.5. The benchmark never
+opens a network connection, creates an OMS, or places an order.
 
 The 1-second Binance mark-price stream has a Paper-only public REST safety net.
 After 1.5 seconds without a WebSocket mark, one batch `premiumIndex` request
@@ -168,6 +257,29 @@ path. Missing SQLite rows are idempotently backfilled from the verified journal
 on the next start. Do not delete `storage/paper/oms_journal.jsonl` after a fill
 has been recorded merely because it also appears in SQLite.
 
+The projection queue is capped at 4,096 records and the writer commits up to 64
+records per SQLite transaction. If a batch contains an invalid record, the
+transaction is rolled back and each record is retried separately so valid rows
+are retained and the bad projection is reported unhealthy. Short-lived SQLite
+connections are explicitly closed; shutdown drains every record before the
+stop marker. Journal verification and startup backfill stream records instead
+of retaining the complete JSONL file in an additional list.
+
+The tracked AWS profile reserves 512 MiB of free disk for both the OMS journal
+and the SQLite projection. The journal reserves the exact encoded batch size
+before every append; SQLite uses a conservative per-transaction reservation.
+Checks are cached for one second and expose free bytes, last-check time,
+rejection count, and check failures in their health snapshots. Falling below
+the reserve, failing to inspect the filesystem, `ENOSPC`, a projection queue
+overflow, or a SQLite write failure marks the database unhealthy, freezes OMS,
+and requests cancellation of active quotes. The pre-trade gate continues to
+reject new risk while the database is unhealthy; reduce-only orders remain
+available. The relevant settings are
+`oms.journal_min_free_bytes`,
+`oms.journal_space_check_interval_sec`,
+`paper_trade_database.min_free_bytes`, and
+`paper_trade_database.space_check_interval_sec`.
+
 Query recent fills or aggregate them by run and symbol:
 
 ```bash
@@ -179,10 +291,25 @@ Query recent fills or aggregate them by run and symbol:
 .venv/bin/python scripts/query_paper_trades.py --dataset markouts --limit 100
 .venv/bin/python scripts/query_paper_trades.py --dataset accounts --limit 100
 .venv/bin/python scripts/query_paper_trades.py --dataset system --limit 100
+.venv/bin/python scripts/query_paper_trades.py --dataset runtime --limit 10000
 .venv/bin/python scripts/query_paper_trades.py --dataset markets --limit 100
+.venv/bin/python scripts/analyze_runtime_soak.py --minimum-hours 24
 ```
 
 The query tool opens SQLite read-only and is safe while the service is running.
+Paper mode records one versioned runtime-resource event for each actual Linux
+resource sample (five seconds in the tracked profile), rather than once per
+0.1-second main-loop iteration. `--dataset runtime` filters those events and
+decodes the compact JSON payload. It preserves RSS and RSS-growth trend,
+main/aggregate threads and file descriptors, CPU, process-tree discovery, and
+systemd-watchdog delivery counters for AWS soak analysis. At the tracked
+interval a 72-hour run produces about 51,840 small rows; the existing SQLite
+queue, batching, disk-reserve, and failure-freeze rules apply unchanged.
+`analyze_runtime_soak.py` streams the selected run (latest by default), ignores
+the configured 30-minute warmup for trend fitting, and fails unless duration,
+sample continuity, process discovery, watchdog delivery, resource ceilings,
+and the default 5 MiB/hour RSS-slope gate all pass. Use 72 hours before treating
+the result as strong evidence; the 24-hour default is only the minimum gate.
 For a raw file-level backup, stop `chronoshft` first or use SQLite's online
 backup API; copying only the main `.sqlite3` file while WAL writes are active
 can produce an incomplete backup.
@@ -216,7 +343,7 @@ were never recorded.
 ## Configuration architecture
 
 `config.json` is a tracked Paper-only manifest, not a runtime settings bucket.
-Its `includes` array composes 25 single-purpose fragments from `config/` into
+Its `includes` array composes 29 single-purpose fragments from `config/` into
 one effective configuration. Include paths are resolved relative to the
 manifest rather than the process working directory.
 
@@ -231,8 +358,12 @@ manifest rather than the process working directory.
 | `config/oms.json` | OMS identity, persistence, order limits, and lifecycle policy |
 | `config/alerts.json` | External alert transport and failure handling |
 | `config/backtest.json` | Backtest-only starting state and costs |
-| `config/system/logging.json` | Log level and sinks |
+| `config/system/logging.json` | Log level, sinks, and bounded async queue |
 | `config/system/dashboard.json` | Local monitoring server |
+| `config/system/admin_control.json` | Local admin command TTL, session, and bounded result/archive retention |
+| `config/system/event_engine.json` | Event-lane capacity, latency alerts, and shutdown drain timeout |
+| `config/system/strategy_runtime.json` | Strategy control-event capacity, backlog watchdog, and handler timing |
+| `config/system/resource_monitor.json` | Linux process RSS, CPU, thread, and file-descriptor thresholds |
 | `config/system/market_data.json` | Order-book depth, freshness, and stream handling |
 | `config/system/rate_limit.json` | Runtime request-rate controls |
 | `config/system/time_sync.json` | Exchange-clock calibration and health limits |
@@ -252,6 +383,55 @@ Configuration leaf paths must have exactly one owner. The loader rejects an
 empty fragment, duplicate include, duplicate leaf path, nested manifest,
 absolute path, parent traversal, symlink, or more than 128 fragments. Do not
 repeat a setting in another file to override it; edit the owning fragment.
+
+### Runtime component boundaries
+
+The exchange and strategy runtimes keep stable facades while stateful policy is
+split into independently testable components:
+
+| Module | Owns |
+| --- | --- |
+| `gateway/base_gateway.py` | Exchange-facing command and query contract |
+| `gateway/binance/paper_gateway.py` | Public transport, admission barrier, ledger, and event publication facade |
+| `gateway/binance/paper_state.py` | Paper order, position, and worker-command state records |
+| `gateway/binance/paper_book_sync.py` | Public depth snapshot/delta synchronization, generation fencing, and bounded gap recovery |
+| `gateway/binance/paper_ledger.py` | Single-writer fills, position basis, balances, fees, venue-event sequencing, and terminal-history pruning |
+| `gateway/binance/paper_matching.py` | Immediate/passive matching, RPI priority, queue-ahead, price eligibility, and fee selection |
+| `risk/binance_sidecar_clock.py` | Independent sidecar clock sampling, quality gates, phase-risk thresholds, and monotonic exchange-time anchor |
+| `risk/binance_sidecar_truth.py` | Consistent account/position/open-order snapshots, funding observations, and deduplicated external cash flow |
+| `risk/binance_sidecar_emergency.py` | Independent emergency DMS/cancel and reduce-only flatten actions |
+| `risk/independent_supervisor.py` | Durable kill/rearm state machine and parent-process control channel |
+| `strategy/contracts.py` | Structural event-handler contract consumed by the strategy runtime |
+| `strategy/runtime.py` | Bounded event scheduling, coalescing, timing, and fail-closed dispatch |
+
+`BinancePaperGateway` retains its existing method surface so OMS integration
+and operator instrumentation do not depend on component layout. The book-sync
+component owns snapshot/delta sequencing and recovery policy while the facade
+retains transport and state; recovery threads deliberately call through the
+facade so existing instrumentation remains valid. The matching component
+selects simulated fills but cannot mutate balances or publish venue events
+directly. Those effects are committed together by the ledger component on the
+gateway's single matching worker; order and account events observe the updated
+position and balance state. This makes recovery-token fencing, position-basis
+transitions, and RPI `at_price`/`through` behavior testable without starting
+REST, WebSocket, OMS, or background workers.
+
+On Linux, `system.resource_monitor` samples `/proc` every five seconds and
+recursively discovers the complete descendant process tree from the main
+process plus the known data-recorder and risk-supervisor PIDs. Discovery scans
+children forked by every thread, deduplicates descendants, and is capped at 128
+processes. An incomplete or over-limit traversal is itself a sustained
+fail-closed condition, so a newly added helper cannot silently escape the
+application-level RSS, thread, or file-descriptor guard. Main-process counts
+remain separate for diagnosis. A warning starts at 768 MiB RSS; three consecutive
+samples at 1.25 GiB RSS, 96 main threads, 4,096 main file descriptors, 112
+aggregate threads, or 8,192 aggregate file descriptors freeze new risk and
+cancel active orders. The aggregate thread guard fires before systemd's
+`TasksMax=128`. Six healthy samples clear the monitor latch, but the OMS still
+requires an explicit manual rearm.
+CPU at 150% of one core is warning-only. History is bounded to 12 samples.
+Windows has no `/proc`, so the metric reports unavailable and does not block
+Paper startup; the production target for this guard is the AWS Linux service.
 
 For capital changes, edit only `strategy.capital_multiplier` in
 `config/strategy/capital_scaling.json`. The loader derives the Paper, account,
@@ -388,10 +568,11 @@ for the same symbol: simultaneous quoting would duplicate orders, split
 inventory ownership, and corrupt per-strategy risk accounting.
 
 GLFT is the architectural primary for continuous multi-symbol market making;
-A-S remains the simpler, interpretable baseline and cold-start fallback. This
-is a Paper-validation choice, not live approval. Both implementations now use
-the same explicit `bps/sqrt(second)` volatility and fixed-notional inventory
-units. GLFT uses the full asymptotic Model A `c1/c2` equation; its live `A/k`
+A-S is the finite-horizon, interpretable Paper alternative. This is a
+Paper-validation choice, not live approval. Both implementations use the same
+explicit `bps/sqrt(second)` volatility and fixed-notional inventory units, and
+both have portfolio/adaptive Paper extensions. GLFT uses the full asymptotic
+Model A `c1/c2` equation; its live `A/k`
 fit accepts only exchange-ACK-to-terminal RPI exposure, including zero-fill
 quotes. Public `aggTrade` and Paper fills are never eligible live intensity
 samples. Genuine RPI exposure, markout, and walk-forward/OOS evidence are still
@@ -421,6 +602,24 @@ solution `H D_eff^-1 H = Sigma`. Bid and ask inventory charges remain exact
 finite differences of `Phi`. Correlated inventory therefore moves quotes in
 other books through `(Hq)_i`.
 
+The A-S alternative uses a different, exact finite-horizon risk potential:
+
+```text
+H = gamma T Sigma
+Phi(q) = 0.5 q' H q
+```
+
+For an order of size `Delta_i`, each inventory charge is the exact finite
+difference of `Phi(q +/- Delta_i e_i) / Delta_i`. With one asset, equal bid/ask
+`k`, zero extra cost, and a one-lot order, this reduces exactly to the original
+finite-horizon A-S reservation price and spread. Bid and ask may use different
+`k` and separately add queue, flow-toxicity, and conservative markout costs.
+The Paper implementation evaluates all six corners of the configured `k` and
+volatility bounds and keeps the widest depth independently on each side.
+Unlike GLFT, the exponential intensity amplitude `A` cancels from the A-S
+optimal-price condition; its bounded Hawkes-adjusted Paper proxy is used only
+by size optimization and is explicitly labelled `CONFIGURED_PAPER_PROXY`.
+
 Configured `SYMBOL|SYMBOL` correlations provide the cold-start covariance.
 After every symbol contributes enough synchronized fixed-time mid samples,
 runtime covariance switches to an EWMA outer-product estimate, shrinks toward
@@ -439,20 +638,24 @@ The adaptive Paper layer also adds bounded online controls:
   one-sided confidence bound becomes a side-specific adverse-selection cost
   only after the minimum sample count; each side/horizon uses a finite rolling
   window so a recent toxic regime is not diluted by the entire process history;
-- a Paper-only stale-quote guard checks every order-book callback and requests
+- Both models' Paper-only stale-quote guard checks every order-book callback and requests
   cancellation when either resting quote moves within the configured minimum
   depth of mid, without waiting for the next full strategy cycle;
 - L1 queue volume and side-specific trade service rates estimate queue delay;
   queue and configured network latency become a volatility-scaled quote cost;
-- each cycle evaluates all 12 corners of the configured intensity, `k`, and
-  volatility bounds, then keeps the widest bid and ask depth independently;
+- GLFT evaluates all 12 configured intensity, `k`, and volatility corners;
+  A-S evaluates its six relevant `k` and volatility corners because `A`
+  cancels from its price equation. Both keep the widest bid and ask depth
+  independently;
 - size is selected from `[0, 0.25, 0.5, 1.0]` by fill edge minus fee, markout,
   inventory change, queue delay, and quadratic size cost. Zero suppresses an
   uneconomic side. The optimizer can only reduce volume already approved by
   the existing sizing path and cannot expand an OMS or risk limit.
 
-All parameters live under `strategy.glft.adaptive` in
-`config/strategy/glft.json`. The tracked one-symbol profile exercises the same
+GLFT parameters live under `strategy.glft.adaptive` in
+`config/strategy/glft.json`; A-S equivalents live under
+`strategy.avellaneda_stoikov.adaptive` in
+`config/strategy/avellaneda_stoikov.json`. The tracked one-symbol profile exercises the same
 math with a scalar covariance. Its Paper overrides use a 0.5-second quote cycle,
 an 8 bps minimum total spread, a 1.5 bps stale-side cancellation threshold, and
 a 200-observation markout window with 12 samples required before activation.
@@ -578,7 +781,11 @@ with a bounded queue, one-second `fsync` policy, and its own single-writer
 fence. The recorder starts before the gateway, anchors its start and clean
 stop to the durable OMS journal, and must seal every session with zero dropped
 records. A writer error or queue overflow freezes new risk and cancels active
-quotes; it does not independently request a market flatten. OMS journal,
+quotes; it does not independently request a market flatten. Before advancing
+its in-memory sequence or hash tail, each encoded batch must leave at least
+512 MiB free according to `system.evidence_recorder.min_free_bytes`. A failed
+space inspection or exhausted reserve follows the same fail-closed path and is
+reported with free bytes and rejection/check-failure counters. OMS journal,
 market-evidence journal, both writer fences, sidecar state, and external-alert
 failure spool must be distinct deployment-bound files.
 
@@ -604,7 +811,13 @@ non-reduce orders. A successful worker recovery probe allows the main loop to
 clear only that constraint. Delivery failures and queue-overflow summaries
 are appended with `fsync` to the deployment-bound
 `external_alert_failures.jsonl`; records contain no endpoint, response body,
-or exception text. A complete host or process loss still requires an
+or exception text. The spool checks the exact encoded record before append and
+must preserve the 512 MiB configured by
+`alert.failure_spool_min_free_bytes`; inability to inspect or preserve that
+reserve makes the alert channel unhealthy. These append-only audit chains are
+not silently rotated. Expand the volume or archive a cleanly stopped
+deployment rather than deleting an active chain. A complete host or process
+loss still requires an
 independent infrastructure heartbeat monitor; the exchange dead-man switch
 remains responsible for cancelling orders after such a loss.
 
@@ -765,11 +978,11 @@ that deployment host. Multi-host active/passive operation is not supported.
       consume real live market streams, route every order to a local matching
       and fill simulator, never call private exchange trading endpoints, and
       label the UI environment as `PAPER · LIVE DATA`.
-- [x] Audit the Avellaneda-Stoikov and GLFT implementations against the
-      original papers and institutional practice. Formula units and inventory
-      direction are internally consistent; GLFT remains the primary model and
-      A-S remains a benchmark. The audit identified the implementation and
-      evidence gaps listed below.
+- [x] Audit and extend the Avellaneda-Stoikov and GLFT implementations against
+      the original papers and institutional practice. Formula units, inventory
+      direction, finite-horizon portfolio risk, and exact risk-potential
+      differences are tested; GLFT remains the primary and A-S the manually
+      selected Paper alternative. The evidence gaps below still apply.
 - [x] Implement the separate, signed and independently loss-capped
       `rpi_calibration_canary`, including offline permit, reservation, quota,
       journal, artifact, and model-readiness replay.

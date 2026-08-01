@@ -676,6 +676,8 @@ def optimize_quote_size(
     expected_queue_delay_s: float,
     utility_horizon_s: float = 1.0,
     size_penalty_bps: float = 0.05,
+    marginal_inventory_risk_bps: float | None = None,
+    self_risk_curvature_bps: float | None = None,
 ) -> SizeOptimizationResult:
     """Select a bounded size by expected edge minus inventory and size risk."""
 
@@ -702,6 +704,25 @@ def optimize_quote_size(
     queue_delay = _nonnegative(expected_queue_delay_s, "expected_queue_delay_s")
     horizon = _positive(utility_horizon_s, "utility_horizon_s")
     size_penalty = _nonnegative(size_penalty_bps, "size_penalty_bps")
+    if (marginal_inventory_risk_bps is None) != (
+        self_risk_curvature_bps is None
+    ):
+        raise ValueError(
+            "marginal_inventory_risk_bps and self_risk_curvature_bps "
+            "must be provided together"
+        )
+    if marginal_inventory_risk_bps is None:
+        marginal_risk = None
+        self_curvature = None
+    else:
+        marginal_risk = _finite(
+            marginal_inventory_risk_bps,
+            "marginal_inventory_risk_bps",
+        )
+        self_curvature = _nonnegative(
+            self_risk_curvature_bps,
+            "self_risk_curvature_bps",
+        )
 
     raw_fill_intensity = intensity * math.exp(-k * max(0.0, depth))
     effective_fill_intensity = raw_fill_intensity / (
@@ -713,15 +734,21 @@ def optimize_quote_size(
     best_utility = -math.inf
     for multiplier in candidates:
         size_lots = base_size * multiplier
-        post_inventory = inventory + signed_inventory_change * size_lots
-        inventory_risk = (
-            0.5
-            * gamma
-            * sigma
-            * sigma
-            * horizon
-            * (post_inventory * post_inventory - inventory * inventory)
-        )
+        if marginal_risk is not None and self_curvature is not None:
+            inventory_risk = (
+                signed_inventory_change * size_lots * marginal_risk
+                + 0.5 * size_lots * size_lots * self_curvature
+            )
+        else:
+            post_inventory = inventory + signed_inventory_change * size_lots
+            inventory_risk = (
+                0.5
+                * gamma
+                * sigma
+                * sigma
+                * horizon
+                * (post_inventory * post_inventory - inventory * inventory)
+            )
         per_fill_value = size_lots * net_edge - inventory_risk
         utility = effective_fill_intensity * per_fill_value
         utility -= size_penalty * size_lots * size_lots

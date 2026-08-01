@@ -34,7 +34,9 @@ class BinanceWsApi:
         self.ws = None
         self.lock = threading.RLock()
         self.stream_apps = {}
+        self.stream_threads = {}
         self.close_requested = False
+        self._close_event = threading.Event()
         self.connected_events = {
             "PublicWS": threading.Event(),
             "MarketWS": threading.Event(),
@@ -82,10 +84,23 @@ class BinanceWsApi:
 
     def _start_thread(self, url, name):
         with self.lock:
+            existing = self.stream_threads.get(name)
+            if existing is not None and existing.is_alive():
+                logger.warning(f"[{name}] Stream worker is already running")
+                return False
             self.active = True
             self.close_requested = False
+            self._close_event.clear()
             self.connected_events.setdefault(name, threading.Event()).clear()
-        threading.Thread(target=self._run, args=(url, name), daemon=True).start()
+            thread = threading.Thread(
+                target=self._run,
+                args=(url, name),
+                daemon=True,
+                name=f"BinanceWs-{name}",
+            )
+            self.stream_threads[name] = thread
+        thread.start()
+        return True
 
     def wait_until_connected(
         self,
@@ -150,13 +165,24 @@ class BinanceWsApi:
 
             if self._is_active():
                 logger.info(f"[{name}] Reconnecting in 5s...")
-                time.sleep(5)
+                if self._close_event.wait(5.0):
+                    break
+        with self.lock:
+            current = threading.current_thread()
+            if self.stream_threads.get(name) is current:
+                self.stream_threads.pop(name, None)
 
     def close(self):
         with self.lock:
             self.active = False
             self.close_requested = True
+            self._close_event.set()
             stream_apps = list(self.stream_apps.values())
+            stream_threads = [
+                thread
+                for thread in self.stream_threads.values()
+                if thread is not threading.current_thread()
+            ]
             self.stream_apps = {}
             self.ws = None
             for connected in self.connected_events.values():
@@ -167,6 +193,16 @@ class BinanceWsApi:
                 ws_app.close()
             except Exception:
                 pass
+        deadline = time.perf_counter() + 2.0
+        for thread in stream_threads:
+            if thread.is_alive():
+                thread.join(timeout=max(0.0, deadline - time.perf_counter()))
+        stopped = all(not thread.is_alive() for thread in stream_threads)
+        if not stopped:
+            logger.critical(
+                "[BinanceWsApi] Stream workers did not stop before timeout"
+            )
+        return stopped
 
     def _is_active(self):
         with self.lock:

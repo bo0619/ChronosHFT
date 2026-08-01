@@ -3,7 +3,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import infrastructure.external_alerts as external_alerts_module
 from infrastructure.external_alerts import (
     AlertDeliveryError,
     ExternalAlertService,
@@ -109,6 +112,7 @@ def alert_config(spool_path: Path, *, queue_capacity: int = 8):
             "shutdown_flush_timeout_sec": 1.0,
             "failure_spool_path": str(spool_path),
             "failure_spool_fsync": True,
+            "failure_spool_min_free_bytes": 536870912,
         },
     }
 
@@ -253,6 +257,41 @@ class ExternalAlertServiceTests(unittest.TestCase):
         self.assertFalse(service.probe_startup())
         self.assertEqual(len(transport.calls), 3)
         self.assertFalse(service.get_health_snapshot()["healthy"])
+        self.assertTrue(service.stop())
+
+    def test_failure_spool_preserves_disk_reserve_and_reports_health(self):
+        spool = self._spool_path()
+        service = ExternalAlertService(
+            alert_config(spool),
+            transport=FakeTransport(),
+        )
+        service.start()
+        self.assertTrue(service.probe_startup())
+        reserve = service.failure_spool_min_free_bytes
+
+        with patch.object(
+            external_alerts_module.shutil,
+            "disk_usage",
+            return_value=SimpleNamespace(free=reserve),
+        ):
+            self.assertFalse(
+                service._append_failure_record(
+                    {
+                        "schema": "test",
+                        "record_type": "forced_failure",
+                    }
+                )
+            )
+
+        snapshot = service.get_health_snapshot()
+        self.assertFalse(snapshot["healthy"])
+        self.assertEqual(
+            snapshot["reason"],
+            "failure_spool_disk_reserve_exhausted",
+        )
+        self.assertEqual(snapshot["failure_spool_space_rejections"], 1)
+        self.assertEqual(snapshot["failure_spool_free_bytes"], reserve)
+        self.assertEqual(spool.read_text(encoding="utf-8"), "")
         self.assertTrue(service.stop())
 
     def test_event_payload_and_snapshot_are_bounded_and_secret_free(self):

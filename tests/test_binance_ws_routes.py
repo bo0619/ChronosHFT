@@ -1,4 +1,5 @@
 import unittest
+import time
 from unittest.mock import patch
 
 from gateway.binance.ws_api import BinanceWsApi
@@ -117,6 +118,34 @@ class BinanceWebSocketRouteTests(unittest.TestCase):
         self.assertTrue(socket.closed)
         self.assertFalse(api.connected_events["UserWS"].is_set())
         self.assertNotIn("UserWS", api.stream_apps)
+
+    def test_close_interrupts_reconnect_wait_and_joins_worker(self):
+        api = BinanceWsApi(lambda _message: None, lambda _error: None)
+
+        class ReturningSocket:
+            def __init__(self, *_args, **_kwargs):
+                self.closed = False
+
+            def run_forever(self, **_kwargs):
+                return None
+
+            def close(self):
+                self.closed = True
+
+        with patch(
+            "gateway.binance.ws_api.websocket.WebSocketApp",
+            ReturningSocket,
+        ):
+            self.assertTrue(
+                api._start_thread("wss://example.invalid", "PublicWS")
+            )
+            started_at = time.perf_counter()
+            self.assertTrue(api.close())
+
+        self.assertLess(time.perf_counter() - started_at, 0.5)
+        self.assertFalse(
+            any(thread.is_alive() for thread in api.stream_threads.values())
+        )
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ from infrastructure.logger import logger
 from infrastructure.time_service import time_service
 
 from .component import OMSComponent
+from .execution_identity import discard_cursor_covered_execution_ids
 from .journal import JournalError
 from .order import Order
 
@@ -532,6 +533,11 @@ class OMSAccountTruth(OMSComponent):
                 },
             )
             self.trade_cursors[symbol] = trade_id
+            discard_cursor_covered_execution_ids(
+                self.execution_ids,
+                symbol=symbol,
+                trade_id=trade_id,
+            )
         return True
 
     def _apply_exchange_trade(self, trade: dict) -> bool:
@@ -817,6 +823,9 @@ class OMSAccountTruth(OMSComponent):
                                     symbol
                                 )
                                 self.trade_tail_expected_ids.pop(symbol, None)
+                                self.rest_confirmed_execution_ids.difference_update(
+                                    expected
+                                )
                                 cleaned = True
                         if not pending:
                             return

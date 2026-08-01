@@ -6,11 +6,13 @@ import os
 import queue
 import secrets
 import signal
-import statistics
 import threading
 import time
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+
+from risk.binance_sidecar_clock import BinanceSidecarClock
+from risk.binance_sidecar_emergency import BinanceSidecarEmergencyActions
+from risk.binance_sidecar_truth import BinanceSidecarTruthReader
 
 from risk.deployment_loss import (
     MAX_CANARY_DEPLOYED_EQUITY_FRACTION,
@@ -26,7 +28,6 @@ from risk.funding_guard import (
     FundingGuardState,
     FundingObservation,
     evaluate_funding_guard,
-    parse_binance_premium_index_payload,
 )
 
 
@@ -303,822 +304,76 @@ class BinanceRiskSidecarExchange:
         self.clock_reason = "clock_sync_missing"
 
     def _collect_clock_samples(self, *, emergency: bool = False):
-        sample_count = max(1, int(getattr(self, "clock_sample_count", 1)))
-        min_samples = max(
-            1,
-            min(
-                sample_count,
-                int(getattr(self, "clock_min_successful_samples", 1)),
-            ),
+        return BinanceSidecarClock(self, _finite_float).collect_samples(
+            emergency=emergency
         )
-        low_rtt_count = max(
-            1,
-            min(
-                sample_count,
-                int(getattr(self, "clock_low_rtt_sample_count", 1)),
-            ),
-        )
-        spacing_ms = max(
-            0.0,
-            float(getattr(self, "clock_sample_spacing_ms", 0.0) or 0.0),
-        )
-        max_wall_step_ms = max(
-            0.0,
-            float(getattr(self, "clock_max_wall_step_ms", 20.0) or 0.0),
-        )
-        samples = []
-        errors = []
-        for index in range(sample_count):
-            started_monotonic = time.perf_counter()
-            started_ms = time.time() * 1000.0
-            if emergency:
-                server_time_response = self.rest.get_server_time(
-                    emergency=True
-                )
-            else:
-                server_time_response = self.rest.get_server_time()
-            ok, payload, reason = self._response_payload(
-                server_time_response,
-                dict,
-                "server_time",
-            )
-            finished_ms = time.time() * 1000.0
-            finished_monotonic = time.perf_counter()
-            if not ok:
-                errors.append(reason)
-            else:
-                try:
-                    server_time_ms = float(payload["serverTime"])
-                except (KeyError, TypeError, ValueError):
-                    errors.append("server_time_payload_invalid")
-                else:
-                    if not math.isfinite(server_time_ms):
-                        errors.append("server_time_non_finite")
-                    elif server_time_ms <= 0.0:
-                        errors.append("server_time_non_positive")
-                    else:
-                        rtt_ms = max(
-                            0.0,
-                            (finished_monotonic - started_monotonic) * 1000.0,
-                        )
-                        wall_step_ms = (
-                            finished_ms - started_ms - rtt_ms
-                        )
-                        if (
-                            max_wall_step_ms > 0.0
-                            and abs(wall_step_ms) >= max_wall_step_ms
-                        ):
-                            errors.append(
-                                f"clock_wall_step:{wall_step_ms:.3f}ms"
-                            )
-                        else:
-                            samples.append(
-                                {
-                                    "offset_ms": server_time_ms
-                                    - (started_ms + rtt_ms / 2.0),
-                                    "rtt_ms": rtt_ms,
-                                }
-                            )
-            if index + 1 < sample_count and spacing_ms > 0.0:
-                time.sleep(spacing_ms / 1000.0)
-        if len(samples) < min_samples:
-            reason = errors[-1] if errors else "clock_sample_quorum_failed"
-            return None, reason
-        selected = sorted(samples, key=lambda item: item["rtt_ms"])[
-            : min(len(samples), low_rtt_count)
-        ]
-        offsets = [sample["offset_ms"] for sample in selected]
-        offset_ms = float(statistics.median(offsets))
-        rtt_ms = float(
-            statistics.median(sample["rtt_ms"] for sample in selected)
-        )
-        dispersion_ms = float(
-            statistics.median(abs(offset - offset_ms) for offset in offsets)
-        )
-        return {
-            "offset_ms": offset_ms,
-            "rtt_ms": rtt_ms,
-            "dispersion_ms": dispersion_ms,
-            "uncertainty_ms": rtt_ms / 2.0 + dispersion_ms,
-        }, ""
 
     def sync_exchange_clock(self, *, emergency: bool = False):
-        from infrastructure.time_service import time_service
-
-        sample, reason = self._collect_clock_samples(
-            emergency=emergency,
+        return BinanceSidecarClock(self, _finite_float).sync(
+            emergency=emergency
         )
-        if sample is None:
-            self.clock_reason = reason
-            return False, reason
-        max_rtt_ms = max(
-            0.0,
-            float(getattr(self, "clock_max_rtt_ms", 200.0) or 0.0),
-        )
-        max_uncertainty_ms = max(
-            0.0,
-            float(getattr(self, "clock_max_uncertainty_ms", 50.0) or 0.0),
-        )
-        max_dispersion_ms = max(
-            0.0,
-            float(
-                getattr(self, "clock_max_offset_dispersion_ms", 10.0)
-                or 0.0
-            ),
-        )
-        if max_rtt_ms > 0.0 and sample["rtt_ms"] >= max_rtt_ms:
-            reason = f"clock_rtt_exceeded:{sample['rtt_ms']:.3f}ms"
-            self.clock_reason = reason
-            return False, reason
-        if (
-            max_uncertainty_ms > 0.0
-            and sample["uncertainty_ms"] >= max_uncertainty_ms
-        ):
-            reason = (
-                f"clock_uncertainty_exceeded:"
-                f"{sample['uncertainty_ms']:.3f}ms"
-            )
-            self.clock_reason = reason
-            return False, reason
-        if (
-            max_dispersion_ms > 0.0
-            and sample["dispersion_ms"] >= max_dispersion_ms
-        ):
-            reason = (
-                f"clock_dispersion_exceeded:"
-                f"{sample['dispersion_ms']:.3f}ms"
-            )
-            self.clock_reason = reason
-            return False, reason
-
-        offset_ms = float(sample["offset_ms"])
-        anchor_monotonic = time.perf_counter()
-        anchor_wall_ms = time.time() * 1000.0
-        anchor_epoch_ms = anchor_wall_ms + offset_ms
-        if not all(
-            math.isfinite(value)
-            for value in (offset_ms, anchor_monotonic, anchor_epoch_ms)
-        ):
-            reason = "clock_anchor_non_finite"
-            self.clock_reason = reason
-            return False, reason
-
-        previous_anchor_epoch_ms = float(
-            getattr(self, "_clock_anchor_epoch_ms", 0.0) or 0.0
-        )
-        previous_anchor_monotonic = float(
-            getattr(self, "_clock_anchor_monotonic", 0.0) or 0.0
-        )
-        if previous_anchor_epoch_ms > 0.0 and previous_anchor_monotonic > 0.0:
-            monotonic_elapsed_ms = (
-                anchor_monotonic - previous_anchor_monotonic
-            ) * 1000.0
-            if not math.isfinite(monotonic_elapsed_ms) or monotonic_elapsed_ms < 0.0:
-                reason = "clock_monotonic_regressed"
-                self.clock_reason = reason
-                return False, reason
-            expected_epoch_ms = previous_anchor_epoch_ms + monotonic_elapsed_ms
-            phase_error_ms = anchor_epoch_ms - expected_epoch_ms
-            if not math.isfinite(phase_error_ms):
-                reason = "clock_phase_error_non_finite"
-                self.clock_reason = reason
-                return False, reason
-        else:
-            max_initial_offset_ms = max(
-                0.0,
-                float(
-                    getattr(self, "clock_max_initial_offset_ms", 5000.0)
-                    or 0.0
-                ),
-            )
-            if max_initial_offset_ms > 0.0 and abs(offset_ms) >= max_initial_offset_ms:
-                reason = f"clock_initial_offset_exceeded:{offset_ms:.3f}ms"
-                self.clock_reason = reason
-                return False, reason
-            phase_error_ms = 0.0
-
-        try:
-            reduce_only_phase_error_ms = max(
-                0.0,
-                _finite_float(
-                    getattr(
-                        self,
-                        "clock_reduce_only_phase_error_ms",
-                        25.0,
-                    )
-                    or 0.0,
-                    "clock_reduce_only_phase_error_ms",
-                ),
-            )
-            kill_phase_error_ms = max(
-                reduce_only_phase_error_ms,
-                _finite_float(
-                    getattr(
-                        self,
-                        "clock_kill_phase_error_ms",
-                        100.0,
-                    )
-                    or 0.0,
-                    "clock_kill_phase_error_ms",
-                ),
-            )
-        except ValueError:
-            reason = "clock_phase_threshold_invalid"
-            self.clock_reason = reason
-            return False, reason
-
-        # Preserve candidate quality/phase telemetry, but never replace the
-        # last-known-good exchange anchor with a candidate that already
-        # requires an independent risk action.
-        self.clock_phase_error_ms = phase_error_ms
-        self.clock_rtt_ms = float(sample["rtt_ms"])
-        self.clock_uncertainty_ms = float(sample["uncertainty_ms"])
-        self.clock_offset_dispersion_ms = float(sample["dispersion_ms"])
-        if (
-            kill_phase_error_ms > 0.0
-            and abs(phase_error_ms) >= kill_phase_error_ms
-        ):
-            reason = f"clock_phase_error_kill:{phase_error_ms:.3f}ms"
-            self.clock_reason = reason
-            return False, reason
-        if (
-            reduce_only_phase_error_ms > 0.0
-            and abs(phase_error_ms) >= reduce_only_phase_error_ms
-        ):
-            reason = f"clock_phase_error_reduce_only:{phase_error_ms:.3f}ms"
-            self.clock_reason = reason
-            return False, reason
-
-        self.clock_offset_ms = offset_ms
-        self._clock_anchor_epoch_ms = anchor_epoch_ms
-        self._clock_anchor_monotonic = anchor_monotonic
-        time_service.offset = self.clock_offset_ms
-        time_service.last_sync_time = anchor_wall_ms / 1000.0
-        time_service.last_rtt_ms = self.clock_rtt_ms
-        time_service.last_error = ""
-        self.last_clock_sync_monotonic = anchor_monotonic
-        self.clock_reason = ""
-        return True, ""
 
     def _ensure_exchange_clock(self, force: bool = False):
-        if not getattr(self, "clock_sync_enabled", False):
-            return True, ""
-        age = max(
-            0.0,
-            time.perf_counter()
-            - float(getattr(self, "last_clock_sync_monotonic", 0.0) or 0.0),
-        )
-        if (
-            not force
-            and self.last_clock_sync_monotonic > 0.0
-            and age <= self.clock_sync_interval_sec
-            and not str(getattr(self, "clock_reason", "") or "")
-        ):
-            return True, ""
-        if force:
-            return self.sync_exchange_clock(emergency=True)
-        return self.sync_exchange_clock()
+        return BinanceSidecarClock(self, _finite_float).ensure(force)
 
     def check_account_channel(self):
-        try:
-            response = self.rest.get_account()
-            status_code = getattr(response, "status_code", None)
-            if status_code != 200:
-                return False, f"account_status={status_code or 'unavailable'}"
-            payload = response.json()
-            if not isinstance(payload, dict):
-                return False, "account_payload_invalid"
-            return True, ""
-        except Exception as exc:
-            return False, f"account_exception:{type(exc).__name__}:{exc}"
+        return BinanceSidecarTruthReader(self).check_account_channel()
 
     @staticmethod
     def _response_payload(response, expected_type, label: str):
-        status_code = getattr(response, "status_code", None)
-        if status_code != 200:
-            return False, None, f"{label}_status={status_code or 'unavailable'}"
-        try:
-            payload = response.json()
-        except Exception as exc:
-            return False, None, f"{label}_json:{type(exc).__name__}:{exc}"
-        if not isinstance(payload, expected_type):
-            return False, None, f"{label}_payload_invalid"
-        return True, payload, ""
+        return BinanceSidecarTruthReader.response_payload(
+            response,
+            expected_type,
+            label,
+        )
 
     @staticmethod
     def _position_risk_fingerprint(positions) -> tuple:
-        def normalized_number(value):
-            try:
-                parsed = Decimal(str(value or "0"))
-            except (InvalidOperation, ValueError):
-                return str(value or "").strip()
-            if not parsed.is_finite():
-                return str(value or "").strip()
-            return str(parsed.normalize())
-
-        rows = []
-        for position in positions:
-            if not isinstance(position, dict):
-                rows.append(("<invalid>", repr(position)))
-                continue
-            rows.append(
-                (
-                    str(position.get("symbol", "") or "").upper(),
-                    str(
-                        position.get("positionSide", "BOTH") or "BOTH"
-                    ).upper(),
-                    normalized_number(position.get("positionAmt")),
-                    normalized_number(position.get("entryPrice")),
-                    normalized_number(position.get("breakEvenPrice")),
-                    normalized_number(position.get("isolatedWallet")),
-                    normalized_number(position.get("liquidationPrice")),
-                    normalized_number(position.get("leverage")),
-                    str(position.get("marginType", "") or "").upper(),
-                    str(position.get("isolated", "") or "").lower(),
-                    normalized_number(position.get("updateTime")),
-                )
-            )
-        return tuple(sorted(rows))
+        return BinanceSidecarTruthReader.position_risk_fingerprint(
+            positions
+        )
 
     def _corrected_epoch_at(self, observed_monotonic: float):
-        try:
-            observed_monotonic = float(observed_monotonic)
-            anchor_monotonic = float(self._clock_anchor_monotonic)
-            anchor_epoch_ms = float(self._clock_anchor_epoch_ms)
-        except (AttributeError, TypeError, ValueError):
-            return None
-        if (
-            not math.isfinite(observed_monotonic)
-            or not math.isfinite(anchor_monotonic)
-            or not math.isfinite(anchor_epoch_ms)
-            or observed_monotonic < anchor_monotonic
-            or anchor_monotonic <= 0.0
-            or anchor_epoch_ms <= 0.0
-        ):
-            return None
-        return (
-            anchor_epoch_ms
-            + (observed_monotonic - anchor_monotonic) * 1_000.0
-        ) / 1_000.0
+        return BinanceSidecarClock(self, _finite_float).corrected_epoch_at(
+            observed_monotonic
+        )
 
     def _get_funding_observations(self):
-        if not getattr(self, "funding_guard_enabled", False):
-            return True, {}, ""
-        if not self.symbols:
-            return False, {}, "funding_guard_symbols_missing"
-
-        observations = {}
-        for symbol in self.symbols:
-            ok, payload, reason = self._response_payload(
-                self.rest.request(
-                    "GET",
-                    BINANCE_PREMIUM_INDEX_ENDPOINT,
-                    {"symbol": symbol},
-                    signed=False,
-                ),
-                dict,
-                f"funding_rate:{symbol}",
-            )
-            if not ok:
-                return False, {}, reason
-            received_monotonic = time.perf_counter()
-            corrected_received_epoch = self._corrected_epoch_at(
-                received_monotonic
-            )
-            if corrected_received_epoch is None:
-                return (
-                    False,
-                    {},
-                    f"funding_clock_anchor_unavailable:{symbol}",
-                )
-            try:
-                observation = parse_binance_premium_index_payload(
-                    payload,
-                    expected_symbol=symbol,
-                    corrected_received_epoch=corrected_received_epoch,
-                    received_monotonic=received_monotonic,
-                    max_source_age_ms=self.funding_max_source_age_ms,
-                    clock_healthy=not bool(self.clock_reason),
-                )
-            except ValueError as exc:
-                return (
-                    False,
-                    {},
-                    f"funding_payload_invalid:{symbol}:{exc}",
-                )
-            observations[symbol] = {
-                "observation_id": observation.observation_id,
-                "funding_rate": observation.funding_rate,
-                "next_funding_epoch": observation.next_funding_epoch,
-                "corrected_received_epoch": (
-                    observation.corrected_received_epoch
-                ),
-                "received_monotonic": observation.received_monotonic,
-                "clock_healthy": observation.clock_healthy,
-            }
-        return True, observations, ""
+        return BinanceSidecarTruthReader(self).get_funding_observations()
 
     def get_risk_snapshot(self):
-        try:
-            clock_ok, reason = self._ensure_exchange_clock()
-            if not clock_ok:
-                return False, {}, reason
-            account_ok, account, reason = self._response_payload(
-                self.rest.get_account(),
-                dict,
-                "account",
-            )
-            if not account_ok:
-                return False, {}, reason
-            positions_ok, positions, reason = self._response_payload(
-                self.rest.get_positions(),
-                list,
-                "positions",
-            )
-            if not positions_ok:
-                return False, {}, reason
-            orders_ok, open_orders, reason = (
-                self._get_open_orders_snapshot()
-            )
-            if not orders_ok:
-                return False, {}, reason
-            positions_after_ok, positions_after, reason = (
-                self._response_payload(
-                    self.rest.get_positions(),
-                    list,
-                    "positions_after_open_orders",
-                )
-            )
-            if not positions_after_ok:
-                return False, {}, reason
-            if self._position_risk_fingerprint(
-                positions
-            ) != self._position_risk_fingerprint(positions_after):
-                return (
-                    False,
-                    {},
-                    "snapshot_inconsistent:positions_changed_during_"
-                    "open_orders_query",
-                )
-            positions = positions_after
-            external_cash_flow_total = 0.0
-            if getattr(self, "daily_loss_enabled", False):
-                cash_flow_ok, external_cash_flow_total, reason = (
-                    self._get_cached_daily_external_cash_flow()
-                )
-                if not cash_flow_ok:
-                    return False, {}, reason
-            funding_ok, funding_observations, reason = (
-                self._get_funding_observations()
-            )
-            if not funding_ok:
-                return False, {}, reason
-            from infrastructure.time_service import time_service
-
-            return (
-                True,
-                {
-                    "account": account,
-                    "positions": positions,
-                    "open_orders": open_orders,
-                    "funding_observations": funding_observations,
-                    "external_cash_flow_total": external_cash_flow_total,
-                    "clock_offset_ms": float(
-                        getattr(self, "clock_offset_ms", 0.0) or 0.0
-                    ),
-                    "clock_phase_error_ms": float(
-                        getattr(self, "clock_phase_error_ms", 0.0) or 0.0
-                    ),
-                    "clock_rtt_ms": float(
-                        getattr(self, "clock_rtt_ms", 0.0) or 0.0
-                    ),
-                    "clock_uncertainty_ms": float(
-                        getattr(self, "clock_uncertainty_ms", 0.0) or 0.0
-                    ),
-                    "clock_offset_dispersion_ms": float(
-                        getattr(
-                            self,
-                            "clock_offset_dispersion_ms",
-                            0.0,
-                        )
-                        or 0.0
-                    ),
-                    "captured_at": time_service.now() / 1000.0,
-                },
-                "",
-            )
-        except Exception as exc:
-            return False, {}, f"snapshot_exception:{type(exc).__name__}:{exc}"
+        return BinanceSidecarTruthReader(self).get_risk_snapshot()
 
     @staticmethod
     def _income_identity(row: dict) -> str:
-        income_type = str(
-            row.get("incomeType", row.get("income_type", "")) or ""
-        ).upper()
-        transaction_id = row.get("tranId", row.get("trandId"))
-        if transaction_id not in (None, ""):
-            return f"{income_type}:{transaction_id}"
-        fingerprint = "|".join(
-            str(row.get(key, "") or "")
-            for key in ("time", "asset", "income", "symbol", "info")
-        )
-        return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+        return BinanceSidecarTruthReader.income_identity(row)
 
     def _get_daily_external_cash_flow(self):
-        from infrastructure.time_service import time_service
-
-        now = datetime.fromtimestamp(
-            time_service.now() / 1000.0,
-            tz=timezone.utc,
-        )
-        day_start_ms = int(
-            now.replace(
-                hour=0,
-                minute=0,
-                second=0,
-                microsecond=0,
-            ).timestamp()
-            * 1000
-        )
-        end_time_ms = int(now.timestamp() * 1000)
-        total = 0.0
-        seen = set()
-        limit = 1000
-        for page in range(1, self.cash_flow_max_pages + 1):
-            ok, rows, reason = self._response_payload(
-                self.rest.get_income_history(
-                    start_time=day_start_ms,
-                    end_time=end_time_ms,
-                    page=page,
-                    limit=limit,
-                ),
-                list,
-                "income_history",
-            )
-            if not ok:
-                return False, 0.0, reason
-            for row in rows:
-                if not isinstance(row, dict):
-                    return False, 0.0, "income_history_row_invalid"
-                income_type = str(
-                    row.get(
-                        "incomeType",
-                        row.get("income_type", ""),
-                    )
-                    or ""
-                ).upper()
-                if income_type not in self.cash_flow_income_types:
-                    continue
-                asset = str(row.get("asset", "") or "").upper()
-                if asset not in self.cash_flow_assets:
-                    return (
-                        False,
-                        0.0,
-                        f"cash_flow_asset_unsupported:{asset or 'empty'}",
-                    )
-                identity = self._income_identity(row)
-                if identity in seen:
-                    continue
-                seen.add(identity)
-                try:
-                    amount = float(row.get("income", 0.0) or 0.0)
-                except (TypeError, ValueError):
-                    return False, 0.0, "cash_flow_amount_invalid"
-                if not math.isfinite(amount):
-                    return False, 0.0, "cash_flow_amount_non_finite"
-                total += amount
-            if len(rows) < limit:
-                return True, total, ""
-        return False, 0.0, "income_history_page_limit_exceeded"
+        return BinanceSidecarTruthReader(
+            self
+        ).get_daily_external_cash_flow()
 
     def _get_cached_daily_external_cash_flow(self):
-        now = time.perf_counter()
-        initialized = bool(
-            getattr(self, "_cash_flow_cache_initialized", False)
-        )
-        last_poll = float(
-            getattr(self, "_last_cash_flow_poll_monotonic", 0.0) or 0.0
-        )
-        interval = max(
-            1.0,
-            float(
-                getattr(self, "cash_flow_poll_interval_sec", 30.0)
-                or 30.0
-            ),
-        )
-        if initialized and now - last_poll < interval:
-            return (
-                True,
-                float(
-                    getattr(
-                        self,
-                        "_cached_external_cash_flow_total",
-                        0.0,
-                    )
-                    or 0.0
-                ),
-                "",
-            )
-
-        ok, total, reason = self._get_daily_external_cash_flow()
-        if not ok:
-            return False, 0.0, reason
-        self._cached_external_cash_flow_total = float(total)
-        self._last_cash_flow_poll_monotonic = now
-        self._cash_flow_cache_initialized = True
-        return True, float(total), ""
+        return BinanceSidecarTruthReader(
+            self
+        ).get_cached_daily_external_cash_flow()
 
     def _get_open_orders_snapshot(self):
-        symbols = tuple(getattr(self, "symbols", ()) or ())
-        now = time.perf_counter()
-        last_full_audit = float(
-            getattr(
-                self,
-                "_last_full_open_orders_audit_monotonic",
-                0.0,
-            )
-            or 0.0
-        )
-        interval = max(
-            5.0,
-            float(
-                getattr(
-                    self,
-                    "full_open_orders_audit_interval_sec",
-                    60.0,
-                )
-                or 60.0
-            ),
-        )
-        if not symbols or last_full_audit <= 0.0 or now - last_full_audit >= interval:
-            ok, rows, reason = self._response_payload(
-                self.rest.get_open_orders(),
-                list,
-                "open_orders",
-            )
-            if not ok:
-                return False, [], reason
-            self._last_full_open_orders_audit_monotonic = now
-            self._remember_open_order_symbols(rows)
-            return True, rows, ""
-
-        rows = []
-        known_symbols = set(
-            getattr(self, "_known_open_order_symbols", set()) or set()
-        )
-        for symbol in sorted(set(symbols) | known_symbols):
-            ok, symbol_rows, reason = self._response_payload(
-                self.rest.get_open_orders(symbol),
-                list,
-                f"open_orders:{symbol}",
-            )
-            if not ok:
-                return False, [], reason
-            rows.extend(symbol_rows)
-        self._remember_open_order_symbols(rows)
-        return True, rows, ""
+        return BinanceSidecarTruthReader(self).get_open_orders_snapshot()
 
     def _remember_open_order_symbols(self, rows):
-        known_symbols = getattr(
-            self,
-            "_known_open_order_symbols",
-            None,
+        return BinanceSidecarTruthReader(self).remember_open_order_symbols(
+            rows
         )
-        if known_symbols is None:
-            known_symbols = set()
-            self._known_open_order_symbols = known_symbols
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            symbol = str(row.get("symbol", "") or "").strip().upper()
-            if symbol:
-                known_symbols.add(symbol)
 
     def emergency_cancel(self, symbols, countdown_time_ms: int):
-        failures = []
-        clock_ok, clock_reason = self._ensure_exchange_clock(force=True)
-        if not clock_ok:
-            failures.append(f"clock:{clock_reason}")
-        target_symbols = {
-            str(symbol or "").upper()
-            for symbol in symbols
-            if str(symbol or "").strip()
-        }
-        try:
-            response = self.rest.get_open_orders(emergency=True)
-            status_code = getattr(response, "status_code", None)
-            if status_code != 200:
-                failures.append(
-                    f"account_open_orders_status={status_code}"
-                )
-            else:
-                open_orders = response.json()
-                if not isinstance(open_orders, list):
-                    failures.append("account_open_orders_payload_invalid")
-                else:
-                    for index, order in enumerate(open_orders):
-                        if not isinstance(order, dict):
-                            failures.append(
-                                "account_open_order_row_invalid:"
-                                f"{index}"
-                            )
-                            continue
-                        symbol = str(
-                            order.get("symbol", "") or ""
-                        ).upper()
-                        if not symbol:
-                            failures.append(
-                                "account_open_order_symbol_missing:"
-                                f"{index}"
-                            )
-                            continue
-                        target_symbols.add(symbol)
-        except Exception as exc:
-            failures.append(
-                "account_open_orders_exception:"
-                f"{type(exc).__name__}:{exc}"
-            )
-
-        for symbol in sorted(target_symbols):
-            try:
-                countdown_response = self.rest.set_countdown_cancel_all(
-                    symbol,
-                    countdown_time_ms,
-                )
-                if getattr(countdown_response, "status_code", None) != 200:
-                    failures.append(
-                        f"{symbol}:countdown_status="
-                        f"{getattr(countdown_response, 'status_code', None)}"
-                    )
-            except Exception as exc:
-                failures.append(
-                    f"{symbol}:countdown_exception:{type(exc).__name__}:{exc}"
-                )
-
-            try:
-                cancel_response = self.rest.cancel_all_orders(symbol)
-                if getattr(cancel_response, "status_code", None) != 200:
-                    failures.append(
-                        f"{symbol}:cancel_status="
-                        f"{getattr(cancel_response, 'status_code', None)}"
-                    )
-            except Exception as exc:
-                failures.append(
-                    f"{symbol}:cancel_exception:{type(exc).__name__}:{exc}"
-                )
-        return not failures, ";".join(failures)
+        return BinanceSidecarEmergencyActions(self).cancel(
+            symbols,
+            countdown_time_ms,
+        )
 
     def emergency_flatten(self):
-        from event.type import OrderRequest
-
-        clock_ok, clock_reason = self._ensure_exchange_clock(force=True)
-        ok, positions, reason = self._response_payload(
-            self.rest.get_positions(emergency=True),
-            list,
-            "positions",
-        )
-        if not ok:
-            return False, 0, reason
-
-        failures = [] if clock_ok else [f"clock:{clock_reason}"]
-        submitted = 0
-        timestamp_fragment = int(time.time() * 1000) % 1_000_000_000
-        for index, position in enumerate(positions):
-            symbol = str(position.get("symbol", "") or "").upper()
-            try:
-                amount = float(position.get("positionAmt", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                failures.append(f"{symbol or 'unknown'}:invalid_position")
-                continue
-            if not symbol or abs(amount) <= 1e-9:
-                continue
-            side = "SELL" if amount > 0.0 else "BUY"
-            request = OrderRequest(
-                symbol=symbol,
-                price=0.0,
-                volume=abs(amount),
-                side=side,
-                order_type="MARKET",
-                time_in_force="IOC",
-                reduce_only=True,
-            )
-            client_oid = (
-                f"crsk-{os.getpid()}-{timestamp_fragment}-{index}"
-            )[:36]
-            try:
-                response = self.rest.new_order(request, client_oid)
-                if getattr(response, "status_code", None) != 200:
-                    failures.append(
-                        f"{symbol}:flatten_status="
-                        f"{getattr(response, 'status_code', None)}"
-                    )
-                    continue
-                submitted += 1
-            except Exception as exc:
-                failures.append(
-                    f"{symbol}:flatten_exception:{type(exc).__name__}:{exc}"
-                )
-        return not failures, submitted, ";".join(failures)
+        return BinanceSidecarEmergencyActions(self).flatten()
 
     def close(self):
         self.session.close()

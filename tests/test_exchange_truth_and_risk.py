@@ -476,6 +476,33 @@ class ExchangeTruthTests(unittest.TestCase):
         }
         return strategy, oms
 
+    def test_oms_event_log_is_bounded_without_dropping_processing(self):
+        config = self.make_config()
+        config["oms"]["event_log_max"] = 2
+        oms = OMS(DummyEngine(), DummyGateway(), config)
+        try:
+            events = [Event(f"diagnostic-{index}", index) for index in range(3)]
+            for event in events:
+                oms._append_and_process(event)
+
+            self.assertEqual(list(oms.event_log), events[-2:])
+            self.assertEqual(oms.event_log_evictions, 1)
+            snapshot = oms.get_capability_snapshot()["event_log"]
+            self.assertEqual(
+                snapshot,
+                {"depth": 2, "capacity": 2, "evictions": 1},
+            )
+        finally:
+            oms.stop()
+
+    def test_oms_event_log_capacity_is_strictly_validated(self):
+        for invalid in (True, 0, -1, 1.5, "2048"):
+            with self.subTest(invalid=invalid):
+                config = self.make_config()
+                config["oms"]["event_log_max"] = invalid
+                with self.assertRaisesRegex(ValueError, "event_log_max"):
+                    OMS(DummyEngine(), DummyGateway(), config)
+
     def test_strategy_cancel_all_waits_for_terminal_updates(self):
         strategy, oms = self.make_strategy()
 
@@ -3907,7 +3934,10 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             session_id="test-session",
             status_interval_sec=0.02,
             parent_heartbeat_timeout_sec=0.10,
-            cancel_retry_sec=0.05,
+            exchange_poll_interval_sec=0.10,
+            exchange_max_age_sec=0.20,
+            snapshot_worker_timeout_sec=0.20,
+            cancel_retry_sec=0.10,
             orphan_exit_sec=0.20,
         )
         command_queue.put(
@@ -3926,10 +3956,24 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         worker.start()
 
         healthy_seen = False
+        heartbeat_sequence = 1
         deadline = time.time() + 1.0
-        while time.time() < deadline and worker.is_alive():
+        while (
+            time.time() < deadline
+            and worker.is_alive()
+            and not healthy_seen
+        ):
+            heartbeat_sequence += 1
+            command_queue.put(
+                {
+                    "type": "HEARTBEAT",
+                    "session_id": "test-session",
+                    "sequence": heartbeat_sequence,
+                    "sent_monotonic": time.perf_counter(),
+                }
+            )
             try:
-                status = status_queue.get(timeout=0.05)
+                status = status_queue.get(timeout=0.03)
             except queue.Empty:
                 continue
             healthy_seen = healthy_seen or bool(status.get("healthy"))

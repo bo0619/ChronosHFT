@@ -17,6 +17,9 @@
     "ack_timeout_recheck_sec": 60.0,
     "monitor_check_interval_sec": 1.0,
     "risk_rejection_log_interval_sec": 5.0,
+    "event_log_max": 2048,
+    "journal_min_free_bytes": 536870912,
+    "journal_space_check_interval_sec": 1.0,
     "tombstone_max": 2000
   }
 }

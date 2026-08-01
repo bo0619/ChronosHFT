@@ -1,0 +1,19 @@
+{
+  "system": {
+    "strategy_runtime": {
+      "_comment": "Bound strategy control truth in memory and freeze/cancel fail-closed before a stalled strategy can exhaust a small AWS instance.",
+      "control_queue_capacity": 2048,
+      "queue_warn_depth": 512,
+      "warn_queue_depth": 128,
+      "freeze_queue_depth": 512,
+      "warn_backlog_ms": 400.0,
+      "freeze_backlog_ms": 1500.0,
+      "async_worker_warn_deferred": 8,
+      "async_worker_freeze_deferred": 32,
+      "recovery_checks": 20,
+      "slow_handler_ms": 100.0,
+      "alert_interval_sec": 5.0,
+      "shutdown_timeout_sec": 5.0
+    }
+  }
+}

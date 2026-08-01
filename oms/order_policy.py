@@ -221,6 +221,10 @@ class OMSOrderPolicy(OMSComponent):
         return ""
 
     def _get_submission_safety_reason_locked(self, intent: OrderIntent) -> str:
+        database_rejection = self._get_paper_database_rejection_locked(intent)
+        if database_rejection:
+            return database_rejection
+
         clock_rejection = self._get_clock_health_rejection_locked(intent)
         if clock_rejection:
             return clock_rejection
@@ -311,6 +315,24 @@ class OMSOrderPolicy(OMSComponent):
                 f"{strategy_symbol_active}>={self.max_strategy_symbol_active_orders}"
             )
         return ""
+
+    def _get_paper_database_rejection_locked(
+        self,
+        intent: OrderIntent,
+    ) -> str:
+        if intent.reduce_only:
+            return ""
+        database = getattr(self, "paper_trade_database", None)
+        if database is None:
+            return ""
+        try:
+            snapshot = database.health_snapshot()
+        except Exception as exc:
+            return f"paper_trade_database_health_unavailable:{type(exc).__name__}"
+        if bool(snapshot.get("healthy", False)):
+            return ""
+        reason = str(snapshot.get("last_error", "") or "unhealthy")
+        return f"paper_trade_database_unhealthy:{reason}"
 
     def _get_self_trade_prevention_rejection_locked(
         self,

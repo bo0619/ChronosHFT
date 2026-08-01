@@ -2,19 +2,25 @@ import math
 import unittest
 
 from strategy.quote_math import (
+    ADAPTIVE_AS_FORMULA_VERSION,
     ADAPTIVE_GLFT_FORMULA_VERSION,
+    ASQuoteScenario,
     AS_FORMULA_VERSION,
     GLFT_FORMULA_VERSION,
     GLFTQuoteScenario,
+    PORTFOLIO_AS_FORMULA_VERSION,
     PORTFOLIO_GLFT_FORMULA_VERSION,
     UNITS_VERSION,
+    PortfolioASQuoteSolution,
     PortfolioQuoteSolution,
     QuoteOffsets,
+    adaptive_portfolio_as_quote_offsets,
     adaptive_portfolio_glft_quote_offsets,
     as_quote_offsets,
     depths_bps_to_prices,
     glft_quote_offsets,
     portfolio_glft_quote_offsets,
+    robust_adaptive_portfolio_as_quote_offsets,
     robust_adaptive_portfolio_glft_quote_offsets,
 )
 
@@ -30,6 +36,14 @@ class QuoteMathTests(unittest.TestCase):
             "avellaneda_stoikov.log_bps_finite_horizon.v1",
         )
         self.assertEqual(
+            PORTFOLIO_AS_FORMULA_VERSION,
+            "avellaneda_stoikov.log_bps_finite_horizon_portfolio.v1",
+        )
+        self.assertEqual(
+            ADAPTIVE_AS_FORMULA_VERSION,
+            "avellaneda_stoikov.log_bps_finite_horizon_adaptive_portfolio.v1",
+        )
+        self.assertEqual(
             GLFT_FORMULA_VERSION,
             "glft.log_bps_asymptotic_model_a.v2",
         )
@@ -40,6 +54,129 @@ class QuoteMathTests(unittest.TestCase):
         self.assertEqual(
             ADAPTIVE_GLFT_FORMULA_VERSION,
             "glft.log_bps_finite_horizon_adaptive_portfolio_model_a.v1",
+        )
+
+    def test_portfolio_as_one_asset_exactly_recovers_scalar_as(self):
+        scalar = as_quote_offsets(
+            mid_price=100.0,
+            inventory_lots=2.25,
+            sigma_bps_sqrt_s=1.0,
+            gamma_per_bps=0.05,
+            k_per_bps=0.5,
+            horizon_s=2.0,
+        )
+        portfolio = adaptive_portfolio_as_quote_offsets(
+            mid_prices=[100.0],
+            inventory_lots=[2.25],
+            covariance_bps2_per_s=[[1.0]],
+            gamma_per_bps=0.05,
+            bid_k_per_bps=[0.5],
+            ask_k_per_bps=[0.5],
+            order_size_lots=[1.0],
+            bid_adverse_cost_bps=[0.0],
+            ask_adverse_cost_bps=[0.0],
+            horizon_s=2.0,
+        )
+
+        self.assertIsInstance(portfolio, PortfolioASQuoteSolution)
+        for field in (
+            "bid_depth_bps",
+            "ask_depth_bps",
+            "center_offset_bps",
+            "half_spread_bps",
+            "bid_price",
+            "ask_price",
+        ):
+            self.assertAlmostEqual(
+                getattr(portfolio.quotes[0], field),
+                getattr(scalar, field),
+                places=12,
+            )
+
+    def test_portfolio_as_uses_exact_inventory_potential_differences(self):
+        inventory = [1.25, -0.5]
+        order_sizes = [0.75, 1.2]
+        solution = adaptive_portfolio_as_quote_offsets(
+            mid_prices=[100.0, 200.0],
+            inventory_lots=inventory,
+            covariance_bps2_per_s=[[4.0, 1.0], [1.0, 9.0]],
+            gamma_per_bps=0.05,
+            bid_k_per_bps=[0.5, 0.9],
+            ask_k_per_bps=[0.5, 0.9],
+            order_size_lots=order_sizes,
+            bid_adverse_cost_bps=[0.0, 0.0],
+            ask_adverse_cost_bps=[0.0, 0.0],
+            horizon_s=2.0,
+        )
+        curvature = solution.risk_curvature_bps
+
+        def penalty(position):
+            return 0.5 * sum(
+                position[row]
+                * sum(
+                    curvature[row][column] * position[column]
+                    for column in range(2)
+                )
+                for row in range(2)
+            )
+
+        for index in range(2):
+            buy_inventory = list(inventory)
+            sell_inventory = list(inventory)
+            buy_inventory[index] += order_sizes[index]
+            sell_inventory[index] -= order_sizes[index]
+            bid_risk = (
+                penalty(buy_inventory) - penalty(inventory)
+            ) / order_sizes[index]
+            ask_risk = (
+                penalty(sell_inventory) - penalty(inventory)
+            ) / order_sizes[index]
+            self.assertAlmostEqual(
+                solution.quotes[index].bid_depth_bps,
+                solution.bid_liquidity_depth_bps[index] + bid_risk,
+                places=11,
+            )
+            self.assertAlmostEqual(
+                solution.quotes[index].ask_depth_bps,
+                solution.ask_liquidity_depth_bps[index] + ask_risk,
+                places=11,
+            )
+
+    def test_robust_as_takes_per_side_scenario_envelope(self):
+        baseline = ASQuoteScenario(
+            name="BASE",
+            bid_k_per_bps=[0.5],
+            ask_k_per_bps=[0.5],
+            covariance_bps2_per_s=[[1.0]],
+            bid_adverse_cost_bps=[0.0],
+            ask_adverse_cost_bps=[0.0],
+        )
+        adverse = ASQuoteScenario(
+            name="ADVERSE",
+            bid_k_per_bps=[0.5],
+            ask_k_per_bps=[0.5],
+            covariance_bps2_per_s=[[1.0]],
+            bid_adverse_cost_bps=[2.0],
+            ask_adverse_cost_bps=[3.0],
+        )
+        robust = robust_adaptive_portfolio_as_quote_offsets(
+            mid_prices=[100.0],
+            inventory_lots=[0.0],
+            gamma_per_bps=0.05,
+            order_size_lots=[1.0],
+            horizon_s=1.0,
+            scenarios=(baseline, adverse),
+        )
+
+        self.assertEqual(robust.selected_bid_scenario, ("ADVERSE",))
+        self.assertEqual(robust.selected_ask_scenario, ("ADVERSE",))
+        self.assertAlmostEqual(
+            robust.quotes[0].bid_depth_bps,
+            robust.scenario_solutions[0].quotes[0].bid_depth_bps + 2.0,
+        )
+        self.assertAlmostEqual(
+            robust.quotes[0].ask_depth_bps,
+            robust.scenario_solutions[0].quotes[0].ask_depth_bps + 3.0,
         )
 
     def test_adaptive_symmetric_asymptote_recovers_portfolio_glft(self):

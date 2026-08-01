@@ -1,7 +1,10 @@
 ﻿import json
 import hashlib
+import math
 import os
+import shutil
 import threading
+import time
 from collections import deque
 from datetime import datetime
 from enum import Enum
@@ -52,11 +55,49 @@ class OMSJournal:
             "journal_path",
             os.path.join("storage", "oms", "oms_journal.jsonl"),
         )
+        raw_min_free_bytes = oms_conf.get("journal_min_free_bytes", 0)
+        if (
+            isinstance(raw_min_free_bytes, bool)
+            or not isinstance(raw_min_free_bytes, int)
+            or raw_min_free_bytes < 0
+        ):
+            raise ValueError(
+                "oms.journal_min_free_bytes must be a non-negative integer"
+            )
+        self.min_free_bytes = raw_min_free_bytes
+        raw_space_check_interval = oms_conf.get(
+            "journal_space_check_interval_sec",
+            1.0,
+        )
+        if isinstance(raw_space_check_interval, bool):
+            raise ValueError(
+                "oms.journal_space_check_interval_sec must be positive"
+            )
+        try:
+            self.space_check_interval_sec = float(raw_space_check_interval)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "oms.journal_space_check_interval_sec must be positive"
+            ) from exc
+        if (
+            not math.isfinite(self.space_check_interval_sec)
+            or self.space_check_interval_sec <= 0.0
+        ):
+            raise ValueError(
+                "oms.journal_space_check_interval_sec must be positive"
+            )
         self.lock = threading.RLock()
         self._next_seq = 1
         self._last_hash = ""
         self._recent_commits = {}
         self._recent_commit_order = deque()
+        self._disk_free_bytes = None
+        self._last_space_check_monotonic = 0.0
+        self._last_space_check_at = 0.0
+        self._space_check_failure_count = 0
+        self._space_rejection_count = 0
+        self._write_failure_count = 0
+        self._last_space_error = ""
 
         if self.enabled:
             parent = os.path.dirname(os.path.abspath(self.path))
@@ -81,16 +122,20 @@ class OMSJournal:
     def _initialize_tail(self):
         if not os.path.exists(self.path):
             return
-        records = self._read_records()
-        for record in reversed(records):
+        physical_count = 0
+        last_durable_record = None
+        for record in self._iter_records_unlocked():
+            physical_count += 1
             if record.get("version") == self.RECORD_VERSION:
-                self._next_seq = int(record["seq"]) + 1
-                self._last_hash = str(record["hash"])
-                return
+                last_durable_record = record
+        if last_durable_record is not None:
+            self._next_seq = int(last_durable_record["seq"]) + 1
+            self._last_hash = str(last_durable_record["hash"])
+            return
         # Legacy records did not have sequence numbers. Starting after their
         # physical count keeps the first durable sequence monotonic while still
         # allowing an in-place upgrade.
-        self._next_seq = len(records) + 1
+        self._next_seq = physical_count + 1
 
     def append(self, kind: str, payload: dict):
         committed = self.append_batch(((kind, payload),))
@@ -146,17 +191,30 @@ class OMSJournal:
                     f"{exc}"
                 ) from exc
 
+            batch_text = "\n".join(lines) + "\n"
+            encoded_batch = batch_text.encode("utf-8")
+            self._ensure_disk_space(len(encoded_batch))
             try:
                 with open(self.path, "a", encoding="utf-8", newline="\n") as f:
-                    f.write("\n".join(lines) + "\n")
+                    f.write(batch_text)
                     f.flush()
                     if self.fsync_enabled:
                         os.fsync(f.fileno())
             except OSError as exc:
+                self._write_failure_count += 1
+                self._last_space_error = (
+                    f"write_failed:{type(exc).__name__}:{exc}"
+                )
                 raise JournalWriteError(
                     "Failed to persist OMS journal batch "
                     f"seq={self._next_seq}..{next_seq - 1}: {exc}"
                 ) from exc
+
+            if self._disk_free_bytes is not None:
+                self._disk_free_bytes = max(
+                    0,
+                    self._disk_free_bytes - len(encoded_batch),
+                )
 
             self._next_seq = next_seq
             self._last_hash = last_hash
@@ -169,6 +227,51 @@ class OMSJournal:
                     self._recent_commits.pop(expired, None)
             return committed_sequences
 
+    def _ensure_disk_space(self, required_bytes: int) -> None:
+        if self.min_free_bytes <= 0:
+            return
+
+        required_bytes = max(0, int(required_bytes))
+        now_monotonic = time.monotonic()
+        refresh_required = (
+            self._disk_free_bytes is None
+            or now_monotonic - self._last_space_check_monotonic
+            >= self.space_check_interval_sec
+            or self._disk_free_bytes < self.min_free_bytes + required_bytes
+        )
+        if refresh_required:
+            parent = os.path.dirname(os.path.abspath(self.path))
+            try:
+                free_bytes = int(shutil.disk_usage(parent).free)
+            except Exception as exc:
+                self._space_check_failure_count += 1
+                self._last_space_error = (
+                    f"space_check_failed:{type(exc).__name__}:{exc}"
+                )
+                raise JournalWriteError(
+                    "Failed to verify free space for the OMS journal: "
+                    f"{type(exc).__name__}:{exc}"
+                ) from exc
+            self._disk_free_bytes = free_bytes
+            self._last_space_check_monotonic = now_monotonic
+            self._last_space_check_at = time.time()
+            self._last_space_error = ""
+
+        free_after_write = self._disk_free_bytes - required_bytes
+        if free_after_write < self.min_free_bytes:
+            self._space_rejection_count += 1
+            self._last_space_error = (
+                "insufficient_space:"
+                f"free={self._disk_free_bytes}:"
+                f"required={required_bytes}:"
+                f"reserve={self.min_free_bytes}"
+            )
+            raise JournalWriteError(
+                "OMS journal write rejected because disk free space would fall "
+                f"below the reserve: free={self._disk_free_bytes} "
+                f"batch={required_bytes} reserve={self.min_free_bytes}"
+            )
+
     def commit_metadata(self, sequence: int):
         """Return immutable metadata for one recent in-process commit."""
         with self.lock:
@@ -176,21 +279,27 @@ class OMSJournal:
             return dict(metadata) if metadata is not None else None
 
     def load(self):
-        if not self.enabled or not self.replay_on_startup or not os.path.exists(self.path):
-            return []
-
-        return self.read_all()
+        return list(self.iter_records(respect_replay_policy=True))
 
     def read_all(self):
         """Read and verify every record regardless of OMS replay policy."""
-        if not self.enabled or not os.path.exists(self.path):
-            return []
+        return list(self.iter_records())
 
+    def iter_records(self, *, respect_replay_policy: bool = False):
+        """Yield verified records without retaining the complete journal."""
+        if (
+            not self.enabled
+            or not os.path.exists(self.path)
+            or (respect_replay_policy and not self.replay_on_startup)
+        ):
+            return
         with self.lock:
-            return self._read_records()
+            yield from self._iter_records_unlocked()
 
     def _read_records(self):
-        records = []
+        return list(self._iter_records_unlocked())
+
+    def _iter_records_unlocked(self):
         expected_seq = None
         previous_hash = ""
         durable_chain_started = False
@@ -217,7 +326,7 @@ class OMSJournal:
                             raise JournalCorruptionError(
                                 f"Legacy record after durable chain at line {line_number}"
                             )
-                        records.append(record)
+                        yield record
                         continue
 
                     durable_chain_started = True
@@ -250,20 +359,28 @@ class OMSJournal:
                             f"OMS journal record hash mismatch at line {line_number}"
                         )
 
-                    records.append(record)
+                    yield record
                     expected_seq = seq + 1
                     previous_hash = stored_hash
         except OSError as exc:
             raise JournalError(f"Failed to read OMS journal: {exc}") from exc
 
-        return records
-
     def health_snapshot(self):
-        return {
-            "enabled": self.enabled,
-            "path": os.path.abspath(self.path),
-            "fsync_enabled": self.fsync_enabled,
-            "integrity_check_enabled": self.integrity_check_enabled,
-            "next_seq": self._next_seq,
-            "last_hash": self._last_hash,
-        }
+        with self.lock:
+            return {
+                "enabled": self.enabled,
+                "path": os.path.abspath(self.path),
+                "fsync_enabled": self.fsync_enabled,
+                "integrity_check_enabled": self.integrity_check_enabled,
+                "next_seq": self._next_seq,
+                "last_hash": self._last_hash,
+                "min_free_bytes": self.min_free_bytes,
+                "disk_free_bytes": self._disk_free_bytes,
+                "last_space_check_at": self._last_space_check_at,
+                "space_check_failure_count": (
+                    self._space_check_failure_count
+                ),
+                "space_rejection_count": self._space_rejection_count,
+                "write_failure_count": self._write_failure_count,
+                "last_space_error": self._last_space_error,
+            }

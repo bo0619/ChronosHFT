@@ -2,6 +2,7 @@ import math
 
 from event.type import (
     AccountData,
+    AggTradeData,
     Event,
     LifecycleState,
     OrderBook,
@@ -190,6 +191,9 @@ class StrategyTemplate:
 
     def on_orderbook(self, orderbook: OrderBook):
         raise NotImplementedError
+
+    def on_market_trade(self, trade: AggTradeData):
+        pass
 
     def on_trade(self, trade: TradeData):
         pass

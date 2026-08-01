@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+import json
 import math
 import time
 
@@ -341,9 +343,32 @@ class OMS:
         if database is None:
             return False
         event_kind = str(event_kind or "system_health")
-        message = data if isinstance(data, str) else getattr(data, "msg", "")
+        is_mapping = isinstance(data, Mapping)
+
+        def read_value(name, default=None):
+            if is_mapping:
+                return data.get(name, default)
+            return getattr(data, name, default)
+
+        message = data if isinstance(data, str) else read_value("msg", "")
+        if not message:
+            message = read_value("message", "")
+        if not message and is_mapping and data.get("details") is not None:
+            try:
+                message = json.dumps(
+                    data["details"],
+                    allow_nan=False,
+                    default=str,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError):
+                message = "system_event_details_unserializable"
         message = str(message or "")
-        severity = str(getattr(data, "level", "") or "").upper()
+        if len(message) > 16_384:
+            message = message[:16_384]
+        severity = str(read_value("level", "") or "").upper()
         if not severity:
             if message.startswith(("HALT:", "KILL:", "MARKET_DATA_STALE:")):
                 severity = "CRITICAL"
@@ -358,27 +383,30 @@ class OMS:
                 severity = "ERROR"
             else:
                 severity = "INFO"
-        state = getattr(data, "state", "")
+        state = read_value("state", "")
         state = getattr(state, "value", state) or ""
         return database.record_system_event(
             {
-                "event_time": getattr(data, "timestamp", None) or time.time(),
+                "event_time": (
+                    read_value("event_time", None)
+                    or read_value("timestamp", None)
+                    or time.time()
+                ),
                 "event_kind": event_kind,
                 "severity": severity,
                 "message": message,
                 "state": str(state),
-                "total_exposure": getattr(data, "total_exposure", None),
-                "margin_ratio": getattr(data, "margin_ratio", None),
-                "order_count_local": getattr(data, "order_count_local", None),
-                "order_count_remote": getattr(data, "order_count_remote", None),
-                "cancelling_count": getattr(data, "cancelling_count", None),
-                "fill_ratio": getattr(data, "fill_ratio", None),
-                "api_weight": getattr(
-                    data,
+                "total_exposure": read_value("total_exposure", None),
+                "margin_ratio": read_value("margin_ratio", None),
+                "order_count_local": read_value("order_count_local", None),
+                "order_count_remote": read_value("order_count_remote", None),
+                "cancelling_count": read_value("cancelling_count", None),
+                "fill_ratio": read_value("fill_ratio", None),
+                "api_weight": read_value(
                     "api_weight",
-                    getattr(data, "weight_used_1m", None),
+                    read_value("weight_used_1m", None),
                 ),
-                "is_sync_error": getattr(data, "is_sync_error", None),
+                "is_sync_error": read_value("is_sync_error", None),
             }
         )
 
@@ -667,6 +695,7 @@ class OMS:
     emergency_reduce_only_flatten = component_method("order_policy")
     _get_order_block_reason = component_method("order_policy")
     _get_submission_safety_reason_locked = component_method("order_policy")
+    _get_paper_database_rejection_locked = component_method("order_policy")
     _get_clock_health_rejection_locked = component_method("order_policy")
 
     _get_self_trade_prevention_rejection_locked = component_method("order_policy")

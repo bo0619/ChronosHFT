@@ -17,6 +17,12 @@ import numpy as np
 
 UNITS_VERSION = "chronoshft.log_bps_seconds_fixed_notional_lot.v1"
 AS_FORMULA_VERSION = "avellaneda_stoikov.log_bps_finite_horizon.v1"
+PORTFOLIO_AS_FORMULA_VERSION = (
+    "avellaneda_stoikov.log_bps_finite_horizon_portfolio.v1"
+)
+ADAPTIVE_AS_FORMULA_VERSION = (
+    "avellaneda_stoikov.log_bps_finite_horizon_adaptive_portfolio.v1"
+)
 GLFT_FORMULA_VERSION = "glft.log_bps_asymptotic_model_a.v2"
 PORTFOLIO_GLFT_FORMULA_VERSION = (
     "glft.log_bps_riccati_portfolio_model_a.v1"
@@ -36,6 +42,42 @@ class QuoteOffsets:
     half_spread_bps: float
     bid_price: float
     ask_price: float
+
+
+@dataclass(frozen=True, slots=True)
+class PortfolioASQuoteSolution:
+    """Finite-horizon portfolio A-S quotes and inventory-risk geometry."""
+
+    quotes: tuple[QuoteOffsets, ...]
+    risk_curvature_bps: tuple[tuple[float, ...], ...]
+    marginal_inventory_risk_bps: tuple[float, ...]
+    inventory_penalty_bps: float
+    bid_liquidity_depth_bps: tuple[float, ...]
+    ask_liquidity_depth_bps: tuple[float, ...]
+    horizon_s: float
+
+
+@dataclass(frozen=True, slots=True)
+class ASQuoteScenario:
+    """One bounded parameter scenario evaluated by robust A-S quoting."""
+
+    name: str
+    bid_k_per_bps: Sequence[float]
+    ask_k_per_bps: Sequence[float]
+    covariance_bps2_per_s: Sequence[Sequence[float]]
+    bid_adverse_cost_bps: Sequence[float]
+    ask_adverse_cost_bps: Sequence[float]
+
+
+@dataclass(frozen=True, slots=True)
+class RobustASPortfolioQuoteSolution:
+    """Per-side conservative A-S envelope across bounded scenarios."""
+
+    quotes: tuple[QuoteOffsets, ...]
+    scenario_solutions: tuple[PortfolioASQuoteSolution, ...]
+    scenario_names: tuple[str, ...]
+    selected_bid_scenario: tuple[str, ...]
+    selected_ask_scenario: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,10 +187,10 @@ def as_quote_offsets(
         gamma * sigma_squared * horizon,
         "A-S risk term",
     )
-    gamma_over_k = _positive_finite(gamma / k, "gamma_per_bps / k_per_bps")
-    liquidity_half_spread_bps = _positive_finite(
-        math.log1p(gamma_over_k) / gamma,
-        "A-S liquidity half-spread",
+    liquidity_half_spread_bps = _as_liquidity_depth(
+        gamma_per_bps=gamma,
+        k_per_bps=k,
+        order_size_lots=1.0,
     )
     half_spread_bps = _positive_finite(
         0.5 * risk_bps + liquidity_half_spread_bps,
@@ -163,6 +205,213 @@ def as_quote_offsets(
         mid,
         half_spread_bps=half_spread_bps,
         center_offset_bps=center_offset_bps,
+    )
+
+
+def adaptive_portfolio_as_quote_offsets(
+    *,
+    mid_prices: Sequence[float],
+    inventory_lots: Sequence[float],
+    covariance_bps2_per_s: Sequence[Sequence[float]],
+    gamma_per_bps: float,
+    bid_k_per_bps: Sequence[float],
+    ask_k_per_bps: Sequence[float],
+    order_size_lots: Sequence[float],
+    bid_adverse_cost_bps: Sequence[float],
+    ask_adverse_cost_bps: Sequence[float],
+    horizon_s: float,
+) -> PortfolioASQuoteSolution:
+    """Solve finite-horizon, side-specific portfolio A-S quotes.
+
+    The inventory certainty-equivalent is the convex potential
+    ``Phi(q) = 0.5 * q' H q`` with ``H = gamma * horizon * Sigma``.
+    Each bid/ask risk charge is the exact finite difference of ``Phi`` for
+    the configured order size.  With one asset, equal side parameters and a
+    one-lot order this reduces exactly to :func:`as_quote_offsets`.
+
+    The exponential arrival amplitude ``A`` does not appear because it
+    cancels from the A-S first-order condition.  It can still affect optimal
+    quote size in the strategy layer.
+    """
+
+    mids = _finite_vector(mid_prices, "mid_prices", positive=True)
+    size = len(mids)
+    if size == 0:
+        raise ValueError("portfolio A-S requires at least one asset")
+    inventories = _finite_vector(
+        inventory_lots,
+        "inventory_lots",
+        expected_size=size,
+    )
+    gamma = _positive_finite(gamma_per_bps, "gamma_per_bps")
+    horizon = _positive_finite(horizon_s, "horizon_s")
+    bid_k = _finite_vector(
+        bid_k_per_bps,
+        "bid_k_per_bps",
+        expected_size=size,
+        positive=True,
+    )
+    ask_k = _finite_vector(
+        ask_k_per_bps,
+        "ask_k_per_bps",
+        expected_size=size,
+        positive=True,
+    )
+    order_sizes = _finite_vector(
+        order_size_lots,
+        "order_size_lots",
+        expected_size=size,
+        positive=True,
+    )
+    bid_adverse = _finite_vector(
+        bid_adverse_cost_bps,
+        "bid_adverse_cost_bps",
+        expected_size=size,
+    )
+    ask_adverse = _finite_vector(
+        ask_adverse_cost_bps,
+        "ask_adverse_cost_bps",
+        expected_size=size,
+    )
+    if min((*bid_adverse, *ask_adverse)) < 0.0:
+        raise ValueError("adverse selection costs must be nonnegative")
+    covariance = _covariance_matrix(covariance_bps2_per_s, size)
+
+    curvature = gamma * horizon * covariance
+    if not np.isfinite(curvature).all():
+        raise ValueError("portfolio A-S risk curvature is not finite")
+    inventory = np.asarray(inventories, dtype=float)
+    marginal_risk = curvature @ inventory
+    inventory_penalty = 0.5 * float(inventory @ marginal_risk)
+    covariance_scale = max(1.0, float(np.linalg.norm(covariance, ord=2)))
+    if inventory_penalty < -1e-10 * covariance_scale:
+        raise ValueError("portfolio A-S inventory penalty is negative")
+    inventory_penalty = max(0.0, inventory_penalty)
+
+    bid_liquidity = tuple(
+        _as_liquidity_depth(
+            gamma_per_bps=gamma,
+            k_per_bps=bid_k[index],
+            order_size_lots=order_sizes[index],
+        )
+        for index in range(size)
+    )
+    ask_liquidity = tuple(
+        _as_liquidity_depth(
+            gamma_per_bps=gamma,
+            k_per_bps=ask_k[index],
+            order_size_lots=order_sizes[index],
+        )
+        for index in range(size)
+    )
+    quotes = []
+    for index in range(size):
+        diagonal_charge = 0.5 * order_sizes[index] * curvature[index, index]
+        quotes.append(
+            _build_quote_from_depths(
+                mids[index],
+                bid_depth_bps=float(
+                    bid_liquidity[index]
+                    + bid_adverse[index]
+                    + marginal_risk[index]
+                    + diagonal_charge
+                ),
+                ask_depth_bps=float(
+                    ask_liquidity[index]
+                    + ask_adverse[index]
+                    - marginal_risk[index]
+                    + diagonal_charge
+                ),
+            )
+        )
+
+    return PortfolioASQuoteSolution(
+        quotes=tuple(quotes),
+        risk_curvature_bps=tuple(
+            tuple(float(value) for value in row) for row in curvature
+        ),
+        marginal_inventory_risk_bps=tuple(
+            float(value) for value in marginal_risk
+        ),
+        inventory_penalty_bps=inventory_penalty,
+        bid_liquidity_depth_bps=bid_liquidity,
+        ask_liquidity_depth_bps=ask_liquidity,
+        horizon_s=horizon,
+    )
+
+
+def robust_adaptive_portfolio_as_quote_offsets(
+    *,
+    mid_prices: Sequence[float],
+    inventory_lots: Sequence[float],
+    gamma_per_bps: float,
+    order_size_lots: Sequence[float],
+    horizon_s: float,
+    scenarios: Sequence[ASQuoteScenario],
+) -> RobustASPortfolioQuoteSolution:
+    """Evaluate bounded A-S scenarios and keep the widest depth per side."""
+
+    if isinstance(scenarios, (str, bytes)) or not isinstance(scenarios, Sequence):
+        raise ValueError("scenarios must be a non-empty sequence")
+    if not scenarios:
+        raise ValueError("scenarios must be a non-empty sequence")
+    normalized_names = tuple(str(scenario.name or "").strip() for scenario in scenarios)
+    if any(not name for name in normalized_names):
+        raise ValueError("every A-S scenario requires a name")
+    if len(set(normalized_names)) != len(normalized_names):
+        raise ValueError("A-S scenario names must be unique")
+
+    solutions = tuple(
+        adaptive_portfolio_as_quote_offsets(
+            mid_prices=mid_prices,
+            inventory_lots=inventory_lots,
+            covariance_bps2_per_s=scenario.covariance_bps2_per_s,
+            gamma_per_bps=gamma_per_bps,
+            bid_k_per_bps=scenario.bid_k_per_bps,
+            ask_k_per_bps=scenario.ask_k_per_bps,
+            order_size_lots=order_size_lots,
+            bid_adverse_cost_bps=scenario.bid_adverse_cost_bps,
+            ask_adverse_cost_bps=scenario.ask_adverse_cost_bps,
+            horizon_s=horizon_s,
+        )
+        for scenario in scenarios
+    )
+    mids = _finite_vector(mid_prices, "mid_prices", positive=True)
+    robust_quotes = []
+    selected_bid = []
+    selected_ask = []
+    for index, mid in enumerate(mids):
+        bid_scenario_index = max(
+            range(len(solutions)),
+            key=lambda scenario_index: (
+                solutions[scenario_index].quotes[index].bid_depth_bps
+            ),
+        )
+        ask_scenario_index = max(
+            range(len(solutions)),
+            key=lambda scenario_index: (
+                solutions[scenario_index].quotes[index].ask_depth_bps
+            ),
+        )
+        robust_quotes.append(
+            _build_quote_from_depths(
+                mid,
+                bid_depth_bps=(
+                    solutions[bid_scenario_index].quotes[index].bid_depth_bps
+                ),
+                ask_depth_bps=(
+                    solutions[ask_scenario_index].quotes[index].ask_depth_bps
+                ),
+            )
+        )
+        selected_bid.append(normalized_names[bid_scenario_index])
+        selected_ask.append(normalized_names[ask_scenario_index])
+    return RobustASPortfolioQuoteSolution(
+        quotes=tuple(robust_quotes),
+        scenario_solutions=solutions,
+        scenario_names=normalized_names,
+        selected_bid_scenario=tuple(selected_bid),
+        selected_ask_scenario=tuple(selected_ask),
     )
 
 
@@ -611,6 +860,29 @@ def _riccati_curvature(
     if not np.isfinite(curvature).all():
         raise ValueError("adaptive GLFT risk curvature is not finite")
     return curvature
+
+
+def _as_liquidity_depth(
+    *,
+    gamma_per_bps: float,
+    k_per_bps: float,
+    order_size_lots: float,
+) -> float:
+    gamma = _positive_finite(gamma_per_bps, "gamma_per_bps")
+    k = _positive_finite(k_per_bps, "k_per_bps")
+    order_size = _positive_finite(order_size_lots, "order_size_lots")
+    gamma_delta = _positive_finite(
+        gamma * order_size,
+        "gamma_per_bps * order_size_lots",
+    )
+    ratio = _positive_finite(
+        gamma_delta / k,
+        "gamma_per_bps * order_size_lots / k_per_bps",
+    )
+    return _positive_finite(
+        math.log1p(ratio) / gamma_delta,
+        "A-S liquidity depth",
+    )
 
 
 def _glft_liquidity_terms(

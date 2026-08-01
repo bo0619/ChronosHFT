@@ -1,3 +1,4 @@
+import time
 import unittest
 
 from event.type import Event, OrderRequest, OrderStatus, OrderSubmitted
@@ -5,6 +6,19 @@ from oms.order_manager import OrderManager
 
 
 class OrderManagerAckTimeoutTests(unittest.TestCase):
+    def test_stop_interrupts_long_poll_and_joins_worker(self):
+        monitor = OrderManager(
+            engine=None,
+            gateway=None,
+            monitor_config={"monitor_check_interval_sec": 60.0},
+        )
+
+        started_at = time.perf_counter()
+        self.assertTrue(monitor.stop())
+
+        self.assertLess(time.perf_counter() - started_at, 0.5)
+        self.assertFalse(monitor.check_thread.is_alive())
+
     def test_ack_timeout_only_escalates_once_within_cooldown(self):
         callbacks = []
         monitor = OrderManager(

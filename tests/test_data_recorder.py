@@ -5,6 +5,7 @@ import time
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -43,6 +44,49 @@ def make_book():
 
 
 class DataRecorderIsolationTests(unittest.TestCase):
+    def test_hdf_flush_rejects_low_disk_before_writing(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            buffers = {
+                "depth": {"BTCUSDT": [{"symbol": "BTCUSDT"}]},
+                "trade": {"BTCUSDT": []},
+            }
+            reserve = 512 * 1024 * 1024
+
+            with patch.object(
+                recorder_module.shutil,
+                "disk_usage",
+                return_value=SimpleNamespace(free=reserve),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "recorder_disk_reserve_exhausted",
+                ):
+                    recorder_module._flush_hdf_buffer(
+                        temporary_directory,
+                        buffers,
+                        "BTCUSDT",
+                        "depth",
+                        reserve,
+                    )
+
+            self.assertEqual(len(buffers["depth"]["BTCUSDT"]), 1)
+            self.assertEqual(list(Path(temporary_directory).glob("*.h5")), [])
+
+    def test_invalid_capacity_configuration_fails_before_process_start(self):
+        invalid_cases = (
+            {"flush_threshold": True},
+            {"flush_threshold": 100, "queue_capacity": 99},
+            {"min_free_bytes": True},
+            {"process_niceness": True},
+            {"process_niceness": -1},
+            {"process_niceness": 20},
+            {"close_timeout_sec": float("nan")},
+        )
+        for overrides in invalid_cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(ValueError):
+                    DataRecorder(DummyEngine(), ["BTCUSDT"], **overrides)
+
     def test_writer_process_ignores_console_interrupts(self):
         command_queue = queue.Queue()
         status_queue = queue.Queue()
@@ -64,6 +108,36 @@ class DataRecorderIsolationTests(unittest.TestCase):
             signal.SIGINT,
             signal.SIG_IGN,
         )
+        self.assertEqual(status_queue.get_nowait()["type"], "stopped")
+
+    def test_writer_process_applies_configured_niceness_when_supported(self):
+        command_queue = queue.Queue()
+        status_queue = queue.Queue()
+        command_queue.put((recorder_module._STOP,))
+
+        with (
+            patch.object(recorder_module.os, "setpriority", None, create=True),
+            patch.object(
+                recorder_module.os,
+                "nice",
+                return_value=10,
+                create=True,
+            ) as nice,
+        ):
+            recorder_module._recorder_writer_main(
+                command_queue,
+                status_queue,
+                save_path=".",
+                symbols=(),
+                flush_threshold=1,
+                process_niceness=10,
+            )
+
+        nice.assert_called_once_with(10)
+        startup = status_queue.get_nowait()
+        self.assertEqual(startup["type"], "startup")
+        self.assertTrue(startup["ok"])
+        self.assertEqual(startup["applied_process_niceness"], 10)
         self.assertEqual(status_queue.get_nowait()["type"], "stopped")
 
     def test_hdf_flush_runs_outside_event_handler_process(self):

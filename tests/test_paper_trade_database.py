@@ -1,11 +1,20 @@
+import json
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from event.type import ExchangeOrderUpdate, OrderIntent, Side, TIF_RPI
+from event.type import (
+    ExchangeOrderUpdate,
+    LifecycleState,
+    OrderIntent,
+    Side,
+    TIF_RPI,
+)
 from oms.engine import OMS
 from oms.initializer import OMSInitializer
 from oms.journal import OMSJournal
@@ -150,6 +159,81 @@ def test_oms_market_sample_rejects_invalid_prices_and_missing_database():
     database.record_market_sample.assert_not_called()
 
 
+def test_oms_runtime_system_event_serializes_mapping_details():
+    database = SimpleNamespace(record_system_event=MagicMock(return_value=True))
+    oms = object.__new__(OMS)
+    oms.paper_trade_database = database
+
+    assert oms.record_paper_system_event(
+        "runtime_resources",
+        {
+            "event_time": 1234.5,
+            "level": "WARNING",
+            "state": "warning",
+            "details": {
+                "schema": "chronoshft.paper_runtime_resources.v1",
+                "resource": {"rss_bytes": 100},
+            },
+        },
+    )
+
+    payload = database.record_system_event.call_args.args[0]
+    assert payload["event_time"] == 1234.5
+    assert payload["event_kind"] == "runtime_resources"
+    assert payload["severity"] == "WARNING"
+    assert payload["state"] == "warning"
+    assert json.loads(payload["message"])["resource"]["rss_bytes"] == 100
+
+
+def test_runtime_dataset_filters_and_decodes_resource_events():
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        """
+        CREATE TABLE paper_system_events (
+            event_id INTEGER PRIMARY KEY,
+            run_id TEXT,
+            event_time REAL,
+            event_kind TEXT,
+            severity TEXT,
+            message TEXT,
+            state TEXT,
+            recorded_at_utc TEXT
+        )
+        """
+    )
+    connection.executemany(
+        """
+        INSERT INTO paper_system_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            (
+                1,
+                "run-1",
+                1.0,
+                "runtime_resources",
+                "INFO",
+                '{"resource":{"rss_bytes":100}}',
+                "healthy",
+                "now",
+            ),
+            (2, "run-1", 2.0, "alert", "WARNING", "alert", "", "now"),
+        ),
+    )
+
+    rows = query_observations(
+        connection,
+        dataset="runtime",
+        symbol="",
+        run_id="run-1",
+        limit=10,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["runtime"]["resource"]["rss_bytes"] == 100
+    connection.close()
+
+
 def test_async_projection_records_run_and_fill(tmp_path):
     config = make_config(tmp_path)
     journal = OMSJournal(config)
@@ -196,6 +280,83 @@ def test_async_projection_records_run_and_fill(tmp_path):
     assert run["shutdown_reason"] == "test_complete"
 
 
+def test_writer_batches_queued_projections_and_drains_before_stop(tmp_path):
+    config = make_config(tmp_path)
+    config["paper_trade_database"].update(
+        {"queue_capacity": 200, "write_batch_size": 32}
+    )
+    journal = OMSJournal(config)
+    with patch.object(PaperTradeDatabase, "_writer_main", autospec=True):
+        database = PaperTradeDatabase(config, journal)
+    database._thread.join(timeout=1.0)
+
+    for index in range(90):
+        assert database.record_system_event(
+            {
+                "event_time": float(index),
+                "event_kind": "batch_test",
+                "severity": "INFO",
+                "message": f"event-{index}",
+            }
+        )
+
+    database._thread = threading.Thread(
+        target=database._writer_main,
+        daemon=True,
+        name="PaperTradeDatabaseWriterTest",
+    )
+    database._thread.start()
+    assert database.close(clean_shutdown=True, reason="batch_test")
+
+    health = database.health_snapshot()
+    assert health["queue_depth"] == 0
+    assert health["write_batch_size"] == 32
+    assert health["committed_system_event_count"] == 90
+    assert health["committed_batch_count"] == 3
+    assert health["max_committed_batch_size"] == 32
+    count = fetch_one(
+        Path(config["paper_trade_database"]["path"]),
+        "SELECT COUNT(*) AS count FROM paper_system_events",
+    )
+    assert count["count"] == 90
+
+
+def test_bad_projection_does_not_discard_valid_records_from_batch(tmp_path):
+    config = make_config(tmp_path)
+    config["paper_trade_database"]["write_batch_size"] = 16
+    journal = OMSJournal(config)
+    with patch.object(PaperTradeDatabase, "_writer_main", autospec=True):
+        database = PaperTradeDatabase(config, journal)
+    database._thread.join(timeout=1.0)
+
+    database._queue.put_nowait(("unsupported", {}))
+    assert database.record_system_event(
+        {
+            "event_time": 1.0,
+            "event_kind": "valid_after_bad",
+            "severity": "INFO",
+            "message": "must survive batch rollback",
+        }
+    )
+    database._thread = threading.Thread(
+        target=database._writer_main,
+        daemon=True,
+        name="PaperTradeDatabaseWriterFallbackTest",
+    )
+    database._thread.start()
+
+    assert not database.close(clean_shutdown=True, reason="fallback_test")
+    health = database.health_snapshot()
+    assert not health["healthy"]
+    assert health["failed_observation_count"] == 1
+    assert health["committed_system_event_count"] == 1
+    row = fetch_one(
+        Path(config["paper_trade_database"]["path"]),
+        "SELECT event_kind FROM paper_system_events",
+    )
+    assert row["event_kind"] == "valid_after_bad"
+
+
 def test_journal_backfill_is_idempotent_when_oms_replay_is_disabled(tmp_path):
     config = make_config(tmp_path)
     journal = OMSJournal(config)
@@ -203,7 +364,12 @@ def test_journal_backfill_is_idempotent_when_oms_replay_is_disabled(tmp_path):
     assert journal.load() == []
     assert [record["seq"] for record in journal.read_all()] == [sequence]
 
-    first = PaperTradeDatabase(config, journal)
+    with patch.object(
+        journal,
+        "read_all",
+        side_effect=AssertionError("database bootstrap must stream"),
+    ):
+        first = PaperTradeDatabase(config, journal)
     assert first.health_snapshot()["backfilled_fill_count"] == 1
     assert first.close(clean_shutdown=False, reason="first_projection")
 
@@ -822,6 +988,90 @@ def test_database_failure_precedes_background_thread_startup(tmp_path):
         OMS(DummyEngine(), DummyGateway(), config)
 
     start_tasks.assert_not_called()
+
+
+def test_database_disk_guard_marks_unhealthy_and_notifies_once(tmp_path):
+    config = make_config(tmp_path)
+    config["paper_trade_database"].update(
+        {
+            "min_free_bytes": 1024,
+            "space_check_interval_sec": 0.1,
+        }
+    )
+    usage = SimpleNamespace(free=10 * 1024 * 1024)
+    failures = []
+
+    with patch(
+        "oms.paper_trade_database.shutil.disk_usage",
+        return_value=usage,
+    ):
+        database = PaperTradeDatabase(
+            config,
+            OMSJournal(config),
+            failure_callback=failures.append,
+        )
+        database._disk_free_bytes = None
+        usage.free = 1024
+
+        assert database.record_system_event({"event_kind": "health"})
+        deadline = time.monotonic() + 1.0
+        while database.health_snapshot()["healthy"]:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+
+        health = database.health_snapshot()
+        assert health["space_rejection_count"] == 1
+        assert health["failed_observation_count"] == 1
+        assert len(failures) == 1
+        assert failures[0].startswith("disk_guard_failed:")
+        assert not database.record_system_event({"event_kind": "late"})
+        assert database.close(clean_shutdown=False, reason="disk_guard_test") is False
+
+
+def test_database_failure_freezes_oms_and_blocks_new_risk(tmp_path):
+    config = make_config(tmp_path)
+    oms = OMS(DummyEngine(), DummyGateway(), config)
+    oms.state = LifecycleState.LIVE
+    oms._sync_capability_mode("database_failure_test")
+    database = oms.paper_trade_database
+
+    try:
+        database._set_failure("forced_projection_failure")
+
+        assert oms.state == LifecycleState.FROZEN
+        assert oms.last_freeze_reason.startswith(
+            "paper_trade_database_unhealthy:"
+        )
+        opening = OrderIntent(
+            "GLFT_MultiScale",
+            "SNDKUSDT",
+            Side.BUY,
+            1250.0,
+            1.0,
+        )
+        reduction = OrderIntent(
+            "GLFT_MultiScale",
+            "SNDKUSDT",
+            Side.SELL,
+            1250.0,
+            1.0,
+            reduce_only=True,
+        )
+        assert oms._get_paper_database_rejection_locked(opening).startswith(
+            "paper_trade_database_unhealthy:"
+        )
+        assert oms._get_paper_database_rejection_locked(reduction) == ""
+    finally:
+        oms.stop(reason="database_failure_test")
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, True])
+def test_database_config_rejects_invalid_min_free_bytes(tmp_path, value):
+    config = make_config(tmp_path)
+    config["paper_trade_database"]["min_free_bytes"] = value
+
+    with pytest.raises(ValueError, match="min_free_bytes"):
+        PaperTradeDatabase(config, OMSJournal(config))
 
 
 def test_oms_execution_commit_projects_paper_fill_model(tmp_path):

@@ -332,6 +332,8 @@ class OMSExchangeEventProcessor(OMSComponent):
         )
 
     def _append_and_process(self, event):
+        if len(self.event_log) >= self.event_log_max:
+            self.event_log_evictions += 1
         self.event_log.append(event)
         self._apply_event(event)
 

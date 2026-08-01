@@ -22,12 +22,20 @@ class OrderManager:
         self.ACTIVE_ORDER_AUDIT_INTERVAL = float(
             monitor_config.get("active_order_audit_interval_sec", 30.0)
         )
-        self.CHECK_INTERVAL = float(monitor_config.get("monitor_check_interval_sec", 1.0))
+        self.CHECK_INTERVAL = max(
+            0.01,
+            float(monitor_config.get("monitor_check_interval_sec", 1.0)),
+        )
 
         self.active = True
+        self._stop_event = threading.Event()
         self.check_thread = None
         if start_thread:
-            self.check_thread = threading.Thread(target=self._check_loop, daemon=True)
+            self.check_thread = threading.Thread(
+                target=self._check_loop,
+                daemon=True,
+                name="OMSOrderMonitor",
+            )
             self.check_thread.start()
 
     def on_order_submitted(self, event):
@@ -159,8 +167,23 @@ class OrderManager:
 
     def _check_loop(self):
         while self.active:
-            time.sleep(self.CHECK_INTERVAL)
+            if self._stop_event.wait(self.CHECK_INTERVAL):
+                break
             self._check_once()
 
     def stop(self):
         self.active = False
+        self._stop_event.set()
+        thread = self.check_thread
+        if (
+            thread
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=max(1.0, self.CHECK_INTERVAL + 0.5))
+        stopped = not thread or not thread.is_alive()
+        if not stopped:
+            logger.critical(
+                "[OMS] Order monitor did not stop before timeout"
+            )
+        return stopped

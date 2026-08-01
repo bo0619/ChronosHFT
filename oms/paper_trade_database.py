@@ -7,9 +7,12 @@ import json
 import math
 import os
 import queue
+import shutil
 import sqlite3
 import threading
+import time
 import uuid
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -111,7 +114,7 @@ class PaperTradeDatabase:
 
     _STOP = object()
 
-    def __init__(self, config: dict, journal) -> None:
+    def __init__(self, config: dict, journal, failure_callback=None) -> None:
         database_config = validate_paper_trade_database_config(config)
         if not database_config.get("enabled", False):
             raise ValueError("paper_trade_database is not enabled")
@@ -147,7 +150,16 @@ class PaperTradeDatabase:
         )
         queue_capacity = max(
             100,
-            int(database_config.get("queue_capacity", 10_000) or 10_000),
+            int(database_config.get("queue_capacity", 4096) or 4096),
+        )
+        self.write_batch_size = int(
+            database_config.get("write_batch_size", 64) or 64
+        )
+        self.min_free_bytes = int(
+            database_config.get("min_free_bytes", 0) or 0
+        )
+        self.space_check_interval_sec = float(
+            database_config.get("space_check_interval_sec", 1.0) or 1.0
         )
         self.strategy_sample_interval_sec = max(
             0.1,
@@ -195,6 +207,7 @@ class PaperTradeDatabase:
         )
 
         self._journal = journal
+        self._failure_callback = failure_callback
         self._queue = queue.Queue(maxsize=queue_capacity)
         self._health_lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -214,17 +227,32 @@ class PaperTradeDatabase:
         self._committed_account_sample_count = 0
         self._committed_system_event_count = 0
         self._committed_market_sample_count = 0
+        self._committed_batch_count = 0
+        self._max_committed_batch_size = 0
         self._throttled_strategy_sample_count = 0
         self._throttled_account_sample_count = 0
         self._throttled_market_sample_count = 0
         self._backfilled_fill_count = 0
         self._failed_fill_count = 0
         self._failed_observation_count = 0
+        self._disk_free_bytes = None
+        self._last_space_check_monotonic = 0.0
+        self._last_space_check_at = 0.0
+        self._space_check_failure_count = 0
+        self._space_rejection_count = 0
+        self._last_space_error = ""
+        self._failure_notified = False
         self._thread = None
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            historical_records = journal.read_all()
+            self._ensure_disk_space(1024 * 1024)
+            stream_records = getattr(journal, "iter_records", None)
+            historical_records = (
+                stream_records()
+                if callable(stream_records)
+                else iter(journal.read_all())
+            )
             self._bootstrap(historical_records)
             start_seq = journal.append("paper_run_started", self.run_payload())
             if not start_seq:
@@ -628,7 +656,7 @@ class PaperTradeDatabase:
 
     def _bootstrap(self, records) -> None:
         detected_at = self.started_at_utc
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             self._create_schema(connection)
             check = str(connection.execute("PRAGMA quick_check").fetchone()[0])
             if check.lower() != "ok":
@@ -650,7 +678,11 @@ class PaperTradeDatabase:
                 """,
                 (detected_at,),
             )
-            for record in records:
+            for record_index, record in enumerate(records):
+                if record_index % 256 == 0:
+                    bootstrap_reserve = 1024 * 1024
+                    self._ensure_disk_space(bootstrap_reserve)
+                    self._consume_reserved_space(bootstrap_reserve)
                 self._project_historical_record(connection, record)
             connection.execute(
                 """
@@ -671,6 +703,9 @@ class PaperTradeDatabase:
                     str(self.journal_path),
                 ),
             )
+        with self._health_lock:
+            self._disk_free_bytes = None
+        self._ensure_disk_space(0)
 
     def _project_historical_record(self, connection, record: dict) -> None:
         if not isinstance(record, dict):
@@ -1178,7 +1213,7 @@ class PaperTradeDatabase:
         return cursor.rowcount == 1
 
     def _set_start_journal_seq(self, sequence: int) -> None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute(
                 "UPDATE paper_runs SET start_journal_seq = ? WHERE run_id = ?",
                 (int(sequence), self.run_id),
@@ -1188,7 +1223,7 @@ class PaperTradeDatabase:
         try:
             if not self.path.exists():
                 return
-            with self._connect() as connection:
+            with closing(self._connect()) as connection, connection:
                 self._create_schema(connection)
                 connection.execute(
                     """
@@ -1330,6 +1365,84 @@ class PaperTradeDatabase:
                 self._last_market_sample_time[symbol] = sample_time
             return accepted
 
+    @staticmethod
+    def _estimate_batch_bytes(batch) -> int:
+        payload_bytes = sum(
+            len(_canonical_json(item).encode("utf-8")) for item in batch
+        )
+        return max(64 * 1024, payload_bytes * 2)
+
+    def _ensure_disk_space(self, required_bytes: int) -> None:
+        if self.min_free_bytes <= 0:
+            return
+
+        required_bytes = max(0, int(required_bytes))
+        now_monotonic = time.monotonic()
+        with self._health_lock:
+            refresh_required = (
+                self._disk_free_bytes is None
+                or now_monotonic - self._last_space_check_monotonic
+                >= self.space_check_interval_sec
+                or self._disk_free_bytes < self.min_free_bytes + required_bytes
+            )
+        if refresh_required:
+            try:
+                free_bytes = int(shutil.disk_usage(self.path.parent).free)
+            except Exception as exc:
+                with self._health_lock:
+                    self._space_check_failure_count += 1
+                    self._last_space_error = (
+                        f"space_check_failed:{type(exc).__name__}:{exc}"
+                    )
+                raise PaperTradeDatabaseError(
+                    "Failed to verify free space for the Paper database: "
+                    f"{type(exc).__name__}:{exc}"
+                ) from exc
+            with self._health_lock:
+                self._disk_free_bytes = free_bytes
+                self._last_space_check_monotonic = now_monotonic
+                self._last_space_check_at = time.time()
+                self._last_space_error = ""
+
+        with self._health_lock:
+            free_bytes = int(self._disk_free_bytes or 0)
+            free_after_write = free_bytes - required_bytes
+            if free_after_write >= self.min_free_bytes:
+                return
+            self._space_rejection_count += 1
+            self._last_space_error = (
+                "insufficient_space:"
+                f"free={free_bytes}:"
+                f"required={required_bytes}:"
+                f"reserve={self.min_free_bytes}"
+            )
+        raise PaperTradeDatabaseError(
+            "Paper database write rejected because disk free space would fall "
+            f"below the reserve: free={free_bytes} batch={required_bytes} "
+            f"reserve={self.min_free_bytes}"
+        )
+
+    def _consume_reserved_space(self, reserved_bytes: int) -> None:
+        with self._health_lock:
+            if self._disk_free_bytes is not None:
+                self._disk_free_bytes = max(
+                    0,
+                    self._disk_free_bytes - max(0, int(reserved_bytes)),
+                )
+
+    def _set_batch_failure(self, batch, reason: str) -> None:
+        execution_count = sum(
+            1
+            for item in batch
+            if isinstance(item, tuple) and item and item[0] == "execution"
+        )
+        observation_count = len(batch) - execution_count
+        self._set_failure_counts(
+            reason,
+            execution_count=execution_count,
+            observation_count=observation_count,
+        )
+
     def _writer_main(self) -> None:
         try:
             connection = self._connect()
@@ -1344,77 +1457,143 @@ class PaperTradeDatabase:
 
         try:
             while True:
-                item = self._queue.get()
+                batch = [self._queue.get()]
+                stop_requested = batch[0] is self._STOP
+                while not stop_requested and len(batch) < self.write_batch_size:
+                    try:
+                        item = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    batch.append(item)
+                    stop_requested = item is self._STOP
+
+                projections = batch[:-1] if stop_requested else batch
                 try:
-                    if item is self._STOP:
-                        return
-                    kind = item[0]
-                    inserted = False
-                    with connection:
-                        if kind == "execution":
-                            _, journal_seq, journal_ts, journal_hash, payload = item
-                            inserted = self._insert_fill(
-                                connection,
-                                journal_seq=journal_seq,
-                                journal_hash=journal_hash,
-                                journal_ts=journal_ts,
-                                payload=payload,
-                            )
-                        elif kind == "order_event":
-                            inserted = self._insert_order_event(connection, item[1])
-                        elif kind == "strategy_sample":
-                            inserted = self._insert_strategy_sample(connection, item[1])
-                        elif kind == "markout":
-                            inserted = self._insert_markout(connection, item[1])
-                        elif kind == "account_sample":
-                            inserted = self._insert_account_sample(
-                                connection,
-                                item[1],
-                            )
-                        elif kind == "system_event":
-                            inserted = self._insert_system_event(
-                                connection,
-                                item[1],
-                            )
-                        elif kind == "market_sample":
-                            inserted = self._insert_market_sample(
-                                connection,
-                                item[1],
-                            )
-                        else:
-                            raise ValueError(f"unsupported projection kind: {kind}")
-                    if not inserted:
-                        continue
-                    with self._health_lock:
-                        if kind == "execution":
-                            self._committed_fill_count += 1
-                        elif kind == "order_event":
-                            self._committed_order_event_count += 1
-                        elif kind == "strategy_sample":
-                            self._committed_strategy_sample_count += 1
-                        elif kind == "markout":
-                            self._committed_markout_count += 1
-                        elif kind == "account_sample":
-                            self._committed_account_sample_count += 1
-                        elif kind == "system_event":
-                            self._committed_system_event_count += 1
-                        elif kind == "market_sample":
-                            self._committed_market_sample_count += 1
-                except Exception as exc:
-                    kind = item[0] if isinstance(item, tuple) and item else "unknown"
-                    self._set_failure(
-                        f"{kind}_projection_failed:{type(exc).__name__}:{exc}",
-                        observation=kind != "execution",
-                    )
-                    logger.critical(
-                        "[PaperTradeDatabase] Projection failed: "
-                        f"kind={kind} "
-                        f"{type(exc).__name__}:{exc}"
-                    )
+                    if projections:
+                        write_ok = self._write_projection_batch(
+                            connection,
+                            projections,
+                        )
+                    else:
+                        write_ok = True
                 finally:
-                    self._queue.task_done()
+                    for _item in batch:
+                        self._queue.task_done()
+                if not write_ok and not stop_requested:
+                    self._drain_without_writing()
+                    return
+                if stop_requested:
+                    return
         finally:
             connection.close()
+
+    def _write_projection_batch(self, connection, batch) -> bool:
+        outcomes = []
+        reserved_bytes = self._estimate_batch_bytes(batch)
+        try:
+            self._ensure_disk_space(reserved_bytes)
+            with connection:
+                outcomes = [
+                    self._insert_projection_item(connection, item)
+                    for item in batch
+                ]
+        except PaperTradeDatabaseError as exc:
+            self._set_batch_failure(
+                batch,
+                f"disk_guard_failed:{type(exc).__name__}:{exc}",
+            )
+            logger.critical(f"[PaperTradeDatabase] {exc}")
+            return False
+        except Exception as batch_error:
+            logger.warning(
+                "[PaperTradeDatabase] Batch projection failed; retrying "
+                "records individually: "
+                f"size={len(batch)} "
+                f"{type(batch_error).__name__}:{batch_error}"
+            )
+            all_written = True
+            for item in batch:
+                all_written = (
+                    self._write_projection_item_individually(connection, item)
+                    and all_written
+                )
+            return all_written
+        self._record_committed_outcomes(outcomes, len(batch))
+        self._consume_reserved_space(reserved_bytes)
+        return True
+
+    def _write_projection_item_individually(self, connection, item) -> bool:
+        try:
+            reserved_bytes = self._estimate_batch_bytes((item,))
+            self._ensure_disk_space(reserved_bytes)
+            with connection:
+                outcome = self._insert_projection_item(connection, item)
+        except Exception as exc:
+            kind = item[0] if isinstance(item, tuple) and item else "unknown"
+            self._set_failure(
+                f"{kind}_projection_failed:{type(exc).__name__}:{exc}",
+                observation=kind != "execution",
+            )
+            logger.critical(
+                "[PaperTradeDatabase] Projection failed: "
+                f"kind={kind} {type(exc).__name__}:{exc}"
+            )
+            return False
+        self._record_committed_outcomes([outcome], 1)
+        self._consume_reserved_space(reserved_bytes)
+        return True
+
+    def _insert_projection_item(self, connection, item) -> tuple[str, bool]:
+        kind = item[0]
+        if kind == "execution":
+            _, journal_seq, journal_ts, journal_hash, payload = item
+            inserted = self._insert_fill(
+                connection,
+                journal_seq=journal_seq,
+                journal_hash=journal_hash,
+                journal_ts=journal_ts,
+                payload=payload,
+            )
+        elif kind == "order_event":
+            inserted = self._insert_order_event(connection, item[1])
+        elif kind == "strategy_sample":
+            inserted = self._insert_strategy_sample(connection, item[1])
+        elif kind == "markout":
+            inserted = self._insert_markout(connection, item[1])
+        elif kind == "account_sample":
+            inserted = self._insert_account_sample(connection, item[1])
+        elif kind == "system_event":
+            inserted = self._insert_system_event(connection, item[1])
+        elif kind == "market_sample":
+            inserted = self._insert_market_sample(connection, item[1])
+        else:
+            raise ValueError(f"unsupported projection kind: {kind}")
+        return kind, bool(inserted)
+
+    def _record_committed_outcomes(self, outcomes, batch_size: int) -> None:
+        with self._health_lock:
+            self._committed_batch_count += 1
+            self._max_committed_batch_size = max(
+                self._max_committed_batch_size,
+                int(batch_size),
+            )
+            for kind, inserted in outcomes:
+                if not inserted:
+                    continue
+                if kind == "execution":
+                    self._committed_fill_count += 1
+                elif kind == "order_event":
+                    self._committed_order_event_count += 1
+                elif kind == "strategy_sample":
+                    self._committed_strategy_sample_count += 1
+                elif kind == "markout":
+                    self._committed_markout_count += 1
+                elif kind == "account_sample":
+                    self._committed_account_sample_count += 1
+                elif kind == "system_event":
+                    self._committed_system_event_count += 1
+                elif kind == "market_sample":
+                    self._committed_market_sample_count += 1
 
     def _drain_without_writing(self) -> None:
         while True:
@@ -1431,13 +1610,45 @@ class PaperTradeDatabase:
                 self._queue.task_done()
 
     def _set_failure(self, reason: str, *, observation: bool = False) -> None:
+        self._set_failure_counts(
+            reason,
+            execution_count=0 if observation else 1,
+            observation_count=1 if observation else 0,
+        )
+
+    def _set_failure_counts(
+        self,
+        reason: str,
+        *,
+        execution_count: int,
+        observation_count: int,
+    ) -> None:
+        should_notify = False
         with self._health_lock:
             self._healthy = False
             self._last_error = str(reason)
-            if observation:
-                self._failed_observation_count += 1
-            else:
-                self._failed_fill_count += 1
+            self._failed_fill_count += max(0, int(execution_count))
+            self._failed_observation_count += max(
+                0,
+                int(observation_count),
+            )
+            if (
+                self._accepting
+                and not self._closed
+                and not self._failure_notified
+                and callable(self._failure_callback)
+            ):
+                self._failure_notified = True
+                should_notify = True
+            self._accepting = False
+        if should_notify:
+            try:
+                self._failure_callback(str(reason))
+            except Exception as exc:
+                logger.critical(
+                    "[PaperTradeDatabase] Fail-closed callback failed: "
+                    f"{type(exc).__name__}:{exc}"
+                )
 
     def close(self, *, clean_shutdown: bool, reason: str = "") -> bool:
         with self._close_lock:
@@ -1461,7 +1672,7 @@ class PaperTradeDatabase:
             database_clean = bool(clean_shutdown and drained and healthy)
             status = "stopped" if database_clean else "incomplete"
             try:
-                with self._connect() as connection:
+                with closing(self._connect()) as connection, connection:
                     connection.execute(
                         """
                         UPDATE paper_runs
@@ -1497,6 +1708,17 @@ class PaperTradeDatabase:
                 "path": str(self.path),
                 "run_id": self.run_id,
                 "queue_depth": self._queue.qsize(),
+                "write_batch_size": self.write_batch_size,
+                "min_free_bytes": self.min_free_bytes,
+                "disk_free_bytes": self._disk_free_bytes,
+                "last_space_check_at": self._last_space_check_at,
+                "space_check_failure_count": (
+                    self._space_check_failure_count
+                ),
+                "space_rejection_count": self._space_rejection_count,
+                "last_space_error": self._last_space_error,
+                "committed_batch_count": self._committed_batch_count,
+                "max_committed_batch_size": self._max_committed_batch_size,
                 "committed_fill_count": self._committed_fill_count,
                 "committed_order_event_count": self._committed_order_event_count,
                 "committed_strategy_sample_count": (

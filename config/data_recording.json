@@ -1,3 +1,12 @@
 {
-  "record_data": true
+  "record_data": true,
+  "data_recorder": {
+    "_comment": "Bound the isolated HDF5 writer for AWS t3.small and preserve the same disk reserve as OMS persistence.",
+    "save_path": "storage",
+    "flush_threshold": 500,
+    "queue_capacity": 8192,
+    "close_timeout_sec": 30.0,
+    "min_free_bytes": 536870912,
+    "process_niceness": 10
+  }
 }

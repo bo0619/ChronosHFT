@@ -370,6 +370,76 @@ def _rest_telemetry_sections(
 class _DashboardHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+    request_queue_size = 16
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        request_handler_class: type[BaseHTTPRequestHandler],
+        *,
+        max_request_threads: int,
+        request_timeout_sec: float,
+    ) -> None:
+        self.max_request_threads = max_request_threads
+        self.request_timeout_sec = request_timeout_sec
+        self._request_slots = threading.BoundedSemaphore(max_request_threads)
+        self._request_metrics_lock = threading.Lock()
+        self._active_request_threads = 0
+        self._peak_request_threads = 0
+        self._accepted_connections = 0
+        self._rejected_connections = 0
+        super().__init__(server_address, request_handler_class)
+
+    def get_request(self):
+        request, client_address = super().get_request()
+        request.settimeout(self.request_timeout_sec)
+        return request, client_address
+
+    def process_request(self, request, client_address) -> None:
+        if not self._request_slots.acquire(blocking=False):
+            with self._request_metrics_lock:
+                self._rejected_connections += 1
+            self.shutdown_request(request)
+            return
+        with self._request_metrics_lock:
+            self._accepted_connections += 1
+            self._active_request_threads += 1
+            self._peak_request_threads = max(
+                self._peak_request_threads,
+                self._active_request_threads,
+            )
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._release_request_slot()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._release_request_slot()
+
+    def _release_request_slot(self) -> None:
+        with self._request_metrics_lock:
+            self._active_request_threads = max(
+                0,
+                self._active_request_threads - 1,
+            )
+        self._request_slots.release()
+
+    def request_metrics_snapshot(self) -> dict[str, Any]:
+        with self._request_metrics_lock:
+            return {
+                "available": True,
+                "max_request_threads": self.max_request_threads,
+                "active_request_threads": self._active_request_threads,
+                "peak_request_threads": self._peak_request_threads,
+                "accepted_connections": self._accepted_connections,
+                "rejected_connections": self._rejected_connections,
+                "request_timeout_sec": self.request_timeout_sec,
+                "request_queue_size": self.request_queue_size,
+            }
 
 
 class _DashboardHTTPServerV6(_DashboardHTTPServer):
@@ -405,6 +475,8 @@ class LocalWebDashboard:
         history_points: int | None = None,
         history_interval_sec: float | None = None,
         publish_interval_sec: float | None = None,
+        max_request_threads: int | None = None,
+        request_timeout_sec: float | None = None,
     ):
         full_config = dict(config or {})
         web_config = self._extract_web_config(full_config)
@@ -415,8 +487,50 @@ class LocalWebDashboard:
         if not 0 <= resolved_port <= 65535:
             raise ValueError("LocalWebDashboard port must be between 0 and 65535")
 
+        resolved_request_threads = (
+            max_request_threads
+            if max_request_threads is not None
+            else web_config.get("max_request_threads", 8)
+        )
+        if (
+            isinstance(resolved_request_threads, bool)
+            or not isinstance(resolved_request_threads, int)
+            or not 1 <= resolved_request_threads <= 32
+        ):
+            raise ValueError(
+                "LocalWebDashboard max_request_threads must be an integer "
+                "from 1 to 32"
+            )
+        resolved_request_timeout = (
+            request_timeout_sec
+            if request_timeout_sec is not None
+            else web_config.get("request_timeout_sec", 5.0)
+        )
+        if isinstance(resolved_request_timeout, bool):
+            raise ValueError(
+                "LocalWebDashboard request_timeout_sec must be finite and "
+                "from 0.1 to 30 seconds"
+            )
+        try:
+            resolved_request_timeout = float(resolved_request_timeout)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "LocalWebDashboard request_timeout_sec must be finite and "
+                "from 0.1 to 30 seconds"
+            ) from exc
+        if (
+            not math.isfinite(resolved_request_timeout)
+            or not 0.1 <= resolved_request_timeout <= 30.0
+        ):
+            raise ValueError(
+                "LocalWebDashboard request_timeout_sec must be finite and "
+                "from 0.1 to 30 seconds"
+            )
+
         self.host = resolved_host
         self.port = resolved_port
+        self.max_request_threads = resolved_request_threads
+        self.request_timeout_sec = resolved_request_timeout
         configured_static = static_path or web_config.get("static_path")
         self.static_path = Path(configured_static).resolve() if configured_static else _DEFAULT_STATIC_PATH
         self.max_orders = max(
@@ -511,7 +625,7 @@ class LocalWebDashboard:
 
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.Lock()
-        self._server: ThreadingHTTPServer | None = None
+        self._server: _DashboardHTTPServer | None = None
         self._server_thread: threading.Thread | None = None
         self._running = False
         self._service_state = "initialized"
@@ -835,7 +949,12 @@ class LocalWebDashboard:
                 return self.url
             self._static_bytes = self._load_static_page()
             server_class = _DashboardHTTPServerV6 if ":" in self.host else _DashboardHTTPServer
-            server = server_class((self.host, self.port), self._handler_factory())
+            server = server_class(
+                (self.host, self.port),
+                self._handler_factory(),
+                max_request_threads=self.max_request_threads,
+                request_timeout_sec=self.request_timeout_sec,
+            )
             self._server = server
             self._actual_port = int(server.server_address[1])
             with self._lock:
@@ -2102,6 +2221,7 @@ class LocalWebDashboard:
             if self._started_monotonic
             else 0.0
         )
+        request_metrics = self._dashboard_request_snapshot()
         system = {
             "available": True,
             "startup": deepcopy(self._startup_status),
@@ -2234,6 +2354,7 @@ class LocalWebDashboard:
                     "publish_interval_sec": self.publish_interval_sec,
                     "history_interval_sec": self.history_interval_sec,
                     "history_points": self.history_points,
+                    **request_metrics,
                 },
             },
             "histories": {
@@ -2246,6 +2367,20 @@ class LocalWebDashboard:
             },
             "logs": deepcopy(list(self._logs)),
             "alerts": deepcopy(list(self._alerts)),
+        }
+
+    def _dashboard_request_snapshot(self) -> dict[str, Any]:
+        server = self._server
+        if server is not None:
+            return server.request_metrics_snapshot()
+        return {
+            "max_request_threads": self.max_request_threads,
+            "active_request_threads": 0,
+            "peak_request_threads": 0,
+            "accepted_connections": 0,
+            "rejected_connections": 0,
+            "request_timeout_sec": self.request_timeout_sec,
+            "request_queue_size": _DashboardHTTPServer.request_queue_size,
         }
 
     def _build_readiness_locked(

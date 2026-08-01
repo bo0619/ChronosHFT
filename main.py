@@ -45,6 +45,8 @@ from infrastructure.live_config_guard import (
 )
 from infrastructure.logger import logger
 from infrastructure.paper_trade import apply_paper_trade_mode, is_paper_trade
+from infrastructure.process_resources import ProcessResourceMonitor
+from infrastructure.systemd_watchdog import SystemdWatchdog
 from infrastructure.rpi_policy import (
     requires_zero_rpi_commission,
     validate_live_rpi_policy,
@@ -151,6 +153,86 @@ def run_live_risk_checks(risk_controller, independent_supervisor=None):
     funding_healthy = bool(risk_controller.check_funding_guard())
     risk_healthy = bool(risk_controller.check_market_data_freshness())
     return supervisor_healthy and funding_healthy and risk_healthy
+
+
+_RUNTIME_RESOURCE_FIELDS = (
+    "sampled_at_monotonic",
+    "available",
+    "healthy",
+    "status",
+    "reason",
+    "breaches",
+    "warnings",
+    "rss_bytes",
+    "rss_warn_bytes",
+    "rss_freeze_bytes",
+    "rss_growth_bytes_per_min",
+    "main_thread_count",
+    "max_main_threads",
+    "total_thread_count",
+    "max_total_threads",
+    "main_fd_count",
+    "max_main_fds",
+    "total_fd_count",
+    "max_total_fds",
+    "cpu_percent_one_core",
+    "cpu_warn_percent_one_core",
+    "process_count",
+    "explicit_process_count",
+    "discovered_process_count",
+    "process_discovery_complete",
+    "process_discovery_reason",
+    "max_processes",
+    "missing_pids",
+    "sample_interval_sec",
+)
+_RUNTIME_WATCHDOG_FIELDS = (
+    "enabled",
+    "reason",
+    "watchdog_period_sec",
+    "ping_interval_sec",
+    "send_count",
+    "error_count",
+    "last_error",
+    "last_success_at_monotonic",
+)
+
+
+def build_runtime_resource_event(
+    resource_snapshot,
+    watchdog_snapshot,
+    *,
+    event_time=None,
+):
+    """Build one bounded, versioned Paper soak-observation payload."""
+
+    resource = dict(resource_snapshot or {})
+    watchdog = dict(watchdog_snapshot or {})
+    status = str(resource.get("status", "unknown") or "unknown")
+    if not bool(resource.get("healthy", True)):
+        severity = "CRITICAL"
+    elif status == "breach_pending":
+        severity = "ERROR"
+    elif status in {"warning", "unavailable"}:
+        severity = "WARNING"
+    else:
+        severity = "INFO"
+    return {
+        "event_time": time.time() if event_time is None else float(event_time),
+        "level": severity,
+        "state": status,
+        "details": {
+            "schema": "chronoshft.paper_runtime_resources.v1",
+            "resource": {
+                field: resource.get(field)
+                for field in _RUNTIME_RESOURCE_FIELDS
+            },
+            "systemd_watchdog": {
+                field: watchdog.get(field)
+                for field in _RUNTIME_WATCHDOG_FIELDS
+            },
+        },
+    }
 
 
 def wait_for_initial_market_data_readiness(
@@ -628,7 +710,12 @@ def start_local_dashboard(
     return dashboard_url
 
 
-def run_startup_blocked_dashboard(config, clock_health, clock_service=None):
+def run_startup_blocked_dashboard(
+    config,
+    clock_health,
+    clock_service=None,
+    systemd_watchdog=None,
+):
     """Keep read-only diagnostics available after the HFT clock gate fails."""
     clock_service = clock_service or time_service
     web_config = config.get("system", {}).get("web_dashboard", {}) or {}
@@ -698,6 +785,8 @@ def run_startup_blocked_dashboard(config, clock_health, clock_service=None):
         )
         try:
             while True:
+                if systemd_watchdog is not None:
+                    systemd_watchdog.pulse()
                 web_dashboard.publish_snapshot(force=True)
                 time.sleep(refresh_sec)
         except KeyboardInterrupt:
@@ -957,14 +1046,17 @@ def _run_main(argv=None, runtime=None):
     logger.init_logging(config)
     logger.set_ui_callback(None)
     logger.set_alert_callback(None)
+    systemd_watchdog = SystemdWatchdog()
     runtime.update(
         {
             "config": config,
             "paper_trade": paper_trade,
+            "systemd_watchdog": systemd_watchdog,
             "_account_shutdown_proof_required": False,
             "_risk_supervisor_started": False,
         }
     )
+    systemd_watchdog.pulse(force=True)
     external_alerts = start_external_alert_service(
         config,
         runtime,
@@ -983,6 +1075,7 @@ def _run_main(argv=None, runtime=None):
             config,
             read_clock_health(time_service),
             clock_service=time_service,
+            systemd_watchdog=systemd_watchdog,
         )
         return 0 if diagnostics_available else 2
 
@@ -1138,12 +1231,49 @@ def _run_main(argv=None, runtime=None):
         failure_callback=on_strategy_runtime_failure,
     )
     runtime["strategy_runtime"] = strategy_runtime
+    data_recorder_config = config.get("data_recorder", {}) or {}
+    if not isinstance(data_recorder_config, dict):
+        raise ValueError("data_recorder must be an object")
     data_recorder = (
-        DataRecorder(engine, config["symbols"])
+        DataRecorder(
+            engine,
+            config["symbols"],
+            save_path=str(
+                data_recorder_config.get("save_path", "storage")
+                or "storage"
+            ),
+            flush_threshold=data_recorder_config.get(
+                "flush_threshold",
+                500,
+            ),
+            queue_capacity=data_recorder_config.get(
+                "queue_capacity",
+                8192,
+            ),
+            close_timeout_sec=data_recorder_config.get(
+                "close_timeout_sec",
+                30.0,
+            ),
+            min_free_bytes=data_recorder_config.get(
+                "min_free_bytes",
+                0,
+            ),
+            process_niceness=data_recorder_config.get(
+                "process_niceness",
+                0,
+            ),
+        )
         if config.get("record_data", False)
         else None
     )
     runtime["data_recorder"] = data_recorder
+    resource_monitor_config = (
+        config.get("system", {}).get("resource_monitor", {}) or {}
+    )
+    if not isinstance(resource_monitor_config, dict):
+        raise ValueError("system.resource_monitor must be an object")
+    resource_monitor = ProcessResourceMonitor(resource_monitor_config)
+    runtime["resource_monitor"] = resource_monitor
     live_evidence_recorder = None
     if not paper_trade:
         journal_snapshot = getattr(
@@ -1433,6 +1563,7 @@ def _run_main(argv=None, runtime=None):
     )
     warmup_deadline = time.perf_counter() + startup_warmup_sec
     while time.perf_counter() < warmup_deadline:
+        systemd_watchdog.pulse()
         run_live_risk_checks(risk_controller, risk_supervisor)
         time.sleep(0.1)
     if not risk_supervisor.wait_until_healthy(timeout_sec=2.0):
@@ -1549,8 +1680,10 @@ def _run_main(argv=None, runtime=None):
         logger.info("ChronosHFT Core Engine LIVE · REAL MONEY.")
 
     external_alert_constraint_state = {}
+    last_recorded_resource_sample_at = None
     while True:
         time.sleep(0.1)
+        systemd_watchdog.pulse()
         enforce_external_alert_health(
             external_alerts,
             oms_system,
@@ -1581,7 +1714,39 @@ def _run_main(argv=None, runtime=None):
             main.strategy_runtime_watchdog_state,
             config.get("system", {}).get("strategy_runtime", {}),
         )
+        monitored_child_pids = []
+        recorder_process = getattr(data_recorder, "_writer_process", None)
+        recorder_pid = getattr(recorder_process, "pid", None)
+        if isinstance(recorder_pid, int) and recorder_pid > 0:
+            monitored_child_pids.append(recorder_pid)
+        supervisor_process = getattr(risk_supervisor, "process", None)
+        supervisor_pid = getattr(supervisor_process, "pid", None)
+        if isinstance(supervisor_pid, int) and supervisor_pid > 0:
+            monitored_child_pids.append(supervisor_pid)
+        resource_snapshot = resource_monitor.sample(monitored_child_pids)
+        sampled_at = resource_snapshot.get("sampled_at_monotonic")
+        if (
+            paper_trade
+            and sampled_at is not None
+            and sampled_at != last_recorded_resource_sample_at
+        ):
+            last_recorded_resource_sample_at = sampled_at
+            record_paper_observation(
+                "record_paper_system_event",
+                "runtime_resources",
+                build_runtime_resource_event(
+                    resource_snapshot,
+                    systemd_watchdog.snapshot(),
+                ),
+            )
+        resource_failure = resource_monitor.consume_fail_closed_reason()
+        if resource_failure:
+            oms_system.freeze_system(
+                f"ProcessResources: {resource_failure}",
+                cancel_active_orders=True,
+            )
         runtime_metrics = {
+            "logger": logger.get_metrics_snapshot(),
             "event_engine": engine.get_metrics_snapshot(),
             "event_handlers": engine.get_handler_metrics_snapshot(limit=50),
             "strategy_runtime": strategy_runtime.get_metrics_snapshot(),
@@ -1589,6 +1754,8 @@ def _run_main(argv=None, runtime=None):
             "live_evidence": live_evidence_health(
                 live_evidence_recorder
             ),
+            "process_resources": resource_snapshot,
+            "systemd_watchdog": systemd_watchdog.snapshot(),
         }
         if web_dashboard is not None:
             web_dashboard.update_runtime_metrics(runtime_metrics)

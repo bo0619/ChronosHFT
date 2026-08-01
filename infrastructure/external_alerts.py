@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import threading
 import time
 from typing import Any, Protocol
@@ -197,6 +198,10 @@ class _PendingAlert:
     receipt: _DeliveryReceipt | None = None
 
 
+class _FailureSpoolSpaceError(RuntimeError):
+    pass
+
+
 def _safe_label(value: Any, fallback: str) -> str:
     rendered = _SAFE_LABEL_PATTERN.sub(
         "_",
@@ -291,6 +296,20 @@ class ExternalAlertService:
         self.failure_spool_fsync = bool(
             alert_config.get("failure_spool_fsync", True)
         )
+        failure_spool_min_free_bytes = alert_config.get(
+            "failure_spool_min_free_bytes",
+            0,
+        )
+        if (
+            isinstance(failure_spool_min_free_bytes, bool)
+            or not isinstance(failure_spool_min_free_bytes, int)
+            or failure_spool_min_free_bytes < 0
+        ):
+            raise ValueError(
+                "alert.failure_spool_min_free_bytes must be a non-negative "
+                "integer"
+            )
+        self.failure_spool_min_free_bytes = failure_spool_min_free_bytes
         spool_path = str(
             alert_config.get("failure_spool_path", "") or ""
         ).strip()
@@ -344,6 +363,10 @@ class ExternalAlertService:
         self._overflow_last_code = ""
         self._failure_records = 0
         self._failure_spool_errors = 0
+        self._failure_spool_free_bytes: int | None = None
+        self._failure_spool_last_space_check_at = 0.0
+        self._failure_spool_space_rejections = 0
+        self._failure_spool_space_check_failures = 0
         self._last_success_at = 0.0
         self._last_failure_at = 0.0
         self._last_failure_kind = ""
@@ -561,6 +584,21 @@ class ExternalAlertService:
                 "failure_records": int(self._failure_records),
                 "failure_spool_errors": int(
                     self._failure_spool_errors
+                ),
+                "failure_spool_min_free_bytes": int(
+                    self.failure_spool_min_free_bytes
+                ),
+                "failure_spool_free_bytes": (
+                    self._failure_spool_free_bytes
+                ),
+                "failure_spool_last_space_check_at": float(
+                    self._failure_spool_last_space_check_at
+                ),
+                "failure_spool_space_rejections": int(
+                    self._failure_spool_space_rejections
+                ),
+                "failure_spool_space_check_failures": int(
+                    self._failure_spool_space_check_failures
                 ),
                 "last_success_at": float(self._last_success_at),
                 "last_failure_at": float(self._last_failure_at),
@@ -881,6 +919,9 @@ class ExternalAlertService:
                 parents=True,
                 exist_ok=True,
             )
+            space_error = self._failure_spool_space_error(0)
+            if space_error:
+                raise _FailureSpoolSpaceError(space_error)
             with self._failure_spool_path.open(
                 "a",
                 encoding="utf-8",
@@ -888,10 +929,33 @@ class ExternalAlertService:
                 handle.flush()
                 if self.failure_spool_fsync:
                     os.fsync(handle.fileno())
-        except (OSError, ValueError):
+        except (OSError, ValueError, _FailureSpoolSpaceError):
             raise RuntimeError(
                 "external alert failure spool is unavailable"
             ) from None
+
+    def _failure_spool_space_error(self, required_bytes: int) -> str:
+        if self.failure_spool_min_free_bytes <= 0:
+            return ""
+        try:
+            free_bytes = int(
+                shutil.disk_usage(self._failure_spool_path.parent).free
+            )
+        except (OSError, ValueError):
+            with self._condition:
+                self._failure_spool_last_space_check_at = self._wall_time()
+                self._failure_spool_space_check_failures += 1
+            return "failure_spool_space_check_failed"
+
+        free_after_write = free_bytes - max(0, int(required_bytes))
+        with self._condition:
+            self._failure_spool_free_bytes = free_bytes
+            self._failure_spool_last_space_check_at = self._wall_time()
+            if free_after_write < self.failure_spool_min_free_bytes:
+                self._failure_spool_space_rejections += 1
+        if free_after_write < self.failure_spool_min_free_bytes:
+            return "failure_spool_disk_reserve_exhausted"
+        return ""
 
     def _append_failure_record(
         self,
@@ -921,8 +985,13 @@ class ExternalAlertService:
             separators=(",", ":"),
             sort_keys=True,
         )
+        encoded_bytes = len(encoded.encode("utf-8")) + 1
+        failure_reason = "failure_spool_unavailable"
         try:
             with self._spool_lock:
+                space_error = self._failure_spool_space_error(encoded_bytes)
+                if space_error:
+                    raise _FailureSpoolSpaceError(space_error)
                 with self._failure_spool_path.open(
                     "a",
                     encoding="utf-8",
@@ -932,19 +1001,24 @@ class ExternalAlertService:
                     handle.flush()
                     if self.failure_spool_fsync:
                         os.fsync(handle.fileno())
+        except _FailureSpoolSpaceError as exc:
+            failure_reason = str(exc)
         except (OSError, TypeError, ValueError):
+            pass
+        else:
             with self._condition:
-                self._failure_spool_errors += 1
-                self._healthy = False
-                self._health_reason = "failure_spool_unavailable"
-                self._last_failure_kind = "failure_spool_unavailable"
-                self._last_failure_at = self._wall_time()
+                self._failure_records += 1
                 self._condition.notify_all()
-            return False
+            return True
+
         with self._condition:
-            self._failure_records += 1
+            self._failure_spool_errors += 1
+            self._healthy = False
+            self._health_reason = failure_reason
+            self._last_failure_kind = failure_reason
+            self._last_failure_at = self._wall_time()
             self._condition.notify_all()
-        return True
+        return False
 
     def _close_transport(self) -> None:
         close = getattr(self._transport, "close", None)

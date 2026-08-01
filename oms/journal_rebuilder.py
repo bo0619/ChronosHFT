@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+from collections import OrderedDict, defaultdict
+from itertools import chain
 
 from infrastructure.logger import logger
 
@@ -14,6 +16,7 @@ from event.type import (
 )
 
 from .component import OMSComponent
+from .execution_identity import retain_cursor_uncovered_execution_ids
 from .journal import JournalCorruptionError
 from .order import Order
 
@@ -22,8 +25,14 @@ class OMSJournalRebuilder(OMSComponent):
     """Own the deterministic journal-to-memory reconstruction pass."""
 
     def rebuild_from_log(self):
-        records = self.journal.load()
-        if not records:
+        stream_records = getattr(self.journal, "iter_records", None)
+        records = iter(
+            stream_records(respect_replay_policy=True)
+            if callable(stream_records)
+            else self.journal.load()
+        )
+        first_record = next(records, None)
+        if first_record is None:
             calibration_replay = (
                 self._new_rpi_calibration_replay_state()
             )
@@ -63,11 +72,18 @@ class OMSJournalRebuilder(OMSComponent):
                 ),
             }
 
+        records = chain((first_record,), records)
         latest_order_records = {}
         latest_order_record_indexes = {}
-        commands = {}
+        terminal_order_oids = OrderedDict()
+        pending_commands = {}
+        pending_command_ids_by_client_oid = defaultdict(set)
+        latest_command_results = {}
         executions_by_client_oid = {}
-        execution_records = []
+        replayed_execution_ids = set()
+        strategy_positions = defaultdict(float)
+        strategy_average_prices = defaultdict(float)
+        deferred_strategy_executions = defaultdict(list)
         last_lifecycle = None
         last_freeze_reason = ""
         last_halt_reason = ""
@@ -92,10 +108,79 @@ class OMSJournalRebuilder(OMSComponent):
         external_cash_flow_ids = set()
         external_cash_flow_scan_end_ms = 0
         calibration_replay = self._new_rpi_calibration_replay_state()
-        clean_shutdown = records[-1].get("kind") == "oms_stopped"
+        record_count = 0
+        last_record_kind = ""
+
+        def replay_strategy_execution(
+            execution_payload,
+            execution_record_index,
+            intent_payload=None,
+        ) -> bool:
+            intent = intent_payload if isinstance(intent_payload, dict) else {}
+            execution_id = str(
+                execution_payload.get("execution_id", "") or ""
+            )
+            strategy_id = str(
+                execution_payload.get("strategy_id", "")
+                or intent.get("strategy_id", "")
+                or "exchange_recovery"
+            )
+            symbol = str(
+                execution_payload.get("symbol", "")
+                or intent.get("symbol", "")
+            ).upper()
+            side_value = str(
+                execution_payload.get("side", "")
+                or intent.get("side", "")
+            )
+            if not symbol or not side_value:
+                return False
+            try:
+                side = Side(side_value)
+                fill_qty = float(
+                    execution_payload.get("fill_qty", 0.0) or 0.0
+                )
+                fill_price = float(
+                    execution_payload.get("fill_price", 0.0) or 0.0
+                )
+            except (TypeError, ValueError) as exc:
+                raise JournalCorruptionError(
+                    f"Malformed strategy execution {execution_id}: {exc}"
+                ) from exc
+            if (
+                fill_qty <= 0.0
+                or fill_price <= 0.0
+                or not math.isfinite(fill_qty)
+                or not math.isfinite(fill_price)
+            ):
+                raise JournalCorruptionError(
+                    "Invalid strategy execution values for "
+                    f"{execution_id} at journal record "
+                    f"{execution_record_index}"
+                )
+            self.exposure._apply_fill_to_ledger(
+                strategy_positions,
+                strategy_average_prices,
+                (strategy_id, symbol),
+                side,
+                fill_qty,
+                fill_price,
+            )
+            return True
+
+        terminal_statuses = {
+            OrderStatus.FILLED.value,
+            OrderStatus.CANCELLED.value,
+            OrderStatus.REJECTED.value,
+            OrderStatus.REJECTED_LOCALLY.value,
+            OrderStatus.EXPIRED.value,
+        }
+        tombstone_limit = max(1, int(self.TOMBSTONE_MAX or 1))
         for record_index, record in enumerate(records):
+            record_count = record_index + 1
             payload = record.get("payload", {})
             kind = record.get("kind")
+            last_record_kind = kind
             if self._replay_rpi_calibration_record(
                 kind,
                 payload,
@@ -108,11 +193,91 @@ class OMSJournalRebuilder(OMSComponent):
                 if client_oid:
                     latest_order_records[client_oid] = payload
                     latest_order_record_indexes[client_oid] = record_index
-            elif kind in {"command_prepared", "command_result"}:
+                    latest_command_results.pop(client_oid, None)
+                    executions_by_client_oid.pop(client_oid, None)
+                    pending_ids = pending_command_ids_by_client_oid.get(
+                        client_oid,
+                        (),
+                    )
+                    for command_id in tuple(pending_ids):
+                        pending = pending_commands.get(command_id)
+                        if pending is not None:
+                            pending["snapshot_index"] = record_index
+                            pending["snapshot_status"] = str(
+                                payload.get("status", "") or ""
+                            )
+
+                    deferred = deferred_strategy_executions.pop(
+                        client_oid,
+                        (),
+                    )
+                    intent_payload = payload.get("intent", {})
+                    for execution in deferred:
+                        if not replay_strategy_execution(
+                            execution["payload"],
+                            execution["index"],
+                            intent_payload,
+                        ):
+                            raise JournalCorruptionError(
+                                "Execution record cannot resolve order intent "
+                                f"for {client_oid} at journal record "
+                                f"{execution['index']}"
+                            )
+
+                    status = str(payload.get("status", "") or "")
+                    if status in terminal_statuses:
+                        terminal_order_oids[client_oid] = None
+                        terminal_order_oids.move_to_end(client_oid)
+                        while len(terminal_order_oids) > tombstone_limit:
+                            expired_oid, _ = terminal_order_oids.popitem(
+                                last=False
+                            )
+                            latest_order_records.pop(expired_oid, None)
+                            latest_order_record_indexes.pop(expired_oid, None)
+                            latest_command_results.pop(expired_oid, None)
+                            executions_by_client_oid.pop(expired_oid, None)
+                    else:
+                        terminal_order_oids.pop(client_oid, None)
+            elif kind == "command_prepared":
                 command_id = str(payload.get("command_id", "") or "")
                 if command_id:
-                    entry = commands.setdefault(command_id, {})
-                    entry[kind] = {
+                    client_oid = str(payload.get("client_oid", "") or "")
+                    order_snapshot = latest_order_records.get(client_oid, {})
+                    entry = {
+                        "index": record_index,
+                        "payload": payload,
+                        "client_oid": client_oid,
+                        "snapshot_index": latest_order_record_indexes.get(
+                            client_oid,
+                            -1,
+                        ),
+                        "snapshot_status": str(
+                            order_snapshot.get("status", "") or ""
+                        ),
+                    }
+                    pending_commands[command_id] = entry
+                    if client_oid:
+                        pending_command_ids_by_client_oid[client_oid].add(
+                            command_id
+                        )
+            elif kind == "command_result":
+                command_id = str(payload.get("command_id", "") or "")
+                prepared = pending_commands.pop(command_id, None)
+                if prepared is not None:
+                    prepared_client_oid = prepared["client_oid"]
+                    pending_ids = pending_command_ids_by_client_oid.get(
+                        prepared_client_oid
+                    )
+                    if pending_ids is not None:
+                        pending_ids.discard(command_id)
+                        if not pending_ids:
+                            pending_command_ids_by_client_oid.pop(
+                                prepared_client_oid,
+                                None,
+                            )
+                client_oid = str(payload.get("client_oid", "") or "")
+                if client_oid:
+                    latest_command_results[client_oid] = {
                         "index": record_index,
                         "payload": payload,
                     }
@@ -129,13 +294,27 @@ class OMSJournalRebuilder(OMSComponent):
                     symbol = str(payload.get("symbol", "") or "").upper()
                     if symbol:
                         unverified_execution_symbols.add(symbol)
-                execution_records.append(
-                    {"index": record_index, "payload": payload}
-                )
+                execution_id = str(payload.get("execution_id", "") or "")
+                if not execution_id:
+                    raise JournalCorruptionError(
+                        "Execution record without execution_id during "
+                        f"strategy replay at journal record {record_index}"
+                    )
+                execution = {"index": record_index, "payload": payload}
                 if client_oid:
                     executions_by_client_oid.setdefault(client_oid, []).append(
-                        {"index": record_index, "payload": payload}
+                        execution
                     )
+                if execution_id in replayed_execution_ids:
+                    continue
+                replayed_execution_ids.add(execution_id)
+                order_payload = latest_order_records.get(client_oid, {})
+                if not replay_strategy_execution(
+                    payload,
+                    record_index,
+                    order_payload.get("intent", {}),
+                ):
+                    deferred_strategy_executions[client_oid].append(execution)
             elif kind == "lifecycle":
                 last_lifecycle = payload.get("state")
                 reason = str(payload.get("reason", "") or "")
@@ -482,38 +661,31 @@ class OMSJournalRebuilder(OMSComponent):
                     int(payload.get("end_time_ms", 0) or 0),
                 )
 
-        latest_command_results = {}
-        pending_commands = 0
-        for entry in commands.values():
-            prepared = entry.get("command_prepared")
-            result = entry.get("command_result")
-            if prepared and not result:
-                prepared_payload = prepared["payload"]
-                client_oid = str(prepared_payload.get("client_oid", "") or "")
-                snapshot = latest_order_records.get(client_oid, {})
-                snapshot_index = latest_order_record_indexes.get(client_oid, -1)
-                snapshot_status = str(snapshot.get("status", "") or "")
-                ambiguous_statuses = {
-                    OrderStatus.SUBMITTING.value,
-                    OrderStatus.SUBMIT_UNKNOWN.value,
-                    OrderStatus.CANCELLING.value,
-                    OrderStatus.CANCEL_UNKNOWN.value,
-                }
-                if (
-                    not snapshot
-                    or snapshot_index <= prepared["index"]
-                    or snapshot_status in ambiguous_statuses
-                ):
-                    pending_commands += 1
-            if not result:
-                continue
-            result_payload = result["payload"]
-            client_oid = str(result_payload.get("client_oid", "") or "")
-            if not client_oid:
-                continue
-            current = latest_command_results.get(client_oid)
-            if current is None or result["index"] > current["index"]:
-                latest_command_results[client_oid] = result
+        if deferred_strategy_executions:
+            unresolved = next(iter(deferred_strategy_executions.values()))[0]
+            raise JournalCorruptionError(
+                "Execution record cannot resolve symbol/side at journal "
+                f"record {unresolved['index']}"
+            )
+
+        ambiguous_statuses = {
+            OrderStatus.SUBMITTING.value,
+            OrderStatus.SUBMIT_UNKNOWN.value,
+            OrderStatus.CANCELLING.value,
+            OrderStatus.CANCEL_UNKNOWN.value,
+        }
+        pending_command_count = sum(
+            prepared["snapshot_index"] <= prepared["index"]
+            or prepared["snapshot_status"] in ambiguous_statuses
+            for prepared in pending_commands.values()
+        )
+        retained_execution_ids = retain_cursor_uncovered_execution_ids(
+            replayed_execution_ids,
+            trade_cursors,
+        )
+        compacted_execution_id_count = (
+            len(replayed_execution_ids) - len(retained_execution_ids)
+        )
 
         with self.lock:
             self.orders.clear()
@@ -525,59 +697,9 @@ class OMSJournalRebuilder(OMSComponent):
             self.exposure.strategy_avg_prices.clear()
             self.exposure.strategy_open_buy_qty.clear()
             self.exposure.strategy_open_sell_qty.clear()
-            replayed_strategy_executions = set()
-            for execution in execution_records:
-                payload = execution["payload"]
-                execution_id = str(payload.get("execution_id", "") or "")
-                if not execution_id:
-                    raise JournalCorruptionError(
-                        "Execution record without execution_id during strategy replay"
-                    )
-                if execution_id in replayed_strategy_executions:
-                    continue
-                client_oid = str(payload.get("client_oid", "") or "")
-                order_payload = latest_order_records.get(client_oid, {})
-                intent_payload = order_payload.get("intent", {})
-                strategy_id = str(
-                    payload.get("strategy_id", "")
-                    or intent_payload.get("strategy_id", "")
-                    or "exchange_recovery"
-                )
-                symbol = str(
-                    payload.get("symbol", "")
-                    or intent_payload.get("symbol", "")
-                ).upper()
-                side_value = str(
-                    payload.get("side", "")
-                    or intent_payload.get("side", "")
-                )
-                try:
-                    side = Side(side_value)
-                    fill_qty = float(payload.get("fill_qty", 0.0) or 0.0)
-                    fill_price = float(payload.get("fill_price", 0.0) or 0.0)
-                except (TypeError, ValueError) as exc:
-                    raise JournalCorruptionError(
-                        f"Malformed strategy execution {execution_id}: {exc}"
-                    ) from exc
-                if (
-                    not symbol
-                    or fill_qty <= 0.0
-                    or fill_price <= 0.0
-                    or not math.isfinite(fill_qty)
-                    or not math.isfinite(fill_price)
-                ):
-                    raise JournalCorruptionError(
-                        f"Invalid strategy execution values for {execution_id}"
-                    )
-                self.exposure.on_strategy_fill(
-                    strategy_id,
-                    symbol,
-                    side,
-                    fill_qty,
-                    fill_price,
-                )
-                replayed_strategy_executions.add(execution_id)
-                self.execution_ids.add(execution_id)
+            self.exposure.strategy_net_positions.update(strategy_positions)
+            self.exposure.strategy_avg_prices.update(strategy_average_prices)
+            self.execution_ids.update(retained_execution_ids)
             recovered_terminal_ids = 0
             recovered_active_orders = 0
             for client_oid, payload in latest_order_records.items():
@@ -599,11 +721,10 @@ class OMSJournalRebuilder(OMSComponent):
                     )
 
                 for execution in executions_by_client_oid.get(client_oid, []):
-                    self.execution_ids.add(
-                        str(execution["payload"].get("execution_id", "") or "")
+                    self._apply_recovered_execution(
+                        order,
+                        execution["payload"],
                     )
-                    if execution["index"] > latest_order_record_indexes[client_oid]:
-                        self._apply_recovered_execution(order, execution["payload"])
 
                 # PREPARED/SUBMITTING and PREPARED/CANCELLING are deliberately
                 # ambiguous after a process crash. They must be queried by the
@@ -629,15 +750,19 @@ class OMSJournalRebuilder(OMSComponent):
                         self._remember_terminated_oid(order.exchange_oid)
                         recovered_terminal_ids += 1
 
+            self.execution_ids.intersection_update(retained_execution_ids)
             self.exposure.update_open_orders(self.orders)
             self.account.calculate()
 
+        clean_shutdown = last_record_kind == "oms_stopped"
         summary = {
-            "records": len(records),
+            "records": record_count,
             "recovered_orders": len(latest_order_records),
             "recovered_active_orders": recovered_active_orders,
             "recovered_terminal_ids": recovered_terminal_ids,
-            "pending_commands": pending_commands,
+            "pending_commands": pending_command_count,
+            "retained_execution_ids": len(retained_execution_ids),
+            "compacted_execution_ids": compacted_execution_id_count,
             "last_lifecycle": last_lifecycle,
             "last_freeze_reason": last_freeze_reason,
             "last_halt_reason": last_halt_reason,

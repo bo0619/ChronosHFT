@@ -1,0 +1,29 @@
+{
+  "system": {
+    "event_engine": {
+      "_comment": "Bound all event lanes for a small AWS instance; queue overflow and sustained backlog fail closed through the existing OMS watchdog.",
+      "queue_capacity": {
+        "market": 2048,
+        "execution": 1024,
+        "cold": 2048
+      },
+      "queue_warn_depth": {
+        "market": 256,
+        "execution": 128,
+        "cold": 512
+      },
+      "backlog_warn_ms": {
+        "market": 200.0,
+        "execution": 300.0,
+        "cold": 2000.0
+      },
+      "handler_slow_ms": {
+        "market": 5.0,
+        "execution": 20.0,
+        "cold": 100.0
+      },
+      "alert_interval_sec": 5.0,
+      "shutdown_drain_timeout_sec": 5.0
+    }
+  }
+}

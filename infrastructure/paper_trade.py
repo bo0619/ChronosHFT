@@ -88,6 +88,7 @@ def validate_paper_trade_database_config(config: dict) -> dict:
         ("strategy_sample_interval_sec", 1.0),
         ("account_sample_interval_sec", 1.0),
         ("market_sample_interval_sec", 1.0),
+        ("space_check_interval_sec", 1.0),
     ):
         value = database.get(field, default)
         if isinstance(value, bool):
@@ -118,6 +119,27 @@ def validate_paper_trade_database_config(config: dict) -> dict:
     ):
         raise ValueError(
             "paper_trade_database.queue_capacity must be an integer of at least 100"
+        )
+
+    write_batch_size = database.get("write_batch_size", 64)
+    if (
+        isinstance(write_batch_size, bool)
+        or not isinstance(write_batch_size, int)
+        or not 1 <= write_batch_size <= 256
+    ):
+        raise ValueError(
+            "paper_trade_database.write_batch_size must be an integer "
+            "between 1 and 256"
+        )
+
+    min_free_bytes = database.get("min_free_bytes", 0)
+    if (
+        isinstance(min_free_bytes, bool)
+        or not isinstance(min_free_bytes, int)
+        or min_free_bytes < 0
+    ):
+        raise ValueError(
+            "paper_trade_database.min_free_bytes must be a non-negative integer"
         )
 
     oms = config.get("oms", {}) or {}

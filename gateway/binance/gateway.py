@@ -101,7 +101,7 @@ class BinanceGateway(BaseGateway):
         self._book_lock = threading.RLock()
         self.max_book_buffer = max(
             100,
-            int(market_data_config.get("max_book_buffer", 50_000) or 50_000),
+            int(market_data_config.get("max_book_buffer", 2048) or 2048),
         )
         self.book_resync_max_attempts = max(
             1,
@@ -111,6 +111,25 @@ class BinanceGateway(BaseGateway):
             0.0,
             float(market_data_config.get("book_resync_retry_sec", 0.25) or 0.0),
         )
+        self.max_book_recovery_threads = max(
+            1,
+            int(
+                market_data_config.get("max_book_recovery_threads", 4)
+                or 4
+            ),
+        )
+        self.book_recovery_join_timeout_sec = max(
+            0.5,
+            float(
+                market_data_config.get(
+                    "book_recovery_join_timeout_sec",
+                    3.0,
+                )
+                or 3.0
+            ),
+        )
+        self._book_recovery_threads = set()
+        self._book_recovery_stop = threading.Event()
         self.stream_ready_timeout_sec = max(
             1.0,
             float(market_data_config.get("stream_ready_timeout_sec", 10.0) or 10.0),
@@ -121,6 +140,26 @@ class BinanceGateway(BaseGateway):
         )
         self.emit_full_orderbook_events = bool(
             market_data_config.get("emit_full_orderbook_events", False)
+        )
+        self.max_orderbook_levels_per_side = max(
+            self.publish_depth_levels,
+            int(
+                market_data_config.get(
+                    "max_orderbook_levels_per_side",
+                    4096,
+                )
+                or 4096
+            ),
+        )
+        self.max_delta_levels_per_side = max(
+            1,
+            int(
+                market_data_config.get(
+                    "max_delta_levels_per_side",
+                    2048,
+                )
+                or 2048
+            ),
         )
         try:
             ingress_age_ms = float(
@@ -145,6 +184,8 @@ class BinanceGateway(BaseGateway):
         self.account_configuration_mode = ACCOUNT_CONFIGURATION_MODE_APPLY
         self.recovery_lock = threading.Lock()
         self.keep_alive_generation = 0
+        self._keep_alive_stop = threading.Event()
+        self._keep_alive_thread = None
         self._closing = False
 
         self.global_sequence_id = 0
@@ -165,6 +206,13 @@ class BinanceGateway(BaseGateway):
     def _connect_once(self, symbols: list):
         self.set_state(GatewayState.CONNECTING)
         self.symbols = [s.upper() for s in symbols]
+        book_recovery_stop = getattr(self, "_book_recovery_stop", None)
+        if book_recovery_stop is None:
+            book_recovery_stop = threading.Event()
+            self._book_recovery_stop = book_recovery_stop
+        if not hasattr(self, "_book_recovery_threads"):
+            self._book_recovery_threads = set()
+        book_recovery_stop.clear()
 
         with self._book_lock:
             if getattr(self, "_closing", False):
@@ -262,28 +310,65 @@ class BinanceGateway(BaseGateway):
         with self._book_lock:
             self._closing = True
             self.active = False
+            keep_alive_stop = getattr(self, "_keep_alive_stop", None)
+            if keep_alive_stop is not None:
+                keep_alive_stop.set()
+            book_recovery_stop = getattr(
+                self,
+                "_book_recovery_stop",
+                None,
+            )
+            if book_recovery_stop is not None:
+                book_recovery_stop.set()
+            keep_alive_thread = getattr(
+                self,
+                "_keep_alive_thread",
+                None,
+            )
             self._book_generation += 1
             self.book_resyncing.clear()
             self.book_recovery_generation.clear()
             self.book_recovery_tokens.clear()
             ws = self.ws
         self.set_state(GatewayState.DISCONNECTED)
+        ws_stopped = True
         if ws:
-            ws.close()
-        return True
+            ws_stopped = ws.close() is not False
+        keep_alive_stopped = True
+        if (
+            keep_alive_thread is not None
+            and keep_alive_thread is not threading.current_thread()
+            and keep_alive_thread.is_alive()
+        ):
+            keep_alive_thread.join(timeout=2.0)
+            keep_alive_stopped = not keep_alive_thread.is_alive()
+            if not keep_alive_stopped:
+                logger.critical(
+                    "[BINANCE] Listen-key keepalive worker did not stop"
+                )
+        book_recovery_stopped = self._join_book_recovery_threads()
+        return bool(
+            ws_stopped
+            and keep_alive_stopped
+            and book_recovery_stopped
+        )
 
     def close(self):
-        self.begin_shutdown()
+        transport_stopped = self.begin_shutdown()
         with self.recovery_lock:
             with self._book_lock:
                 ws = self.ws
                 self.ws = None
             if ws:
-                ws.close()
+                transport_stopped = bool(
+                    ws.close() is not False and transport_stopped
+                )
+        if not self._book_recovery_threads_stopped():
+            return False
         if self.session:
             self.session.close()
         logger.info(f"[{self.gateway_name}] Closed.")
-        return True
+        return transport_stopped
 
     def send_order(
         self,
@@ -470,12 +555,22 @@ class BinanceGateway(BaseGateway):
 
         self.listen_key = listen_key
         self.ws.start_user_stream(listen_key)
+        self._keep_alive_stop.set()
+        stop_event = threading.Event()
+        self._keep_alive_stop = stop_event
         self.keep_alive_generation += 1
-        threading.Thread(
+        keep_alive_thread = threading.Thread(
             target=self._keep_alive_loop,
-            args=(self.keep_alive_generation, expected_generation),
+            args=(
+                self.keep_alive_generation,
+                expected_generation,
+                stop_event,
+            ),
             daemon=True,
-        ).start()
+            name="BinanceListenKeyKeepAlive",
+        )
+        self._keep_alive_thread = keep_alive_thread
+        keep_alive_thread.start()
         return True
 
     def _apply_account_trading_configuration(self):
@@ -569,9 +664,16 @@ class BinanceGateway(BaseGateway):
             return False
         return True
 
-    def _keep_alive_loop(self, generation, transport_generation=None):
+    def _keep_alive_loop(
+        self,
+        generation,
+        transport_generation=None,
+        stop_event=None,
+    ):
+        stop_event = stop_event or threading.Event()
         while self.active and generation == self.keep_alive_generation:
-            time.sleep(1800)
+            if stop_event.wait(1800.0):
+                return
             if not self.active or generation != self.keep_alive_generation:
                 return
             if not self._keep_alive_once(
@@ -1086,6 +1188,7 @@ class BinanceGateway(BaseGateway):
             try:
                 buf = self.ws_buffer[symbol]
                 if buf is not None:
+                    self.orderbooks[symbol].validate_delta_shape(raw)
                     if len(buf) >= self.max_book_buffer:
                         raise OrderBookGapError(
                             f"book buffer overflow for {symbol}"
@@ -1163,13 +1266,87 @@ class BinanceGateway(BaseGateway):
                         f"FREEZE_SYMBOL:{symbol}:{freeze_reason}:{recovery_token}",
                     )
                 )
-        threading.Thread(
-            target=self._recover_orderbook,
-            args=(symbol, generation, recovery_token),
-            daemon=True,
-            name=f"BinanceBookRecovery-{symbol}",
-        ).start()
+            stop_event = getattr(self, "_book_recovery_stop", None)
+            if stop_event is None:
+                stop_event = threading.Event()
+                self._book_recovery_stop = stop_event
+            threads = getattr(self, "_book_recovery_threads", None)
+            if threads is None:
+                threads = set()
+                self._book_recovery_threads = threads
+            threads.intersection_update(
+                thread for thread in threads if thread.is_alive()
+            )
+            max_threads = max(
+                1,
+                int(getattr(self, "max_book_recovery_threads", 4) or 4),
+            )
+            if stop_event.is_set() or len(threads) >= max_threads:
+                logger.critical(
+                    f"[{symbol}] OrderBook recovery capacity unavailable: "
+                    f"active={len(threads)} limit={max_threads}"
+                )
+                return False
+            thread = threading.Thread(
+                target=self._run_book_recovery,
+                args=(symbol, generation, recovery_token),
+                daemon=True,
+                name=f"BinanceBookRecovery-{symbol}",
+            )
+            threads.add(thread)
+        thread.start()
         return True
+
+    def _run_book_recovery(self, symbol, generation, recovery_token):
+        try:
+            self._recover_orderbook(symbol, generation, recovery_token)
+        finally:
+            current = threading.current_thread()
+            with self._book_lock:
+                threads = getattr(self, "_book_recovery_threads", None)
+                if threads is not None:
+                    threads.discard(current)
+
+    def _book_recovery_threads_stopped(self) -> bool:
+        with self._book_lock:
+            threads = getattr(self, "_book_recovery_threads", set())
+            threads.intersection_update(
+                thread for thread in threads if thread.is_alive()
+            )
+            return not threads
+
+    def _join_book_recovery_threads(self) -> bool:
+        with self._book_lock:
+            threads = tuple(
+                thread
+                for thread in getattr(
+                    self,
+                    "_book_recovery_threads",
+                    (),
+                )
+                if thread is not threading.current_thread()
+                and thread.is_alive()
+            )
+        timeout_sec = max(
+            0.0,
+            float(
+                getattr(
+                    self,
+                    "book_recovery_join_timeout_sec",
+                    3.0,
+                )
+                or 0.0
+            ),
+        )
+        deadline = time.perf_counter() + timeout_sec
+        for thread in threads:
+            thread.join(timeout=max(0.0, deadline - time.perf_counter()))
+        stopped = self._book_recovery_threads_stopped()
+        if not stopped:
+            logger.critical(
+                "[BINANCE] OrderBook recovery workers did not stop before timeout"
+            )
+        return stopped
 
     def _schedule_book_recovery(
         self,
@@ -1186,12 +1363,14 @@ class BinanceGateway(BaseGateway):
             )
         if recovery is None:
             return False
-        self._launch_book_recovery(recovery)
-        return True
+        return self._launch_book_recovery(recovery)
 
     def _recover_orderbook(self, symbol, generation, recovery_token):
         try:
             for attempt in range(1, self.book_resync_max_attempts + 1):
+                stop_event = getattr(self, "_book_recovery_stop", None)
+                if stop_event is not None and stop_event.is_set():
+                    return
                 if self._resync_book(
                     symbol,
                     expected_generation=generation,
@@ -1226,7 +1405,12 @@ class BinanceGateway(BaseGateway):
                         break
                     self.orderbooks[symbol] = self._new_local_orderbook(symbol)
                     self.ws_buffer[symbol] = []
-                time.sleep(self.book_resync_retry_sec * attempt)
+                retry_delay = self.book_resync_retry_sec * attempt
+                if stop_event is not None:
+                    if stop_event.wait(retry_delay):
+                        return
+                else:
+                    time.sleep(retry_delay)
             logger.critical(
                 f"[{symbol}] OrderBook resync exhausted "
                 f"{self.book_resync_max_attempts} attempts; symbol remains frozen."
@@ -1405,6 +1589,16 @@ class BinanceGateway(BaseGateway):
             symbol,
             publish_depth_levels=getattr(self, "publish_depth_levels", 5),
             emit_full_book=getattr(self, "emit_full_orderbook_events", False),
+            max_levels_per_side=getattr(
+                self,
+                "max_orderbook_levels_per_side",
+                4096,
+            ),
+            max_delta_levels_per_side=getattr(
+                self,
+                "max_delta_levels_per_side",
+                2048,
+            ),
         )
 
     def _owns_book_recovery_locked(self, symbol, generation, recovery_token):

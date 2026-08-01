@@ -1,0 +1,22 @@
+{
+  "system": {
+    "resource_monitor": {
+      "_comment": "Sample Linux /proc at low frequency; sustained aggregate memory, thread, or file-descriptor exhaustion freezes new risk on AWS t3.small.",
+      "enabled": true,
+      "sample_interval_sec": 5.0,
+      "rss_warn_bytes": 805306368,
+      "rss_freeze_bytes": 1342177280,
+      "max_main_threads": 96,
+      "max_main_fds": 4096,
+      "max_total_threads": 112,
+      "max_total_fds": 8192,
+      "max_processes": 128,
+      "cpu_warn_percent_one_core": 150.0,
+      "breach_checks": 3,
+      "recovery_checks": 6,
+      "history_samples": 12,
+      "require_available_on_linux": true,
+      "require_complete_process_tree_on_linux": true
+    }
+  }
+}

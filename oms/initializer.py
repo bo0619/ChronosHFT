@@ -67,7 +67,17 @@ class OMSInitializer(OMSComponent):
         if not isinstance(database_config, dict):
             raise ValueError("paper_trade_database must be an object")
         if bool(database_config.get("enabled", False)):
-            self.paper_trade_database = PaperTradeDatabase(config, self.journal)
+            self.paper_trade_database = PaperTradeDatabase(
+                config,
+                self.journal,
+                failure_callback=self._on_paper_database_failure,
+            )
+
+    def _on_paper_database_failure(self, reason: str) -> None:
+        self.freeze_system(
+            f"paper_trade_database_unhealthy:{reason}",
+            cancel_active_orders=True,
+        )
 
     def _configure_order_controls(self, config, oms_cfg) -> str:
         target_position_mode = str(
@@ -182,7 +192,18 @@ class OMSInitializer(OMSComponent):
         self.state = LifecycleState.BOOTSTRAP
         self._lifecycle_generation = 0
 
-        self.event_log = []
+        oms_cfg = config.get("oms", {})
+        oms_cfg = oms_cfg if isinstance(oms_cfg, dict) else {}
+        event_log_max = oms_cfg.get("event_log_max", 2048)
+        if (
+            isinstance(event_log_max, bool)
+            or not isinstance(event_log_max, int)
+            or event_log_max <= 0
+        ):
+            raise ValueError("oms.event_log_max must be a positive integer")
+        self.event_log_max = event_log_max
+        self.event_log = deque(maxlen=event_log_max)
+        self.event_log_evictions = 0
         self.orders = {}
         # Cancels received during submit settlement either fence the POST or
         # run once settlement establishes whether the order can be live.

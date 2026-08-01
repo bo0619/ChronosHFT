@@ -3,7 +3,11 @@
     "log_level": "INFO",
     "log_path": "logs",
     "log_console": false,
+    "log_queue_capacity": 4096,
+    "log_max_bytes": 33554432,
+    "log_backup_count": 7,
+    "log_close_timeout_sec": 5.0,
     "web_port": 8000,
-    "hdf5_flush_threshold": 1000
+    "_comment": "Fixed-name size rotation bounds log storage across daily process restarts."
   }
 }

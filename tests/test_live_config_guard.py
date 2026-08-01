@@ -62,6 +62,7 @@ def safe_live_config():
                 "external_alert_failures.jsonl"
             ),
             "failure_spool_fsync": True,
+            "failure_spool_min_free_bytes": 536870912,
         },
         "system": {
             "market_data": {
@@ -92,6 +93,7 @@ def safe_live_config():
                 "max_batch_records": 256,
                 "fsync_interval_sec": 1.0,
                 "close_timeout_sec": 15.0,
+                "min_free_bytes": 536870912,
                 "single_writer_fence": {
                     "enabled": True,
                     "path": (
@@ -419,6 +421,16 @@ class LiveConfigGuardTests(unittest.TestCase):
                 "port must be an integer",
             ),
             (
+                ("system", "web_dashboard", "max_request_threads"),
+                33,
+                "max_request_threads",
+            ),
+            (
+                ("system", "web_dashboard", "request_timeout_sec"),
+                0.0,
+                "request_timeout_sec",
+            ),
+            (
                 ("system", "admin_control", "command_ttl_sec"),
                 31.0,
                 "command_ttl_sec",
@@ -458,6 +470,11 @@ class LiveConfigGuardTests(unittest.TestCase):
             ),
             ("runtime_fail_closed", False, "runtime_fail_closed"),
             ("failure_spool_fsync", False, "failure_spool_fsync"),
+            (
+                "failure_spool_min_free_bytes",
+                536870911,
+                "failure_spool_min_free_bytes",
+            ),
             ("queue_capacity", 31, "queue_capacity"),
             ("max_attempts", 4, "max_attempts"),
             (
@@ -541,6 +558,11 @@ class LiveConfigGuardTests(unittest.TestCase):
                 ("system", "evidence_recorder", "close_timeout_sec"),
                 30.01,
                 "close_timeout_sec",
+            ),
+            (
+                ("system", "evidence_recorder", "min_free_bytes"),
+                536870911,
+                "min_free_bytes",
             ),
         )
         for path, value, expected in cases:

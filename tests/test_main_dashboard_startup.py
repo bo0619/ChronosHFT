@@ -15,6 +15,38 @@ import main as main_module
 from infrastructure import admin_control as admin_control_module
 
 
+class RuntimeResourceEventTests(unittest.TestCase):
+    def test_runtime_resource_event_is_bounded_versioned_and_severity_aware(self):
+        event = main_module.build_runtime_resource_event(
+            {
+                "sampled_at_monotonic": 123.0,
+                "healthy": False,
+                "status": "unhealthy",
+                "rss_bytes": 456,
+                "processes": [{"ignored": "large raw process detail"}],
+            },
+            {
+                "enabled": True,
+                "send_count": 7,
+                "unexpected": "ignored",
+            },
+            event_time=1000.0,
+        )
+
+        self.assertEqual(event["event_time"], 1000.0)
+        self.assertEqual(event["level"], "CRITICAL")
+        self.assertEqual(event["state"], "unhealthy")
+        details = event["details"]
+        self.assertEqual(
+            details["schema"],
+            "chronoshft.paper_runtime_resources.v1",
+        )
+        self.assertEqual(details["resource"]["rss_bytes"], 456)
+        self.assertNotIn("processes", details["resource"])
+        self.assertEqual(details["systemd_watchdog"]["send_count"], 7)
+        self.assertNotIn("unexpected", details["systemd_watchdog"])
+
+
 class FakeLogger:
     def __init__(self):
         self.callback = None

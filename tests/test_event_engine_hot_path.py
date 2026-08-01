@@ -229,6 +229,89 @@ class EventEngineHotPathTests(unittest.TestCase):
         self.assertEqual(failures[0]["kind"], "queue_overflow")
         self.assertEqual(failures[0]["lane"], "cold")
 
+    def test_stop_seals_admission_and_drains_queued_hot_and_cold_work(self):
+        engine = EventEngine({"shutdown_drain_timeout_sec": 1.0})
+        first_started = threading.Event()
+        release_first = threading.Event()
+        hot_seen = []
+        cold_seen = []
+        stop_results = []
+
+        def execution_handler(event):
+            hot_seen.append(event.data)
+            if event.data == "first":
+                first_started.set()
+                release_first.wait(timeout=1.0)
+
+        def cold_handler(event):
+            cold_seen.append(event.data)
+
+        engine.register_execution("eStopDrain", execution_handler)
+        engine.register_cold("eStopDrain", cold_handler)
+        engine.start()
+        engine.put(Event("eStopDrain", "first"))
+        self.assertTrue(first_started.wait(timeout=0.5))
+        engine.put(Event("eStopDrain", "second"))
+
+        stopper = threading.Thread(
+            target=lambda: stop_results.append(engine.stop()),
+        )
+        stopper.start()
+        deadline = time.monotonic() + 0.5
+        while not engine.get_metrics_snapshot()["stopping"]:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.005)
+
+        self.assertFalse(engine.put(Event("eStopDrain", "late")))
+        release_first.set()
+        stopper.join(timeout=1.0)
+
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual(stop_results, [True])
+        self.assertEqual(hot_seen, ["first", "second"])
+        self.assertEqual(cold_seen, ["first", "second"])
+        self.assertEqual(engine.get_queue_snapshot()["pending_work"], 0)
+        snapshot = engine.get_metrics_snapshot()
+        self.assertFalse(snapshot["accepting"])
+        self.assertEqual(snapshot["rejected_put_count"], 1)
+
+    def test_stop_timeout_keeps_workers_alive_for_drain_retry(self):
+        engine = EventEngine()
+        started = threading.Event()
+        release = threading.Event()
+
+        def handler(_event):
+            started.set()
+            release.wait(timeout=1.0)
+
+        engine.register_execution("eStopRetry", handler)
+        engine.start()
+        engine.put(Event("eStopRetry", "inflight"))
+        self.assertTrue(started.wait(timeout=0.5))
+
+        self.assertFalse(engine.stop(timeout_sec=0.01))
+        snapshot = engine.get_metrics_snapshot()
+        self.assertTrue(snapshot["active"])
+        self.assertTrue(snapshot["stopping"])
+        self.assertFalse(snapshot["accepting"])
+
+        release.set()
+        self.assertTrue(engine.wait_until_idle(timeout_sec=0.5))
+        self.assertTrue(engine.stop(timeout_sec=0.5))
+        self.assertFalse(engine.get_metrics_snapshot()["active"])
+
+    def test_stop_before_start_synchronously_drains_existing_events(self):
+        engine = EventEngine()
+        seen = []
+        engine.register_execution("ePrestartStop", lambda event: seen.append(event.data))
+
+        self.assertTrue(engine.put(Event("ePrestartStop", "queued")))
+        self.assertTrue(engine.stop(timeout_sec=0.5))
+
+        self.assertEqual(seen, ["queued"])
+        self.assertEqual(engine.get_queue_snapshot()["pending_work"], 0)
+        self.assertFalse(engine.put(Event("ePrestartStop", "late")))
+
 
 if __name__ == "__main__":
     unittest.main()

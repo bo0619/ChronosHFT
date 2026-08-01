@@ -10,7 +10,14 @@ from infrastructure.logger import logger
 
 
 class LocalOrderBook:
-    def __init__(self, symbol, publish_depth_levels=5, emit_full_book=False):
+    def __init__(
+        self,
+        symbol,
+        publish_depth_levels=5,
+        emit_full_book=False,
+        max_levels_per_side=4096,
+        max_delta_levels_per_side=2048,
+    ):
         self.symbol = symbol
         self.bids = {}
         self.asks = {}
@@ -24,6 +31,14 @@ class LocalOrderBook:
         self.last_corrected_received_ts = 0.0
         self.publish_depth_levels = max(1, int(publish_depth_levels or 1))
         self.emit_full_book = bool(emit_full_book)
+        self.max_levels_per_side = max(
+            self.publish_depth_levels,
+            int(max_levels_per_side or self.publish_depth_levels),
+        )
+        self.max_delta_levels_per_side = max(
+            1,
+            int(max_delta_levels_per_side or 1),
+        )
         self.best_bid_price = 0.0
         self.best_bid_volume = 0.0
         self.best_ask_price = 0.0
@@ -33,6 +48,10 @@ class LocalOrderBook:
 
     def init_snapshot(self, snapshot_data: dict):
         self.initialized = False
+        self.validate_delta_shape(
+            {"b": snapshot_data["bids"], "a": snapshot_data["asks"]},
+            max_levels_per_side=self.max_levels_per_side,
+        )
         bids = self._parse_levels(snapshot_data["bids"], "bid")
         asks = self._parse_levels(snapshot_data["asks"], "ask")
         last_update_id = int(snapshot_data["lastUpdateId"])
@@ -91,6 +110,7 @@ class LocalOrderBook:
             )
 
         try:
+            self.validate_delta_shape(delta)
             u = int(delta["u"])
             U = int(delta["U"])
             pu = int(delta["pu"])
@@ -138,6 +158,16 @@ class LocalOrderBook:
 
         for price, qty in ask_updates.items():
             ask_levels_dirty = self._apply_ask_update(price, qty) or ask_levels_dirty
+
+        if (
+            len(self.bids) > self.max_levels_per_side
+            or len(self.asks) > self.max_levels_per_side
+        ):
+            self._reject_integrity(
+                "order book level capacity exceeded: "
+                f"bids={len(self.bids)} asks={len(self.asks)} "
+                f"limit={self.max_levels_per_side}"
+            )
 
         if bid_levels_dirty:
             self._recompute_published_bid_levels()
@@ -217,6 +247,29 @@ class LocalOrderBook:
             if qty > 0.0 or keep_zero:
                 levels[price] = qty
         return levels
+
+    def validate_delta_shape(
+        self,
+        delta: dict,
+        *,
+        max_levels_per_side: int | None = None,
+    ) -> None:
+        if not isinstance(delta, dict):
+            raise ValueError("order book delta must be an object")
+        limit = (
+            self.max_delta_levels_per_side
+            if max_levels_per_side is None
+            else max(1, int(max_levels_per_side))
+        )
+        for key, side in (("b", "bid"), ("a", "ask")):
+            levels = delta.get(key)
+            if not isinstance(levels, (list, tuple)):
+                raise ValueError(f"{side} levels must be an array")
+            if len(levels) > limit:
+                raise ValueError(
+                    f"{side} delta level capacity exceeded: "
+                    f"levels={len(levels)} limit={limit}"
+                )
 
     @staticmethod
     def _validate_book(bids, asks):

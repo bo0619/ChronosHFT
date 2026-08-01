@@ -37,7 +37,13 @@ tests/*
 !tests/test_oms_institutional_recovery.py
 !tests/test_oms_durable_ledger.py
 !tests/test_paper_gateway.py
+!tests/test_paper_book_sync.py
+!tests/test_paper_ledger.py
+!tests/test_paper_matching.py
 !tests/test_main_dashboard_startup.py
+!tests/test_process_resource_monitor.py
+!tests/test_runtime_hot_path_benchmark.py
+!tests/test_runtime_soak_analysis.py
 !tests/test_live_config_guard.py
 !tests/test_rpi_policy.py
 !tests/test_rpi_calibration_permit.py
@@ -60,9 +66,13 @@ tests/*
 !tests/test_binance_rate_limit_budget.py
 !tests/test_binance_truth_provider.py
 !tests/test_binance_ws_routes.py
+!tests/test_binance_sidecar_clock.py
+!tests/test_binance_sidecar_emergency.py
+!tests/test_binance_sidecar_truth.py
 !tests/test_data_recorder.py
 !tests/test_live_canary_evidence_collector.py
 !tests/test_rpi_terminal_truth_static.py
 !tests/test_systemd_deployment.py
+!tests/test_systemd_watchdog.py
 !tests/test_paper_trade_database.py
 !tests/test_paper_model_calibration.py

@@ -6,6 +6,7 @@ import math
 import os
 import queue
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -699,6 +700,17 @@ class LiveEvidenceRecorder:
                 "evidence recorder close_timeout_sec must be <= "
                 f"{_MAX_CLOSE_TIMEOUT_SEC:g}"
             )
+        min_free_bytes = settings.get("min_free_bytes", 0)
+        if (
+            isinstance(min_free_bytes, bool)
+            or not isinstance(min_free_bytes, int)
+            or min_free_bytes < 0
+        ):
+            raise LiveEvidenceError(
+                "evidence recorder min_free_bytes must be a non-negative "
+                "integer"
+            )
+        self.min_free_bytes = min_free_bytes
         self.max_batch_records = max_batch_records
         self._queue: queue.Queue = queue.Queue(maxsize=queue_capacity)
         self._failure_callback = failure_callback
@@ -717,6 +729,10 @@ class LiveEvidenceRecorder:
         self._last_fsync_monotonic = 0.0
         self._last_record_monotonic = 0.0
         self._dropped_records = 0
+        self._disk_free_bytes: int | None = None
+        self._last_space_check_monotonic = 0.0
+        self._disk_space_rejections = 0
+        self._disk_space_check_failures = 0
         self._session_id = uuid.uuid4().hex
         self._deployment_id = deployment_id
         self._symbols = symbols
@@ -824,28 +840,6 @@ class LiveEvidenceRecorder:
             "last_hash": last_hash,
         }
 
-    def _make_record(
-        self,
-        kind: str,
-        payload: Mapping[str, Any],
-    ) -> tuple[dict[str, Any], str]:
-        if kind not in LIVE_EVIDENCE_KINDS:
-            raise LiveEvidenceWriteError(
-                f"unsupported Live evidence kind: {kind!r}"
-            )
-        unsigned = {
-            "version": LIVE_EVIDENCE_RECORD_VERSION,
-            "seq": self._next_seq,
-            "recorded_at_utc": _utc_now(),
-            "kind": kind,
-            "payload": dict(payload),
-            "prev_hash": self._last_hash,
-        }
-        record_hash = _record_hash(unsigned)
-        record = dict(unsigned)
-        record["hash"] = record_hash
-        return record, record_hash
-
     def _write_records(
         self,
         items: list[tuple[str, Mapping[str, Any]]],
@@ -857,13 +851,32 @@ class LiveEvidenceRecorder:
             raise LiveEvidenceWriteError(
                 "Live evidence file handle is unavailable"
             )
+        next_seq = self._next_seq
+        previous_hash = self._last_hash
+        encoded_records = []
         for kind, payload in items:
-            record, record_hash = self._make_record(kind, payload)
-            handle.write(_canonical_json(record) + "\n")
-            self._last_hash = record_hash
-            self._committed_seq = self._next_seq
-            self._next_seq += 1
-            self._last_record_monotonic = time.perf_counter()
+            if kind not in LIVE_EVIDENCE_KINDS:
+                raise LiveEvidenceWriteError(
+                    f"unsupported Live evidence kind: {kind!r}"
+                )
+            unsigned = {
+                "version": LIVE_EVIDENCE_RECORD_VERSION,
+                "seq": next_seq,
+                "recorded_at_utc": _utc_now(),
+                "kind": kind,
+                "payload": dict(payload),
+                "prev_hash": previous_hash,
+            }
+            record_hash = _record_hash(unsigned)
+            record = dict(unsigned)
+            record["hash"] = record_hash
+            encoded_records.append(_canonical_json(record) + "\n")
+            previous_hash = record_hash
+            next_seq += 1
+
+        encoded_batch = "".join(encoded_records)
+        self._require_disk_reserve(len(encoded_batch.encode("ascii")))
+        handle.write(encoded_batch)
         handle.flush()
         if force_fsync:
             os.fsync(handle.fileno())
@@ -871,6 +884,36 @@ class LiveEvidenceRecorder:
             if self._created_new_file:
                 _sync_directory(self.path.parent)
                 self._created_new_file = False
+        self._last_hash = previous_hash
+        self._committed_seq = next_seq - 1
+        self._next_seq = next_seq
+        self._last_record_monotonic = time.perf_counter()
+
+    def _require_disk_reserve(self, required_bytes: int) -> None:
+        if self.min_free_bytes <= 0:
+            return
+        try:
+            free_bytes = int(shutil.disk_usage(self.path.parent).free)
+        except (OSError, ValueError) as exc:
+            with self._lock:
+                self._disk_space_check_failures += 1
+                self._last_space_check_monotonic = time.perf_counter()
+            raise LiveEvidenceWriteError(
+                "disk_space_check_failed"
+            ) from exc
+
+        free_after_write = free_bytes - max(0, int(required_bytes))
+        with self._lock:
+            self._disk_free_bytes = free_bytes
+            self._last_space_check_monotonic = time.perf_counter()
+            if free_after_write < self.min_free_bytes:
+                self._disk_space_rejections += 1
+        if free_after_write < self.min_free_bytes:
+            raise LiveEvidenceWriteError(
+                "disk_reserve_exhausted:"
+                f"free={free_bytes}:required={required_bytes}:"
+                f"reserve={self.min_free_bytes}"
+            )
 
     def _fail(self, reason: str) -> None:
         callback = None
@@ -982,7 +1025,10 @@ class LiveEvidenceRecorder:
                 force_fsync=True,
             )
         except BaseException as exc:
-            self._fail(f"writer_{type(exc).__name__}")
+            reason = f"writer_{type(exc).__name__}"
+            if isinstance(exc, LiveEvidenceWriteError):
+                reason = f"{reason}:{exc}"
+            self._fail(reason)
 
     def _enqueue(self, kind: str, payload: Mapping[str, Any]) -> bool:
         with self._lock:
@@ -1041,6 +1087,21 @@ class LiveEvidenceRecorder:
                     else None
                 ),
                 "dropped_records": self._dropped_records,
+                "min_free_bytes": self.min_free_bytes,
+                "disk_free_bytes": self._disk_free_bytes,
+                "last_space_check_age_sec": (
+                    max(
+                        0.0,
+                        time.perf_counter()
+                        - self._last_space_check_monotonic,
+                    )
+                    if self._last_space_check_monotonic > 0.0
+                    else None
+                ),
+                "disk_space_rejections": self._disk_space_rejections,
+                "disk_space_check_failures": (
+                    self._disk_space_check_failures
+                ),
                 "closing": self._closing,
                 "closed": self._closed,
             }

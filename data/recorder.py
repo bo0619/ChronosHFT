@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import math
 import multiprocessing
 import os
 import queue
+import shutil
 import signal
 import threading
 import time
@@ -30,6 +32,35 @@ def _isolate_recorder_console_interrupts() -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
+def _apply_process_niceness(requested_niceness: int) -> tuple[int | None, str]:
+    """Lower the HDF5 writer priority where the platform supports it."""
+    if requested_niceness <= 0:
+        return None, "disabled"
+
+    setpriority = getattr(os, "setpriority", None)
+    priority_process = getattr(os, "PRIO_PROCESS", None)
+    if callable(setpriority) and priority_process is not None:
+        try:
+            setpriority(priority_process, 0, requested_niceness)
+            getpriority = getattr(os, "getpriority", None)
+            applied = (
+                getpriority(priority_process, 0)
+                if callable(getpriority)
+                else requested_niceness
+            )
+            return int(applied), "applied"
+        except OSError as exc:
+            return None, f"setpriority_failed:{type(exc).__name__}:{exc}"
+
+    nice = getattr(os, "nice", None)
+    if callable(nice):
+        try:
+            return int(nice(requested_niceness)), "applied"
+        except OSError as exc:
+            return None, f"nice_failed:{type(exc).__name__}:{exc}"
+    return None, "unsupported_platform"
+
+
 def _put_writer_status(status_queue, payload: dict) -> None:
     try:
         status_queue.put_nowait(dict(payload))
@@ -43,6 +74,7 @@ def _flush_hdf_buffer(
     buffers: dict,
     symbol: str,
     data_type: str,
+    min_free_bytes: int = 0,
 ) -> int:
     source_buffer = buffers[data_type][symbol]
     if not source_buffer:
@@ -53,6 +85,15 @@ def _flush_hdf_buffer(
     import pandas as pd
 
     batch = list(source_buffer)
+    if min_free_bytes > 0:
+        reserved_bytes = max(8 * 1024 * 1024, len(batch) * 8192)
+        free_bytes = int(shutil.disk_usage(save_path).free)
+        if free_bytes - reserved_bytes < min_free_bytes:
+            raise RuntimeError(
+                "recorder_disk_reserve_exhausted:"
+                f"free={free_bytes}:required={reserved_bytes}:"
+                f"reserve={min_free_bytes}"
+            )
     today = datetime.now().strftime("%Y%m%d")
     filename = Path(save_path) / f"{symbol}_{data_type}_{today}.h5"
     frame = pd.DataFrame(batch)
@@ -77,6 +118,8 @@ def _recorder_writer_main(
     save_path: str,
     symbols: tuple[str, ...],
     flush_threshold: int,
+    min_free_bytes: int = 0,
+    process_niceness: int = 0,
 ) -> None:
     try:
         _isolate_recorder_console_interrupts()
@@ -91,6 +134,20 @@ def _recorder_writer_main(
             },
         )
         raise
+    if process_niceness > 0:
+        applied_niceness, niceness_reason = _apply_process_niceness(
+            process_niceness
+        )
+        _put_writer_status(
+            status_queue,
+            {
+                "type": "startup",
+                "ok": applied_niceness is not None,
+                "requested_process_niceness": process_niceness,
+                "applied_process_niceness": applied_niceness,
+                "reason": niceness_reason,
+            },
+        )
     os.makedirs(save_path, exist_ok=True)
     buffers = {
         "depth": {symbol: [] for symbol in symbols},
@@ -111,6 +168,7 @@ def _recorder_writer_main(
                         buffers,
                         symbol,
                         data_type,
+                        min_free_bytes,
                     )
                 continue
 
@@ -121,6 +179,7 @@ def _recorder_writer_main(
                     buffers,
                     symbol,
                     data_type,
+                    min_free_bytes,
                 )
                 written_records += flushed
                 _put_writer_status(
@@ -141,12 +200,14 @@ def _recorder_writer_main(
                         buffers,
                         symbol,
                         "depth",
+                        min_free_bytes,
                     )
                     written_records += _flush_hdf_buffer(
                         save_path,
                         buffers,
                         symbol,
                         "trade",
+                        min_free_bytes,
                     )
                 _put_writer_status(
                     status_queue,
@@ -182,8 +243,10 @@ class DataRecorder:
         *,
         save_path: str = "storage",
         flush_threshold: int = 1000,
-        queue_capacity: int = 50_000,
+        queue_capacity: int = 8192,
         close_timeout_sec: float = 30.0,
+        min_free_bytes: int = 0,
+        process_niceness: int = 0,
         multiprocessing_context=None,
     ):
         self.engine = engine
@@ -195,15 +258,44 @@ class DataRecorder:
             )
         )
         self.save_path = str(save_path or "storage")
-        self.flush_threshold = max(1, int(flush_threshold or 1))
-        self.queue_capacity = max(
-            self.flush_threshold,
-            int(queue_capacity or self.flush_threshold),
-        )
-        self.close_timeout_sec = max(
-            1.0,
-            float(close_timeout_sec or 30.0),
-        )
+        if isinstance(flush_threshold, bool) or not isinstance(
+            flush_threshold,
+            int,
+        ) or flush_threshold <= 0:
+            raise ValueError("flush_threshold must be a positive integer")
+        if (
+            isinstance(queue_capacity, bool)
+            or not isinstance(queue_capacity, int)
+            or queue_capacity < flush_threshold
+        ):
+            raise ValueError(
+                "queue_capacity must be an integer no smaller than "
+                "flush_threshold"
+            )
+        if (
+            isinstance(min_free_bytes, bool)
+            or not isinstance(min_free_bytes, int)
+            or min_free_bytes < 0
+        ):
+            raise ValueError("min_free_bytes must be a non-negative integer")
+        if (
+            isinstance(process_niceness, bool)
+            or not isinstance(process_niceness, int)
+            or process_niceness < 0
+            or process_niceness > 19
+        ):
+            raise ValueError("process_niceness must be an integer from 0 to 19")
+        try:
+            parsed_close_timeout = float(close_timeout_sec)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("close_timeout_sec must be positive") from exc
+        if not math.isfinite(parsed_close_timeout) or parsed_close_timeout <= 0.0:
+            raise ValueError("close_timeout_sec must be positive")
+        self.flush_threshold = flush_threshold
+        self.queue_capacity = queue_capacity
+        self.close_timeout_sec = parsed_close_timeout
+        self.min_free_bytes = min_free_bytes
+        self.process_niceness = process_niceness
         self._symbol_set = frozenset(self.symbols)
         self._lock = threading.RLock()
         self._healthy = True
@@ -215,6 +307,7 @@ class DataRecorder:
         self._enqueued_records = 0
         self._dropped_records = 0
         self._flush_results = {}
+        self._pending_flush_requests = set()
         self._writer_status = {}
 
         os.makedirs(self.save_path, exist_ok=True)
@@ -234,6 +327,8 @@ class DataRecorder:
                 self.save_path,
                 self.symbols,
                 self.flush_threshold,
+                self.min_free_bytes,
+                self.process_niceness,
             ),
             name="ChronosDataRecorder",
             daemon=True,
@@ -251,7 +346,8 @@ class DataRecorder:
         logger.info(
             "[DataRecorder] Isolated HDF5 writer started "
             f"pid={self._writer_process.pid} symbols={len(self.symbols)} "
-            f"queue_capacity={self.queue_capacity}"
+            f"queue_capacity={self.queue_capacity} "
+            f"process_niceness={self.process_niceness}"
         )
 
     def on_orderbook(self, event: Event):
@@ -357,9 +453,13 @@ class DataRecorder:
             with self._lock:
                 self._writer_status = dict(payload)
                 if message_type == "flush":
-                    self._flush_results[
-                        str(payload.get("request_id", "") or "")
-                    ] = bool(payload.get("ok", False))
+                    request_id = str(
+                        payload.get("request_id", "") or ""
+                    )
+                    if request_id in self._pending_flush_requests:
+                        self._flush_results[request_id] = bool(
+                            payload.get("ok", False)
+                        )
                 elif message_type == "fatal":
                     self._mark_failure_locked(
                         str(payload.get("reason", "") or "writer_fatal")
@@ -379,15 +479,28 @@ class DataRecorder:
         if data_type not in {"depth", "trade"}:
             return False
         request_id = uuid.uuid4().hex
-        self._enqueue((_FLUSH, request_id, symbol, data_type))
+        with self._lock:
+            self._pending_flush_requests.add(request_id)
+        try:
+            self._enqueue((_FLUSH, request_id, symbol, data_type))
+        except Exception:
+            with self._lock:
+                self._pending_flush_requests.discard(request_id)
+            raise
         deadline = time.perf_counter() + max(0.0, float(timeout_sec))
         while time.perf_counter() < deadline:
             self._drain_status(wait_sec=0.05)
             with self._lock:
                 if request_id in self._flush_results:
-                    return self._flush_results.pop(request_id)
+                    result = self._flush_results.pop(request_id)
+                    self._pending_flush_requests.discard(request_id)
+                    return result
                 if not self._healthy:
+                    self._pending_flush_requests.discard(request_id)
                     return False
+        with self._lock:
+            self._pending_flush_requests.discard(request_id)
+            self._flush_results.pop(request_id, None)
         return False
 
     def get_metrics_snapshot(self) -> dict:
@@ -408,6 +521,11 @@ class DataRecorder:
                 "queue_depth": self._queue_depth(),
                 "queue_capacity": self.queue_capacity,
                 "flush_threshold": self.flush_threshold,
+                "min_free_bytes": self.min_free_bytes,
+                "process_niceness": self.process_niceness,
+                "pending_flush_requests": len(
+                    self._pending_flush_requests
+                ),
                 "closing": self._closing,
                 "closed": self._closed,
                 "writer_status": dict(self._writer_status),

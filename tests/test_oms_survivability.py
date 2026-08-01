@@ -2585,6 +2585,83 @@ class OMSSurvivabilityTests(unittest.TestCase):
                     data_cache.mark_prices.pop("BTCUSDT", None)
                     data_cache.mark_update_times.pop("BTCUSDT", None)
 
+    def test_journal_rebuild_bounds_terminal_state_and_compacts_cursor_ids(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            journal_path = os.path.join(temp_dir, "oms_journal.jsonl")
+            config = self.make_journaled_config(journal_path)
+            config["oms"]["tombstone_max"] = 5
+            journal = OMSJournal(config)
+            order_count = 40
+            for index in range(order_count):
+                side = Side.BUY if index % 2 == 0 else Side.SELL
+                order = Order(
+                    f"bounded-{index}",
+                    OrderIntent("alpha", "BTCUSDT", side, 100.0, 1.0),
+                )
+                order.mark_submitting()
+                order.mark_pending_ack(f"exchange-{index}")
+                order.mark_new(f"exchange-{index}", update_time=float(index + 1))
+                journal.append("order_snapshot", order.to_record())
+                journal.append(
+                    "execution_record",
+                    {
+                        "execution_id": f"BINANCE:BTCUSDT:{index}",
+                        "venue": "BINANCE",
+                        "client_oid": order.client_oid,
+                        "exchange_oid": order.exchange_oid,
+                        "strategy_id": "alpha",
+                        "symbol": "BTCUSDT",
+                        "side": side.value,
+                        "fill_qty": 1.0,
+                        "fill_price": 100.0,
+                        "cum_filled_qty": 1.0,
+                        "exchange_status": "FILLED",
+                        "exchange_time": float(index + 1),
+                        "trade_id": index,
+                    },
+                )
+                order.add_fill(
+                    1.0,
+                    100.0,
+                    update_time=float(index + 1),
+                    seq=index + 1,
+                    exchange_status="FILLED",
+                )
+                journal.append("order_snapshot", order.to_record())
+                journal.append(
+                    "trade_cursor_advanced",
+                    {
+                        "symbol": "BTCUSDT",
+                        "trade_id": index,
+                        "trade_time": float(index + 1),
+                        "source": "rest_backfill",
+                    },
+                )
+
+            recovered = OMS(DummyEngine(), DummyGateway(), config)
+            try:
+                self.assertEqual(
+                    recovered.exposure.strategy_net_positions[
+                        ("alpha", "BTCUSDT")
+                    ],
+                    0.0,
+                )
+                self.assertLessEqual(
+                    recovered.rebuild_summary["recovered_orders"],
+                    config["oms"]["tombstone_max"],
+                )
+                self.assertEqual(recovered.execution_ids, set())
+                self.assertEqual(
+                    recovered.rebuild_summary["compacted_execution_ids"],
+                    order_count,
+                )
+                self.assertLessEqual(
+                    len(recovered.terminated_oids),
+                    config["oms"]["tombstone_max"],
+                )
+            finally:
+                recovered.stop()
+
     def test_unattributed_position_residual_is_assigned_to_recovery_bucket(self):
         owner = OMS(DummyEngine(), DummyGateway(), self.make_config())
         exposure = owner.exposure

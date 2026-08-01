@@ -3,12 +3,24 @@ from threading import Condition, Thread
 import time
 
 from infrastructure.logger import logger
+from strategy.contracts import StrategyRuntimeContract
+
+
+_HANDLER_METHOD_BY_KIND = {
+    "orderbook": "on_orderbook",
+    "market_trade": "on_market_trade",
+    "order": "on_order",
+    "trade": "on_trade",
+    "position": "on_position",
+    "account": "on_account_update",
+    "system_health": "on_system_health",
+}
 
 
 class StrategyRuntime:
     def __init__(
         self,
-        strategy,
+        strategy: StrategyRuntimeContract,
         config=None,
         start_thread=True,
         failure_callback=None,
@@ -18,6 +30,11 @@ class StrategyRuntime:
         if failure_callback is not None and not callable(failure_callback):
             raise TypeError("strategy runtime failure callback must be callable")
         self.failure_callback = failure_callback
+        self.control_queue_capacity = int(
+            self.config.get("control_queue_capacity", 4096) or 0
+        )
+        if self.control_queue_capacity <= 0:
+            raise ValueError("strategy runtime control_queue_capacity must be positive")
         self.queue_warn_depth = int(self.config.get("queue_warn_depth", 100))
         self.slow_handler_ms = float(self.config.get("slow_handler_ms", 100.0))
         self.alert_interval_sec = float(self.config.get("alert_interval_sec", 5.0))
@@ -46,6 +63,8 @@ class StrategyRuntime:
             "market_depth": 0,
             "max_control_depth": 0,
             "max_market_depth": 0,
+            "control_queue_overflow_count": 0,
+            "control_queue_overflow_latched": False,
             "coalesced_market_events": 0,
             "processed": 0,
             "last_kind": "",
@@ -174,6 +193,7 @@ class StrategyRuntime:
         with self._condition:
             snapshot = dict(self._stats)
             snapshot["active"] = bool(self._active)
+            snapshot["control_queue_capacity"] = self.control_queue_capacity
             snapshot["control_depth"] = len(self._control_queue)
             snapshot["market_depth"] = len(self._market_queue)
             now = time.perf_counter()
@@ -232,10 +252,42 @@ class StrategyRuntime:
     def _submit_control(self, kind: str, payload):
         enqueued_at = time.perf_counter()
         with self._condition:
-            self._control_queue.append((kind, enqueued_at, payload))
-            self._refresh_depth_stats_locked()
-            self._maybe_warn_backlog_locked()
-            self._condition.notify()
+            if len(self._control_queue) >= self.control_queue_capacity:
+                overflow = OverflowError(
+                    "strategy runtime control queue capacity exceeded: "
+                    f"capacity={self.control_queue_capacity} kind={kind}"
+                )
+                report_overflow = not self._stats[
+                    "control_queue_overflow_latched"
+                ]
+                self._stats["control_queue_overflow_latched"] = True
+                self._stats["control_queue_overflow_count"] += 1
+                self._stats["last_error_at"] = time.time()
+                self._stats["last_error_kind"] = kind
+                self._stats["last_error_message"] = (
+                    f"{type(overflow).__name__}:{overflow}"
+                )
+            else:
+                overflow = None
+                report_overflow = False
+                self._control_queue.append((kind, enqueued_at, payload))
+                self._refresh_depth_stats_locked()
+                self._maybe_warn_backlog_locked()
+                self._condition.notify()
+
+        if overflow is not None:
+            if report_overflow:
+                logger.critical(f"[StrategyRuntime] {overflow}")
+                self._report_failure(
+                    kind=kind,
+                    payload=payload,
+                    handler=None,
+                    error=overflow,
+                    phase="enqueue",
+                    record_stats=False,
+                )
+            return False
+        return True
 
     def _refresh_depth_stats_locked(self):
         control_depth = len(self._control_queue)
@@ -361,19 +413,22 @@ class StrategyRuntime:
         handler,
         error: BaseException,
         phase: str,
+        record_stats: bool = True,
     ) -> None:
         failed_at = time.time()
         message = f"{type(error).__name__}:{error}"
-        with self._condition:
-            counter = (
-                "async_error_count"
-                if phase.startswith("async")
-                else "handler_error_count"
-            )
-            self._stats[counter] += 1
-            self._stats["last_error_at"] = failed_at
-            self._stats["last_error_kind"] = kind
-            self._stats["last_error_message"] = message
+        if record_stats:
+            with self._condition:
+                if phase == "enqueue":
+                    counter = "control_queue_overflow_count"
+                elif phase.startswith("async"):
+                    counter = "async_error_count"
+                else:
+                    counter = "handler_error_count"
+                self._stats[counter] += 1
+                self._stats["last_error_at"] = failed_at
+                self._stats["last_error_kind"] = kind
+                self._stats["last_error_message"] = message
 
         if self.failure_callback is None:
             logger.critical(
@@ -413,18 +468,9 @@ class StrategyRuntime:
         return {}
 
     def _resolve_handler(self, kind: str):
-        if kind == "orderbook":
-            return getattr(self.strategy, "on_orderbook", None)
-        if kind == "market_trade":
-            return getattr(self.strategy, "on_market_trade", None)
-        if kind == "order":
-            return getattr(self.strategy, "on_order", None)
-        if kind == "trade":
-            return getattr(self.strategy, "on_trade", None)
-        if kind == "position":
-            return getattr(self.strategy, "on_position", None)
-        if kind == "account":
-            return getattr(self.strategy, "on_account_update", None)
-        if kind == "system_health":
-            return getattr(self.strategy, "on_system_health", None)
-        return None
+        method_name = _HANDLER_METHOD_BY_KIND.get(kind)
+        return (
+            getattr(self.strategy, method_name, None)
+            if method_name is not None
+            else None
+        )

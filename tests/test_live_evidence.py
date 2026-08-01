@@ -1,8 +1,14 @@
 from datetime import datetime
+import io
+from types import SimpleNamespace
+import threading
+from unittest.mock import patch
 
 import pytest
 
+import data.live_evidence as live_evidence_module
 from data.live_evidence import (
+    LiveEvidenceRecorder,
     LiveEvidenceWriteError,
     account_update_evidence_payload,
     mark_price_evidence_payload,
@@ -89,3 +95,41 @@ def test_non_finite_payload_is_rejected():
 
     with pytest.raises(LiveEvidenceWriteError, match="mark_price must be finite"):
         mark_price_evidence_payload(mark)
+
+
+def test_live_evidence_rejects_batch_before_advancing_hash_chain(tmp_path):
+    recorder = object.__new__(LiveEvidenceRecorder)
+    recorder.path = tmp_path / "market_evidence.jsonl"
+    recorder._handle = io.StringIO()
+    recorder._lock = threading.RLock()
+    recorder._next_seq = 1
+    recorder._last_hash = ""
+    recorder._committed_seq = 0
+    recorder._last_record_monotonic = 0.0
+    recorder._last_fsync_monotonic = 0.0
+    recorder._created_new_file = False
+    recorder.min_free_bytes = 512 * 1024 * 1024
+    recorder._disk_free_bytes = None
+    recorder._last_space_check_monotonic = 0.0
+    recorder._disk_space_rejections = 0
+    recorder._disk_space_check_failures = 0
+
+    with patch.object(
+        live_evidence_module.shutil,
+        "disk_usage",
+        return_value=SimpleNamespace(free=recorder.min_free_bytes),
+    ):
+        with pytest.raises(
+            LiveEvidenceWriteError,
+            match="disk_reserve_exhausted",
+        ):
+            recorder._write_records(
+                [("session_start", {"schema": "test"})],
+                force_fsync=False,
+            )
+
+    assert recorder._handle.getvalue() == ""
+    assert recorder._next_seq == 1
+    assert recorder._last_hash == ""
+    assert recorder._committed_seq == 0
+    assert recorder._disk_space_rejections == 1

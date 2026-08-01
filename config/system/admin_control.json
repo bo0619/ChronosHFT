@@ -1,0 +1,13 @@
+{
+  "system": {
+    "admin_control": {
+      "_comment": "Bound local dashboard/CLI command artifacts; these are diagnostic copies, not the durable OMS audit journal.",
+      "path": "storage/admin",
+      "command_ttl_sec": 10.0,
+      "session_max_age_sec": 2.0,
+      "max_retained_results": 256,
+      "max_retained_archives": 256,
+      "retention_max_age_sec": 604800.0
+    }
+  }
+}

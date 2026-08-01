@@ -1,7 +1,9 @@
 import json
 import math
+import socket
 import sys
 import threading
+import time
 import types
 import unittest
 from datetime import datetime
@@ -45,6 +47,7 @@ from strategy.avellaneda_stoikov import AvellanedaStoikovStrategy
 from strategy.base import StrategyTemplate
 from strategy.glft import GLFTStrategy
 from strategy.quote_math import (
+    ADAPTIVE_AS_FORMULA_VERSION,
     ADAPTIVE_GLFT_FORMULA_VERSION,
     PORTFOLIO_GLFT_FORMULA_VERSION,
 )
@@ -1279,6 +1282,143 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             self.assertEqual(len(oms.submitted), 2)
             self.assertEqual(len(oms.cancelled), 2)
 
+    def test_adaptive_avellaneda_stoikov_exposes_bounded_paper_inputs(self):
+        engine = DispatchingEngine()
+        oms = PassiveQuoteOMS()
+        oms.config["backtest"]["maker_fee"] = 0.0
+        strategy = AvellanedaStoikovStrategy(
+            engine,
+            oms,
+            strategy_config={
+                "cycle_interval": 0.0,
+                "target_order_notional": 8.0,
+                "max_pos_usdt": 18.0,
+                "as_parameters": {
+                    "gamma": 0.05,
+                    "k": 0.5,
+                    "vol_window": 5,
+                    "horizon_s": 2.0,
+                    "adaptive": {
+                        "enabled": True,
+                        "flow_toxicity": {
+                            "enabled": True,
+                            "trade_imbalance_cost_bps": 1.0,
+                            "microprice_weight": 1.0,
+                            "max_adverse_cost_bps": 2.0,
+                        },
+                        "dynamic_covariance": {"min_samples": 2},
+                        "size_optimization": {
+                            "candidate_multipliers": [0.0, 1.0],
+                            "size_penalty_bps": 0.0,
+                        },
+                    },
+                },
+            },
+        )
+        ob = OrderBook(
+            symbol="LTCUSDT",
+            exchange="BINANCE",
+            datetime=datetime.utcnow(),
+            best_bid_price=99.9,
+            best_bid_volume=0.1,
+            best_ask_price=100.1,
+            best_ask_volume=0.1,
+        )
+
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"LTCUSDT": self.make_contract("LTCUSDT", supports_rpi=False)},
+            clear=True,
+        ):
+            strategy.on_orderbook(ob)
+
+        telemetry = [
+            event.data
+            for event in engine.events
+            if event.type == EVENT_STRATEGY_UPDATE
+        ][-1]
+        self.assertEqual(
+            telemetry.params["formula_version"],
+            ADAPTIVE_AS_FORMULA_VERSION,
+        )
+        self.assertTrue(telemetry.params["adaptive"]["enabled"])
+        self.assertEqual(
+            telemetry.params["adaptive"]["intensity_source"],
+            "CONFIGURED_PAPER_PROXY",
+        )
+        self.assertEqual(
+            telemetry.params["portfolio_risk"]["scenario_count"],
+            6,
+        )
+        self.assertTrue(telemetry.params["size_optimization"]["enabled"])
+        self.assertEqual(telemetry.params["order_size_lots"], 1.0)
+        self.assertGreater(telemetry.params["A_per_s"], 0.0)
+        self.assertEqual(
+            telemetry.params["intensity_source"],
+            "CONFIGURED_PAPER_PROXY",
+        )
+        self.assertEqual(
+            telemetry.params["market_data_timing"]["best_bid_qty"],
+            0.1,
+        )
+        self.assertIn("quote_center_price", telemetry.params)
+        self.assertTrue(all(order.tag == "as_quote" for order in oms.submitted))
+        json.dumps(telemetry.params)
+
+    def test_adaptive_avellaneda_stoikov_is_rejected_in_live_mode(self):
+        oms = PassiveQuoteOMS()
+        oms.config = {
+            "execution": {"mode": "live"},
+            "paper_trade": {"enabled": False},
+        }
+        with self.assertRaisesRegex(ValueError, "Live A-S requires adaptive"):
+            AvellanedaStoikovStrategy(
+                DispatchingEngine(),
+                oms,
+                strategy_config={
+                    "as_parameters": {"adaptive": {"enabled": True}}
+                },
+            )
+
+    def test_avellaneda_stoikov_stale_guard_cancels_only_attacked_side(self):
+        oms = PassiveQuoteOMS()
+        strategy = AvellanedaStoikovStrategy(
+            DispatchingEngine(),
+            oms,
+            strategy_config={
+                "as_parameters": {
+                    "adaptive": {
+                        "stale_quote_guard": {
+                            "enabled": True,
+                            "min_depth_bps": 1.5,
+                        }
+                    }
+                }
+            },
+        )
+        with patch.dict(
+            ref_data_manager.contracts,
+            {
+                "LTCUSDT": self.make_contract(
+                    "LTCUSDT",
+                    supports_rpi=False,
+                )
+            },
+            clear=True,
+        ):
+            bid_oid = strategy.buy("LTCUSDT", 99.0, 0.1)
+            strategy.sell("LTCUSDT", 101.0, 0.1)
+
+        result = strategy._guard_stale_quotes(
+            symbol="LTCUSDT",
+            mid_price=99.01,
+        )
+
+        self.assertTrue(result["bid_at_risk"])
+        self.assertTrue(result["bid_cancel_requested"])
+        self.assertFalse(result["ask_at_risk"])
+        self.assertEqual(oms.cancelled, [bid_oid])
+
     def test_glft_quotes_rpi_and_does_not_overlap_cancel_replace(self):
         engine = DispatchingEngine()
         oms = PassiveQuoteOMS()
@@ -1663,6 +1803,8 @@ class LocalWebDashboardTests(unittest.TestCase):
                     "trades_limit": 20,
                     "logs_limit": 20,
                     "history_limit": 20,
+                    "max_request_threads": 2,
+                    "request_timeout_sec": 5.0,
                 }
             },
             "strategy": {
@@ -1858,6 +2000,59 @@ class LocalWebDashboardTests(unittest.TestCase):
             self.assertFalse(readiness["execution_enabled"])
             self.assertTrue(readiness["restart_required"])
         finally:
+            dashboard.stop()
+
+    def test_dashboard_bounds_slow_request_threads_and_reports_rejections(self):
+        config = self.make_config()
+        config["system"]["web_dashboard"]["max_request_threads"] = 1
+        dashboard = LocalWebDashboard(config=config)
+        first = None
+        second = None
+        try:
+            dashboard.start()
+            server = dashboard._server
+            self.assertIsNotNone(server)
+            first = socket.create_connection(
+                (dashboard.host, dashboard._actual_port),
+                timeout=1.0,
+            )
+            deadline = time.monotonic() + 1.0
+            while (
+                server.request_metrics_snapshot()["active_request_threads"]
+                != 1
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            self.assertEqual(
+                server.request_metrics_snapshot()["active_request_threads"],
+                1,
+            )
+
+            second = socket.create_connection(
+                (dashboard.host, dashboard._actual_port),
+                timeout=1.0,
+            )
+            deadline = time.monotonic() + 1.0
+            while (
+                server.request_metrics_snapshot()["rejected_connections"]
+                != 1
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+
+            metrics = server.request_metrics_snapshot()
+            self.assertEqual(metrics["max_request_threads"], 1)
+            self.assertEqual(metrics["peak_request_threads"], 1)
+            self.assertEqual(metrics["rejected_connections"], 1)
+            dashboard.publish_snapshot(force=True)
+            runtime_metrics = dashboard.get_snapshot()["runtime"]["dashboard"]
+            self.assertEqual(runtime_metrics["peak_request_threads"], 1)
+            self.assertEqual(runtime_metrics["rejected_connections"], 1)
+        finally:
+            if first is not None:
+                first.close()
+            if second is not None:
+                second.close()
             dashboard.stop()
 
     def test_paper_dashboard_never_labels_simulated_execution_as_live_money(self):

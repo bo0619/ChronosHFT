@@ -30,6 +30,7 @@ def parse_args(argv=None):
             "markouts",
             "accounts",
             "system",
+            "runtime",
             "markets",
         ),
         default="fills",
@@ -216,6 +217,15 @@ def query_observations(
             "event_id",
             False,
         ),
+        "runtime": (
+            "paper_system_events",
+            """
+                event_id, run_id, event_time, event_kind, severity, message,
+                state, recorded_at_utc
+            """,
+            "event_id",
+            False,
+        ),
         "markets": (
             "paper_market_samples",
             """
@@ -242,6 +252,9 @@ def query_observations(
     if run_id:
         where.append("run_id = ?")
         parameters.append(run_id)
+    if dataset == "runtime":
+        where.append("event_kind = ?")
+        parameters.append("runtime_resources")
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     parameters.append(max(1, min(10_000, int(limit))))
     sql = f"""
@@ -251,7 +264,16 @@ def query_observations(
         ORDER BY {order_column} DESC
         LIMIT ?
     """
-    return [dict(row) for row in connection.execute(sql, parameters).fetchall()]
+    rows = [
+        dict(row) for row in connection.execute(sql, parameters).fetchall()
+    ]
+    if dataset == "runtime":
+        for row in rows:
+            try:
+                row["runtime"] = json.loads(row.get("message", ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                row["runtime"] = None
+    return rows
 
 
 def main(argv=None) -> int:

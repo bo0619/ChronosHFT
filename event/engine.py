@@ -1,6 +1,6 @@
 from collections import defaultdict, deque
 from queue import Empty, Full, Queue
-from threading import Condition, Lock, Thread, local
+from threading import Condition, Lock, RLock, Thread, local
 import time
 
 from infrastructure.logger import logger
@@ -9,9 +9,13 @@ from infrastructure.logger import logger
 class EventEngine:
     HOT_LANES = ("market", "execution")
     ALL_LANES = HOT_LANES + ("cold",)
+    _STOP_WORKER = object()
 
     def __init__(self, profile_config=None):
         self._active = False
+        self._accepting = True
+        self._stopping = False
+        self._rejected_put_count = 0
         self.profile_config = self._build_profile_config(profile_config or {})
         self._queues = {
             lane: Queue(maxsize=self.profile_config["queue_capacity"][lane])
@@ -55,6 +59,7 @@ class EventEngine:
         self._dispatch_seq = 0
         self._lock = Lock()
         self._idle_condition = Condition(self._lock)
+        self._admission_lock = RLock()
         self._alert_lock = Lock()
         self._last_depth_alert_at = {}
         self._last_backlog_alert_at = {}
@@ -86,6 +91,7 @@ class EventEngine:
                 "cold": 8192,
             },
             "alert_interval_sec": 5.0,
+            "shutdown_drain_timeout_sec": 5.0,
         }
         normalized = {}
         for key in ("queue_warn_depth", "backlog_warn_ms", "handler_slow_ms"):
@@ -107,6 +113,15 @@ class EventEngine:
         }
         normalized["alert_interval_sec"] = float(
             profile_config.get("alert_interval_sec", defaults["alert_interval_sec"])
+        )
+        normalized["shutdown_drain_timeout_sec"] = max(
+            0.0,
+            float(
+                profile_config.get(
+                    "shutdown_drain_timeout_sec",
+                    defaults["shutdown_drain_timeout_sec"],
+                )
+            ),
         )
         return normalized
 
@@ -132,7 +147,17 @@ class EventEngine:
         }
 
     def start(self):
-        self._active = True
+        with self._admission_lock:
+            if self._active:
+                if self._stopping:
+                    logger.error(
+                        ">>> [EventEngine] cannot restart while shutdown drain is pending"
+                    )
+                    return False
+                return True
+            self._active = True
+            self._accepting = True
+            self._stopping = False
         for lane in self.ALL_LANES:
             thread = self._threads.get(lane)
             if thread is None or not thread.is_alive():
@@ -144,13 +169,39 @@ class EventEngine:
                 )
                 self._threads[lane].start()
         logger.info(">>> [EventEngine] started with market/execution/cold lanes")
+        return True
 
-    def stop(self):
+    def stop(self, timeout_sec: float | None = None):
+        with self._admission_lock:
+            self._accepting = False
+            self._stopping = True
+
+        if not any(thread.is_alive() for thread in self._threads.values()):
+            self.process_existing_events()
+
+        drain_timeout = (
+            self.profile_config["shutdown_drain_timeout_sec"]
+            if timeout_sec is None
+            else max(0.0, float(timeout_sec))
+        )
+        if not self.wait_until_idle(drain_timeout):
+            logger.critical(
+                ">>> [EventEngine] shutdown drain timed out: "
+                f"{self.get_queue_snapshot()}"
+            )
+            return False
+
+        for lane in self.ALL_LANES:
+            thread = self._threads.get(lane)
+            if thread and thread.is_alive():
+                self._queues[lane].put_nowait(self._STOP_WORKER)
         self._active = False
         for lane in self.ALL_LANES:
             thread = self._threads.get(lane)
             if thread and thread.is_alive():
                 thread.join()
+        with self._admission_lock:
+            self._stopping = False
         logger.info(">>> [EventEngine] stopped")
         return all(
             thread is None or not thread.is_alive()
@@ -176,30 +227,42 @@ class EventEngine:
             return True
 
     def put(self, event):
-        dispatch_id = self._next_dispatch_id()
-        hot_lanes = [lane for lane in self.HOT_LANES if event.type in self._handlers[lane]]
-        cold_registered = event.type in self._handlers["cold"]
-        if not hot_lanes and not cold_registered:
-            return True
+        with self._admission_lock:
+            if not self._accepting:
+                with self._lock:
+                    self._rejected_put_count += 1
+                return False
 
-        if cold_registered and hot_lanes:
-            with self._lock:
-                self._pending_cold[dispatch_id] = {
-                    "event": event,
-                    "remaining": len(hot_lanes),
-                }
+            dispatch_id = self._next_dispatch_id()
+            hot_lanes = [
+                lane
+                for lane in self.HOT_LANES
+                if event.type in self._handlers[lane]
+            ]
+            cold_registered = event.type in self._handlers["cold"]
+            if not hot_lanes and not cold_registered:
+                return True
 
-        accepted = True
-        for lane in hot_lanes:
-            if self._enqueue(lane, dispatch_id, event):
-                continue
-            accepted = False
-            if cold_registered:
-                accepted = self._handoff_to_cold(dispatch_id) and accepted
+            if cold_registered and hot_lanes:
+                with self._lock:
+                    self._pending_cold[dispatch_id] = {
+                        "event": event,
+                        "remaining": len(hot_lanes),
+                    }
 
-        if cold_registered and not hot_lanes:
-            accepted = self._enqueue("cold", dispatch_id, event)
-        return accepted
+            accepted = True
+            for lane in hot_lanes:
+                if self._enqueue(lane, dispatch_id, event):
+                    continue
+                accepted = False
+                if cold_registered:
+                    accepted = (
+                        self._handoff_to_cold(dispatch_id) and accepted
+                    )
+
+            if cold_registered and not hot_lanes:
+                accepted = self._enqueue("cold", dispatch_id, event)
+            return accepted
 
     def register(self, type_, handler):
         self.register_cold(type_, handler)
@@ -239,6 +302,8 @@ class EventEngine:
         now = time.perf_counter()
         snapshot = {
             "active": bool(self._active),
+            "accepting": bool(self._accepting),
+            "stopping": bool(self._stopping),
             "queues": self.get_queue_snapshot(),
             "lanes": {},
             "config": {
@@ -246,9 +311,13 @@ class EventEngine:
                 "backlog_warn_ms": dict(self.profile_config["backlog_warn_ms"]),
                 "handler_slow_ms": dict(self.profile_config["handler_slow_ms"]),
                 "queue_capacity": dict(self.profile_config["queue_capacity"]),
+                "shutdown_drain_timeout_sec": self.profile_config[
+                    "shutdown_drain_timeout_sec"
+                ],
             },
         }
         with self._lock:
+            snapshot["rejected_put_count"] = self._rejected_put_count
             for lane in self.ALL_LANES:
                 stats = dict(self._lane_stats[lane])
                 inflight = dict(self._lane_inflight[lane])
@@ -332,9 +401,12 @@ class EventEngine:
         return True
 
     def _run_lane(self, lane: str):
-        while self._active:
+        while True:
             try:
-                dispatch_id, enqueued_at, event = self._queues[lane].get(timeout=1.0)
+                item = self._queues[lane].get(timeout=1.0)
+                if item is self._STOP_WORKER:
+                    return
+                dispatch_id, enqueued_at, event = item
                 self._note_dequeue(lane)
                 try:
                     self._process_lane(lane, event, enqueued_at)
@@ -345,7 +417,8 @@ class EventEngine:
                     finally:
                         self._mark_work_complete()
             except Empty:
-                pass
+                if not self._active:
+                    return
 
     def _mark_work_complete(self):
         with self._idle_condition:

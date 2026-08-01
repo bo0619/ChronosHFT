@@ -7,11 +7,20 @@ StartLimitBurst=10
 
 [Service]
 Type=simple
+NotifyAccess=main
+WatchdogSec=60s
+WatchdogSignal=SIGABRT
 User=@USER@
 Group=@GROUP@
 WorkingDirectory=@ROOT_DIR@
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONFAULTHANDLER=1
+Environment=MALLOC_ARENA_MAX=2
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=NUMEXPR_NUM_THREADS=1
 ExecStartPre="@PYTHON_BIN@" "@ROOT_DIR@/main.py" --config "@CONFIG_PATH@" --check-config
 ExecStart="@PYTHON_BIN@" "@ROOT_DIR@/main.py" --config "@CONFIG_PATH@"
 Restart=on-failure
@@ -22,6 +31,12 @@ KillMode=mixed
 TimeoutStopSec=120
 UMask=0077
 LimitNOFILE=65536
+LimitCORE=0
+TasksMax=128
+MemoryHigh=1400M
+MemoryMax=1600M
+MemorySwapMax=0
+OOMPolicy=stop
 StandardOutput=journal
 StandardError=journal
 
@@ -36,7 +51,10 @@ ProtectKernelModules=true
 ProtectKernelLogs=true
 ProtectControlGroups=true
 ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
 RestrictSUIDSGID=true
+RestrictNamespaces=true
 LockPersonality=true
 RestrictRealtime=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

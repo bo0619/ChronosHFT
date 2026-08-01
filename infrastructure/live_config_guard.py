@@ -151,6 +151,7 @@ MAX_EXTERNAL_ALERT_STARTUP_PROBE_TIMEOUT_SEC = 30.0
 MIN_EXTERNAL_ALERT_RECOVERY_PROBE_INTERVAL_SEC = 10.0
 MAX_EXTERNAL_ALERT_RECOVERY_PROBE_INTERVAL_SEC = 300.0
 MAX_EXTERNAL_ALERT_SHUTDOWN_FLUSH_TIMEOUT_SEC = 5.0
+MIN_LIVE_DURABLE_FREE_BYTES = 512 * 1024 * 1024
 MIN_LIVE_EVIDENCE_QUEUE_CAPACITY = 1024
 MAX_LIVE_EVIDENCE_QUEUE_CAPACITY = 65_536
 MAX_LIVE_EVIDENCE_BATCH_RECORDS = 1024
@@ -333,6 +334,18 @@ def validate_live_external_alert_config(
         violations.append("alert.runtime_fail_closed must be true")
     if not _enabled(alert.get("failure_spool_fsync")):
         violations.append("alert.failure_spool_fsync must be true")
+    failure_spool_min_free_bytes = alert.get(
+        "failure_spool_min_free_bytes"
+    )
+    if (
+        isinstance(failure_spool_min_free_bytes, bool)
+        or not isinstance(failure_spool_min_free_bytes, int)
+        or failure_spool_min_free_bytes < MIN_LIVE_DURABLE_FREE_BYTES
+    ):
+        violations.append(
+            "alert.failure_spool_min_free_bytes must be an integer of at "
+            f"least {MIN_LIVE_DURABLE_FREE_BYTES}"
+        )
 
     queue_capacity = alert.get("queue_capacity")
     if (
@@ -617,6 +630,16 @@ def validate_live_evidence_recorder_config(
         violations.append(
             "system.evidence_recorder.close_timeout_sec must be positive "
             f"and no more than {MAX_LIVE_EVIDENCE_CLOSE_TIMEOUT_SEC:g}"
+        )
+    min_free_bytes = evidence.get("min_free_bytes")
+    if (
+        isinstance(min_free_bytes, bool)
+        or not isinstance(min_free_bytes, int)
+        or min_free_bytes < MIN_LIVE_DURABLE_FREE_BYTES
+    ):
+        violations.append(
+            "system.evidence_recorder.min_free_bytes must be an integer of "
+            f"at least {MIN_LIVE_DURABLE_FREE_BYTES}"
         )
 
     evidence_path = str(evidence.get("path", "") or "").strip()
@@ -2460,6 +2483,27 @@ def validate_live_runtime_config(
     ):
         violations.append(
             "system.web_dashboard.port must be an integer from 1 to 65535"
+        )
+    dashboard_request_threads = web_dashboard.get("max_request_threads", 8)
+    if (
+        isinstance(dashboard_request_threads, bool)
+        or not isinstance(dashboard_request_threads, int)
+        or not 1 <= dashboard_request_threads <= 32
+    ):
+        violations.append(
+            "system.web_dashboard.max_request_threads must be an integer "
+            "from 1 to 32"
+        )
+    dashboard_request_timeout = _positive_finite_value(
+        web_dashboard.get("request_timeout_sec", 5.0)
+    )
+    if (
+        dashboard_request_timeout is None
+        or not 0.1 <= dashboard_request_timeout <= 30.0
+    ):
+        violations.append(
+            "system.web_dashboard.request_timeout_sec must be finite and "
+            "from 0.1 to 30 seconds"
         )
     admin_command_ttl = _positive_finite_value(
         admin_control.get("command_ttl_sec")

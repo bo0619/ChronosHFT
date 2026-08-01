@@ -1,7 +1,10 @@
+import errno
 import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from event.type import (
     CommandOutcome,
@@ -106,6 +109,10 @@ class DurableJournalTests(unittest.TestCase):
             self.assertEqual(records[0]["prev_hash"], "")
             self.assertEqual(records[1]["prev_hash"], records[0]["hash"])
             self.assertEqual(journal.health_snapshot()["next_seq"], 3)
+            self.assertEqual(
+                [record["seq"] for record in journal.iter_records()],
+                [1, 2],
+            )
 
     def test_tampered_record_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -132,6 +139,85 @@ class DurableJournalTests(unittest.TestCase):
 
             with self.assertRaises(JournalCorruptionError):
                 OMSJournal(make_config(path))
+
+    def test_tail_initialization_streams_without_building_record_list(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "oms.jsonl")
+            journal = OMSJournal(make_config(path))
+            journal.append("first", {"value": 1})
+            journal.append("second", {"value": 2})
+            expected_hash = journal.health_snapshot()["last_hash"]
+
+            with patch.object(
+                OMSJournal,
+                "_read_records",
+                side_effect=AssertionError("tail initialization must stream"),
+            ):
+                restarted = OMSJournal(make_config(path))
+
+            health = restarted.health_snapshot()
+            self.assertEqual(health["next_seq"], 3)
+            self.assertEqual(health["last_hash"], expected_hash)
+
+    def test_low_disk_space_rejects_batch_before_open(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "oms.jsonl")
+            config = make_config(path)
+            config["oms"]["journal_min_free_bytes"] = 1024
+            journal = OMSJournal(config)
+
+            with patch(
+                "oms.journal.shutil.disk_usage",
+                return_value=SimpleNamespace(free=1024),
+            ):
+                with self.assertRaisesRegex(
+                    JournalWriteError,
+                    "below the reserve",
+                ):
+                    journal.append("first", {"value": 1})
+
+            health = journal.health_snapshot()
+            self.assertEqual(health["space_rejection_count"], 1)
+            self.assertEqual(health["next_seq"], 1)
+            self.assertFalse(os.path.exists(path))
+
+    def test_disk_space_check_failure_is_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "oms.jsonl")
+            config = make_config(path)
+            config["oms"]["journal_min_free_bytes"] = 1
+            journal = OMSJournal(config)
+
+            with patch(
+                "oms.journal.shutil.disk_usage",
+                side_effect=OSError("disk unavailable"),
+            ):
+                with self.assertRaisesRegex(
+                    JournalWriteError,
+                    "verify free space",
+                ):
+                    journal.append("first", {"value": 1})
+
+            health = journal.health_snapshot()
+            self.assertEqual(health["space_check_failure_count"], 1)
+            self.assertEqual(health["next_seq"], 1)
+
+    def test_enospc_does_not_advance_hash_chain(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "oms.jsonl")
+            journal = OMSJournal(make_config(path))
+
+            with patch(
+                "builtins.open",
+                side_effect=OSError(errno.ENOSPC, "disk full"),
+            ):
+                with self.assertRaises(JournalWriteError):
+                    journal.append("first", {"value": 1})
+
+            health = journal.health_snapshot()
+            self.assertEqual(health["write_failure_count"], 1)
+            self.assertEqual(health["next_seq"], 1)
+            self.assertEqual(health["last_hash"], "")
 
 
 class DurableCommandRecoveryTests(unittest.TestCase):

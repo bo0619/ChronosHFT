@@ -457,6 +457,44 @@ class GatewayRecoveryTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(launched[0][2], 2)
 
+    def test_book_recovery_retry_wait_is_interruptible_and_joined(self):
+        gateway = BinanceGateway.__new__(BinanceGateway)
+        gateway._book_lock = threading.RLock()
+        gateway._book_generation = 1
+        gateway.book_resyncing = {"BTCUSDT"}
+        gateway.book_recovery_generation = {"BTCUSDT": 1}
+        gateway.book_recovery_tokens = {"BTCUSDT": 1}
+        gateway._book_recovery_threads = set()
+        gateway._book_recovery_stop = threading.Event()
+        gateway.book_recovery_join_timeout_sec = 0.5
+        gateway.book_resync_max_attempts = 3
+        gateway.book_resync_retry_sec = 10.0
+        gateway.orderbooks = {"BTCUSDT": LocalOrderBook("BTCUSDT")}
+        gateway.ws_buffer = {"BTCUSDT": []}
+        gateway._new_local_orderbook = lambda symbol: LocalOrderBook(symbol)
+        first_attempt = threading.Event()
+
+        def failed_resync(*_args, **_kwargs):
+            first_attempt.set()
+            return False
+
+        gateway._resync_book = failed_resync
+        worker = threading.Thread(
+            target=gateway._run_book_recovery,
+            args=("BTCUSDT", 1, 1),
+        )
+        gateway._book_recovery_threads.add(worker)
+        worker.start()
+        self.assertTrue(first_attempt.wait(timeout=0.5))
+
+        started_at = time.perf_counter()
+        gateway._book_recovery_stop.set()
+        self.assertTrue(gateway._join_book_recovery_threads())
+
+        self.assertLess(time.perf_counter() - started_at, 0.5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(gateway._book_recovery_threads, set())
+
     def test_stale_live_transport_callbacks_cannot_touch_current_connection(self):
         engine = DummyEngine()
         gateway = BinanceGateway.__new__(BinanceGateway)
@@ -559,6 +597,22 @@ class GatewayRecoveryTests(unittest.TestCase):
         self.assertEqual(gateway.state, GatewayState.READY)
         self.assertEqual(gateway.event_engine.events, [])
         self.assertEqual(replacement_closed, [])
+
+    def test_keep_alive_wait_is_interruptible(self):
+        gateway = self.make_keep_alive_gateway()
+        stop_event = threading.Event()
+        worker = threading.Thread(
+            target=gateway._keep_alive_loop,
+            args=(1, 1, stop_event),
+        )
+        worker.start()
+
+        started_at = time.perf_counter()
+        stop_event.set()
+        worker.join(timeout=0.5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertLess(time.perf_counter() - started_at, 0.5)
 
     def test_resync_serializes_delta_at_snapshot_cutover(self):
         gateway = BinanceGateway.__new__(BinanceGateway)

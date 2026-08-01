@@ -71,6 +71,34 @@ render_unit() {
     printf '%s\n' "${rendered}" > "${UNIT_TMP}"
 }
 
+effective_property() {
+    local property="$1"
+    systemctl show "${UNIT_NAME}" --property="${property}" --value
+}
+
+verify_effective_unit() {
+    local watchdog_usec tasks_max memory_high memory_max memory_swap_max
+    watchdog_usec="$(effective_property WatchdogUSec)"
+    tasks_max="$(effective_property TasksMax)"
+    memory_high="$(effective_property MemoryHigh)"
+    memory_max="$(effective_property MemoryMax)"
+    memory_swap_max="$(effective_property MemorySwapMax)"
+
+    case "${watchdog_usec}" in
+        ""|0|0s|infinity)
+            die "systemd did not enable the configured service watchdog"
+            ;;
+    esac
+    [[ "${tasks_max}" == "128" ]] \
+        || die "effective TasksMax is ${tasks_max:-missing}, expected 128"
+    [[ "${memory_high}" == "1468006400" ]] \
+        || die "effective MemoryHigh is ${memory_high:-missing}, expected 1400M"
+    [[ "${memory_max}" == "1677721600" ]] \
+        || die "effective MemoryMax is ${memory_max:-missing}, expected 1600M"
+    [[ "${memory_swap_max}" == "0" ]] \
+        || die "effective MemorySwapMax is ${memory_swap_max:-missing}, expected 0"
+}
+
 find_project_python_pids() {
     local proc_dir proc_uid proc_exe proc_cwd arg
     local -a argv
@@ -238,11 +266,15 @@ if [[ "${START_SERVICE}" == true ]]; then
         journalctl -u "${UNIT_NAME}" -n 50 --no-pager >&2 || true
         die "${UNIT_NAME} did not remain active"
     fi
+    verify_effective_unit
     printf '\n%s is installed, enabled, and active.\n' "${UNIT_NAME}"
 else
     printf '\n%s is installed and enabled but was not started.\n' "${UNIT_NAME}"
     if systemctl is-active --quiet "${UNIT_NAME}"; then
         printf 'The running service was not restarted; use systemctl restart %s to apply the new unit.\n' "${UNIT_NAME}"
+        printf 'Effective runtime limits were not checked because the old process is still active.\n'
+    else
+        verify_effective_unit
     fi
 fi
 

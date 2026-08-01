@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from strategy.contracts import StrategyRuntimeContract
 from strategy.runtime import StrategyRuntime
 
 
@@ -32,6 +33,16 @@ class DummyStrategy:
 
 
 class StrategyRuntimeTests(unittest.TestCase):
+    def test_complete_strategy_satisfies_explicit_runtime_contract(self):
+        class CompleteStrategy(DummyStrategy):
+            def on_trade(self, _trade):
+                return None
+
+            def on_position(self, _position):
+                return None
+
+        self.assertIsInstance(CompleteStrategy(), StrategyRuntimeContract)
+
     def test_orderbook_updates_coalesce_by_symbol(self):
         strategy = DummyStrategy()
         runtime = StrategyRuntime(strategy, start_thread=False)
@@ -59,6 +70,43 @@ class StrategyRuntimeTests(unittest.TestCase):
         self.assertEqual(strategy.orders, ["oid-1"])
         self.assertEqual(strategy.accounts, [1000.0])
         self.assertEqual(strategy.health, ["FROZEN:test"])
+
+    def test_control_queue_overflow_is_bounded_and_fails_closed(self):
+        strategy = DummyStrategy()
+        failures = []
+        runtime = StrategyRuntime(
+            strategy,
+            {"control_queue_capacity": 2},
+            start_thread=False,
+            failure_callback=failures.append,
+        )
+
+        self.assertTrue(runtime._submit_control("order", SimpleNamespace(order_id="oid-1")))
+        self.assertTrue(runtime._submit_control("order", SimpleNamespace(order_id="oid-2")))
+        self.assertFalse(runtime._submit_control("order", SimpleNamespace(order_id="oid-3")))
+        self.assertFalse(runtime._submit_control("order", SimpleNamespace(order_id="oid-4")))
+
+        metrics = runtime.get_metrics_snapshot()
+        self.assertEqual(metrics["control_depth"], 2)
+        self.assertEqual(metrics["max_control_depth"], 2)
+        self.assertEqual(metrics["control_queue_capacity"], 2)
+        self.assertEqual(metrics["control_queue_overflow_count"], 2)
+        self.assertTrue(metrics["control_queue_overflow_latched"])
+        self.assertEqual(metrics["handler_error_count"], 0)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["phase"], "enqueue")
+        self.assertEqual(failures[0]["kind"], "order")
+
+        self.assertEqual(runtime.process_pending(), 2)
+        self.assertEqual(strategy.orders, ["oid-1", "oid-2"])
+
+    def test_control_queue_capacity_must_be_positive(self):
+        with self.assertRaisesRegex(ValueError, "control_queue_capacity"):
+            StrategyRuntime(
+                DummyStrategy(),
+                {"control_queue_capacity": 0},
+                start_thread=False,
+            )
 
     def test_start_rebases_prestart_state_without_reporting_false_backlog(self):
         strategy = DummyStrategy()
