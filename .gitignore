@@ -74,5 +74,9 @@ tests/*
 !tests/test_rpi_terminal_truth_static.py
 !tests/test_systemd_deployment.py
 !tests/test_systemd_watchdog.py
+!tests/test_sidecar_policy.py
+!tests/test_sidecar_durable_state.py
+!tests/test_sidecar_protocol.py
+!tests/test_sidecar_transport.py
 !tests/test_paper_trade_database.py
 !tests/test_paper_model_calibration.py

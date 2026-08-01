@@ -400,7 +400,11 @@ split into independently testable components:
 | `risk/binance_sidecar_clock.py` | Independent sidecar clock sampling, quality gates, phase-risk thresholds, and monotonic exchange-time anchor |
 | `risk/binance_sidecar_truth.py` | Consistent account/position/open-order snapshots, funding observations, and deduplicated external cash flow |
 | `risk/binance_sidecar_emergency.py` | Independent emergency DMS/cancel and reduce-only flatten actions |
-| `risk/independent_supervisor.py` | Durable kill/rearm state machine and parent-process control channel |
+| `risk/sidecar_policy.py` | Immutable normalized sidecar thresholds, timing limits, funding policy, and deployment identity |
+| `risk/sidecar_durable_state.py` | Checksummed identity-bound kill/rearm state, corruption quarantine, fsync, and atomic replacement |
+| `risk/sidecar_protocol.py` | Parent/sidecar status validation plus request-correlated control ACK decoding |
+| `risk/sidecar_transport.py` | Parent-side process lifecycle, bounded IPC queues, status draining, and reliable control requests |
+| `risk/independent_supervisor.py` | Durable kill/rearm state machine and parent orchestration facade |
 | `strategy/contracts.py` | Structural event-handler contract consumed by the strategy runtime |
 | `strategy/runtime.py` | Bounded event scheduling, coalescing, timing, and fail-closed dispatch |
 

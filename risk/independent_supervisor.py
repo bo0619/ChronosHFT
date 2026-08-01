@@ -1,5 +1,4 @@
 import hashlib
-import json
 import math
 import multiprocessing
 import os
@@ -18,17 +17,19 @@ from risk.deployment_loss import (
     MAX_CANARY_DEPLOYED_EQUITY_FRACTION,
     deployed_capital_equity_ratio,
     deployed_capital_within_equity_limit,
-    deployment_policy_fingerprint,
     deployment_loss_action,
     update_deployment_loss,
 )
 from risk.funding_guard import (
     ALLOW as FUNDING_ALLOW,
-    FundingGuardPolicy,
     FundingGuardState,
     FundingObservation,
     evaluate_funding_guard,
 )
+from risk.sidecar_durable_state import SidecarDurableState
+from risk.sidecar_policy import RiskSidecarPolicy
+from risk.sidecar_protocol import SidecarProtocol
+from risk.sidecar_transport import SidecarTransport
 
 
 SUPERVISOR_SOURCE = "independent_supervisor"
@@ -491,351 +492,52 @@ class RiskSidecarCore:
             raise ValueError("now must be non-negative")
         self.exchange = exchange
         self.snapshot_worker = snapshot_worker
-        self.symbols = tuple(
-            sorted(
-                {
-                    str(symbol or "").upper()
-                    for symbol in settings.get("symbols", [])
-                    if str(symbol or "").strip()
-                }
-            )
+        self.policy = RiskSidecarPolicy.from_settings(
+            settings,
+            _finite_float,
         )
-        funding_guard = settings.get("funding_guard", {})
-        if not isinstance(funding_guard, dict):
-            raise ValueError("funding_guard settings must be an object")
-        self.funding_guard_policy = FundingGuardPolicy(
-            enabled=funding_guard.get("enabled", False),
-            require_snapshot=funding_guard.get(
-                "require_snapshot",
-                funding_guard.get("enabled", False),
-            ),
-            max_snapshot_age_ms=funding_guard.get(
-                "max_snapshot_age_ms",
-                3_000.0,
-            ),
-            pre_funding_reduce_only_sec=funding_guard.get(
-                "pre_funding_reduce_only_sec",
-                600.0,
-            ),
-            post_funding_hold_sec=funding_guard.get(
-                "post_funding_hold_sec",
-                120.0,
-            ),
-            max_abs_funding_rate=funding_guard.get(
-                "max_abs_funding_rate",
-                0.0005,
-            ),
-            max_next_funding_horizon_sec=funding_guard.get(
-                "max_next_funding_horizon_sec",
-                32_400.0,
-            ),
-            recovery_updates=funding_guard.get(
-                "recovery_updates",
-                5,
-            ),
-        )
-        self.parent_heartbeat_timeout_sec = max(
-            0.1,
-            _finite_float(
-                settings.get("parent_heartbeat_timeout_sec", 1.5) or 1.5,
-                "parent_heartbeat_timeout_sec",
-            ),
-        )
-        configured_exchange_poll_interval_sec = max(
-            0.1,
-            _finite_float(
-                settings.get("exchange_poll_interval_sec", 5.0) or 5.0,
-                "exchange_poll_interval_sec",
-            ),
-        )
-        funding_poll_ceiling_sec = max(
-            0.1,
-            self.funding_guard_policy.max_snapshot_age_ms / 2_000.0,
-        )
-        self.exchange_poll_interval_sec = (
-            min(
-                configured_exchange_poll_interval_sec,
-                funding_poll_ceiling_sec,
-            )
-            if self.funding_guard_policy.enabled
-            else configured_exchange_poll_interval_sec
-        )
-        self.exchange_max_age_sec = max(
-            self.exchange_poll_interval_sec,
-            _finite_float(
-                settings.get("exchange_max_age_sec", 10.0) or 10.0,
-                "exchange_max_age_sec",
-            ),
-        )
-        self.snapshot_worker_timeout_sec = min(
-            self.exchange_max_age_sec,
-            max(
-                0.1,
-                _finite_float(
-                    settings.get(
-                        "snapshot_worker_timeout_sec",
-                        self.exchange_max_age_sec,
-                    )
-                    or self.exchange_max_age_sec,
-                    "snapshot_worker_timeout_sec",
-                ),
-            ),
-        )
-        self.rearm_snapshot_max_age_sec = min(
-            self.exchange_max_age_sec,
-            max(
-                0.1,
-                _finite_float(
-                    settings.get(
-                        "rearm_snapshot_max_age_sec",
-                        min(1.0, self.exchange_poll_interval_sec),
-                    )
-                    or min(1.0, self.exchange_poll_interval_sec),
-                    "rearm_snapshot_max_age_sec",
-                ),
-            ),
-        )
-        self.cancel_retry_sec = max(
-            0.1,
-            _finite_float(
-                settings.get("cancel_retry_sec", 2.0) or 2.0,
-                "cancel_retry_sec",
-            ),
-        )
-        self.orphan_exit_sec = max(
-            self.parent_heartbeat_timeout_sec,
-            _finite_float(
-                settings.get("orphan_exit_sec", 30.0) or 30.0,
-                "orphan_exit_sec",
-            ),
-        )
-        self.emergency_countdown_time_ms = max(
-            1,
-            int(settings.get("emergency_countdown_time_ms", 1000) or 1000),
-        )
-        self.max_account_gross_notional = max(
-            0.0,
-            _finite_float(
-                settings.get("max_account_gross_notional", 0.0) or 0.0,
-                "max_account_gross_notional",
-            ),
-        )
-        self.gross_kill_multiplier = max(
-            1.0,
-            _finite_float(
-                settings.get("gross_kill_multiplier", 1.25) or 1.25,
-                "gross_kill_multiplier",
-            ),
-        )
-        self.margin_reduce_only_ratio = max(
-            0.0,
-            _finite_float(
-                settings.get("margin_reduce_only_ratio", 0.70),
-                "margin_reduce_only_ratio",
-            ),
-        )
-        self.margin_kill_ratio = max(
-            self.margin_reduce_only_ratio,
-            _finite_float(
-                settings.get("margin_kill_ratio", 0.90),
-                "margin_kill_ratio",
-            ),
-        )
-        self.max_open_orders = max(
-            0,
-            int(settings.get("max_open_orders", 0) or 0),
-        )
-        self.daily_loss_enabled = bool(
-            settings.get("daily_loss_enabled", False)
-        )
-        self.max_daily_loss = max(
-            0.0,
-            _finite_float(
-                settings.get("max_daily_loss", 0.0) or 0.0,
-                "max_daily_loss",
-            ),
-        )
-        self.max_drawdown_pct = max(
-            0.0,
-            _finite_float(
-                settings.get("max_drawdown_pct", 0.0) or 0.0,
-                "max_drawdown_pct",
-            ),
-        )
-        self.daily_loss_reduce_only_fraction = min(
-            1.0,
-            max(
-                0.0,
-                _finite_float(
-                    settings.get(
-                        "daily_loss_reduce_only_fraction",
-                        0.80,
-                    ),
-                    "daily_loss_reduce_only_fraction",
-                ),
-            ),
-        )
-        self.deployment_id = str(
-            settings.get("deployment_id", "") or ""
-        ).strip()
-        self.declared_account_equity = max(
-            0.0,
-            _finite_float(
-                settings.get("declared_account_equity_usdt", 0.0) or 0.0,
-                "declared_account_equity_usdt",
-            ),
-        )
-        self.max_deployed_capital = max(
-            0.0,
-            _finite_float(
-                settings.get("max_deployed_capital_usdt", 0.0) or 0.0,
-                "max_deployed_capital_usdt",
-            ),
-        )
-        self.max_deployment_loss = max(
-            0.0,
-            _finite_float(
-                settings.get("max_deployment_loss_usdt", 0.0) or 0.0,
-                "max_deployment_loss_usdt",
-            ),
-        )
-        self.deployment_loss_reduce_only_fraction = min(
-            1.0,
-            max(
-                0.0,
-                _finite_float(
-                    settings.get(
-                        "deployment_loss_reduce_only_fraction",
-                        0.80,
-                    )
-                    or 0.0,
-                    "deployment_loss_reduce_only_fraction",
-                ),
-            ),
-        )
-        self.deployment_policy_fingerprint = deployment_policy_fingerprint(
-            deployment_id=self.deployment_id,
-            symbols=settings.get("symbols", []),
-            declared_account_equity=self.declared_account_equity,
-            max_deployed_capital=self.max_deployed_capital,
-            maximum_loss=self.max_deployment_loss,
-            reduce_only_fraction=self.deployment_loss_reduce_only_fraction,
-        )
-        self.account_key_fingerprint = str(
-            settings.get("account_key_fingerprint", "") or ""
-        ).strip()
-        self.clock_sync_enabled = bool(
-            settings.get("clock_sync_enabled", False)
-        )
-        reduce_only_phase_setting = settings.get(
-            "clock_reduce_only_phase_error_ms"
-        )
-        reduce_only_phase_key = "clock_reduce_only_phase_error_ms"
-        if reduce_only_phase_setting is None:
-            reduce_only_phase_setting = settings.get(
-                "clock_reduce_only_offset_ms",
-                25.0,
-            )
-            reduce_only_phase_key = "clock_reduce_only_offset_ms"
-        self.clock_reduce_only_phase_error_ms = max(
-            0.0,
-            _finite_float(
-                reduce_only_phase_setting or 0.0,
-                reduce_only_phase_key,
-            ),
-        )
-        kill_phase_setting = settings.get("clock_kill_phase_error_ms")
-        kill_phase_key = "clock_kill_phase_error_ms"
-        if kill_phase_setting is None:
-            kill_phase_setting = settings.get(
-                "clock_kill_offset_ms",
-                100.0,
-            )
-            kill_phase_key = "clock_kill_offset_ms"
-        self.clock_kill_phase_error_ms = max(
-            self.clock_reduce_only_phase_error_ms,
-            _finite_float(
-                kill_phase_setting or 0.0,
-                kill_phase_key,
-            ),
-        )
-        # Compatibility attributes for code which still inspects the old
-        # names.  Their values are phase-error thresholds, never raw offsets.
-        self.clock_reduce_only_offset_ms = (
-            self.clock_reduce_only_phase_error_ms
-        )
-        self.clock_kill_offset_ms = self.clock_kill_phase_error_ms
-        self.clock_max_rtt_ms = max(
-            0.0,
-            _finite_float(
-                settings.get("clock_max_rtt_ms", 200.0) or 0.0,
-                "clock_max_rtt_ms",
-            ),
-        )
-        self.clock_max_uncertainty_ms = max(
-            0.0,
-            _finite_float(
-                settings.get("clock_max_uncertainty_ms", 50.0) or 0.0,
-                "clock_max_uncertainty_ms",
-            ),
-        )
-        self.clock_max_offset_dispersion_ms = max(
-            0.0,
-            _finite_float(
-                settings.get("clock_max_offset_dispersion_ms", 10.0) or 0.0,
-                "clock_max_offset_dispersion_ms",
-            ),
-        )
-        self.liquidation_proximity_enabled = bool(
-            settings.get("liquidation_proximity_enabled", False)
-        )
-        self.require_liquidation_price = bool(
-            settings.get("require_liquidation_price", True)
-        )
-        self.liquidation_reduce_only_distance_pct = max(
-            0.0,
-            _finite_float(
-                settings.get(
-                    "liquidation_reduce_only_distance_pct",
-                    0.05,
-                )
-                or 0.0,
-                "liquidation_reduce_only_distance_pct",
-            ),
-        )
-        self.liquidation_kill_distance_pct = min(
-            self.liquidation_reduce_only_distance_pct,
-            max(
-                0.0,
-                _finite_float(
-                    settings.get(
-                        "liquidation_kill_distance_pct",
-                        0.02,
-                    )
-                    or 0.0,
-                    "liquidation_kill_distance_pct",
-                ),
-            ),
-        )
-        self.flatten_enabled = bool(settings.get("flatten_enabled", True))
-        self.parent_loss_flatten_delay_sec = max(
-            0.0,
-            _finite_float(
-                settings.get("parent_loss_flatten_delay_sec", 3.0) or 0.0,
-                "parent_loss_flatten_delay_sec",
-            ),
-        )
-        self.flatten_retry_sec = max(
-            0.1,
-            _finite_float(
-                settings.get("flatten_retry_sec", 2.0) or 2.0,
-                "flatten_retry_sec",
-            ),
-        )
-        self.flat_verification_checks = max(
-            1,
-            int(settings.get("flat_verification_checks", 2) or 2),
-        )
+        self.symbols = self.policy.symbols
+        self.funding_guard_policy = self.policy.funding_guard_policy
+        self.parent_heartbeat_timeout_sec = self.policy.parent_heartbeat_timeout_sec
+        self.exchange_poll_interval_sec = self.policy.exchange_poll_interval_sec
+        self.exchange_max_age_sec = self.policy.exchange_max_age_sec
+        self.snapshot_worker_timeout_sec = self.policy.snapshot_worker_timeout_sec
+        self.rearm_snapshot_max_age_sec = self.policy.rearm_snapshot_max_age_sec
+        self.cancel_retry_sec = self.policy.cancel_retry_sec
+        self.orphan_exit_sec = self.policy.orphan_exit_sec
+        self.emergency_countdown_time_ms = self.policy.emergency_countdown_time_ms
+        self.max_account_gross_notional = self.policy.max_account_gross_notional
+        self.gross_kill_multiplier = self.policy.gross_kill_multiplier
+        self.margin_reduce_only_ratio = self.policy.margin_reduce_only_ratio
+        self.margin_kill_ratio = self.policy.margin_kill_ratio
+        self.max_open_orders = self.policy.max_open_orders
+        self.daily_loss_enabled = self.policy.daily_loss_enabled
+        self.max_daily_loss = self.policy.max_daily_loss
+        self.max_drawdown_pct = self.policy.max_drawdown_pct
+        self.daily_loss_reduce_only_fraction = self.policy.daily_loss_reduce_only_fraction
+        self.deployment_id = self.policy.deployment_id
+        self.declared_account_equity = self.policy.declared_account_equity
+        self.max_deployed_capital = self.policy.max_deployed_capital
+        self.max_deployment_loss = self.policy.max_deployment_loss
+        self.deployment_loss_reduce_only_fraction = self.policy.deployment_loss_reduce_only_fraction
+        self.deployment_policy_fingerprint = self.policy.deployment_policy_fingerprint
+        self.account_key_fingerprint = self.policy.account_key_fingerprint
+        self.clock_sync_enabled = self.policy.clock_sync_enabled
+        self.clock_reduce_only_phase_error_ms = self.policy.clock_reduce_only_phase_error_ms
+        self.clock_kill_phase_error_ms = self.policy.clock_kill_phase_error_ms
+        self.clock_reduce_only_offset_ms = self.policy.clock_reduce_only_offset_ms
+        self.clock_kill_offset_ms = self.policy.clock_kill_offset_ms
+        self.clock_max_rtt_ms = self.policy.clock_max_rtt_ms
+        self.clock_max_uncertainty_ms = self.policy.clock_max_uncertainty_ms
+        self.clock_max_offset_dispersion_ms = self.policy.clock_max_offset_dispersion_ms
+        self.liquidation_proximity_enabled = self.policy.liquidation_proximity_enabled
+        self.require_liquidation_price = self.policy.require_liquidation_price
+        self.liquidation_reduce_only_distance_pct = self.policy.liquidation_reduce_only_distance_pct
+        self.liquidation_kill_distance_pct = self.policy.liquidation_kill_distance_pct
+        self.flatten_enabled = self.policy.flatten_enabled
+        self.parent_loss_flatten_delay_sec = self.policy.parent_loss_flatten_delay_sec
+        self.flatten_retry_sec = self.policy.flatten_retry_sec
+        self.flat_verification_checks = self.policy.flat_verification_checks
         self.started_at = now
         self.last_parent_heartbeat_at = now
         self.last_parent_heartbeat_sent_monotonic = 0.0
@@ -1021,316 +723,42 @@ class RiskSidecarCore:
 
     @staticmethod
     def _state_checksum(payload: dict) -> str:
-        encoded = json.dumps(
-            payload,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
+        return SidecarDurableState.checksum(payload)
 
     def _durable_fingerprint(self):
-        return (
-            bool(self.kill_latched),
-            str(self.kill_reason or ""),
-            str(self.stage or ""),
-            bool(self.quiesced),
-            str(self.quiesce_reason or ""),
-            float(self.quiesced_at),
-            str(self.risk_day or ""),
-            float(self.day_start_equity),
-            float(self.day_start_external_cash_flow_total),
-            float(self.peak_adjusted_equity),
-            float(self.last_equity),
-            str(self.deployment_id or ""),
-            float(self.deployment_start_equity),
-            float(self.deployment_start_external_cash_flow_total),
-            float(self.deployment_adjusted_equity),
-            float(self.deployment_loss),
-            float(self.declared_account_equity),
-            float(self.max_deployed_capital),
-            str(self.deployment_policy_fingerprint or ""),
-            str(self.account_key_fingerprint or ""),
-        )
+        return SidecarDurableState(
+            self,
+            _finite_float,
+            _replace_state_file,
+        ).fingerprint()
 
     def _fail_closed_on_state_error(self, reason: str):
-        self.kill_latched = True
-        self.kill_reason = str(reason or "sidecar_state_error")
-        self.stage = "FAILED"
+        return SidecarDurableState(
+            self,
+            _finite_float,
+            _replace_state_file,
+        ).fail_closed(reason)
 
     def _quarantine_corrupt_state(self):
-        if not self.state_path or not os.path.exists(self.state_path):
-            return
-        quarantine_path = (
-            f"{self.state_path}.corrupt.{int(time.time() * 1000)}"
-        )
-        try:
-            _replace_state_file(self.state_path, quarantine_path)
-        except OSError:
-            pass
+        return SidecarDurableState(
+            self,
+            _finite_float,
+            _replace_state_file,
+        ).quarantine_corrupt()
 
     def _load_durable_state(self):
-        if not self.state_path:
-            if self.state_required:
-                self.state_load_error = "state_path_missing"
-                self._fail_closed_on_state_error(self.state_load_error)
-            return
-        if not os.path.exists(self.state_path):
-            self._persist_durable_state("state_initialized", force=True)
-            return
-        try:
-            with open(self.state_path, "r", encoding="utf-8") as handle:
-                record = json.load(handle)
-            if not isinstance(record, dict):
-                raise ValueError("state_record_invalid")
-            payload = record.get("payload")
-            checksum = str(record.get("sha256", "") or "")
-            if not isinstance(payload, dict):
-                raise ValueError("state_payload_invalid")
-            if checksum != self._state_checksum(payload):
-                raise ValueError("state_checksum_mismatch")
-            if int(payload.get("schema_version", 0) or 0) != 1:
-                raise ValueError("state_schema_unsupported")
-            generation = int(payload.get("generation", 0) or 0)
-            if generation < 0:
-                raise ValueError("state_generation_invalid")
-            stored_account_fingerprint = str(
-                payload.get("account_key_fingerprint", "") or ""
-            ).strip()
-            if self.account_key_fingerprint and not stored_account_fingerprint:
-                raise ValueError("state_account_identity_missing")
-            if (
-                stored_account_fingerprint
-                and self.account_key_fingerprint
-                and not secrets.compare_digest(
-                    stored_account_fingerprint,
-                    self.account_key_fingerprint,
-                )
-            ):
-                raise ValueError("state_account_identity_mismatch")
-            if not self.account_key_fingerprint:
-                self.account_key_fingerprint = stored_account_fingerprint
-            stored_deployment_id = str(
-                payload.get("deployment_id", "") or ""
-            ).strip()
-            if self.deployment_id and not stored_deployment_id:
-                raise ValueError("state_deployment_identity_missing")
-            if (
-                stored_deployment_id
-                and self.deployment_id
-                and not secrets.compare_digest(
-                    stored_deployment_id,
-                    self.deployment_id,
-                )
-            ):
-                raise ValueError("state_deployment_identity_mismatch")
-            if not self.deployment_id:
-                self.deployment_id = stored_deployment_id
-            stored_policy_fingerprint = str(
-                payload.get("deployment_policy_fingerprint", "") or ""
-            ).strip()
-            if (
-                self.deployment_policy_fingerprint
-                and not stored_policy_fingerprint
-            ):
-                raise ValueError("state_deployment_policy_missing")
-            if (
-                stored_policy_fingerprint
-                and self.deployment_policy_fingerprint
-                and not secrets.compare_digest(
-                    stored_policy_fingerprint,
-                    self.deployment_policy_fingerprint,
-                )
-            ):
-                raise ValueError("state_deployment_policy_mismatch")
-            kill_latched = payload.get("kill_latched", False)
-            if not isinstance(kill_latched, bool):
-                raise ValueError("state_kill_latch_invalid")
-            quiesced = payload.get("quiesced", False)
-            if not isinstance(quiesced, bool):
-                raise ValueError("state_quiesced_invalid")
-            quiesced_at = _finite_float(
-                payload.get("quiesced_at", 0.0) or 0.0,
-                "state.quiesced_at",
-            )
-            if quiesced_at < 0.0:
-                raise ValueError("state.quiesced_at must be non-negative")
-            if quiesced and quiesced_at <= 0.0:
-                raise ValueError("state.quiesced_at missing for quiesced state")
-            self.state_generation = generation
-            self.state_recovered = True
-            self.kill_latched = kill_latched
-            self.kill_reason = str(payload.get("kill_reason", "") or "")
-            self.quiesced = quiesced
-            self.quiesce_reason = str(
-                payload.get("quiesce_reason", "") or ""
-            )
-            self.quiesced_at = quiesced_at
-            self.risk_day = str(payload.get("risk_day", "") or "")
-            self.day_start_equity = _finite_float(
-                payload.get("day_start_equity", 0.0) or 0.0,
-                "state.day_start_equity",
-            )
-            self.day_start_external_cash_flow_total = _finite_float(
-                payload.get(
-                    "day_start_external_cash_flow_total",
-                    0.0,
-                )
-                or 0.0,
-                "state.day_start_external_cash_flow_total",
-            )
-            self.peak_adjusted_equity = _finite_float(
-                payload.get("peak_adjusted_equity", 0.0) or 0.0,
-                "state.peak_adjusted_equity",
-            )
-            self.last_equity = _finite_float(
-                payload.get("last_equity", 0.0) or 0.0,
-                "state.last_equity",
-            )
-            self.deployment_start_equity = _finite_float(
-                payload.get("deployment_start_equity", 0.0) or 0.0,
-                "state.deployment_start_equity",
-            )
-            self.deployment_start_external_cash_flow_total = _finite_float(
-                payload.get(
-                    "deployment_start_external_cash_flow_total",
-                    0.0,
-                )
-                or 0.0,
-                "state.deployment_start_external_cash_flow_total",
-            )
-            self.deployment_adjusted_equity = _finite_float(
-                payload.get("deployment_adjusted_equity", 0.0) or 0.0,
-                "state.deployment_adjusted_equity",
-            )
-            deployment_loss = _finite_float(
-                payload.get("deployment_loss", 0.0) or 0.0,
-                "state.deployment_loss",
-            )
-            if deployment_loss < 0.0:
-                raise ValueError(
-                    "state.deployment_loss must be non-negative"
-                )
-            self.deployment_loss = deployment_loss
-            if self.quiesced:
-                self.stage = "QUIESCED"
-            else:
-                self.stage = "FLATTENING" if kill_latched else "ARMED"
-            self._last_persisted_fingerprint = self._durable_fingerprint()
-        except Exception as exc:
-            self.state_load_error = (
-                f"state_load_failed:{type(exc).__name__}:{exc}"
-            )
-            identity_error = str(exc).startswith(
-                (
-                    "state_account_identity_",
-                    "state_deployment_identity_",
-                    "state_deployment_policy_",
-                )
-            )
-            if not identity_error:
-                self._quarantine_corrupt_state()
-            self._fail_closed_on_state_error(self.state_load_error)
+        return SidecarDurableState(
+            self,
+            _finite_float,
+            _replace_state_file,
+        ).load()
 
     def _persist_durable_state(self, event: str, force: bool = False) -> bool:
-        if not self.state_path:
-            if self.state_required:
-                self.state_persist_error = "state_path_missing"
-                self._fail_closed_on_state_error(self.state_persist_error)
-                return False
-            return True
-        fingerprint = self._durable_fingerprint()
-        if not force and fingerprint == self._last_persisted_fingerprint:
-            return True
-        next_generation = self.state_generation + 1
-        payload = {
-            "schema_version": 1,
-            "generation": next_generation,
-            "kill_latched": bool(self.kill_latched),
-            "kill_reason": str(self.kill_reason or ""),
-            "stage": str(self.stage or ""),
-            "quiesced": bool(self.quiesced),
-            "quiesce_reason": str(self.quiesce_reason or ""),
-            "quiesced_at": float(self.quiesced_at),
-            "risk_day": str(self.risk_day or ""),
-            "day_start_equity": float(self.day_start_equity),
-            "day_start_external_cash_flow_total": float(
-                self.day_start_external_cash_flow_total
-            ),
-            "peak_adjusted_equity": float(self.peak_adjusted_equity),
-            "last_equity": float(self.last_equity),
-            "deployment_id": str(self.deployment_id or ""),
-            "deployment_start_equity": float(
-                self.deployment_start_equity
-            ),
-            "deployment_start_external_cash_flow_total": float(
-                self.deployment_start_external_cash_flow_total
-            ),
-            "deployment_adjusted_equity": float(
-                self.deployment_adjusted_equity
-            ),
-            "deployment_loss": float(self.deployment_loss),
-            "declared_account_equity": float(
-                self.declared_account_equity
-            ),
-            "max_deployed_capital": float(self.max_deployed_capital),
-            "deployment_policy_fingerprint": str(
-                self.deployment_policy_fingerprint or ""
-            ),
-            "account_key_fingerprint": str(
-                self.account_key_fingerprint or ""
-            ),
-            "event": str(event or "state_changed"),
-            "updated_at": time.time(),
-            "writer_pid": os.getpid(),
-        }
-        record = {
-            "payload": payload,
-            "sha256": self._state_checksum(payload),
-        }
-        absolute_path = os.path.abspath(self.state_path)
-        state_dir = os.path.dirname(absolute_path)
-        temp_path = (
-            f"{absolute_path}.tmp.{os.getpid()}.{secrets.token_hex(6)}"
-        )
-        try:
-            os.makedirs(state_dir, exist_ok=True)
-            with open(temp_path, "x", encoding="utf-8") as handle:
-                json.dump(
-                    record,
-                    handle,
-                    ensure_ascii=True,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    allow_nan=False,
-                )
-                handle.flush()
-                if self.state_fsync:
-                    os.fsync(handle.fileno())
-            _replace_state_file(temp_path, absolute_path)
-            if self.state_fsync and os.name != "nt":
-                directory_fd = os.open(state_dir, os.O_RDONLY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            self.state_generation = next_generation
-            self.state_persist_error = ""
-            self._last_persisted_fingerprint = fingerprint
-            return True
-        except Exception as exc:
-            try:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-            except OSError:
-                pass
-            self.state_persist_error = (
-                f"state_persist_failed:{type(exc).__name__}:{exc}"
-            )
-            self._fail_closed_on_state_error(self.state_persist_error)
-            return False
-
+        return SidecarDurableState(
+            self,
+            _finite_float,
+            _replace_state_file,
+        ).persist(event, force)
     def receive_parent_heartbeat(
         self,
         sequence: int,
@@ -3688,23 +3116,12 @@ class IndependentRiskSupervisor:
         self.recovery_count = 0
         self.heartbeat_sequence = 0
         self.last_heartbeat_sent_at = 0.0
-        self.context = multiprocessing.get_context("spawn")
-        self.command_queue = self.context.Queue(maxsize=32)
-        self.heartbeat_queue = self.context.Queue(maxsize=1)
-        self.status_queue = self.context.Queue(maxsize=8)
-        self.process = self.context.Process(
-            target=_risk_sidecar_process,
-            args=(
-                self.command_queue,
-                self.status_queue,
-                self.settings,
-                self.heartbeat_queue,
-            ),
-            name="ChronosRiskSupervisor",
-            daemon=False,
+        SidecarTransport.start_process(
+            self,
+            multiprocessing,
+            _risk_sidecar_process,
+            time.perf_counter,
         )
-        self.process.start()
-        self.started_at = time.perf_counter()
         self._send_heartbeat(self.started_at)
         self._apply_oms_health(False, "supervisor_starting")
         return True
@@ -3746,120 +3163,10 @@ class IndependentRiskSupervisor:
 
     @staticmethod
     def _validate_status_payload(status: dict) -> dict:
-        if not isinstance(status, dict):
-            raise ValueError("status_not_object")
-        sequence = status.get("sequence")
-        if (
-            isinstance(sequence, bool)
-            or not isinstance(sequence, int)
-            or sequence <= 0
-        ):
-            raise ValueError("status_sequence_invalid")
-        healthy = status.get("healthy")
-        if not isinstance(healthy, bool):
-            raise ValueError("status_healthy_invalid")
-        if not isinstance(status.get("reason", ""), str):
-            raise ValueError("status_reason_invalid")
-        for field in (
-            "exchange_healthy",
-            "kill_latched",
-            "quiesced",
-            "state_recovered",
-        ):
-            if field in status and not isinstance(status[field], bool):
-                raise ValueError(f"status_{field}_invalid")
-        for field in (
-            "risk_snapshot_sequence",
-            "state_generation",
-            "parent_sequence",
-            "flat_verification_count",
-        ):
-            value = status.get(field)
-            if value is not None and (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value < 0
-            ):
-                raise ValueError(f"status_{field}_invalid")
-        for field in (
-            "reported_at",
-            "risk_snapshot_captured_at",
-            "risk_snapshot_captured_monotonic",
-            "quiesced_at",
-        ):
-            if field not in status:
-                continue
-            value = _finite_float(status[field], f"status.{field}")
-            if value < 0.0:
-                raise ValueError(f"status_{field}_invalid")
-        risk_action = str(status.get("risk_action", "NONE") or "NONE").upper()
-        if risk_action not in {"NONE", "REDUCE_ONLY", "KILL"}:
-            raise ValueError("status_risk_action_invalid")
-        stage = str(status.get("stage", "") or "").upper()
-        if stage and stage not in {
-            "ARMED",
-            "CANCEL_PENDING",
-            "CANCEL_VERIFIED",
-            "FLATTENING",
-            "FLAT_VERIFIED",
-            "FAILED",
-            "QUIESCED",
-        }:
-            raise ValueError("status_stage_invalid")
-        if "risk_metrics" in status and not isinstance(
-            status["risk_metrics"],
-            dict,
-        ):
-            raise ValueError("status_risk_metrics_invalid")
-        if healthy and (
-            risk_action != "NONE"
-            or stage != "ARMED"
-            or status.get("exchange_healthy") is not True
-            or status.get("kill_latched", False) is not False
-            or status.get("quiesced", False) is not False
-            or int(status.get("risk_snapshot_sequence", 0) or 0) <= 0
-            or float(
-                status.get("risk_snapshot_captured_monotonic", 0.0) or 0.0
-            )
-            <= 0.0
-        ):
-            raise ValueError("status_healthy_state_inconsistent")
-        return dict(status)
+        return SidecarProtocol.validate_status(status, _finite_float)
 
     def _drain_status(self, now: float):
-        while True:
-            try:
-                status = self.status_queue.get_nowait()
-            except queue.Empty:
-                break
-            except (OSError, ValueError) as exc:
-                self.last_status = {}
-                self.last_status_received_at = 0.0
-                self.last_status_protocol_error = (
-                    f"status_queue_error:{type(exc).__name__}:{exc}"
-                )
-                break
-            if not isinstance(status, dict):
-                self.last_status = {}
-                self.last_status_received_at = 0.0
-                self.last_status_protocol_error = "status_not_object"
-                continue
-            if str(status.get("session_id", "") or "") != self.session_id:
-                continue
-            try:
-                validated = self._validate_status_payload(status)
-            except (TypeError, ValueError, OverflowError) as exc:
-                self.last_status = {}
-                self.last_status_received_at = 0.0
-                self.last_status_protocol_error = str(exc)
-                continue
-            if validated["sequence"] <= int(
-                self.last_status.get("sequence", 0) or 0
-            ):
-                continue
-            self.last_status = validated
-            self.last_status_received_at = now
-            self.last_status_protocol_error = ""
+        SidecarTransport.drain_status(self, now)
 
     def _record_oms_heartbeat(self, healthy: bool, reason: str):
         record = getattr(self.oms, "record_risk_control_heartbeat", None)
@@ -4014,176 +3321,24 @@ class IndependentRiskSupervisor:
         request_id: str = "",
         **payload,
     ) -> dict:
-        command_type = str(command_type or "").upper()
-        result = {
-            "accepted": False,
-            "reason": str(failure_reason or "supervisor_control_failed"),
-            "request_id": str(request_id or ""),
-        }
-        if command_type == "QUIESCE":
-            result.update(
-                {
-                    "quiesced": bool(
-                        self.last_status.get("quiesced", False)
-                    ),
-                    "persisted": False,
-                }
-            )
-        elif command_type == "RESUME_SHUTDOWN":
-            result.update(
-                {
-                    "quiesced": bool(
-                        self.last_status.get("quiesced", False)
-                    ),
-                    "kill_latched": bool(
-                        self.last_status.get("kill_latched", False)
-                    ),
-                    "persisted": False,
-                }
-            )
-        elif command_type == "STOP":
-            result.update(
-                {
-                    "quiesced": bool(
-                        self.last_status.get("quiesced", False)
-                    ),
-                    "cancel_requested": bool(
-                        payload.get("cancel_orders", True)
-                    ),
-                    "cancel_attempted": False,
-                    "cancel_ok": None,
-                }
-            )
-        else:
-            result["token"] = ""
-        return result
+        return SidecarProtocol.control_failure(
+            command_type,
+            self.last_status,
+            failure_reason,
+            request_id,
+            **payload,
+        )
 
     def _read_control_ack(
         self,
         command_type: str,
         request_id: str,
     ):
-        command_type = str(command_type or "").upper()
-        if command_type == "QUIESCE":
-            if str(
-                self.last_status.get(
-                    "last_quiesce_request_id",
-                    "",
-                )
-                or ""
-            ) != request_id:
-                return None
-            return {
-                "accepted": bool(
-                    self.last_status.get(
-                        "last_quiesce_accepted",
-                        False,
-                    )
-                ),
-                "reason": str(
-                    self.last_status.get(
-                        "last_quiesce_reason",
-                        "",
-                    )
-                    or ""
-                ),
-                "request_id": request_id,
-                "quiesced": bool(
-                    self.last_status.get("quiesced", False)
-                ),
-                "persisted": bool(
-                    self.last_status.get(
-                        "last_quiesce_persisted",
-                        False,
-                    )
-                ),
-            }
-        if command_type == "RESUME_SHUTDOWN":
-            if str(
-                self.last_status.get(
-                    "last_shutdown_resume_request_id",
-                    "",
-                )
-                or ""
-            ) != request_id:
-                return None
-            return {
-                "accepted": bool(
-                    self.last_status.get(
-                        "last_shutdown_resume_accepted",
-                        False,
-                    )
-                ),
-                "reason": str(
-                    self.last_status.get(
-                        "last_shutdown_resume_reason",
-                        "",
-                    )
-                    or ""
-                ),
-                "request_id": request_id,
-                "quiesced": bool(
-                    self.last_status.get("quiesced", False)
-                ),
-                "kill_latched": bool(
-                    self.last_status.get("kill_latched", False)
-                ),
-                "persisted": bool(
-                    self.last_status.get(
-                        "last_shutdown_resume_persisted",
-                        False,
-                    )
-                ),
-            }
-        if command_type == "STOP":
-            if str(
-                self.last_status.get("last_stop_request_id", "") or ""
-            ) != request_id:
-                return None
-            return {
-                "accepted": bool(
-                    self.last_status.get("last_stop_accepted", False)
-                ),
-                "reason": str(
-                    self.last_status.get("last_stop_reason", "") or ""
-                ),
-                "request_id": request_id,
-                "quiesced": bool(
-                    self.last_status.get("last_stop_quiesced", False)
-                ),
-                "cancel_requested": bool(
-                    self.last_status.get(
-                        "last_stop_cancel_requested",
-                        False,
-                    )
-                ),
-                "cancel_attempted": bool(
-                    self.last_status.get(
-                        "last_stop_cancel_attempted",
-                        False,
-                    )
-                ),
-                "cancel_ok": self.last_status.get(
-                    "last_stop_cancel_ok"
-                ),
-            }
-
-        if str(
-            self.last_status.get("last_rearm_request_id", "") or ""
-        ) != request_id:
-            return None
-        return {
-            "accepted": bool(
-                self.last_status.get("last_rearm_accepted", False)
-            ),
-            "reason": str(
-                self.last_status.get("last_rearm_reason", "") or ""
-            ),
-            "request_id": request_id,
-            "token": str(
-                self.last_status.get("last_rearm_token", "") or ""
-            ),
-        }
+        return SidecarProtocol.read_control_ack(
+            command_type,
+            request_id,
+            self.last_status,
+        )
 
     def _request_sidecar_control(
         self,
@@ -4191,92 +3346,15 @@ class IndependentRiskSupervisor:
         timeout_sec: float = None,
         **payload,
     ) -> dict:
-        command_type = str(command_type or "").upper()
-        if not self.enabled:
-            result = self._control_failure_result(
-                command_type,
-                "supervisor_disabled",
-                **payload,
-            )
-            if command_type == "QUIESCE":
-                result.update(
-                    {
-                        "accepted": True,
-                        "quiesced": True,
-                        "persisted": True,
-                    }
-                )
-            elif command_type == "RESUME_SHUTDOWN":
-                result.update(
-                    {
-                        "accepted": True,
-                        "quiesced": False,
-                        "kill_latched": True,
-                        "persisted": True,
-                    }
-                )
-            elif command_type != "STOP":
-                result["accepted"] = True
-            return result
-        if self.process is None or not self.process.is_alive():
-            return self._control_failure_result(
-                command_type,
-                "supervisor_process_down",
-                **payload,
-            )
-        request_id = secrets.token_hex(16)
-        enqueued = _put_reliable(
-            self.command_queue,
-            {
-                "type": command_type,
-                "session_id": self.session_id,
-                "request_id": request_id,
-                **payload,
-            },
-            self.control_enqueue_timeout_sec,
-        )
-        if not enqueued:
-            return self._control_failure_result(
-                command_type,
-                "supervisor_control_queue_full",
-                request_id,
-                **payload,
-            )
-        timeout = (
-            self.rearm_command_timeout_sec
-            if timeout_sec is None
-            else max(0.0, float(timeout_sec or 0.0))
-        )
-        deadline = time.perf_counter() + timeout
-        process_down_at = 0.0
-        while time.perf_counter() <= deadline:
-            now = time.perf_counter()
-            process_alive = self.process.is_alive()
-            if process_alive:
-                self._send_heartbeat(now)
-            self._drain_status(now)
-            ack = self._read_control_ack(command_type, request_id)
-            if ack is not None:
-                return ack
-            if not process_alive:
-                if process_down_at <= 0.0:
-                    process_down_at = now
-                if (
-                    command_type != "STOP"
-                    or now - process_down_at >= 0.5
-                ):
-                    return self._control_failure_result(
-                        command_type,
-                        "supervisor_process_down_before_ack",
-                        request_id,
-                        **payload,
-                    )
-            time.sleep(0.02)
-        return self._control_failure_result(
+        return SidecarTransport.request_control(
+            self,
             command_type,
-            f"supervisor_{command_type.lower()}_timeout",
-            request_id,
-            **payload,
+            timeout_sec,
+            payload,
+            _put_reliable,
+            secrets.token_hex,
+            time.perf_counter,
+            time.sleep,
         )
 
     def prepare_rearm(self, reason: str, timeout_sec: float = None) -> dict:
@@ -4343,19 +3421,7 @@ class IndependentRiskSupervisor:
         return True
 
     def abort_rearm(self, token: str) -> bool:
-        if not self.enabled:
-            return True
-        if self.process is None or not self.process.is_alive():
-            return False
-        return _put_reliable(
-            self.command_queue,
-            {
-                "type": "ABORT_REARM",
-                "session_id": self.session_id,
-                "token": str(token or ""),
-            },
-            self.control_enqueue_timeout_sec,
-        )
+        return SidecarTransport.enqueue_abort(self, token, _put_reliable)
 
     def get_status_snapshot(self) -> dict:
         now = time.perf_counter()
@@ -4612,14 +3678,7 @@ class IndependentRiskSupervisor:
         }
         if process_exited:
             self._apply_oms_health(False, "supervisor_stopped")
-            for channel in (
-                self.command_queue,
-                self.heartbeat_queue,
-                self.status_queue,
-            ):
-                close = getattr(channel, "close", None)
-                if callable(close):
-                    close()
+            SidecarTransport.close_channels(self)
         else:
             self._apply_oms_health(
                 False,
