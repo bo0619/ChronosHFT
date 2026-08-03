@@ -4,6 +4,50 @@ from types import SimpleNamespace
 from risk.sidecar_transport import SidecarTransport
 
 
+def test_put_latest_replaces_the_oldest_item_when_capacity_is_full():
+    channel = queue.Queue(maxsize=1)
+    channel.put_nowait("old")
+
+    assert SidecarTransport.put_latest(channel, "new") is True
+    assert channel.get_nowait() == "new"
+
+
+class _AlwaysFullChannel:
+    def put_nowait(self, payload):
+        raise queue.Full
+
+    def get_nowait(self):
+        raise queue.Empty
+
+
+def test_put_latest_reports_when_capacity_cannot_be_recovered():
+    assert (
+        SidecarTransport.put_latest(_AlwaysFullChannel(), "status")
+        is False
+    )
+
+
+class _ReliableChannel:
+    def __init__(self, error=None):
+        self.error = error
+        self.calls = []
+
+    def put(self, payload, *, block, timeout):
+        self.calls.append((payload, block, timeout))
+        if self.error is not None:
+            raise self.error
+
+
+def test_put_reliable_bounds_timeout_and_converts_queue_errors():
+    channel = _ReliableChannel()
+
+    assert SidecarTransport.put_reliable(channel, "control", -1.0) is True
+    assert channel.calls == [("control", True, 0.0)]
+
+    failed = _ReliableChannel(OSError("closed"))
+    assert SidecarTransport.put_reliable(failed, "control", 1.0) is False
+
+
 class _Process:
     def __init__(self, **kwargs):
         self.kwargs = kwargs

@@ -5,6 +5,35 @@ class SidecarTransport:
     """Parent-side process and queue transport for the risk sidecar."""
 
     @staticmethod
+    def put_latest(target_queue, payload) -> bool:
+        try:
+            target_queue.put_nowait(payload)
+            return True
+        except queue.Full:
+            pass
+        try:
+            target_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            target_queue.put_nowait(payload)
+        except queue.Full:
+            return False
+        return True
+
+    @staticmethod
+    def put_reliable(target_queue, payload, timeout_sec: float) -> bool:
+        try:
+            target_queue.put(
+                payload,
+                block=True,
+                timeout=max(0.0, float(timeout_sec)),
+            )
+        except (OSError, ValueError, queue.Full):
+            return False
+        return True
+
+    @staticmethod
     def start_process(
         owner,
         multiprocessing_module,

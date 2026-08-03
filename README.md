@@ -398,11 +398,19 @@ split into independently testable components:
 | `gateway/binance/paper_ledger.py` | Single-writer fills, position basis, balances, fees, venue-event sequencing, and terminal-history pruning |
 | `gateway/binance/paper_matching.py` | Immediate/passive matching, RPI priority, queue-ahead, price eligibility, and fee selection |
 | `risk/binance_sidecar_clock.py` | Independent sidecar clock sampling, quality gates, phase-risk thresholds, and monotonic exchange-time anchor |
+| `risk/binance_sidecar_settings.py` | Binance sidecar symbol, funding, cash-flow, open-order audit, clock, and REST coordination configuration |
 | `risk/binance_sidecar_truth.py` | Consistent account/position/open-order snapshots, funding observations, and deduplicated external cash flow |
 | `risk/binance_sidecar_emergency.py` | Independent emergency DMS/cancel and reduce-only flatten actions |
+| `risk/sidecar_core_status.py` | Complete read-only child-core status projection, age calculations, and IPC field contract |
+| `risk/sidecar_health.py` | Parent OMS heartbeat propagation, fail-closed mode constraints, and fresh-snapshot recovery gating |
 | `risk/sidecar_policy.py` | Immutable normalized sidecar thresholds, timing limits, funding policy, and deployment identity |
+| `risk/sidecar_process.py` | Child console isolation, dedicated dual-client initialization, failure status publication, and runtime handoff |
 | `risk/sidecar_durable_state.py` | Checksummed identity-bound kill/rearm state, corruption quarantine, fsync, and atomic replacement |
 | `risk/sidecar_protocol.py` | Parent/sidecar status validation plus request-correlated control ACK decoding |
+| `risk/sidecar_runtime.py` | Child command routing, latest-only heartbeat consumption, status publication, and worker/client cleanup |
+| `risk/sidecar_settings.py` | Parent timeout validation, cross-config child settings assembly, credential fingerprinting, and risk-state seeds |
+| `risk/sidecar_snapshot_worker.py` | Capacity-one asynchronous exchange snapshot execution, latest-result delivery, and bounded thread shutdown |
+| `risk/sidecar_status.py` | Read-only parent status projection, freshness calculation, and dashboard/admin snapshot contract |
 | `risk/sidecar_transport.py` | Parent-side process lifecycle, bounded IPC queues, status draining, and reliable control requests |
 | `risk/independent_supervisor.py` | Durable kill/rearm state machine and parent orchestration facade |
 | `strategy/contracts.py` | Structural event-handler contract consumed by the strategy runtime |
