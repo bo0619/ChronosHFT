@@ -2,13 +2,16 @@
 
 import queue
 
+from risk.sidecar_protocol import SidecarProtocol
+
 
 class SidecarRuntime:
     @staticmethod
-    def dispatch_command(core, command: dict, session_id: str) -> None:
-        if str(command.get("session_id", "") or "") != session_id:
-            return
-        command_type = str(command.get("type", "") or "").upper()
+    def dispatch_command(core, command: dict, session_id: str) -> bool:
+        command = SidecarProtocol.validate_control_command(command, session_id)
+        if command is None:
+            return False
+        command_type = command["type"]
         if command_type == "HEARTBEAT":
             core.receive_parent_heartbeat(
                 command.get("sequence", 0),
@@ -41,6 +44,9 @@ class SidecarRuntime:
             )
         elif command_type == "ABORT_REARM":
             core.abort_rearm(command.get("token", ""))
+        else:
+            return False
+        return True
 
     @classmethod
     def drain_commands(
@@ -67,14 +73,16 @@ class SidecarRuntime:
         latest_heartbeat = None
         while True:
             try:
-                latest_heartbeat = heartbeat_queue.get_nowait()
+                candidate = heartbeat_queue.get_nowait()
             except queue.Empty:
                 break
-        if (
-            latest_heartbeat is not None
-            and str(latest_heartbeat.get("session_id", "") or "")
-            == session_id
-        ):
+            validated = SidecarProtocol.validate_heartbeat(
+                candidate,
+                session_id,
+            )
+            if validated is not None:
+                latest_heartbeat = validated
+        if latest_heartbeat is not None:
             core.receive_parent_heartbeat(
                 latest_heartbeat.get("sequence", 0),
                 sent_monotonic=latest_heartbeat.get("sent_monotonic"),
@@ -100,6 +108,12 @@ class SidecarRuntime:
             status["risk_snapshot_captured_monotonic"],
             status["parent_heartbeat_error"],
             status["state_generation"],
+            status.get("writer_epoch", 0),
+            status.get("owner_epoch", 0),
+            status.get("safety_epoch", 0),
+            status.get("state_sha256", ""),
+            status.get("last_flat_proof"),
+            status.get("last_flat_proof_error", ""),
             status["state_load_error"],
             status["state_persist_error"],
             status["last_rearm_request_id"],
@@ -139,6 +153,7 @@ class SidecarRuntime:
         getpid,
         sleep,
     ) -> None:
+        SidecarProtocol.validate_launch_contract(settings)
         session_id = str(settings.get("session_id", "") or "")
         status_interval_sec = max(
             0.05,
@@ -160,6 +175,7 @@ class SidecarRuntime:
         status_sequence = 0
         last_status_at = 0.0
         last_status_signature = None
+        core = None
 
         try:
             core = core_factory(
@@ -186,13 +202,16 @@ class SidecarRuntime:
                     status_sequence += 1
                     put_latest(
                         status_queue,
-                        {
-                            **status,
-                            "session_id": session_id,
-                            "sequence": status_sequence,
-                            "pid": getpid(),
-                            "reported_at": wall_time(),
-                        },
+                        SidecarProtocol.child_status(
+                            {
+                                **status,
+                                "session_id": session_id,
+                                "sequence": status_sequence,
+                                "pid": getpid(),
+                                "reported_at": wall_time(),
+                            },
+                            handshake_complete=True,
+                        ),
                     )
                     last_status_at = now
                     last_status_signature = signature
@@ -201,6 +220,9 @@ class SidecarRuntime:
                 sleep(loop_interval_sec)
         finally:
             snapshot_stopped = snapshot_worker.stop()
+            close_core = getattr(core, "close", None)
+            if callable(close_core):
+                close_core()
             if snapshot_exchange is not exchange:
                 close = getattr(exchange, "close", None)
                 if callable(close):

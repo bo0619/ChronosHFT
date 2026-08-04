@@ -1,5 +1,7 @@
 """Child-process isolation, exchange initialization, and runtime handoff."""
 
+from risk.sidecar_protocol import SidecarProtocol
+
 
 class SidecarProcessBootstrap:
     @staticmethod
@@ -18,7 +20,15 @@ class SidecarProcessBootstrap:
     ) -> None:
         exchange = None
         snapshot_exchange = None
+        handshake_complete = False
+        session_id = (
+            str(settings.get("session_id", "") or "")
+            if isinstance(settings, dict)
+            else ""
+        )
         try:
+            SidecarProtocol.validate_launch_contract(settings)
+            handshake_complete = True
             isolate_console_interrupts()
             api_key = str(settings.get("api_key", "") or "")
             api_secret = str(settings.get("api_secret", "") or "")
@@ -45,16 +55,19 @@ class SidecarProcessBootstrap:
                 close()
             put_latest(
                 status_queue,
-                {
-                    "session_id": settings.get("session_id", ""),
-                    "sequence": 1,
-                    "pid": getpid(),
-                    "reported_at": wall_time(),
-                    "healthy": False,
-                    "reason": (
-                        f"sidecar_init_failed:{type(exc).__name__}:{exc}"
-                    ),
-                },
+                SidecarProtocol.child_status(
+                    {
+                        "session_id": session_id,
+                        "sequence": 1,
+                        "pid": getpid(),
+                        "reported_at": wall_time(),
+                        "healthy": False,
+                        "reason": (
+                            f"sidecar_init_failed:{type(exc).__name__}:{exc}"
+                        ),
+                    },
+                    handshake_complete=handshake_complete,
+                ),
             )
             return
         run_loop(

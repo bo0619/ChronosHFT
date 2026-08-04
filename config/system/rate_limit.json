@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "system.rate_limit",
+  "version": 1,
   "system": {
     "binance_rest_rate_limit": {
       "_comment": "One host/IP budget shared by the main process and independent risk sidecar. Background queries cannot consume the trading or emergency reserves.",

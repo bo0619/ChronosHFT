@@ -1,5 +1,9 @@
 """Read-only status projection for the child risk-sidecar core."""
 
+from dataclasses import asdict
+
+from risk.exchange_port import StateVersion
+
 
 class RiskSidecarStatusProjection:
     @staticmethod
@@ -10,6 +14,12 @@ class RiskSidecarStatusProjection:
         action: str,
         now: float,
     ) -> dict:
+        state_version = getattr(
+            owner,
+            "state_version",
+            StateVersion(0, 0, 0, int(owner.state_generation), ""),
+        )
+        flat_proof = getattr(owner, "last_flat_proof", None)
         return {
             "healthy": bool(healthy),
             "reason": str(reason or ""),
@@ -25,6 +35,11 @@ class RiskSidecarStatusProjection:
             "stage": owner.stage,
             "state_path": owner.state_path,
             "state_generation": owner.state_generation,
+            "writer_epoch": state_version.writer_epoch,
+            "owner_epoch": state_version.owner_epoch,
+            "safety_epoch": state_version.safety_epoch,
+            "state_sha256": state_version.state_sha256,
+            "state_store_v2": getattr(owner, "state_store", None) is not None,
             "state_recovered": owner.state_recovered,
             "state_load_error": owner.state_load_error,
             "state_persist_error": owner.state_persist_error,
@@ -58,6 +73,14 @@ class RiskSidecarStatusProjection:
             "flat_verification_checks": owner.flat_verification_checks,
             "last_verified_snapshot_sequence": (
                 owner.last_verified_snapshot_sequence
+            ),
+            "last_flat_proof": (
+                asdict(flat_proof)
+                if flat_proof is not None
+                else None
+            ),
+            "last_flat_proof_error": str(
+                getattr(owner, "last_flat_proof_error", "") or ""
             ),
             "risk_snapshot_sequence": owner.risk_snapshot_sequence,
             "quiesce_snapshot_sequence": owner.quiesce_snapshot_sequence,

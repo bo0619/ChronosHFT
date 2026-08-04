@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "paper_trade",
+  "version": 1,
   "paper_trade": {
     "enabled": true,
     "market_data_environment": "production",

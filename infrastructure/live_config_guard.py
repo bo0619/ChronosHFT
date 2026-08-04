@@ -205,6 +205,14 @@ def _positive_finite_value(value):
     return float(value)
 
 
+def _nonnegative_finite_value(value):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed >= 0.0 else None
+
+
 def _section(config: Mapping, key: str) -> Mapping:
     value = config.get(key, {})
     return value if isinstance(value, Mapping) else {}
@@ -2673,6 +2681,52 @@ def validate_live_runtime_config(
 
     if not _enabled(supervisor.get("enabled")):
         violations.append("risk.independent_supervisor.enabled must be true")
+    for field, allow_disabled_root in (
+        ("max_account_gross_notional", False),
+        ("max_daily_loss", False),
+        ("max_drawdown_pct", True),
+    ):
+        parse_cap = (
+            _nonnegative_finite_value
+            if allow_disabled_root
+            else _positive_finite_value
+        )
+        root_cap = parse_cap(
+            limits.get(field, 0.0 if allow_disabled_root else None)
+        )
+        if root_cap is None:
+            violations.append(
+                f"risk.limits.{field} must be "
+                + (
+                    "nonnegative and finite"
+                    if allow_disabled_root
+                    else "positive and finite"
+                )
+            )
+        supervisor_cap = parse_cap(supervisor.get(field, root_cap))
+        if supervisor_cap is None:
+            violations.append(
+                f"risk.independent_supervisor.{field} must be "
+                + (
+                    "nonnegative and finite"
+                    if allow_disabled_root
+                    else "positive and finite"
+                )
+            )
+        elif root_cap is not None and root_cap > 0.0 and supervisor_cap <= 0.0:
+            violations.append(
+                f"risk.independent_supervisor.{field} must be positive when "
+                f"risk.limits.{field} is enabled"
+            )
+        elif (
+            root_cap is not None
+            and root_cap > 0.0
+            and supervisor_cap > root_cap
+        ):
+            violations.append(
+                f"risk.independent_supervisor.{field} must not exceed "
+                f"risk.limits.{field}"
+            )
     if not _enabled(supervisor.get("flatten_enabled")):
         violations.append(
             "risk.independent_supervisor.flatten_enabled must be true"

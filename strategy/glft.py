@@ -42,7 +42,6 @@ from event.type import (
     TIF_RPI,
     TradeData,
 )
-from infrastructure.config_scaling import load_root_config
 from infrastructure.paper_trade import is_paper_trade
 from infrastructure.time_service import time_service
 from strategy.base import StrategyTemplate
@@ -111,14 +110,25 @@ class _PortfolioAssetState:
 class GLFTStrategy(StrategyTemplate):
     """GLFT Model A strategy with one fixed-notional inventory unit."""
 
-    def __init__(self, engine, oms, strategy_config=None):
-        super().__init__(engine, oms, "GLFT_MultiScale")
-
-        if strategy_config is None:
-            full_config = self._load_full_config()
-            self.strat_conf = full_config.get("strategy", {})
-        else:
-            self.strat_conf = dict(strategy_config)
+    def __init__(
+        self,
+        engine,
+        execution,
+        strategy_config,
+        *,
+        resolved_config=None,
+        clock=time_service,
+    ):
+        if not isinstance(strategy_config, dict):
+            raise TypeError("resolved GLFT strategy config must be an object")
+        super().__init__(
+            engine,
+            execution,
+            "GLFT_MultiScale",
+            resolved_config=resolved_config,
+        )
+        self.clock = clock
+        self.strat_conf = dict(strategy_config)
 
         raw_glft_config = self.strat_conf.get("glft", {})
         self.glft_conf = (
@@ -139,8 +149,7 @@ class GLFTStrategy(StrategyTemplate):
             )
         )
 
-        root_config = getattr(self.oms, "config", {})
-        root_config = root_config if isinstance(root_config, dict) else {}
+        root_config = self.resolved_config
         self.live_mode = not is_paper_trade(root_config)
         live_launch = root_config.get("live_launch", {})
         live_launch = live_launch if isinstance(live_launch, dict) else {}
@@ -528,9 +537,7 @@ class GLFTStrategy(StrategyTemplate):
             )
         )
         if self.live_mode:
-            if not callable(
-                getattr(self.oms, "record_strategy_evidence", None)
-            ):
+            if not self.execution.supports_strategy_evidence:
                 raise ValueError(
                     "Live GLFT requires durable OMS strategy evidence"
                 )
@@ -784,9 +791,6 @@ class GLFTStrategy(StrategyTemplate):
         if parsed.tzinfo is None:
             return 0.0
         return parsed.astimezone(timezone.utc).timestamp()
-
-    def _load_full_config(self):
-        return load_root_config("config.json")
 
     def _load_validated_prior_bins(
         self,
@@ -1200,10 +1204,7 @@ class GLFTStrategy(StrategyTemplate):
                 for unavailable_symbol in unavailable_symbols
                 if abs(
                     float(
-                        self.oms.exposure.net_positions.get(
-                            unavailable_symbol,
-                            0.0,
-                        )
+                        self.position_for(unavailable_symbol)
                         or 0.0
                     )
                 )
@@ -1245,8 +1246,7 @@ class GLFTStrategy(StrategyTemplate):
             strict=True,
         ):
             position_qty = float(
-                self.oms.exposure.net_positions.get(portfolio_symbol, 0.0)
-                or 0.0
+                self.position_for(portfolio_symbol)
             )
             effective_position_notional = (
                 position_qty * state.mid_price
@@ -1545,7 +1545,8 @@ class GLFTStrategy(StrategyTemplate):
             self.feature_engine.reset_interval(symbol)
             return
 
-        current_pos = self.oms.exposure.net_positions.get(symbol, 0.0)
+        execution_state = self.execution_state()
+        current_pos = execution_state.position(symbol)
         reference_order_volume = self._calculate_safe_vol(
             symbol,
             mid,
@@ -1612,11 +1613,13 @@ class GLFTStrategy(StrategyTemplate):
         effective_pos_usdt = current_pos_usdt - target_pos_usdt
         inventory_lots = effective_pos_usdt / inventory_lot_notional
 
-        account = self.oms.account
         gamma = self.gamma_base
         margin_usage = 0.0
-        if account.equity > 0.0:
-            margin_usage = account.used_margin / account.equity
+        if execution_state.account_equity > 0.0:
+            margin_usage = (
+                execution_state.account_used_margin
+                / execution_state.account_equity
+            )
             gamma *= 1.0 + max(0.0, (margin_usage - 0.5) * 4.0)
 
         signed_orderflow_imbalance = self._decayed_orderflow_imbalance(
@@ -2035,24 +2038,8 @@ class GLFTStrategy(StrategyTemplate):
             )
             return
 
-        enforce_limits = getattr(
-            self.oms,
-            "enforce_rpi_calibration_runtime_limits",
-            None,
-        )
-        if not callable(enforce_limits):
-            self._publish_rpi_calibration_status(
-                symbol,
-                mid,
-                best_bid,
-                best_ask,
-                "CALIBRATION_OMS_GUARD_MISSING",
-                {},
-                now_monotonic,
-            )
-            return
         try:
-            enforced = enforce_limits()
+            enforced = self.execution.enforce_rpi_calibration_runtime_limits()
         except Exception as exc:
             self.log(f"RPI calibration runtime guard failed: {exc}")
             return
@@ -2060,7 +2047,7 @@ class GLFTStrategy(StrategyTemplate):
             return
 
         try:
-            exchange_now = float(time_service.now_seconds())
+            exchange_now = float(self.clock.now_seconds())
         except Exception as exc:
             self.log(f"RPI calibration exchange time unavailable: {exc}")
             return
@@ -2083,7 +2070,7 @@ class GLFTStrategy(StrategyTemplate):
             )
             return
 
-        gate_snapshot = self.oms.get_outbound_gate_snapshot()
+        gate_snapshot = self.execution_state().outbound_gate
         calibration = gate_snapshot.get("rpi_calibration", {})
         if not isinstance(calibration, dict):
             calibration = {}
@@ -2193,7 +2180,7 @@ class GLFTStrategy(StrategyTemplate):
             return
 
         current_position = float(
-            self.oms.exposure.net_positions.get(symbol, 0.0) or 0.0
+            self.position_for(symbol)
         )
         depth_index = (reserved_count // 2) % len(
             self.rpi_calibration_fixed_depths_bps
@@ -2343,17 +2330,11 @@ class GLFTStrategy(StrategyTemplate):
             self._cancel_symbol_quotes(symbol)
             return
         self.rpi_calibration_expiry_handled = True
-        expire = getattr(
-            self.oms,
-            "expire_rpi_calibration_permit",
-            None,
-        )
-        if callable(expire):
-            try:
-                expire(reason)
-                return
-            except Exception as exc:
-                self.log(f"RPI calibration fail-closed transition failed: {exc}")
+        try:
+            self.execution.expire_rpi_calibration_permit(reason)
+            return
+        except Exception as exc:
+            self.log(f"RPI calibration fail-closed transition failed: {exc}")
         self._cancel_symbol_quotes(symbol)
 
     @staticmethod
@@ -2608,11 +2589,8 @@ class GLFTStrategy(StrategyTemplate):
         resolved = self.adaptive_markout.drain_resolved()
         if not resolved or self.live_mode:
             return
-        recorder = getattr(self.oms, "record_paper_markout", None)
-        if not callable(recorder):
-            return
         for observation in resolved:
-            recorder(
+            self.execution.record_paper_markout(
                 {
                     "client_oid": observation.client_oid,
                     "trade_id": observation.trade_id,
@@ -3052,7 +3030,7 @@ class GLFTStrategy(StrategyTemplate):
             "data_source": "LIVE_BINANCE_RPI_ACK",
         }
         try:
-            committed_seq = self.oms.record_strategy_evidence(
+            committed_seq = self.execution.record_strategy_evidence(
                 "rpi_exposure_sample",
                 payload,
                 symbol=snapshot.symbol,

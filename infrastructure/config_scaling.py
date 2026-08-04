@@ -3,6 +3,13 @@ import os
 from copy import deepcopy
 from pathlib import Path
 
+from infrastructure.config_schema import (
+    CONFIG_FRAGMENT_SCHEMA,
+    VERSIONED_CONFIG_MANIFEST_SCHEMA,
+    validate_composed_config,
+    validate_fragment_document,
+    validate_versioned_manifest,
+)
 from infrastructure.live_config_guard import (
     CANARY_STAGE,
     RPI_CALIBRATION_CANARY_STAGE,
@@ -20,7 +27,10 @@ from strategy.model_readiness import (
 
 
 QUOTE_ASSET_SUFFIXES = ("USDT", "USDC", "BUSD", "FDUSD")
-CONFIG_MANIFEST_SCHEMA = "chronoshft.config_manifest.v1"
+# Public startup contract. Legacy manifests are accepted only by offline
+# migration tooling, never by this runtime loader.
+CONFIG_MANIFEST_SCHEMA = VERSIONED_CONFIG_MANIFEST_SCHEMA
+CURRENT_CONFIG_MANIFEST_SCHEMA = VERSIONED_CONFIG_MANIFEST_SCHEMA
 _CONFIG_MANIFEST_KEYS = frozenset({"schema", "includes"})
 TIME_SYNC_DEFAULTS = {
     "startup_required": True,
@@ -213,7 +223,11 @@ def _read_config_json_object(path: str, *, root: bool) -> dict:
 
 
 def _is_config_manifest(payload: dict) -> bool:
-    return payload.get("schema") == CONFIG_MANIFEST_SCHEMA or "includes" in payload
+    schema = payload.get("schema")
+    return (
+        isinstance(schema, str)
+        and schema.startswith("chronoshft.config_manifest.v")
+    ) or "includes" in payload
 
 
 def _resolve_config_fragment_path(manifest_path: str, include: object) -> str:
@@ -303,7 +317,7 @@ def _merge_config_fragment(
         )
 
 
-def _compose_config_manifest(payload: dict, manifest_path: str) -> dict:
+def _compose_legacy_config_manifest(payload: dict, manifest_path: str) -> dict:
     if set(payload) != _CONFIG_MANIFEST_KEYS:
         unexpected = sorted(set(payload) - _CONFIG_MANIFEST_KEYS)
         raise ValueError(
@@ -334,6 +348,11 @@ def _compose_config_manifest(payload: dict, manifest_path: str) -> dict:
             raise ValueError(
                 f"nested config manifests are not supported: {fragment_path}"
             )
+        if fragment.get("$schema") == CONFIG_FRAGMENT_SCHEMA:
+            raise ValueError(
+                "versioned config fragments require a v2 manifest: "
+                f"{fragment_path}"
+            )
         _merge_config_fragment(
             merged,
             fragment,
@@ -341,6 +360,60 @@ def _compose_config_manifest(payload: dict, manifest_path: str) -> dict:
             owners=owners,
         )
     return merged
+
+
+def _compose_versioned_config_manifest(payload: dict, manifest_path: str) -> dict:
+    includes = validate_versioned_manifest(payload)
+    merged = {}
+    owners: dict[tuple[str, ...], str] = {}
+    included_paths = set()
+    for include in includes:
+        fragment_path = _resolve_config_fragment_path(
+            manifest_path,
+            include.path,
+        )
+        normalized_path = os.path.normcase(fragment_path)
+        if normalized_path in included_paths:
+            raise ValueError(
+                f"duplicate config manifest include: {include.path!r}"
+            )
+        included_paths.add(normalized_path)
+        fragment = _read_config_json_object(fragment_path, root=False)
+        if _is_config_manifest(fragment):
+            raise ValueError(
+                f"nested config manifests are not supported: {fragment_path}"
+            )
+        content = validate_fragment_document(
+            fragment,
+            expected_fragment=include.fragment,
+            expected_version=include.version,
+            source=fragment_path,
+        )
+        _merge_config_fragment(
+            merged,
+            content,
+            source=fragment_path,
+            owners=owners,
+        )
+    validate_composed_config(merged)
+    return merged
+
+
+def _compose_config_manifest(payload: dict, manifest_path: str) -> dict:
+    schema = payload.get("schema")
+    if schema == VERSIONED_CONFIG_MANIFEST_SCHEMA:
+        return _compose_versioned_config_manifest(payload, manifest_path)
+    if isinstance(schema, str) and schema.startswith(
+        "chronoshft.config_manifest.v"
+    ):
+        raise ValueError(
+            f"obsolete config manifest schema {schema!r} is rejected at "
+            "runtime; run the explicit offline v3 migration"
+        )
+    raise ValueError(
+        "config manifest schema must be "
+        f"{VERSIONED_CONFIG_MANIFEST_SCHEMA!r}"
+    )
 
 
 def _load_config_document(path: str) -> tuple[dict, bool]:
@@ -932,16 +1005,21 @@ def normalize_root_config_preapproval(raw: dict) -> dict:
     return finalize_strategy_risk_budgets(configured)
 
 
-def load_root_config(path: str = "config.json") -> dict:
+def load_root_config(
+    path: str = "config.json",
+    *,
+    allow_unversioned_offline: bool = False,
+) -> dict:
     config_path = os.path.abspath(os.fspath(path))
     raw, is_manifest = _load_config_document(config_path)
+    if not is_manifest and not allow_unversioned_offline:
+        raise ValueError(
+            "runtime configuration must use strict "
+            f"{VERSIONED_CONFIG_MANIFEST_SCHEMA!r}; monolithic documents "
+            "are accepted only by explicit offline migration tooling"
+        )
     _reject_live_inline_secrets(raw)
     configured = normalize_root_config_preapproval(raw)
-    if is_manifest and not is_paper_trade(configured):
-        raise ValueError(
-            "fragmented config manifests are Paper-only until Live evidence "
-            "digests explicitly bind every fragment"
-        )
     if not is_paper_trade(configured):
         stage = live_launch_stage(configured)
         if stage == RPI_CALIBRATION_CANARY_STAGE:

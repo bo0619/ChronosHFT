@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Protocol
 
+from risk.exchange_port import (
+    AccountTruthSnapshot,
+    CashFlowTruth,
+    SnapshotPurpose,
+    TruthResult,
+)
 from risk.funding_guard import parse_binance_premium_index_payload
 
 
@@ -21,12 +28,19 @@ class BinanceSidecarTruthOwner(Protocol):
     funding_guard_enabled: bool
     funding_max_source_age_ms: float
     daily_loss_enabled: bool
+    cash_flow_required: bool
     cash_flow_income_types: set[str]
     cash_flow_assets: set[str]
     cash_flow_max_pages: int
     cash_flow_poll_interval_sec: float
+    cash_flow_deployment_start_ms: int
     _last_cash_flow_poll_monotonic: float
     _cached_external_cash_flow_total: float
+    _cached_daily_external_cash_flow_total: float
+    _cached_deployment_external_cash_flow_total: float
+    _deployment_cash_flow_carry: float
+    _cash_flow_cache_day: str
+    _cash_flow_cache_generation: int
     _cash_flow_cache_initialized: bool
     full_open_orders_audit_interval_sec: float
     _last_full_open_orders_audit_monotonic: float
@@ -49,6 +63,8 @@ class BinanceSidecarTruthOwner(Protocol):
     def _get_open_orders_snapshot(self): ...
 
     def _get_cached_daily_external_cash_flow(self): ...
+
+    def _get_cached_external_cash_flow_truth(self): ...
 
     def _get_funding_observations(self): ...
 
@@ -132,6 +148,53 @@ class BinanceSidecarTruthReader:
                 )
             )
         return tuple(sorted(rows))
+
+    @staticmethod
+    def open_order_fingerprint(open_orders) -> tuple:
+        rows = []
+        for order in open_orders:
+            if not isinstance(order, dict):
+                rows.append(("<invalid>", repr(order)))
+                continue
+            rows.append(
+                tuple(
+                    str(order.get(field, "") or "").strip()
+                    for field in (
+                        "symbol",
+                        "orderId",
+                        "clientOrderId",
+                        "side",
+                        "positionSide",
+                        "type",
+                        "status",
+                        "price",
+                        "origQty",
+                        "executedQty",
+                        "reduceOnly",
+                        "closePosition",
+                        "time",
+                        "updateTime",
+                    )
+                )
+            )
+        return tuple(sorted(rows))
+
+    def corrected_now(self) -> tuple[float, float] | None:
+        observed_monotonic = time.perf_counter()
+        correct = getattr(self._owner, "_corrected_epoch_at", None)
+        corrected = (
+            correct(observed_monotonic) if callable(correct) else None
+        )
+        if corrected is None:
+            wall_time = getattr(self._owner, "_wall_time", time.time)
+            corrected = float(wall_time())
+        try:
+            corrected = float(corrected)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(corrected) or corrected <= 0.0:
+            return None
+        return observed_monotonic, corrected
 
     def get_funding_observations(self):
         owner = self._owner
@@ -235,10 +298,14 @@ class BinanceSidecarTruthReader:
                     "open_orders_query",
                 )
             positions = positions_after
-            external_cash_flow_total = 0.0
-            if getattr(owner, "daily_loss_enabled", False):
-                cash_flow_ok, external_cash_flow_total, reason = (
-                    owner._get_cached_daily_external_cash_flow()
+            cash_flow_truth = None
+            if getattr(
+                owner,
+                "cash_flow_required",
+                getattr(owner, "daily_loss_enabled", False),
+            ):
+                cash_flow_ok, cash_flow_truth, reason = (
+                    owner._get_cached_external_cash_flow_truth()
                 )
                 if not cash_flow_ok:
                     return False, {}, reason
@@ -247,7 +314,19 @@ class BinanceSidecarTruthReader:
             )
             if not funding_ok:
                 return False, {}, reason
-            from infrastructure.time_service import time_service
+            corrected_now = self.corrected_now()
+            if corrected_now is None:
+                return False, {}, "snapshot_clock_timestamp_unavailable"
+            _, captured_at = corrected_now
+            cash_flow_fields = (
+                cash_flow_truth.as_snapshot_fields()
+                if isinstance(cash_flow_truth, CashFlowTruth)
+                else {
+                    "daily_external_cash_flow_total": 0.0,
+                    "deployment_external_cash_flow_total": 0.0,
+                    "external_cash_flow_total": 0.0,
+                }
+            )
 
             return (
                 True,
@@ -256,7 +335,7 @@ class BinanceSidecarTruthReader:
                     "positions": positions,
                     "open_orders": open_orders,
                     "funding_observations": funding_observations,
-                    "external_cash_flow_total": external_cash_flow_total,
+                    **cash_flow_fields,
                     "clock_offset_ms": float(
                         getattr(owner, "clock_offset_ms", 0.0) or 0.0
                     ),
@@ -279,7 +358,7 @@ class BinanceSidecarTruthReader:
                         )
                         or 0.0
                     ),
-                    "captured_at": time_service.now() / 1000.0,
+                    "captured_at": captured_at,
                 },
                 "",
             )
@@ -289,6 +368,166 @@ class BinanceSidecarTruthReader:
                 {},
                 f"snapshot_exception:{type(exc).__name__}:{exc}",
             )
+
+    def read_account_truth(
+        self,
+        purpose: SnapshotPurpose,
+    ) -> TruthResult:
+        """Return normalized truth, forcing a double full-account read for proof."""
+        if purpose != SnapshotPurpose.FLAT_PROOF:
+            ok, snapshot, reason = self.get_risk_snapshot()
+            if not ok:
+                return TruthResult(False, reason=reason)
+            return self._normalized_truth(
+                snapshot,
+                orders_scope="MONITORING",
+                positions_scope="ACCOUNT_WIDE",
+            )
+
+        owner = self._owner
+        try:
+            clock_ok, reason = owner._ensure_exchange_clock(force=True)
+            if not clock_ok:
+                return TruthResult(False, reason=reason)
+            account_ok, account, reason = owner._response_payload(
+                owner.rest.get_account(),
+                dict,
+                "flat_proof_account",
+            )
+            if not account_ok:
+                return TruthResult(False, reason=reason)
+            snapshots = []
+            for sample in (1, 2):
+                positions_ok, positions, reason = owner._response_payload(
+                    owner.rest.get_positions(emergency=True),
+                    list,
+                    f"flat_proof_positions_{sample}",
+                )
+                if not positions_ok:
+                    return TruthResult(False, reason=reason)
+                orders_ok, orders, reason = owner._response_payload(
+                    owner.rest.get_open_orders(emergency=True),
+                    list,
+                    f"flat_proof_open_orders_{sample}",
+                )
+                if not orders_ok:
+                    return TruthResult(False, reason=reason)
+                if not all(isinstance(row, dict) for row in positions):
+                    return TruthResult(
+                        False,
+                        reason="flat_proof_position_row_invalid",
+                    )
+                if not all(isinstance(row, dict) for row in orders):
+                    return TruthResult(
+                        False,
+                        reason="flat_proof_order_row_invalid",
+                    )
+                snapshots.append((positions, orders))
+            first_positions, first_orders = snapshots[0]
+            positions, open_orders = snapshots[1]
+            if self.position_risk_fingerprint(
+                first_positions
+            ) != self.position_risk_fingerprint(positions):
+                return TruthResult(
+                    False,
+                    reason="flat_proof_positions_changed_during_double_read",
+                )
+            if self.open_order_fingerprint(
+                first_orders
+            ) != self.open_order_fingerprint(open_orders):
+                return TruthResult(
+                    False,
+                    reason="flat_proof_orders_changed_during_double_read",
+                )
+            snapshot = {
+                "account": account,
+                "positions": positions,
+                "open_orders": open_orders,
+                "funding_observations": {},
+            }
+            return self._normalized_truth(
+                snapshot,
+                orders_scope="ACCOUNT_WIDE",
+                positions_scope="ACCOUNT_WIDE",
+            )
+        except Exception as exc:
+            return TruthResult(
+                False,
+                reason=(
+                    "flat_proof_exception:"
+                    f"{type(exc).__name__}:{exc}"
+                ),
+            )
+
+    def _normalized_truth(
+        self,
+        snapshot: dict,
+        *,
+        orders_scope: str,
+        positions_scope: str,
+    ) -> TruthResult:
+        owner = self._owner
+        corrected_now = self.corrected_now()
+        if corrected_now is None:
+            return TruthResult(
+                False,
+                reason="truth_clock_timestamp_unavailable",
+            )
+        captured_monotonic, captured_at = corrected_now
+        positions = tuple(snapshot.get("positions", ()) or ())
+        open_orders = tuple(snapshot.get("open_orders", ()) or ())
+        owner._truth_sequence = int(
+            getattr(owner, "_truth_sequence", 0) or 0
+        ) + 1
+        fingerprints = {
+            "positions": self.position_risk_fingerprint(positions),
+            "orders": self.open_order_fingerprint(open_orders),
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                fingerprints,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        cash_flow = None
+        if isinstance(snapshot.get("cash_flow_truth"), CashFlowTruth):
+            cash_flow = snapshot["cash_flow_truth"]
+        return TruthResult(
+            True,
+            AccountTruthSnapshot(
+                account_scope_id=str(
+                    getattr(
+                        owner,
+                        "account_scope_id",
+                        getattr(owner, "account_key_fingerprint", ""),
+                    )
+                    or ""
+                ),
+                truth_sequence=owner._truth_sequence,
+                captured_monotonic=captured_monotonic,
+                captured_utc_ms=int(captured_at * 1000),
+                orders_scope=orders_scope,
+                positions_scope=positions_scope,
+                complete=True,
+                consistency_digest=digest,
+                account=dict(snapshot.get("account", {}) or {}),
+                positions=positions,
+                open_orders=open_orders,
+                cash_flow=cash_flow,
+                funding=dict(
+                    snapshot.get("funding_observations", {}) or {}
+                ),
+                clock_health={
+                    "offset_ms": float(
+                        getattr(owner, "clock_offset_ms", 0.0) or 0.0
+                    ),
+                    "phase_error_ms": float(
+                        getattr(owner, "clock_phase_error_ms", 0.0) or 0.0
+                    ),
+                },
+            ),
+        )
 
     @staticmethod
     def income_identity(row: dict) -> str:
@@ -305,13 +544,11 @@ class BinanceSidecarTruthReader:
         return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
 
     def get_daily_external_cash_flow(self):
-        from infrastructure.time_service import time_service
-
-        owner = self._owner
-        now = datetime.fromtimestamp(
-            time_service.now() / 1000.0,
-            tz=timezone.utc,
-        )
+        corrected_now = self.corrected_now()
+        if corrected_now is None:
+            return False, 0.0, "cash_flow_clock_timestamp_unavailable"
+        _, corrected_epoch = corrected_now
+        now = datetime.fromtimestamp(corrected_epoch, tz=timezone.utc)
         day_start_ms = int(
             now.replace(
                 hour=0,
@@ -322,13 +559,21 @@ class BinanceSidecarTruthReader:
             * 1000
         )
         end_time_ms = int(now.timestamp() * 1000)
+        return self.get_external_cash_flow_total(day_start_ms, end_time_ms)
+
+    def get_external_cash_flow_total(
+        self,
+        start_time_ms: int,
+        end_time_ms: int,
+    ):
+        owner = self._owner
         total = 0.0
         seen = set()
         limit = 1000
         for page in range(1, owner.cash_flow_max_pages + 1):
             ok, rows, reason = owner._response_payload(
                 owner.rest.get_income_history(
-                    start_time=day_start_ms,
+                    start_time=int(start_time_ms),
                     end_time=end_time_ms,
                     page=page,
                     limit=limit,
@@ -372,11 +617,32 @@ class BinanceSidecarTruthReader:
                 return True, total, ""
         return False, 0.0, "income_history_page_limit_exceeded"
 
-    def get_cached_daily_external_cash_flow(self):
+    def get_cached_external_cash_flow_truth(self):
         owner = self._owner
-        now = time.perf_counter()
+        corrected_now = self.corrected_now()
+        if corrected_now is None:
+            return False, None, "cash_flow_clock_timestamp_unavailable"
+        now_monotonic, corrected_epoch = corrected_now
+        now_datetime = datetime.fromtimestamp(
+            corrected_epoch,
+            tz=timezone.utc,
+        )
+        risk_day = now_datetime.date().isoformat()
+        end_time_ms = int(corrected_epoch * 1000)
+        day_start_ms = int(
+            now_datetime.replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            ).timestamp()
+            * 1000
+        )
         initialized = bool(
             getattr(owner, "_cash_flow_cache_initialized", False)
+        )
+        cache_day = str(
+            getattr(owner, "_cash_flow_cache_day", "") or ""
         )
         last_poll = float(
             getattr(owner, "_last_cash_flow_poll_monotonic", 0.0) or 0.0
@@ -388,27 +654,117 @@ class BinanceSidecarTruthReader:
                 or 30.0
             ),
         )
-        if initialized and now - last_poll < interval:
+        if (
+            initialized
+            and cache_day == risk_day
+            and now_monotonic - last_poll < interval
+        ):
             return (
                 True,
-                float(
-                    getattr(
-                        owner,
-                        "_cached_external_cash_flow_total",
-                        0.0,
-                    )
-                    or 0.0
+                CashFlowTruth(
+                    risk_day=risk_day,
+                    daily_external_cash_flow_total=float(
+                        getattr(
+                            owner,
+                            "_cached_daily_external_cash_flow_total",
+                            getattr(
+                                owner,
+                                "_cached_external_cash_flow_total",
+                                0.0,
+                            ),
+                        )
+                        or 0.0
+                    ),
+                    deployment_external_cash_flow_total=float(
+                        getattr(
+                            owner,
+                            "_cached_deployment_external_cash_flow_total",
+                            0.0,
+                        )
+                        or 0.0
+                    ),
+                    ledger_generation=int(
+                        getattr(owner, "_cash_flow_cache_generation", 0)
+                        or 0
+                    ),
+                    complete_through_ms=int(
+                        getattr(
+                            owner,
+                            "_cash_flow_cache_complete_through_ms",
+                            end_time_ms,
+                        )
+                        or end_time_ms
+                    ),
+                    captured_monotonic=now_monotonic,
                 ),
                 "",
             )
 
-        ok, total, reason = owner._get_daily_external_cash_flow()
+        ok, daily_total, reason = owner._get_daily_external_cash_flow()
+        if not ok:
+            return False, None, reason
+        previous_daily = float(
+            getattr(
+                owner,
+                "_cached_daily_external_cash_flow_total",
+                getattr(owner, "_cached_external_cash_flow_total", 0.0),
+            )
+            or 0.0
+        )
+        carry = float(
+            getattr(owner, "_deployment_cash_flow_carry", 0.0) or 0.0
+        )
+        if initialized and cache_day and cache_day != risk_day:
+            carry += previous_daily
+
+        deployment_start_ms = max(
+            0,
+            int(
+                getattr(owner, "cash_flow_deployment_start_ms", 0) or 0
+            ),
+        )
+        if deployment_start_ms > 0:
+            ok, deployment_total, reason = self.get_external_cash_flow_total(
+                deployment_start_ms,
+                end_time_ms,
+            )
+            if not ok:
+                return False, None, reason
+        else:
+            deployment_total = carry + float(daily_total)
+
+        generation = int(
+            getattr(owner, "_cash_flow_cache_generation", 0) or 0
+        ) + 1
+        owner._cached_external_cash_flow_total = float(daily_total)
+        owner._cached_daily_external_cash_flow_total = float(daily_total)
+        owner._cached_deployment_external_cash_flow_total = float(
+            deployment_total
+        )
+        owner._deployment_cash_flow_carry = float(carry)
+        owner._cash_flow_cache_day = risk_day
+        owner._cash_flow_cache_generation = generation
+        owner._cash_flow_cache_complete_through_ms = end_time_ms
+        owner._last_cash_flow_poll_monotonic = now_monotonic
+        owner._cash_flow_cache_initialized = True
+        return (
+            True,
+            CashFlowTruth(
+                risk_day=risk_day,
+                daily_external_cash_flow_total=float(daily_total),
+                deployment_external_cash_flow_total=float(deployment_total),
+                ledger_generation=generation,
+                complete_through_ms=end_time_ms,
+                captured_monotonic=now_monotonic,
+            ),
+            "",
+        )
+
+    def get_cached_daily_external_cash_flow(self):
+        ok, truth, reason = self.get_cached_external_cash_flow_truth()
         if not ok:
             return False, 0.0, reason
-        owner._cached_external_cash_flow_total = float(total)
-        owner._last_cash_flow_poll_monotonic = now
-        owner._cash_flow_cache_initialized = True
-        return True, float(total), ""
+        return True, float(truth.daily_external_cash_flow_total), ""
 
     def get_open_orders_snapshot(self):
         owner = self._owner

@@ -391,30 +391,70 @@ split into independently testable components:
 
 | Module | Owns |
 | --- | --- |
+| `infrastructure/durability.py` | Shared durable-state failure contract used across OMS and risk boundaries |
+| `infrastructure/oms_risk_port.py` | Stable risk-facing OMS protocol without importing OMS implementation types |
+| `infrastructure/runtime_application.py` | Explicit application graph and ordered startup phases |
+| `infrastructure/runtime_resources.py` | Named startup resources and mapping-compatible partial-startup cleanup state |
+| `infrastructure/runtime_bindings.py` | Event-lane registration, dashboard/alert fan-out, paper observations, and watchdog tick state |
+| `infrastructure/runtime_control_loop.py` | One-iteration watchdog, resource, dashboard, and health supervision loop |
+| `infrastructure/runtime_failure_policy.py` | Fail-closed callbacks for clock, event-engine, strategy, and evidence failures |
+| `infrastructure/runtime_shutdown.py` | Ordered quiesce, account-truth verification, transport drain, and durable shutdown coordinator |
 | `gateway/base_gateway.py` | Exchange-facing command and query contract |
+| `gateway/binance/gateway.py` | Stable live Binance facade and controller composition root |
+| `gateway/binance/connection_controller.py` | Transport lifecycle, generation ownership, connect/recovery, and shutdown state |
+| `gateway/binance/user_stream.py` | Listen-key generation, keepalive thread, and invalidation lifecycle |
+| `gateway/binance/book_controller.py` | Local order-book ownership, delta buffering, and bounded recovery |
+| `gateway/binance/websocket_dispatcher.py` | WebSocket decoding, event classification, normalization, and ingress-freshness checks |
+| `gateway/binance/rest_gateway.py` | Order/query REST adaptation and failure classification |
+| `gateway/binance/account_configuration.py` | Leverage, margin type, and position-mode verification |
 | `gateway/binance/paper_gateway.py` | Public transport, admission barrier, ledger, and event publication facade |
 | `gateway/binance/paper_state.py` | Paper order, position, and worker-command state records |
 | `gateway/binance/paper_book_sync.py` | Public depth snapshot/delta synchronization, generation fencing, and bounded gap recovery |
 | `gateway/binance/paper_ledger.py` | Single-writer fills, position basis, balances, fees, venue-event sequencing, and terminal-history pruning |
 | `gateway/binance/paper_matching.py` | Immediate/passive matching, RPI priority, queue-ahead, price eligibility, and fee selection |
+| `oms/component.py` | Per-component read/write capability bindings without a facade reference |
+| `oms/component_state.py` | Canonical ownership registry for shared OMS fields and compatibility descriptors |
+| `oms/outbound_gate.py` | New/reduce/cancel admission sealing and inflight drain coordination |
+| `oms/recovery_state.py` | Durable recovery hydration into explicitly owned state cells |
+| `oms/exchange_snapshot.py` | Stable exchange snapshot capture and normalization helpers |
+| `oms/full_reset.py` | Full-reset transaction coordination and terminal-state clearing |
+| `risk/state_repository.py` | Deployment-bound in-process risk state and durability handling |
+| `risk/kill_switch.py` | Kill latch, cancel/flatten verification, and recovery policy |
+| `risk/account_risk.py` | Margin, equity, cash-flow, and deployment-loss evaluation |
+| `risk/market_risk.py` | Price, position, order-rate, and market-health risk evaluation |
+| `risk/scope_guards.py` | Symbol/venue freeze scopes and recovery counters |
+| `risk/venue_dms.py` | Venue dead-man-switch renewal and safety cancellation |
+| `risk/binance_sidecar_exchange.py` | Dedicated sidecar Binance client and snapshot-worker wiring |
 | `risk/binance_sidecar_clock.py` | Independent sidecar clock sampling, quality gates, phase-risk thresholds, and monotonic exchange-time anchor |
 | `risk/binance_sidecar_settings.py` | Binance sidecar symbol, funding, cash-flow, open-order audit, clock, and REST coordination configuration |
 | `risk/binance_sidecar_truth.py` | Consistent account/position/open-order snapshots, funding observations, and deduplicated external cash flow |
 | `risk/binance_sidecar_emergency.py` | Independent emergency DMS/cancel and reduce-only flatten actions |
+| `risk/sidecar_core.py` | Deterministic child-side heartbeat, risk-stage, rearm, and emergency-action coordinator |
+| `risk/sidecar_core_fields.py` | Compatibility field names backed by their owning sidecar controllers |
+| `risk/sidecar_account_risk.py` | Sidecar account, liquidation, daily-loss, and deployment-loss truth |
+| `risk/sidecar_funding_risk.py` | Sidecar funding observations and guard decisions |
+| `risk/sidecar_observation.py` | Snapshot generation fencing, freshness, health, and evaluated risk result ownership |
+| `risk/sidecar_control_state.py` | Kill, quiesce, stop, staged action, and two-phase rearm state machine |
 | `risk/sidecar_core_status.py` | Complete read-only child-core status projection, age calculations, and IPC field contract |
 | `risk/sidecar_health.py` | Parent OMS heartbeat propagation, fail-closed mode constraints, and fresh-snapshot recovery gating |
+| `risk/limit_contract.py` | Canonical defaults shared by in-process and sidecar risk caps |
 | `risk/sidecar_policy.py` | Immutable normalized sidecar thresholds, timing limits, funding policy, and deployment identity |
 | `risk/sidecar_process.py` | Child console isolation, dedicated dual-client initialization, failure status publication, and runtime handoff |
 | `risk/sidecar_durable_state.py` | Checksummed identity-bound kill/rearm state, corruption quarantine, fsync, and atomic replacement |
-| `risk/sidecar_protocol.py` | Parent/sidecar status validation plus request-correlated control ACK decoding |
+| `risk/sidecar_protocol.py` | Versioned launch/capability handshake, wire validation, and request-correlated control ACK decoding |
 | `risk/sidecar_runtime.py` | Child command routing, latest-only heartbeat consumption, status publication, and worker/client cleanup |
 | `risk/sidecar_settings.py` | Parent timeout validation, cross-config child settings assembly, credential fingerprinting, and risk-state seeds |
 | `risk/sidecar_snapshot_worker.py` | Capacity-one asynchronous exchange snapshot execution, latest-result delivery, and bounded thread shutdown |
 | `risk/sidecar_status.py` | Read-only parent status projection, freshness calculation, and dashboard/admin snapshot contract |
 | `risk/sidecar_transport.py` | Parent-side process lifecycle, bounded IPC queues, status draining, and reliable control requests |
-| `risk/independent_supervisor.py` | Durable kill/rearm state machine and parent orchestration facade |
+| `risk/sidecar_supervisor.py` | Parent process lifecycle, heartbeat, health recovery, control requests, and shutdown |
+| `risk/independent_supervisor.py` | Compatibility exports and child-process composition root |
 | `strategy/contracts.py` | Structural event-handler contract consumed by the strategy runtime |
 | `strategy/runtime.py` | Bounded event scheduling, coalescing, timing, and fail-closed dispatch |
+
+The risk sidecar's wire fields, strict same-version rule, capability handshake,
+and version-bump policy are documented in
+[`docs/sidecar-ipc-protocol.md`](docs/sidecar-ipc-protocol.md).
 
 `BinancePaperGateway` retains its existing method surface so OMS integration
 and operator instrumentation do not depend on component layout. The book-sync

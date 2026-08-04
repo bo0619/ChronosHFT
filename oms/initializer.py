@@ -18,6 +18,7 @@ from .capability_manager import OMSCapabilityManager
 from .component import OMSComponent
 from .exchange_event_processor import OMSExchangeEventProcessor
 from .exposure import ExposureManager
+from .full_reset import OMSFullResetCoordinator
 from .guard_manager import OMSGuardManager
 from .journal import OMSJournal
 from .journal_rebuilder import OMSJournalRebuilder
@@ -26,8 +27,10 @@ from .order_manager import OrderManager
 from .order_policy import OMSOrderPolicy
 from .order_submission import OMSOrderSubmission
 from .outbound_budget import OutboundMessageBudget
+from .outbound_gate import OMSOutboundGate
 from .paper_trade_database import PaperTradeDatabase
 from .reconciler import OMSReconciler
+from .recovery_state import OMSRecoveryStateRestorer
 from .rpi_calibration_manager import RpiCalibrationManager
 from .rpi_calibration_replay import RpiCalibrationReplay
 from .rpi_calibration_runtime import RpiCalibrationRuntime
@@ -38,6 +41,238 @@ from .validator import OrderValidator
 class OMSInitializer(OMSComponent):
     """Build the shared state and focused components behind the OMS facade."""
 
+    OWNER_WRITES = frozenset(
+        {
+            "TOMBSTONE_MAX",
+            "_account_state_event_time",
+            "_background_tasks",
+            "_deferred_cancel_all_symbols",
+            "_deferred_cancel_oids",
+            "_exchange_account_event_time",
+            "_exchange_position_event_time",
+            "_known_account_order_symbols",
+            "_lifecycle_generation",
+            "_max_pending_reconcile_requests",
+            "_order_truth_resolution_inflight",
+            "_outbound_all_order_seal_reason",
+            "_outbound_budget",
+            "_outbound_gate_condition",
+            "_outbound_gate_epoch",
+            "_outbound_gate_holds",
+            "_outbound_gate_open",
+            "_outbound_gate_reason",
+            "_outbound_order_sends_inflight",
+            "_outbound_risk_sends_inflight",
+            "_outbound_risk_sends_inflight_by_symbol",
+            "_pending_reconcile_requests",
+            "_position_state_event_time",
+            "_reconcile_thread",
+            "_recovered_guard_cleanup_snapshot",
+            "_rpi_calibration",
+            "_rpi_calibration_budget_exhausted",
+            "_rpi_calibration_cumulative_notional_microu",
+            "_rpi_calibration_effective_loss_cap_microu",
+            "_rpi_calibration_enforcement_inflight",
+            "_rpi_calibration_enforcement_thread",
+            "_rpi_calibration_expired",
+            "_rpi_calibration_expiry_reason",
+            "_rpi_calibration_last_reserved_exchange_ns",
+            "_rpi_calibration_peak_observed_loss_microu",
+            "_rpi_calibration_permit_activated",
+            "_rpi_calibration_permit_start_notional_microu",
+            "_rpi_calibration_permit_start_order_count",
+            "_rpi_calibration_reservation_exchange_ns",
+            "_rpi_calibration_reservation_ids",
+            "_rpi_calibration_reserved_order_count",
+            "_rpi_calibration_restart_rearm_blocked",
+            "_rpi_calibration_start_equity_microu",
+            "_rpi_calibration_start_external_cash_flow_microu",
+            "_rpi_calibration_terminal_cancel_sweep_completed",
+            "_rpi_calibration_terminal_empty_snapshots",
+            "_rpi_calibration_terminal_generation",
+            "_rpi_calibration_terminal_pending_reason",
+            "_rpi_calibration_terminal_verified",
+            "_rpi_calibration_ttl_cancel_oids",
+            "_shutdown_cancel_verified",
+            "_shutdown_reason",
+            "_shutdown_requested",
+            "_stopped",
+            "_submit_cancel_requested_oids",
+            "_submit_settlement_inflight_oids",
+            "_unknown_not_found_counts",
+            "_venue_dead_man_renewal_thread",
+            "_venue_dead_man_safety_cancel_last_attempt",
+            "_venue_dead_man_safety_cancel_thread",
+            "account",
+            "account_truth",
+            "audit_logger",
+            "cancellation_manager",
+            "capability_manager",
+            "capability_mode",
+            "capability_reason",
+            "command_fence_timeout_sec",
+            "config",
+            "consecutive_reconcile_api_failures",
+            "degraded_aggressive_to_passive",
+            "duplicate_intent_window_sec",
+            "emergency_flatten_cooldown_sec",
+            "event_engine",
+            "event_log",
+            "event_log_evictions",
+            "event_log_max",
+            "exchange_event_processor",
+            "exchange_id_map",
+            "exchange_self_trade_prevention_mode",
+            "execution_ids",
+            "exposure",
+            "external_cash_flow_assets",
+            "external_cash_flow_ids",
+            "external_cash_flow_max_age_sec",
+            "external_cash_flow_max_pages",
+            "external_cash_flow_poll_interval_sec",
+            "external_cash_flow_recovery_lookback_ms",
+            "external_cash_flow_recovery_overlap_ms",
+            "external_cash_flow_require_snapshot",
+            "external_cash_flow_scan_end_ms",
+            "external_cash_flow_truth_enabled",
+            "external_income_types",
+            "full_reset_coordinator",
+            "gateway",
+            "guard_manager",
+            "journal",
+            "journal_rebuilder",
+            "last_emergency_flatten_ts",
+            "last_external_cash_flow_poll_at",
+            "last_freeze_reason",
+            "last_halt_reason",
+            "last_reconcile_failure_ts",
+            "last_reconcile_request_ts",
+            "last_risk_control_heartbeat_monotonic",
+            "last_risk_control_heartbeat_time",
+            "last_venue_dead_man_attempt_monotonic",
+            "last_venue_dead_man_success_monotonic",
+            "last_venue_dead_man_success_time",
+            "lifecycle_controller",
+            "local_self_cross_check_enabled",
+            "lock",
+            "manual_rearm_required",
+            "margin_health_enabled",
+            "margin_health_require_snapshot",
+            "margin_reduce_only_ratio",
+            "margin_snapshot_max_age_sec",
+            "max_account_gross_notional",
+            "max_cancel_messages_per_window",
+            "max_concurrent_symbols",
+            "max_new_orders_per_window",
+            "max_pos_notional",
+            "max_reduce_orders_per_window",
+            "max_strategy_active_orders",
+            "max_strategy_symbol_active_orders",
+            "max_symbol_active_orders",
+            "max_total_active_orders",
+            "max_total_messages_per_window",
+            "mode_constraint_generation",
+            "mode_constraint_generations",
+            "mode_constraints",
+            "mode_override",
+            "mode_override_reason",
+            "order_monitor",
+            "order_policy",
+            "order_submission",
+            "orders",
+            "outbound_gate",
+            "outbound_gate_drain_timeout_sec",
+            "outbound_message_budget_enabled",
+            "outbound_message_history",
+            "outbound_message_window_sec",
+            "paper_trade_database",
+            "rebuild_summary",
+            "recovery_state_restorer",
+            "reconcile_api_cooldown_sec",
+            "reconcile_api_failure_threshold",
+            "reconcile_min_interval_sec",
+            "reconcile_retry_scheduled",
+            "reconciler",
+            "recovered_guard_cleanup_pending",
+            "rejected_risk_control_heartbeat_sources",
+            "require_explicit_strategy_budget",
+            "require_healthy_clock",
+            "reserved_risk_messages_per_window",
+            "rest_confirmed_execution_ids",
+            "risk_control_heartbeat_enabled",
+            "risk_control_heartbeat_max_age_sec",
+            "risk_control_heartbeat_reason",
+            "risk_control_heartbeat_required_source",
+            "risk_control_heartbeat_source",
+            "risk_control_heartbeat_status",
+            "risk_rejection_log_interval_sec",
+            "rpi_calibration_manager",
+            "rpi_calibration_replay",
+            "rpi_calibration_runtime",
+            "self_trade_prevention_enabled",
+            "shutdown_cancel_settle_interval_sec",
+            "shutdown_cancel_timeout_sec",
+            "shutdown_empty_snapshots_required",
+            "single_writer_fence",
+            "snapshot_max_attempts",
+            "snapshot_settle_interval_sec",
+            "snapshot_stability_required",
+            "state",
+            "strategy_guards",
+            "strategy_risk_budgets",
+            "strategy_risk_budgets_enabled",
+            "strategy_symbol_guards",
+            "submit_settlement",
+            "symbol_guard_epoch_counters",
+            "symbol_guard_epochs",
+            "symbol_guard_records",
+            "symbol_guards",
+            "terminated_oid_queue",
+            "terminated_oids",
+            "trade_cursors",
+            "trade_recovery_id_overlap",
+            "trade_recovery_lookback_ms",
+            "trade_recovery_overlap_ms",
+            "trade_scan_end_ms",
+            "trade_tail_expected_ids",
+            "trade_tail_verification_attempts",
+            "trade_tail_verification_delay_sec",
+            "trade_tail_verification_inflight",
+            "trade_tail_verification_retry_sec",
+            "unknown_order_min_not_found",
+            "unknown_order_resolution_timeout_sec",
+            "validator",
+            "venue_dead_man_armed_symbols",
+            "venue_dead_man_failure_count",
+            "venue_dead_man_last_error",
+            "venue_dead_man_recovery_count",
+            "venue_dead_man_renewal_inflight",
+            "venue_dead_man_safety_cancel_retry_sec",
+            "venue_dead_man_safety_cancel_timeout_sec",
+            "venue_dead_man_switch_countdown_time_ms",
+            "venue_dead_man_switch_enabled",
+            "venue_dead_man_switch_max_renewal_age_sec",
+            "venue_dead_man_switch_recovery_checks",
+            "venue_dead_man_switch_renewal_interval_sec",
+            "venue_dead_man_switch_symbols",
+            "venue_guard_epoch_counters",
+            "venue_guard_epochs",
+            "venue_guard_records",
+            "venue_guards",
+        }
+    )
+    OWNER_READS = OWNER_WRITES | frozenset(
+        {
+            "SUPPORTED_POSITION_MODES",
+            "_apply_rebuild_summary",
+            "_on_background_task_error",
+            "_on_order_truth_check",
+            "_tracked_quote_assets",
+            "freeze_system",
+            "rebuild_from_log",
+        }
+    )
+
     def initialize(self, event_engine, gateway, config) -> None:
         self.event_engine = event_engine
         self.gateway = gateway
@@ -47,7 +282,7 @@ class OMSInitializer(OMSComponent):
         target_position_mode = self._configure_order_controls(config, oms_cfg)
         self._initialize_shared_state(config)
         self._configure_account_and_risk(config, oms_cfg, target_position_mode)
-        self._initialize_components(self._owner, event_engine, gateway, config)
+        self._initialize_components(event_engine, gateway, config)
         self._configure_recovery_and_outbound(config, oms_cfg)
         self._initialize_paper_trade_database(config)
         try:
@@ -490,7 +725,6 @@ class OMSInitializer(OMSComponent):
 
     def _initialize_components(
         self,
-        owner,
         event_engine,
         gateway,
         config,
@@ -498,7 +732,7 @@ class OMSInitializer(OMSComponent):
         self.validator = OrderValidator(config)
         self.exposure = ExposureManager()
         self.account = AccountManager(event_engine, self.exposure, config)
-        self.account_truth = OMSAccountTruth(owner)
+        self.account_truth = self._spawn_component(OMSAccountTruth)
         self.order_monitor = OrderManager(
             event_engine,
             gateway,
@@ -538,18 +772,35 @@ class OMSInitializer(OMSComponent):
         self.last_halt_reason = ""
         self.recovered_guard_cleanup_pending = False
         self._recovered_guard_cleanup_snapshot = None
-        self.rpi_calibration_replay = RpiCalibrationReplay(owner)
-        self.rpi_calibration_runtime = RpiCalibrationRuntime(owner)
-        self.guard_manager = OMSGuardManager(owner)
-        self.capability_manager = OMSCapabilityManager(owner)
-        self.cancellation_manager = OMSCancellationManager(owner)
-        self.lifecycle_controller = OMSLifecycleController(owner)
-        self.exchange_event_processor = OMSExchangeEventProcessor(owner)
-        self.journal_rebuilder = OMSJournalRebuilder(owner)
-        self.reconciler = OMSReconciler(owner)
-        self.order_policy = OMSOrderPolicy(owner)
-        self.order_submission = OMSOrderSubmission(owner)
-        self.submit_settlement = OMSSubmitSettlement(owner)
+        self.rpi_calibration_replay = self._spawn_component(
+            RpiCalibrationReplay
+        )
+        self.rpi_calibration_runtime = self._spawn_component(
+            RpiCalibrationRuntime
+        )
+        self.guard_manager = self._spawn_component(OMSGuardManager)
+        self.capability_manager = self._spawn_component(OMSCapabilityManager)
+        self.cancellation_manager = self._spawn_component(
+            OMSCancellationManager
+        )
+        self.outbound_gate = self._spawn_component(OMSOutboundGate)
+        self.recovery_state_restorer = self._spawn_component(
+            OMSRecoveryStateRestorer
+        )
+        self.lifecycle_controller = self._spawn_component(
+            OMSLifecycleController
+        )
+        self.exchange_event_processor = self._spawn_component(
+            OMSExchangeEventProcessor
+        )
+        self.journal_rebuilder = self._spawn_component(OMSJournalRebuilder)
+        self.full_reset_coordinator = self._spawn_component(
+            OMSFullResetCoordinator
+        )
+        self.reconciler = self._spawn_component(OMSReconciler)
+        self.order_policy = self._spawn_component(OMSOrderPolicy)
+        self.order_submission = self._spawn_component(OMSOrderSubmission)
+        self.submit_settlement = self._spawn_component(OMSSubmitSettlement)
         self.rebuild_summary = self.rebuild_from_log()
         self._apply_rebuild_summary()
 
@@ -671,7 +922,6 @@ class OMSInitializer(OMSComponent):
             0.0,
             float(oms_cfg.get("risk_rejection_log_interval_sec", 5.0) or 0.0),
         )
-        self._risk_rejection_log_state = {}
         outbound_budget = oms_cfg.get("outbound_message_budget", {})
         self._outbound_budget = OutboundMessageBudget(outbound_budget)
         self.outbound_message_budget_enabled = self._outbound_budget.enabled
@@ -738,7 +988,6 @@ class OMSInitializer(OMSComponent):
                 int(background_cfg.get("safety_workers", 2) or 2),
             ),
         )
-        self._background_task_rejection_count = 0
         self._pending_reconcile_requests = []
         self._max_pending_reconcile_requests = max(
             8,

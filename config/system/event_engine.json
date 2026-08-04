@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "system.event_engine",
+  "version": 1,
   "system": {
     "event_engine": {
       "_comment": "Bound all event lanes for a small AWS instance; queue overflow and sustained backlog fail closed through the existing OMS watchdog.",

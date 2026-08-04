@@ -6,6 +6,38 @@ import hashlib
 from dataclasses import dataclass
 from typing import Callable
 
+from risk.limit_contract import (
+    DEFAULT_MAX_ACCOUNT_GROSS_NOTIONAL,
+    DEFAULT_MAX_DAILY_LOSS,
+    DEFAULT_MAX_DRAWDOWN_PCT,
+)
+
+
+def _bounded_risk_cap(
+    *,
+    field: str,
+    limits: dict,
+    supervisor: dict,
+    enabled: bool,
+    root_default: float,
+    finite_float: Callable[[object, str], float],
+) -> float:
+    root_label = f"risk.limits.{field}"
+    supervisor_label = f"risk.independent_supervisor.{field}"
+    root_value = finite_float(limits.get(field, root_default), root_label)
+    value = finite_float(supervisor.get(field, root_value), supervisor_label)
+    if not enabled:
+        return value
+    if root_value < 0.0:
+        raise ValueError(f"{root_label} must be nonnegative")
+    if value < 0.0 or (value == 0.0 and root_value > 0.0):
+        raise ValueError(f"{supervisor_label} must be positive")
+    if root_value > 0.0 and value > root_value:
+        raise ValueError(
+            f"{supervisor_label} must not exceed {root_label}"
+        )
+    return value
+
 
 @dataclass(frozen=True, slots=True)
 class SidecarSupervisorConfiguration:
@@ -48,6 +80,13 @@ class SidecarSupervisorConfiguration:
             raise ValueError(
                 "independent_supervisor requires risk_control_heartbeat."
                 f"required_source={required_heartbeat_source!r}"
+            )
+        if enabled and (
+            not str(supervisor_config.get("api_key", "") or "")
+            or not str(supervisor_config.get("api_secret", "") or "")
+        ):
+            raise ValueError(
+                "independent_supervisor requires dedicated API credentials"
             )
 
         heartbeat_interval_sec = max(
@@ -118,6 +157,42 @@ class SidecarSupervisorConfiguration:
         )
         live_launch_config = dict(config.get("live_launch", {}) or {})
         oms_config = dict(config.get("oms", {}) or {})
+        max_account_gross_notional = _bounded_risk_cap(
+            field="max_account_gross_notional",
+            limits=limits_config,
+            supervisor=supervisor_config,
+            enabled=enabled,
+            root_default=getattr(
+                risk_manager,
+                "max_account_gross_notional",
+                DEFAULT_MAX_ACCOUNT_GROSS_NOTIONAL,
+            ),
+            finite_float=finite_float,
+        )
+        max_daily_loss = _bounded_risk_cap(
+            field="max_daily_loss",
+            limits=limits_config,
+            supervisor=supervisor_config,
+            enabled=enabled,
+            root_default=getattr(
+                risk_manager,
+                "max_daily_loss",
+                DEFAULT_MAX_DAILY_LOSS,
+            ),
+            finite_float=finite_float,
+        )
+        max_drawdown_pct = _bounded_risk_cap(
+            field="max_drawdown_pct",
+            limits=limits_config,
+            supervisor=supervisor_config,
+            enabled=enabled,
+            root_default=getattr(
+                risk_manager,
+                "max_drawdown_pct",
+                DEFAULT_MAX_DRAWDOWN_PCT,
+            ),
+            finite_float=finite_float,
+        )
         child_settings = {
             **supervisor_config,
             "api_key": str(supervisor_config.get("api_key", "") or ""),
@@ -142,13 +217,7 @@ class SidecarSupervisorConfiguration:
                 )
                 or 1000
             ),
-            "max_account_gross_notional": float(
-                supervisor_config.get(
-                    "max_account_gross_notional",
-                    limits_config.get("max_account_gross_notional", 0.0),
-                )
-                or 0.0
-            ),
+            "max_account_gross_notional": max_account_gross_notional,
             "margin_reduce_only_ratio": float(
                 supervisor_config.get(
                     "margin_reduce_only_ratio",
@@ -170,20 +239,8 @@ class SidecarSupervisorConfiguration:
                 )
                 or 0
             ),
-            "max_daily_loss": float(
-                supervisor_config.get(
-                    "max_daily_loss",
-                    limits_config.get("max_daily_loss", 0.0),
-                )
-                or 0.0
-            ),
-            "max_drawdown_pct": float(
-                supervisor_config.get(
-                    "max_drawdown_pct",
-                    limits_config.get("max_drawdown_pct", 0.0),
-                )
-                or 0.0
-            ),
+            "max_daily_loss": max_daily_loss,
+            "max_drawdown_pct": max_drawdown_pct,
             "deployment_id": str(
                 live_launch_config.get("deployment_id", "") or ""
             ),
@@ -276,13 +333,6 @@ class SidecarSupervisorConfiguration:
                 getattr(risk_manager, "deployment_loss", 0.0) or 0.0
             ),
         }
-        if enabled and (
-            not child_settings["api_key"]
-            or not child_settings["api_secret"]
-        ):
-            raise ValueError(
-                "independent_supervisor requires dedicated API credentials"
-            )
         api_key = str(child_settings.get("api_key", "") or "")
         child_settings["account_key_fingerprint"] = (
             hashlib.sha256(api_key.encode("utf-8")).hexdigest()

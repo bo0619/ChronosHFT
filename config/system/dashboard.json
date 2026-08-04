@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "system.dashboard",
+  "version": 1,
   "system": {
     "web_dashboard": {
       "_comment": "Loopback-only read-only monitoring UI. It never exposes API credentials or accepts trading commands.",
@@ -12,7 +15,9 @@
       "history_limit": 600,
       "orders_limit": 100,
       "trades_limit": 100,
-      "logs_limit": 200
+      "logs_limit": 200,
+      "telemetry_mailbox_capacity": 1,
+      "telemetry_stop_timeout_sec": 2.0
     }
   }
 }

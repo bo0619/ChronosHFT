@@ -2372,18 +2372,21 @@ class BinancePaperGateway(BaseGateway):
             if self._closing:
                 return
             self._fault_epoch += 1
-            with self._book_lock:
-                self._book_generation += 1
-                self.book_resyncing.clear()
-                self.book_recovery_generation.clear()
-                self.book_recovery_tokens.clear()
-            self.set_state(GatewayState.ERROR)
-            self.event_engine.put(
-                Event(
-                    EVENT_SYSTEM_HEALTH,
-                    f"FREEZE_VENUE:{self.gateway_name}:{reason}",
-                )
+        # Fault and book state have independent epochs. Never hold both locks:
+        # book recovery paths are allowed to report a fault while owning the
+        # book lock, and nested acquisition would create an ABBA cycle.
+        with self._book_lock:
+            self._book_generation += 1
+            self.book_resyncing.clear()
+            self.book_recovery_generation.clear()
+            self.book_recovery_tokens.clear()
+        self.set_state(GatewayState.ERROR)
+        self.event_engine.put(
+            Event(
+                EVENT_SYSTEM_HEALTH,
+                f"FREEZE_VENUE:{self.gateway_name}:{reason}",
             )
+        )
         logger.error(f"[BINANCE_PAPER] {reason}")
 
     @staticmethod

@@ -8,14 +8,23 @@ from .audit_logger import OMSAuditLogger
 from .background_tasks import OMSBackgroundTaskManager
 from .capability_manager import OMSCapabilityManager
 from .cancellation_manager import OMSCancellationManager
-from .component import component_method
+from .component import OMSComponent, OMSComponentContext, component_method
+from .component_state import (
+    OMSAttributeBinding,
+    OMSSharedField,
+    OMSStateRegistry,
+    build_state_owners,
+)
 from .durability_manager import OMSDurabilityManager
+from .full_reset import OMSFullResetCoordinator
 from .guard_manager import OMSGuardManager
 from .initializer import OMSInitializer
 from .lifecycle_controller import OMSLifecycleController
 from .order import Order
 from .order_accounting import OMSOrderAccounting
 from .order_policy import OMSOrderPolicy
+from .outbound_gate import OMSOutboundGate
+from .recovery_state import OMSRecoveryStateRestorer
 from .rpi_calibration_manager import RpiCalibrationManager
 from .rpi_calibration_replay import RpiCalibrationReplay
 from .rpi_calibration_runtime import RpiCalibrationRuntime
@@ -162,9 +171,12 @@ class OMS:
         "capability_manager": OMSCapabilityManager,
         "cancellation_manager": OMSCancellationManager,
         "durability_manager": OMSDurabilityManager,
+        "full_reset_coordinator": OMSFullResetCoordinator,
         "lifecycle_controller": OMSLifecycleController,
         "order_accounting": OMSOrderAccounting,
         "order_policy": OMSOrderPolicy,
+        "outbound_gate": OMSOutboundGate,
+        "recovery_state_restorer": OMSRecoveryStateRestorer,
         "state_publisher": OMSStatePublisher,
         "submit_settlement": OMSSubmitSettlement,
     }
@@ -193,7 +205,54 @@ class OMS:
         self.__dict__["_rpi_calibration_runtime"] = runtime
 
     def __init__(self, event_engine, gateway, config):
+        self.__dict__["_component_state"] = OMSStateRegistry(
+            self._component_state_field_owners
+        )
         OMSInitializer(self).initialize(event_engine, gateway, config)
+
+    def _component_context_for(
+        self,
+        component_type: type[OMSComponent],
+    ) -> OMSComponentContext:
+        readable = frozenset(component_type.OWNER_READS)
+        writable = frozenset(component_type.OWNER_WRITES)
+        state = self.__dict__["_component_state"]
+        component_name = component_type.__name__
+        bindings = {}
+        for name in readable | writable:
+            if state.manages(name):
+                bindings[name] = OMSAttributeBinding(
+                    read=lambda name=name: state.read(name),
+                    write=(
+                        (
+                            lambda value, name=name: state.write(
+                                component_name,
+                                name,
+                                value,
+                            )
+                        )
+                        if name in writable
+                        else None
+                    ),
+                )
+                continue
+            bindings[name] = OMSAttributeBinding(
+                read=lambda name=name: getattr(self, name),
+                write=(
+                    (lambda value, name=name: setattr(self, name, value))
+                    if name in writable
+                    else None
+                ),
+            )
+        return OMSComponentContext(
+            component_name=component_name,
+            readable=readable,
+            writable=writable,
+            _bindings=bindings,
+            _spawn=lambda child_type: child_type(
+                self._component_context_for(child_type)
+            ),
+        )
 
     def record_paper_order_event(self, snapshot) -> bool:
         database = getattr(self, "paper_trade_database", None)
@@ -517,24 +576,22 @@ class OMS:
 
     bootstrap = component_method("lifecycle_controller")
     _refresh_read_only_account_snapshot = component_method("lifecycle_controller")
-    _apply_rebuild_summary = component_method("lifecycle_controller")
+    _apply_rebuild_summary = component_method("recovery_state_restorer")
     _has_active_guards = component_method("lifecycle_controller")
-    _outbound_gate_should_open_locked = component_method("lifecycle_controller")
-    _close_outbound_gate_locked = component_method("lifecycle_controller")
-    _refresh_outbound_gate_locked = component_method("lifecycle_controller")
-    _acquire_outbound_order_send_permit_locked = component_method(
-        "lifecycle_controller"
-    )
-    _acquire_outbound_risk_send_permit_locked = component_method("lifecycle_controller")
-    _release_outbound_order_send_permit = component_method("lifecycle_controller")
-    _release_outbound_risk_send_permit = component_method("lifecycle_controller")
-    _submit_settlement_count_locked = component_method("lifecycle_controller")
-    _wait_for_outbound_risk_sends = component_method("lifecycle_controller")
-    _wait_for_outbound_order_sends = component_method("lifecycle_controller")
-    close_outbound_gate = component_method("lifecycle_controller")
-    begin_shutdown = component_method("lifecycle_controller")
-    verify_preconnect_shutdown_no_order_path = component_method("lifecycle_controller")
-    get_outbound_gate_snapshot = component_method("lifecycle_controller")
+    _outbound_gate_should_open_locked = component_method("outbound_gate")
+    _close_outbound_gate_locked = component_method("outbound_gate")
+    _refresh_outbound_gate_locked = component_method("outbound_gate")
+    _acquire_outbound_order_send_permit_locked = component_method("outbound_gate")
+    _acquire_outbound_risk_send_permit_locked = component_method("outbound_gate")
+    _release_outbound_order_send_permit = component_method("outbound_gate")
+    _release_outbound_risk_send_permit = component_method("outbound_gate")
+    _submit_settlement_count_locked = component_method("outbound_gate")
+    _wait_for_outbound_risk_sends = component_method("outbound_gate")
+    _wait_for_outbound_order_sends = component_method("outbound_gate")
+    close_outbound_gate = component_method("outbound_gate")
+    begin_shutdown = component_method("outbound_gate")
+    verify_preconnect_shutdown_no_order_path = component_method("outbound_gate")
+    get_outbound_gate_snapshot = component_method("outbound_gate")
     freeze_system = component_method("lifecycle_controller")
     halt_system = component_method("lifecycle_controller")
     rearm_system = component_method("lifecycle_controller")
@@ -596,6 +653,20 @@ class OMS:
                 "active_orders": active_orders,
                 "order_sends_inflight": order_sends_inflight,
             }
+
+    def is_shutdown_started(self) -> bool:
+        """Expose lifecycle shutdown state without leaking private flags."""
+        with self.lock:
+            return bool(self._shutdown_requested or self._stopped)
+
+    def handle_durability_failure(
+        self,
+        exc: Exception,
+        context: str,
+        symbol: str = "",
+    ):
+        """Apply the OMS fail-closed durability policy for external domains."""
+        return self._fail_closed_on_journal_error(exc, context, symbol)
 
     get_known_account_order_symbols = component_method("capability_manager")
     _sync_capability_mode = component_method("capability_manager")
@@ -771,7 +842,10 @@ class OMS:
     _complete_venue_recovery_verification = component_method("reconciler")
     _exchange_snapshot_signature = component_method("reconciler")
     _capture_stable_exchange_snapshot = component_method("reconciler")
-    _perform_full_reset = component_method("reconciler")
+    _perform_full_reset = component_method("full_reset_coordinator")
+    _normalize_remote_account = component_method("reconciler")
+    _normalize_remote_account_balances = component_method("reconciler")
+    _normalize_remote_positions = component_method("reconciler")
     _normalize_remote_open_orders = component_method("reconciler")
     _collect_local_active_orders_locked = component_method("reconciler")
     _collect_exchange_position_drift_locked = component_method("reconciler")
@@ -840,3 +914,27 @@ class OMS:
     def _write_tombstone(self, order: Order):
         self._remember_terminated_oid(order.client_oid)
         self._remember_terminated_oid(order.exchange_oid)
+
+
+def _loaded_oms_component_types() -> tuple[type[OMSComponent], ...]:
+    loaded = []
+    pending = list(OMSComponent.__subclasses__())
+    while pending:
+        component_type = pending.pop()
+        pending.extend(component_type.__subclasses__())
+        if component_type.__module__.startswith("oms."):
+            loaded.append(component_type)
+    return tuple(loaded)
+
+
+_all_state_field_owners = build_state_owners(
+    _loaded_oms_component_types()
+)
+_managed_state_field_owners = {
+    name: owner
+    for name, owner in _all_state_field_owners.items()
+    if not any(name in base.__dict__ for base in OMS.__mro__)
+}
+OMS._component_state_field_owners = _managed_state_field_owners
+for _field_name in _managed_state_field_owners:
+    setattr(OMS, _field_name, OMSSharedField(_field_name))

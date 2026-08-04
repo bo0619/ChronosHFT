@@ -53,27 +53,30 @@ class BinanceWsApi:
                 [f"{sl}@aggTrade", f"{sl}@markPrice@1s"]
             )
 
-        self._start_thread(
+        public_started = self._start_thread(
             self._combined_stream_url(
                 self.public_base_url,
                 public_streams,
             ),
             "PublicWS",
         )
-        self._start_thread(
+        if public_started is False:
+            return False
+        market_started = self._start_thread(
             self._combined_stream_url(
                 self.market_base_url,
                 market_streams,
             ),
             "MarketWS",
         )
+        return market_started is not False
 
     def start_user_stream(self, listen_key):
         if self.testnet:
             url = f"{self.private_base_url}/{listen_key}"
         else:
             url = f"{self.private_base_url}/ws/{listen_key}"
-        self._start_thread(url, "UserWS")
+        return self._start_thread(url, "UserWS") is not False
 
     def _combined_stream_url(self, base_url, streams):
         if self.testnet:
@@ -84,12 +87,13 @@ class BinanceWsApi:
 
     def _start_thread(self, url, name):
         with self.lock:
+            if self.close_requested:
+                return False
             existing = self.stream_threads.get(name)
             if existing is not None and existing.is_alive():
                 logger.warning(f"[{name}] Stream worker is already running")
                 return False
             self.active = True
-            self.close_requested = False
             self._close_event.clear()
             self.connected_events.setdefault(name, threading.Event()).clear()
             thread = threading.Thread(
@@ -99,7 +103,7 @@ class BinanceWsApi:
                 name=f"BinanceWs-{name}",
             )
             self.stream_threads[name] = thread
-        thread.start()
+            thread.start()
         return True
 
     def wait_until_connected(

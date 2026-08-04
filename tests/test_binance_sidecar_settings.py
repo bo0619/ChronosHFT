@@ -1,7 +1,7 @@
 import math
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock
 
 import pytest
 
@@ -181,24 +181,18 @@ def test_exchange_facade_builds_rest_client_and_applies_configuration():
         "clock_sample_count": 2,
     }
 
-    with (
-        patch("requests.Session", return_value=session) as session_type,
-        patch(
-            "gateway.binance.rate_limit_budget."
-            "BinanceRateLimitBudget.from_config",
-            return_value=budget,
-        ) as budget_factory,
-        patch(
-            "gateway.binance.rest_api.BinanceRestApi",
-            return_value=rest,
-        ) as rest_type,
-    ):
-        exchange = BinanceRiskSidecarExchange(
-            "risk-key",
-            "risk-secret",
-            True,
-            settings=settings,
-        )
+    session_type = Mock(return_value=session)
+    budget_factory = Mock(return_value=budget)
+    rest_type = Mock(return_value=rest)
+    exchange = BinanceRiskSidecarExchange(
+        "risk-key",
+        "risk-secret",
+        True,
+        settings=settings,
+        session_factory=session_type,
+        rate_limit_factory=budget_factory,
+        rest_factory=rest_type,
+    )
 
     session_type.assert_called_once_with()
     budget_factory.assert_called_once_with({"enabled": True})

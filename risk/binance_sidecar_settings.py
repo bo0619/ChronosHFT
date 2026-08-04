@@ -13,10 +13,13 @@ class BinanceSidecarExchangeConfiguration:
     funding_guard_enabled: bool
     funding_max_source_age_ms: float
     daily_loss_enabled: bool
+    cash_flow_required: bool
     cash_flow_income_types: frozenset[str]
     cash_flow_assets: frozenset[str]
     cash_flow_max_pages: int
     cash_flow_poll_interval_sec: float
+    cash_flow_deployment_start_ms: int
+    seed_deployment_cash_flow_total: float
     full_open_orders_audit_interval_sec: float
     clock_sync_enabled: bool
     clock_sync_interval_sec: float
@@ -219,10 +222,23 @@ class BinanceSidecarExchangeConfiguration:
             daily_loss_enabled=bool(
                 settings.get("daily_loss_enabled", False)
             ),
+            cash_flow_required=bool(
+                settings.get("daily_loss_enabled", False)
+                or float(settings.get("max_deployment_loss_usdt", 0.0) or 0.0)
+                > 0.0
+            ),
             cash_flow_income_types=cash_flow_income_types,
             cash_flow_assets=cash_flow_assets,
             cash_flow_max_pages=cash_flow_max_pages,
             cash_flow_poll_interval_sec=cash_flow_poll_interval_sec,
+            cash_flow_deployment_start_ms=max(
+                0,
+                int(settings.get("cash_flow_deployment_start_ms", 0) or 0),
+            ),
+            seed_deployment_cash_flow_total=finite_float(
+                settings.get("seed_deployment_cash_flow_total", 0.0) or 0.0,
+                "seed_deployment_cash_flow_total",
+            ),
             full_open_orders_audit_interval_sec=(
                 full_open_orders_audit_interval_sec
             ),
@@ -252,12 +268,26 @@ class BinanceSidecarExchangeConfiguration:
         owner.funding_guard_enabled = self.funding_guard_enabled
         owner.funding_max_source_age_ms = self.funding_max_source_age_ms
         owner.daily_loss_enabled = self.daily_loss_enabled
+        owner.cash_flow_required = self.cash_flow_required
         owner.cash_flow_income_types = set(self.cash_flow_income_types)
         owner.cash_flow_assets = set(self.cash_flow_assets)
         owner.cash_flow_max_pages = self.cash_flow_max_pages
         owner.cash_flow_poll_interval_sec = self.cash_flow_poll_interval_sec
+        owner.cash_flow_deployment_start_ms = (
+            self.cash_flow_deployment_start_ms
+        )
         owner._last_cash_flow_poll_monotonic = 0.0
         owner._cached_external_cash_flow_total = 0.0
+        owner._cached_daily_external_cash_flow_total = 0.0
+        owner._cached_deployment_external_cash_flow_total = float(
+            self.seed_deployment_cash_flow_total
+        )
+        owner._deployment_cash_flow_carry = float(
+            self.seed_deployment_cash_flow_total
+        )
+        owner._cash_flow_cache_day = ""
+        owner._cash_flow_cache_generation = 0
+        owner._cash_flow_cache_complete_through_ms = 0
         owner._cash_flow_cache_initialized = False
         owner.full_open_orders_audit_interval_sec = (
             self.full_open_orders_audit_interval_sec

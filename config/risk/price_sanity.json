@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "risk.price_sanity",
+  "version": 1,
   "risk": {
     "price_sanity": {
       "max_deviation_pct": 0.03,

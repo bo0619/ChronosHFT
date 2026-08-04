@@ -1,6 +1,7 @@
 import queue
 from types import SimpleNamespace
 
+from risk.sidecar_protocol import SidecarProtocol
 from risk.sidecar_transport import SidecarTransport
 
 
@@ -82,7 +83,11 @@ def test_start_process_builds_isolated_channels_and_spawn_process():
     multiprocessing_module = SimpleNamespace(
         get_context=lambda method: (start_methods.append(method), context)[1]
     )
-    owner = SimpleNamespace(settings={"session_id": "session-1"})
+    owner = SimpleNamespace(
+        settings=SidecarProtocol.with_launch_contract(
+            {"session_id": "session-1"}
+        )
+    )
     process_target = object()
 
     SidecarTransport.start_process(
@@ -107,6 +112,29 @@ def test_start_process_builds_isolated_channels_and_spawn_process():
         "daemon": False,
     }
     assert owner.started_at == 12.5
+
+
+def test_start_process_rejects_incompatible_contract_before_spawn():
+    settings = SidecarProtocol.with_launch_contract({})
+    settings["protocol_version"] += 1
+    owner = SimpleNamespace(settings=settings)
+    multiprocessing_module = SimpleNamespace(
+        get_context=lambda method: (_ for _ in ()).throw(
+            AssertionError("spawn context must not be created")
+        )
+    )
+
+    try:
+        SidecarTransport.start_process(
+            owner,
+            multiprocessing_module,
+            object(),
+            lambda: 12.5,
+        )
+    except ValueError as exc:
+        assert "launch_protocol_version_incompatible" in str(exc)
+    else:
+        raise AssertionError("incompatible launch contract was accepted")
 
 
 def test_drain_status_filters_session_and_sequence_before_committing():
@@ -171,6 +199,7 @@ def test_request_control_uses_owner_facades_until_matching_ack():
         (
             owner.command_queue,
             {
+                "protocol_version": SidecarProtocol.VERSION,
                 "type": "QUIESCE",
                 "session_id": "session-1",
                 "request_id": "request-1",
@@ -211,6 +240,7 @@ def test_enqueue_abort_and_close_channels_share_owner_queue_state():
         (
             owner.command_queue,
             {
+                "protocol_version": SidecarProtocol.VERSION,
                 "type": "ABORT_REARM",
                 "session_id": "session-1",
                 "token": "token-1",

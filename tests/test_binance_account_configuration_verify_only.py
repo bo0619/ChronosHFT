@@ -7,9 +7,66 @@ from infrastructure.binance_account_configuration import (
     AccountConfigurationVerificationError,
     verify_account_configuration,
 )
+from gateway.binance.account_configuration import (
+    BinanceAccountConfigurationController,
+    BinanceAccountConfigurationDependencies,
+)
+from gateway.binance.constants import (
+    ACCOUNT_CONFIGURATION_MODE_VERIFY_ONLY,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class _Response:
+    def __init__(self, payload=None, status_code=200):
+        self.payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self.payload
+
+
+class _Rest:
+    def __init__(self):
+        self.calls = []
+
+    @staticmethod
+    def response_succeeded(response, accepted_error_codes=None):
+        return response is not None and response.status_code == 200
+
+    def get_position_mode(self):
+        self.calls.append("get_position_mode")
+        return _Response({"dualSidePosition": False})
+
+    def get_positions(self):
+        self.calls.append("get_positions")
+        return _Response([_position("BTCUSDT")])
+
+    def set_position_mode(self, value):
+        self.calls.append(("set_position_mode", value))
+        return _Response()
+
+    def set_margin_type(self, symbol, value):
+        self.calls.append(("set_margin_type", symbol, value))
+        return _Response()
+
+    def set_leverage(self, symbol, value):
+        self.calls.append(("set_leverage", symbol, value))
+        return _Response()
+
+
+def _controller(rest):
+    return BinanceAccountConfigurationController(
+        BinanceAccountConfigurationDependencies(
+            rest=lambda: rest,
+            symbols=lambda: ["BTCUSDT"],
+            venue_name=lambda: "BINANCE",
+            log_error=lambda _message: None,
+            log_critical=lambda _message: None,
+        )
+    )
 
 
 def _position(symbol, *, side="BOTH", margin_type="isolated", leverage="1"):
@@ -148,29 +205,50 @@ def test_rest_verify_queries_are_signed_get_only():
         assert signed.value.value is True
 
 
-def test_gateway_verify_only_method_has_no_mutating_rest_call():
-    path = ROOT / "gateway" / "binance" / "gateway.py"
+def test_account_configuration_verify_only_has_no_mutating_rest_call():
+    path = ROOT / "gateway" / "binance" / "account_configuration.py"
     method = _method_node(
         path,
-        "BinanceGateway",
-        "_verify_account_trading_configuration",
+        "BinanceAccountConfigurationController",
+        "verify",
     )
     rest_methods = {
         node.func.attr
         for node in ast.walk(method)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Attribute)
-        and isinstance(node.func.value.value, ast.Name)
-        and node.func.value.value.id == "self"
-        and node.func.value.attr == "rest"
     }
-    assert rest_methods == {
+    assert {
         "get_position_mode",
         "get_positions",
         "response_succeeded",
-    }
+    } <= rest_methods
     assert not any(name.startswith(("set_", "post", "put", "delete")) for name in rest_methods)
+
+
+def test_verify_only_controller_reads_truth_without_mutating_account():
+    rest = _Rest()
+    controller = _controller(rest)
+    controller.mode = ACCOUNT_CONFIGURATION_MODE_VERIFY_ONLY
+    controller.target_margin_type = "ISOLATED"
+    controller.target_leverage = 1
+
+    assert controller.apply()
+    assert rest.calls == ["get_position_mode", "get_positions"]
+
+
+def test_apply_controller_sets_each_explicit_account_target():
+    rest = _Rest()
+    controller = _controller(rest)
+    controller.target_margin_type = "ISOLATED"
+    controller.target_leverage = 3
+
+    assert controller.apply()
+    assert rest.calls == [
+        ("set_position_mode", "ONE_WAY"),
+        ("set_margin_type", "BTCUSDT", "ISOLATED"),
+        ("set_leverage", "BTCUSDT", 3),
+    ]
 
 
 def test_oms_wires_account_configuration_mode_to_gateway_statically():

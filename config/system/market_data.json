@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "system.market_data",
+  "version": 1,
   "system": {
     "market_data": {
       "_comment": "Reject stale Binance public events at ingress and reconnect before delayed batches can poison caches, paper matching, or symbol circuit breakers.",

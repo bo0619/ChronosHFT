@@ -23,6 +23,19 @@ from data.oos_reconstruction import (
     OOS_RECONSTRUCTION_SCHEMA,
     RAW_OOS_EVIDENCE_SCHEMA,
 )
+from governance.approval import validate_live_approval_binding
+from governance.contracts import (
+    LIVE_APPROVAL_SCHEMA,
+    LIVE_APPROVAL_SIGNATURE_DOMAIN,
+    RPI_CALIBRATION_ARTIFACT_SCHEMA,
+)
+from governance.deployment_identity import (
+    DEPLOYMENT_CONFIG_PROJECTION_SCHEMA as GOVERNANCE_DEPLOYMENT_SCHEMA,
+    deployment_config_projection as governance_deployment_projection,
+    deployment_config_sha256 as governance_deployment_sha256,
+)
+from governance.release_manifest import build_release_manifest, release_files
+from governance.strategy_identity import effective_strategy_config
 from strategy.formula_governance import (
     LIVE_APPROVED_FORMULA_VERSIONS,
 )
@@ -31,23 +44,20 @@ from strategy.quote_math import (
     GLFT_FORMULA_VERSION,
     UNITS_VERSION,
 )
-from strategy.registry import effective_primary_strategy_config
 
-CALIBRATION_APPROVAL_SCHEMA = "chronoshft.calibration_approval.v2"
-GLFT_CALIBRATION_ARTIFACT_SCHEMA = "chronoshft.glft_rpi_calibration.v3"
+CALIBRATION_APPROVAL_SCHEMA = LIVE_APPROVAL_SCHEMA
+GLFT_CALIBRATION_ARTIFACT_SCHEMA = RPI_CALIBRATION_ARTIFACT_SCHEMA
 GLFT_CALIBRATION_DATA_SOURCE = "LIVE_BINANCE_RPI_ACK"
 GLFT_CALIBRATION_VENUE = "BINANCE_USDM"
 GLFT_CALIBRATION_SOURCE_EVIDENCE_SCHEMA = (
     "chronoshft.glft_rpi_source_evidence.v4"
 )
-DEPLOYMENT_CONFIG_PROJECTION_SCHEMA = (
-    "chronoshft.live_deployment_config_projection.v1"
-)
+DEPLOYMENT_CONFIG_PROJECTION_SCHEMA = GOVERNANCE_DEPLOYMENT_SCHEMA
 CALIBRATION_EVIDENCE_BUNDLE_SCHEMA = (
     "chronoshft.calibration_evidence_bundle.v1"
 )
 APPROVAL_SIGNATURE_ALGORITHM = "ED25519"
-APPROVAL_SIGNATURE_DOMAIN = b"chronoshft.calibration_approval.v2\0"
+APPROVAL_SIGNATURE_DOMAIN = LIVE_APPROVAL_SIGNATURE_DOMAIN
 OOS_EVIDENCE_DOMAIN = b"chronoshft.glft_rpi_oos_evidence.v2\0"
 IMPLEMENTED_UNITS_VERSION = UNITS_VERSION
 IMPLEMENTED_FORMULA_VERSIONS = {
@@ -97,70 +107,6 @@ _MODEL_ALIASES = {
     "avellanedastoikov": "avellaneda_stoikov",
     "avellaneda_stoikov": "avellaneda_stoikov",
 }
-_COMMON_LIVE_IMPLEMENTATION_SOURCE_FILES = (
-    "data/cache.py",
-    "data/live_evidence.py",
-    "data/oos_reconstruction.py",
-    "data/orderbook.py",
-    "data/ref_data.py",
-    "event/type.py",
-    "gateway/binance/constants.py",
-    "gateway/binance/gateway.py",
-    "gateway/binance/rest_api.py",
-    "gateway/binance/rest_metrics.py",
-    "gateway/binance/truth_provider.py",
-    "gateway/binance/ws_api.py",
-    "infrastructure/admin_control.py",
-    "infrastructure/commission_truth.py",
-    "infrastructure/config_scaling.py",
-    "infrastructure/external_alerts.py",
-    "infrastructure/live_config_guard.py",
-    "infrastructure/rpi_calibration_permit.py",
-    "infrastructure/rpi_policy.py",
-    "infrastructure/single_writer_fence.py",
-    "infrastructure/system_health.py",
-    "infrastructure/time_service.py",
-    "infrastructure/truth_monitor.py",
-    "infrastructure/venue_supervisor.py",
-    "infrastructure/watchdog.py",
-    "launcher.py",
-    "main.py",
-    "oms/account_manager.py",
-    "oms/engine.py",
-    "oms/exposure.py",
-    "oms/journal.py",
-    "oms/order.py",
-    "oms/order_manager.py",
-    "oms/sequence.py",
-    "oms/validator.py",
-    "risk/deployment_loss.py",
-    "risk/funding_guard.py",
-    "risk/independent_supervisor.py",
-    "risk/manager.py",
-    "scripts/build_live_oos_evidence.py",
-    "strategy/base.py",
-    "strategy/model_readiness.py",
-    "strategy/quote_math.py",
-    "strategy/registry.py",
-    "strategy/runtime.py",
-)
-_IMPLEMENTATION_SOURCE_FILES = {
-    "glft": (
-        "alpha/engine.py",
-        "alpha/factors.py",
-        "alpha/gate.py",
-        "alpha/rpi_intensity.py",
-        "alpha/signal.py",
-        "scripts/build_rpi_calibration_artifact.py",
-        "strategy/glft.py",
-        *_COMMON_LIVE_IMPLEMENTATION_SOURCE_FILES,
-    ),
-    "avellaneda_stoikov": (
-        "strategy/avellaneda_stoikov.py",
-        *_COMMON_LIVE_IMPLEMENTATION_SOURCE_FILES,
-    ),
-}
-
 ApprovalSignatureVerifier = Callable[[str, str, bytes, bytes], bool]
 
 
@@ -345,6 +291,12 @@ def _validate_live_calibration_approval_with_fence_held(
     config_file = Path(config_path).resolve()
     manifest_path = _resolve_path(config_file.parent, raw_manifest_path)
     manifest = _read_json_object(manifest_path, "calibration approval manifest")
+    validate_live_approval_binding(
+        manifest,
+        config=config,
+        approval_path=manifest_path,
+        project_root=Path(__file__).resolve().parents[1],
+    )
 
     required_manifest_keys = {
         "schema",
@@ -366,17 +318,15 @@ def _validate_live_calibration_approval_with_fence_held(
         "evidence_bundle_sha256",
         "formula_sha256",
         "strategy_config_sha256",
+        "canonical_config_sha256",
+        "release_manifest_path",
+        "release_digest",
         "signature",
     }
     manifest_keys = set(manifest)
     manifest_keys.discard("_warning")
     if manifest_keys != required_manifest_keys:
         raise ValueError("Calibration approval manifest keys are invalid")
-    if manifest.get("schema") != CALIBRATION_APPROVAL_SCHEMA:
-        raise ValueError(
-            "Calibration approval manifest schema must be "
-            f"{CALIBRATION_APPROVAL_SCHEMA!r}"
-        )
     if canonical_model_key(manifest.get("model")) != model:
         raise ValueError("Calibration approval model does not match primary_model")
 
@@ -675,11 +625,11 @@ def _approval_journal_fence_inputs(
         calibration_path_value,
     )
 
-    from scripts.build_rpi_calibration_artifact import (
-        _load_effective_deployment_config,
+    from governance.calibration_artifact import (
+        load_effective_deployment_config,
     )
 
-    calibration_config = _load_effective_deployment_config(
+    calibration_config = load_effective_deployment_config(
         calibration_path
     )
     journal_path = _resolve_path(source_path.parent, journal_path_value)
@@ -695,9 +645,9 @@ def validate_live_calibration_approval(
     signature_verifier: ApprovalSignatureVerifier | None = None,
 ) -> dict[str, Any]:
     """Validate the complete approval graph under the journal writer fence."""
-    from scripts.build_rpi_calibration_artifact import (
+    from governance.calibration_artifact import (
         CalibrationArtifactError,
-        _authorized_journal_fence,
+        authorized_journal_fence,
     )
 
     try:
@@ -721,7 +671,7 @@ def validate_live_calibration_approval(
 
     journal_path, calibration_config, calibration_path = fence_inputs
     try:
-        with _authorized_journal_fence(
+        with authorized_journal_fence(
             journal_path,
             calibration_config=calibration_config,
             calibration_config_path=calibration_path,
@@ -746,26 +696,19 @@ def formula_source_path_for_model(model: Any) -> Path:
 
 
 def implementation_source_paths_for_model(model: Any) -> tuple[Path, ...]:
-    model_key = canonical_model_key(model)
+    canonical_model_key(model)
     project_root = Path(__file__).resolve().parents[1]
     return tuple(
         project_root / relative_path
-        for relative_path in _IMPLEMENTATION_SOURCE_FILES[model_key]
+        for relative_path, _kind in release_files(project_root)
     )
 
 
 def implementation_sha256_for_model(model: Any) -> str:
-    """Hash every source file that can alter model units or live quotes."""
-    model_key = canonical_model_key(model)
+    """Bind model approval to the complete deterministic release digest."""
+    canonical_model_key(model)
     project_root = Path(__file__).resolve().parents[1]
-    digest = hashlib.sha256()
-    for relative_path in _IMPLEMENTATION_SOURCE_FILES[model_key]:
-        path = project_root / relative_path
-        digest.update(relative_path.encode("ascii"))
-        digest.update(b"\0")
-        digest.update(bytes.fromhex(sha256_file(path)))
-        digest.update(b"\0")
-    return digest.hexdigest()
+    return str(build_release_manifest(project_root)["release_digest"])
 
 
 def strategy_policy_sha256(
@@ -778,7 +721,7 @@ def strategy_policy_sha256(
     if not isinstance(root_strategy, Mapping):
         raise ValueError("strategy must be an object")
     if root_strategy.get("registered_models"):
-        effective = effective_primary_strategy_config(config)
+        effective = effective_strategy_config(config, model_key)
     else:
         effective = dict(root_strategy)
 
@@ -879,101 +822,12 @@ def strategy_policy_sha256(
 def deployment_config_projection(
     config: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Return the deterministic, secret-free live deployment identity.
-
-    The projection intentionally omits approval paths/content, runtime
-    calibration, runtime commission truth, and API credentials. This makes
-    the dependency graph acyclic: config -> artifact -> source evidence ->
-    approval. All trading and safety settings which can change the canary's
-    risk or execution behavior remain bound.
-    """
-    if not isinstance(config, Mapping):
-        raise TypeError("deployment configuration must be a mapping")
-    symbols = _normalized_symbols(config.get("symbols"))
-    if not symbols:
-        raise ValueError(
-            "deployment configuration requires unique non-empty symbols"
-        )
-    raw_strategy = config.get("strategy")
-    if not isinstance(raw_strategy, Mapping):
-        raise ValueError("strategy must be an object")
-    model = canonical_model_key(
-        raw_strategy.get("primary_model", raw_strategy.get("name"))
-    )
-
-    strategy = _redacted_json_projection(
-        raw_strategy,
-        excluded_keys={
-            "commission_truth",
-            "maker_fee",
-            "rpi_commission_rate",
-            "rpi_commission_rates",
-            "taker_fee",
-        },
-    )
-    readiness = strategy.get("model_readiness")
-    if isinstance(readiness, dict):
-        live_approval = readiness.get("live_approval")
-        if isinstance(live_approval, dict):
-            # The manifest contains this config digest. Excluding its path
-            # makes that relationship explicit and prevents a reference loop.
-            live_approval.pop("manifest_path", None)
-
-    system = _redacted_section(
-        config,
-        "system",
-        excluded_keys={
-            "api_key",
-            "api_key_env",
-            "api_secret",
-            "api_secret_env",
-        },
-    )
-    # Dashboard presentation cannot alter scheduling, risk, or order behavior.
-    # Every other system field is bound, including event/runtime/watchdog knobs.
-    system.pop("web_dashboard", None)
-
-    projection = {
-        "schema": DEPLOYMENT_CONFIG_PROJECTION_SCHEMA,
-        "symbols": list(symbols),
-        "execution": _redacted_section(config, "execution"),
-        "paper_trade": _redacted_section(config, "paper_trade"),
-        "testnet": config.get("testnet"),
-        "record_data": config.get("record_data"),
-        "live_launch": _redacted_section(config, "live_launch"),
-        "system": system,
-        "account": _redacted_section(config, "account"),
-        "oms": _redacted_section(config, "oms"),
-        "risk": _redacted_section(
-            config,
-            "risk",
-            excluded_keys={
-                "api_key",
-                "api_key_env",
-                "api_secret",
-                "api_secret_env",
-            },
-        ),
-        "strategy": {
-            "primary_model": model,
-            "strategy_policy_sha256": strategy_policy_sha256(config, model),
-            "config": strategy,
-        },
-    }
-    # Reject NaN, non-string object keys, and non-JSON runtime objects now,
-    # rather than allowing different serializers to disagree later.
-    _canonical_json_bytes(projection, "deployment configuration projection")
-    return projection
+    """Return the neutral, deterministic, secret-free deployment identity."""
+    return governance_deployment_projection(config)
 
 
 def deployment_config_sha256(config: Mapping[str, Any]) -> str:
-    projection = deployment_config_projection(config)
-    return hashlib.sha256(
-        _canonical_json_bytes(
-            projection,
-            "deployment configuration projection",
-        )
-    ).hexdigest()
+    return governance_deployment_sha256(config)
 
 
 def oos_evidence_sha256(oos: Mapping[str, Any]) -> str:
@@ -1810,14 +1664,14 @@ def _validate_glft_source_evidence(
         evidence.get("calibration_config_sha256"),
         "GLFT source evidence calibration_config_sha256",
     )
-    from scripts.build_rpi_calibration_artifact import (
+    from governance.calibration_artifact import (
         CalibrationArtifactError,
-        _load_effective_deployment_config,
-        _validate_rpi_calibration_journal_unlocked,
+        load_effective_deployment_config,
+        validate_rpi_calibration_journal_unlocked,
     )
 
     try:
-        calibration_config = _load_effective_deployment_config(
+        calibration_config = load_effective_deployment_config(
             calibration_config_path
         )
     except CalibrationArtifactError as exc:
@@ -2077,7 +1931,7 @@ def _validate_glft_source_evidence(
         # across this replay and every downstream artifact/signature check.
         for symbol in configured_symbols:
             journal_summaries.append(
-                _validate_rpi_calibration_journal_unlocked(
+                validate_rpi_calibration_journal_unlocked(
                     journal_path,
                     symbol=symbol,
                     calibration_config=calibration_config,

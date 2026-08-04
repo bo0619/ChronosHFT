@@ -29,7 +29,6 @@ from event.type import (
     StrategyData,
     TradeData,
 )
-from infrastructure.config_scaling import load_root_config
 from infrastructure.paper_trade import is_paper_trade
 from strategy.base import StrategyTemplate
 from strategy.model_readiness import (
@@ -71,14 +70,25 @@ class _ASPortfolioAssetState:
 class AvellanedaStoikovStrategy(StrategyTemplate):
     """Finite-horizon A-S strategy using fixed-notional inventory lots."""
 
-    def __init__(self, engine, oms, strategy_config=None):
-        super().__init__(engine, oms, "AvellanedaStoikov")
-
-        self.config = (
-            dict(strategy_config)
-            if strategy_config is not None
-            else self._load_strategy_config()
+    def __init__(
+        self,
+        engine,
+        execution,
+        strategy_config,
+        *,
+        resolved_config=None,
+    ):
+        if not isinstance(strategy_config, dict):
+            raise TypeError(
+                "resolved Avellaneda-Stoikov strategy config must be an object"
+            )
+        super().__init__(
+            engine,
+            execution,
+            "AvellanedaStoikov",
+            resolved_config=resolved_config,
         )
+        self.config = dict(strategy_config)
         raw_as_config = self.config.get("as_parameters", {})
         self.as_conf = dict(raw_as_config) if isinstance(raw_as_config, dict) else {}
 
@@ -144,8 +154,7 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
                 f"{required_window} normalized-return samples"
             )
 
-        root_config = getattr(self.oms, "config", {})
-        root_config = root_config if isinstance(root_config, dict) else {}
+        root_config = self.resolved_config
         self.live_mode = not is_paper_trade(root_config)
         raw_portfolio_config = self._config_mapping(
             self.as_conf.get("portfolio_risk", {}),
@@ -389,10 +398,6 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
             f"adaptive={self.adaptive_enabled}, live={self.live_mode}"
         )
 
-    def _load_strategy_config(self):
-        full_config = load_root_config("config.json")
-        return full_config.get("strategy", {}) if full_config else {}
-
     @staticmethod
     def _config_mapping(value, field: str) -> dict:
         if not isinstance(value, dict):
@@ -633,11 +638,8 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
         resolved = self.adaptive_markout.drain_resolved()
         if not resolved or self.live_mode:
             return
-        recorder = getattr(self.oms, "record_paper_markout", None)
-        if not callable(recorder):
-            return
         for observation in resolved:
-            recorder(
+            self.execution.record_paper_markout(
                 {
                     "client_oid": observation.client_oid,
                     "trade_id": observation.trade_id,
@@ -740,10 +742,7 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
                 for unavailable_symbol in unavailable_symbols
                 if abs(
                     float(
-                        self.oms.exposure.net_positions.get(
-                            unavailable_symbol,
-                            0.0,
-                        )
+                        self.position_for(unavailable_symbol)
                         or 0.0
                     )
                 )
@@ -778,8 +777,7 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
         portfolio_gamma = max(state.gamma_per_bps for state in states)
         portfolio_inventory = [
             float(
-                self.oms.exposure.net_positions.get(portfolio_symbol, 0.0)
-                or 0.0
+                self.position_for(portfolio_symbol)
             )
             * state.mid_price
             / state.inventory_lot_notional_usdt
@@ -1027,21 +1025,11 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
                 self.cancel_order(oid)
             return
 
-        strategy_positions = getattr(
-            self.oms.exposure,
-            "strategy_net_positions",
-            {},
-        )
-        strategy_position = strategy_positions.get((self.name, ob.symbol))
+        execution_state = self.execution_state()
+        strategy_position = execution_state.strategy_position(ob.symbol)
         if strategy_position is None:
-            strategy_position = self.oms.exposure.net_positions.get(
-                ob.symbol,
-                self.pos,
-            )
-        risk_position = self.oms.exposure.net_positions.get(
-            ob.symbol,
-            strategy_position,
-        )
+            strategy_position = execution_state.position(ob.symbol, self.pos)
+        risk_position = execution_state.position(ob.symbol, strategy_position)
 
         reference_order_volume = self._calculate_safe_vol(
             ob.symbol,

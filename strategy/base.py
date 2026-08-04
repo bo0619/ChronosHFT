@@ -1,10 +1,10 @@
 import math
+from copy import deepcopy
 
 from event.type import (
     AccountData,
     AggTradeData,
     Event,
-    LifecycleState,
     OrderBook,
     OrderIntent,
     OrderStateSnapshot,
@@ -19,6 +19,11 @@ from event.type import (
 from data.ref_data import ref_data_manager
 from infrastructure.commission_truth import resolve_passive_fee_rate
 from infrastructure.paper_trade import is_paper_trade
+from strategy.contracts import (
+    StrategyExecutionPort,
+    StrategyStateSnapshot,
+    coerce_strategy_execution_port,
+)
 
 
 class StrategyTemplate:
@@ -26,9 +31,28 @@ class StrategyTemplate:
     Base strategy that only talks to OMS.
     """
 
-    def __init__(self, engine, oms, name="Strategy"):
+    def __init__(
+        self,
+        engine,
+        execution,
+        name="Strategy",
+        *,
+        resolved_config: dict | None = None,
+        reference_data=ref_data_manager,
+    ):
         self.engine = engine
-        self.oms = oms
+        self.execution: StrategyExecutionPort = (
+            coerce_strategy_execution_port(execution)
+        )
+        source_config = (
+            resolved_config
+            if resolved_config is not None
+            else getattr(execution, "config", {})
+        )
+        if not isinstance(source_config, dict):
+            raise TypeError("resolved strategy deployment config must be an object")
+        self.resolved_config = deepcopy(source_config)
+        self.reference_data = reference_data
         self.name = name
 
         self.pos = 0.0
@@ -79,7 +103,7 @@ class StrategyTemplate:
                 "strategy.order_sizing.mode must be notional or fixed_quantity"
             )
         if sizing_mode == "fixed_quantity":
-            if not is_paper_trade(getattr(self.oms, "config", {}) or {}):
+            if not is_paper_trade(self.resolved_config):
                 raise ValueError("fixed_quantity order sizing is Paper-only")
             self.fixed_order_quantity = self._positive_finite(
                 order_sizing.get("fixed_quantity", 0.0)
@@ -124,7 +148,7 @@ class StrategyTemplate:
         reference_price: float | None = None,
     ) -> float:
         """Return a step-rounded quote size within order and inventory notionals."""
-        info = ref_data_manager.get_info(symbol)
+        info = self.reference_data.get_info(symbol)
         if info is None:
             return 0.0
 
@@ -175,7 +199,7 @@ class StrategyTemplate:
                 return 0.0
             target_qty = min(target_qty, capacity_qty)
 
-        rounded_qty = ref_data_manager.round_qty(symbol, target_qty)
+        rounded_qty = self.reference_data.round_qty(symbol, target_qty)
         if fixed_quantity and not math.isclose(
             rounded_qty,
             target_qty,
@@ -232,11 +256,20 @@ class StrategyTemplate:
         self.last_submit_reject_by_symbol[intent.symbol] = reason
 
     def can_submit_orders(self, symbol: str = "") -> bool:
-        if hasattr(self.oms, "can_submit_for_strategy"):
-            return bool(self.oms.can_submit_for_strategy(self.name, symbol))
-        if symbol and hasattr(self.oms, "is_symbol_tradeable"):
-            return bool(self.oms.is_symbol_tradeable(symbol))
-        return getattr(self.oms, "state", None) == LifecycleState.LIVE
+        return self.execution.can_submit(self.name, symbol)
+
+    def execution_state(self) -> StrategyStateSnapshot:
+        return self.execution.state_snapshot(self.name)
+
+    def position_for(self, symbol: str, default: float = 0.0) -> float:
+        return self.execution_state().position(symbol, default)
+
+    def strategy_position_for(
+        self,
+        symbol: str,
+        default: float | None = None,
+    ) -> float | None:
+        return self.execution_state().strategy_position(symbol, default)
 
     def log(self, msg):
         self.engine.put(Event(EVENT_LOG, f"[{self.name}] {msg}"))
@@ -252,7 +285,7 @@ class StrategyTemplate:
         """Resolve a passive quote to RPI or GTX using live exchangeInfo data."""
         if not use_rpi:
             return TIF_GTX
-        if ref_data_manager.supports_rpi(symbol):
+        if self.reference_data.supports_rpi(symbol):
             return TIF_RPI
         if not fallback_to_gtx:
             return TIF_RPI
@@ -269,7 +302,7 @@ class StrategyTemplate:
 
     def passive_fee_rate(self, symbol: str, time_in_force: str) -> float:
         """Return the final passive fee rate for the selected venue route."""
-        config = getattr(self.oms, "config", {}) or {}
+        config = self.resolved_config
         fee_config = dict(config.get("backtest", {}) or {})
         paper_config = config.get("paper_trade", {}) or {}
         if is_paper_trade(config):
@@ -293,17 +326,16 @@ class StrategyTemplate:
         return max(0.0, self.passive_fee_rate(symbol, time_in_force) * 20000.0)
 
     def send_intent(self, intent: OrderIntent):
-        intent.price = ref_data_manager.round_price(intent.symbol, intent.price)
-        intent.volume = ref_data_manager.round_qty(intent.symbol, intent.volume)
+        intent.price = self.reference_data.round_price(intent.symbol, intent.price)
+        intent.volume = self.reference_data.round_qty(intent.symbol, intent.volume)
 
-        if hasattr(self.oms, "adapt_intent_for_trading_mode"):
-            adapted_intent, reject_reason = self.oms.adapt_intent_for_trading_mode(intent)
-            if reject_reason:
-                self.on_submit_rejected(intent, reject_reason)
-                return None
-            intent = adapted_intent
+        adapted_intent, reject_reason = self.execution.adapt_intent(intent)
+        if reject_reason:
+            self.on_submit_rejected(intent, reject_reason)
+            return None
+        intent = adapted_intent
 
-        info = ref_data_manager.get_info(intent.symbol)
+        info = self.reference_data.get_info(intent.symbol)
         if info:
             notional = intent.price * intent.volume
             min_notional = max(info.min_notional, 5.0)
@@ -311,7 +343,7 @@ class StrategyTemplate:
                 self.on_submit_rejected(intent, "min_notional")
                 return None
 
-        submit_result = self.oms.submit_order(intent)
+        submit_result = self.execution.submit(intent)
         if isinstance(submit_result, str):
             client_oid = submit_result
             if client_oid:
@@ -358,7 +390,7 @@ class StrategyTemplate:
 
         self.orders_cancelling.add(client_oid)
         try:
-            accepted = bool(self.oms.cancel_order(client_oid))
+            accepted = self.execution.cancel(client_oid)
         except BaseException:
             self.orders_cancelling.discard(client_oid)
             raise
@@ -373,7 +405,7 @@ class StrategyTemplate:
         newly_cancelling = to_cancel.difference(self.orders_cancelling)
         self.orders_cancelling.update(newly_cancelling)
         try:
-            accepted = bool(self.oms.cancel_all_orders(symbol))
+            accepted = self.execution.cancel_all(symbol)
         except BaseException:
             self.orders_cancelling.difference_update(newly_cancelling)
             raise

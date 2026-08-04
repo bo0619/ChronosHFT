@@ -13,6 +13,8 @@ from .order import Order
 class OMSOrderAccounting(OMSComponent):
     """Own quote-asset resolution and execution fee estimates."""
 
+    OWNER_READS = frozenset({"config"})
+
     def _extract_quote_asset(self, symbol: str) -> str:
         symbol = str(symbol or "").upper()
         for suffix in (

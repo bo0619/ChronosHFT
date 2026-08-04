@@ -13,6 +13,9 @@ from unittest.mock import Mock, patch
 import launcher as launcher_module
 import main as main_module
 from infrastructure import admin_control as admin_control_module
+from infrastructure.runtime_application import RuntimeApplication
+from infrastructure.runtime_resources import RuntimeResources
+from infrastructure.runtime_shutdown import RuntimeShutdownCoordinator
 
 
 class RuntimeResourceEventTests(unittest.TestCase):
@@ -335,7 +338,7 @@ class MainDashboardStartupTests(unittest.TestCase):
         engine = FakeEngine("engine")
         clock = Component("clock")
         oms = FakeOms()
-        runtime = {
+        legacy_runtime = {
             "oms": oms,
             "engine": engine,
             "gateway": gateway,
@@ -350,8 +353,10 @@ class MainDashboardStartupTests(unittest.TestCase):
             "time_service": clock,
             "event_engine_config": {"shutdown_drain_timeout_sec": 1.5},
         }
+        runtime = RuntimeResources.coerce(legacy_runtime)
 
         self.assertTrue(main_module.shutdown_runtime(runtime, "test_exit"))
+        self.assertIs(legacy_runtime["_shutdown_complete"], True)
         first_call_count = len(calls)
         self.assertTrue(main_module.shutdown_runtime(runtime, "duplicate"))
         self.assertEqual(len(calls), first_call_count)
@@ -428,6 +433,140 @@ class MainDashboardStartupTests(unittest.TestCase):
             )
         release.set()
 
+    def test_gateway_connect_cancels_midflight_if_sidecar_dies(self):
+        connect_started = threading.Event()
+        connect_completed = threading.Event()
+
+        class BlockingGateway:
+            def __init__(self):
+                self.closing = False
+                self.ready = False
+                self.shutdown_calls = 0
+
+            def connect(self, _symbols):
+                connect_started.set()
+                if not connect_completed.wait(1.0):
+                    raise TimeoutError("startup cancellation was not sent")
+                if not self.closing:
+                    self.ready = True
+                return self.ready
+
+            def begin_shutdown(self):
+                self.shutdown_calls += 1
+                self.closing = True
+                connect_completed.set()
+                return True
+
+        class FailingSupervisor:
+            enabled = True
+
+            def __init__(self):
+                self.pulses = 0
+
+            def pulse_parent_heartbeat(self):
+                self.pulses += 1
+                if self.pulses == 1:
+                    return True
+                if not connect_started.wait(1.0):
+                    raise TimeoutError("gateway startup did not begin")
+                return False
+
+        gateway = BlockingGateway()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "stopped during gateway startup",
+        ):
+            main_module.connect_gateway_with_risk_heartbeat(
+                gateway,
+                ["BTCUSDT"],
+                FailingSupervisor(),
+                poll_interval_sec=0.001,
+                cancellation_timeout_sec=0.2,
+            )
+
+        self.assertEqual(gateway.shutdown_calls, 1)
+        self.assertTrue(connect_completed.is_set())
+        self.assertFalse(gateway.ready)
+        self.assertFalse(
+            any(
+                thread.name == "GatewayStartup" and thread.is_alive()
+                for thread in threading.enumerate()
+            )
+        )
+
+    def test_gateway_connect_rolls_back_partial_startup_on_worker_error(self):
+        class FailedGateway:
+            def __init__(self):
+                self.partially_started = False
+                self.shutdown_calls = 0
+
+            def connect(self, _symbols):
+                self.partially_started = True
+                raise ValueError("connect failed")
+
+            def begin_shutdown(self):
+                self.shutdown_calls += 1
+                self.partially_started = False
+                return True
+
+        class Supervisor:
+            enabled = True
+
+            def pulse_parent_heartbeat(self):
+                return True
+
+        gateway = FailedGateway()
+        with self.assertRaisesRegex(ValueError, "connect failed"):
+            main_module.connect_gateway_with_risk_heartbeat(
+                gateway,
+                ["BTCUSDT"],
+                Supervisor(),
+                poll_interval_sec=0.001,
+            )
+
+        self.assertEqual(gateway.shutdown_calls, 1)
+        self.assertFalse(gateway.partially_started)
+
+    def test_gateway_connect_rolls_back_if_final_heartbeat_fails(self):
+        class ReadyGateway:
+            def __init__(self):
+                self.ready = False
+                self.shutdown_calls = 0
+
+            def connect(self, _symbols):
+                self.ready = True
+                return True
+
+            def begin_shutdown(self):
+                self.shutdown_calls += 1
+                self.ready = False
+                return True
+
+        class FailingSupervisor:
+            enabled = True
+
+            def __init__(self):
+                self.pulses = 0
+
+            def pulse_parent_heartbeat(self):
+                self.pulses += 1
+                return self.pulses == 1
+
+        gateway = ReadyGateway()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "stopped as gateway startup completed",
+        ):
+            main_module.connect_gateway_with_risk_heartbeat(
+                gateway,
+                ["BTCUSDT"],
+                FailingSupervisor(),
+                poll_interval_sec=0.001,
+            )
+
+        self.assertEqual(gateway.shutdown_calls, 1)
+        self.assertFalse(gateway.ready)
+
     def test_required_live_dashboard_bind_failure_is_fatal(self):
         class FailedDashboard:
             def start(self):
@@ -446,7 +585,9 @@ class MainDashboardStartupTests(unittest.TestCase):
                 )
 
     def test_live_dashboard_bind_precedes_gateway_connection_statically(self):
-        source = inspect.getsource(main_module._run_main)
+        source = inspect.getsource(
+            RuntimeApplication._connect_execution_transport
+        )
 
         self.assertLess(
             source.index("start_local_dashboard("),
@@ -499,7 +640,7 @@ class PaperLauncherTests(unittest.TestCase):
 class MainShutdownLatchOrderStaticTests(unittest.TestCase):
     @staticmethod
     def shutdown_source_tree():
-        source = inspect.getsource(main_module.shutdown_runtime)
+        source = inspect.getsource(RuntimeShutdownCoordinator)
         return source, ast.parse(source)
 
     @staticmethod
@@ -508,7 +649,10 @@ class MainShutdownLatchOrderStaticTests(unittest.TestCase):
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            if not isinstance(node.func, ast.Name) or node.func.id != "run_step":
+            if not (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_run_step"
+            ):
                 continue
             if not node.args or not isinstance(node.args[0], ast.Constant):
                 continue
@@ -530,7 +674,7 @@ class MainShutdownLatchOrderStaticTests(unittest.TestCase):
                 called_name = node.func.attr
             else:
                 continue
-            if called_name == function_name:
+            if called_name.lstrip("_") == function_name.lstrip("_"):
                 lines.append(node.lineno)
         return sorted(lines)
 
@@ -543,9 +687,13 @@ class MainShutdownLatchOrderStaticTests(unittest.TestCase):
             for target in node.targets:
                 if not isinstance(target, ast.Subscript):
                     continue
-                if not isinstance(target.value, ast.Name):
-                    continue
-                if target.value.id != "runtime":
+                target_owner = target.value
+                if not (
+                    isinstance(target_owner, ast.Attribute)
+                    and isinstance(target_owner.value, ast.Name)
+                    and target_owner.value.id == "self"
+                    and target_owner.attr == "runtime"
+                ):
                     continue
                 if (
                     isinstance(target.slice, ast.Constant)
@@ -602,20 +750,22 @@ class MainShutdownLatchOrderStaticTests(unittest.TestCase):
 
     def test_failed_flat_verification_returns_before_latches_statically(self):
         source, tree = self.shutdown_source_tree()
-        oms_latch = self.run_step_line(tree, "oms_begin_shutdown")
-        gateway_latch = self.run_step_line(tree, "gateway_begin_shutdown")
-        guard = next(
+        establish = next(
             node
             for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_establish_safety_barrier"
+        )
+        guard = next(
+            node for node in ast.walk(establish)
             if isinstance(node, ast.If)
-            and "account_shutdown_proof_required" in ast.dump(node.test)
-            and "kill_flatten_verified" in ast.dump(node.test)
+            and "_verify_parent_flatten" in ast.dump(node.test)
         )
         publisher = next(
             node
             for node in ast.walk(tree)
             if isinstance(node, ast.FunctionDef)
-            and node.name == "publish_shutdown_blocked"
+            and node.name == "_publish_shutdown_blocked"
         )
         guard_source = ast.get_source_segment(source, guard) or ""
         publisher_source = ast.get_source_segment(source, publisher) or ""
@@ -627,19 +777,19 @@ class MainShutdownLatchOrderStaticTests(unittest.TestCase):
             and node.value.value is False
         ]
 
-        self.assertIn("publish_shutdown_blocked", guard_source)
-        self.assertIn('runtime["_shutdown_retryable"] = True', publisher_source)
+        self.assertIn("_publish_shutdown_blocked", guard_source)
+        self.assertIn(
+            'self.runtime["_shutdown_retryable"] = True',
+            publisher_source,
+        )
         self.assertTrue(guard_returns)
-        self.assertLess(guard.lineno, oms_latch)
-        self.assertLess(guard.lineno, gateway_latch)
-        self.assertGreater(
-            self.runtime_key_assignment_lines(tree, "_shutdown_complete")[0],
-            guard.lineno,
+        establish_source = ast.get_source_segment(source, establish) or ""
+        self.assertLess(
+            establish_source.index("_verify_parent_flatten()"),
+            establish_source.index("_latch_shutdown_paths()"),
         )
-        self.assertGreater(
-            self.runtime_key_assignment_lines(tree, "_shutdown_in_progress")[-1],
-            guard.lineno,
-        )
+        self.assertNotIn("oms_begin_shutdown", guard_source)
+        self.assertNotIn("gateway_begin_shutdown", guard_source)
 
     def test_preconnect_and_paper_truth_boundaries_remain_statically(self):
         source, tree = self.shutdown_source_tree()
@@ -650,25 +800,31 @@ class MainShutdownLatchOrderStaticTests(unittest.TestCase):
             node
             for node in ast.walk(tree)
             if isinstance(node, ast.FunctionDef)
-            and node.name == "verify_account_orders"
+            and node.name == "_verify_account_orders"
         )
         verify_positions = next(
             node
             for node in ast.walk(tree)
             if isinstance(node, ast.FunctionDef)
-            and node.name == "verify_account_positions"
+            and node.name == "_verify_account_positions"
         )
         order_source = ast.get_source_segment(source, verify_orders) or ""
         position_source = ast.get_source_segment(source, verify_positions) or ""
 
-        self.assertIn("if not account_shutdown_proof_required", order_source)
+        self.assertIn("if not self.account_proof_required", order_source)
         self.assertIn(
             "verify_preconnect_shutdown_no_order_path",
             order_source,
         )
-        self.assertIn("shutdown_latched", order_source)
-        self.assertIn("if not live_canary_truth_required", position_source)
-        self.assertIn("return bool(kill_flatten_verified)", position_source)
+        self.assertIn("self.shutdown_latched", order_source)
+        self.assertIn(
+            "if not self.live_canary_truth_required",
+            position_source,
+        )
+        self.assertIn(
+            "return bool(self.kill_flatten_verified)",
+            position_source,
+        )
         self.assertIn(
             'not runtime.get("paper_trade", False)',
             live_boundary_source,
@@ -684,31 +840,31 @@ class MainShutdownLatchOrderStaticTests(unittest.TestCase):
 
     def test_parent_flatten_retry_does_not_depend_on_sidecar_resume(self):
         source, tree = self.shutdown_source_tree()
-        resumed_branch = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Name)
-            and node.test.id == "resumed"
-        )
         restart_helper = next(
             node
             for node in ast.walk(tree)
             if isinstance(node, ast.FunctionDef)
-            and node.name == "restart_parent_kill_after_truth_drift"
+            and node.name == "_restart_parent_kill_after_drift"
         )
         helper_source = ast.get_source_segment(source, restart_helper) or ""
         helper_calls = self.call_lines(
             tree,
-            "restart_parent_kill_after_truth_drift",
+            "restart_parent_kill_after_drift",
         )
         sidecar_quiesce = self.run_step_line(tree, "risk_supervisor_quiesce")
+        post_quiesce = inspect.getsource(
+            RuntimeShutdownCoordinator._verify_post_quiesce_truth
+        )
 
         self.assertEqual(len(helper_calls), 2)
         self.assertIn("restart_kill_switch_after_truth_drift", helper_source)
         self.assertIn("wait_for_kill_flatten_verification", helper_source)
+        self.assertNotIn("resume_shutdown_guard", helper_source)
         self.assertLess(helper_calls[0], sidecar_quiesce)
-        self.assertGreater(helper_calls[1], resumed_branch.end_lineno)
+        self.assertLess(
+            post_quiesce.index("_resume_sidecar_shutdown_guard()"),
+            post_quiesce.index("_restart_parent_kill_after_drift("),
+        )
 
 
 class AdminControlStartupTests(unittest.TestCase):
@@ -1092,60 +1248,45 @@ class CommissionConfigStartupTests(unittest.TestCase):
                 self.assertEqual(config, original)
 
     def test_startup_syncs_fees_after_connect_and_before_oms_bootstrap(self):
-        source = ast.parse(inspect.getsource(main_module._run_main))
-        call_lines = {}
-        expected = {
-            "connect_gateway_with_risk_heartbeat",
-            "synchronize_commission_config",
-            "wait_for_initial_market_data_readiness",
-            "bootstrap_or_rearm",
-        }
-        for node in ast.walk(source):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                if node.func.id in expected:
-                    call_lines[node.func.id] = node.lineno
+        run_source = inspect.getsource(RuntimeApplication.run)
+        transport_source = inspect.getsource(
+            RuntimeApplication._connect_execution_transport
+        )
+        gates_source = inspect.getsource(RuntimeApplication._pass_startup_gates)
 
-        self.assertEqual(set(call_lines), expected)
         self.assertLess(
-            call_lines["connect_gateway_with_risk_heartbeat"],
-            call_lines["synchronize_commission_config"],
+            run_source.index("_connect_execution_transport()"),
+            run_source.index("_pass_startup_gates()"),
         )
         self.assertLess(
-            call_lines["synchronize_commission_config"],
-            call_lines["wait_for_initial_market_data_readiness"],
+            transport_source.index("connect_gateway_with_risk_heartbeat("),
+            transport_source.index("synchronize_commission_config("),
         )
         self.assertLess(
-            call_lines["wait_for_initial_market_data_readiness"],
-            call_lines["bootstrap_or_rearm"],
+            gates_source.index("wait_for_initial_market_data_readiness("),
+            gates_source.index("bootstrap_or_rearm("),
         )
 
     def test_strategy_runtime_starts_only_after_bootstrap_and_monitors(self):
-        source = ast.parse(inspect.getsource(main_module._run_main))
-        call_lines = {}
-        for node in ast.walk(source):
-            if not isinstance(node, ast.Call):
-                continue
-            if isinstance(node.func, ast.Name) and node.func.id == "bootstrap_or_rearm":
-                call_lines["bootstrap"] = node.lineno
-                continue
-            if not isinstance(node.func, ast.Attribute) or node.func.attr != "start":
-                continue
-            owner = node.func.value
-            if isinstance(owner, ast.Name) and owner.id in {
-                "strategy_runtime",
-                "truth_monitor",
-                "venue_supervisor",
-            }:
-                call_lines[owner.id] = node.lineno
-
-        self.assertEqual(
-            set(call_lines),
-            {"bootstrap", "strategy_runtime", "truth_monitor", "venue_supervisor"},
+        run_source = inspect.getsource(RuntimeApplication.run)
+        gates_source = inspect.getsource(RuntimeApplication._pass_startup_gates)
+        activation_source = inspect.getsource(
+            RuntimeApplication._activate_execution
         )
-        self.assertLess(call_lines["bootstrap"], call_lines["truth_monitor"])
-        self.assertLess(call_lines["bootstrap"], call_lines["venue_supervisor"])
-        self.assertLess(call_lines["truth_monitor"], call_lines["strategy_runtime"])
-        self.assertLess(call_lines["venue_supervisor"], call_lines["strategy_runtime"])
+
+        self.assertIn("bootstrap_or_rearm(", gates_source)
+        self.assertLess(
+            run_source.index("_pass_startup_gates()"),
+            run_source.index("_activate_execution()"),
+        )
+        self.assertLess(
+            activation_source.index("self.truth_monitor.start()"),
+            activation_source.index("self.strategy_runtime.start()"),
+        )
+        self.assertLess(
+            activation_source.index("self.venue_supervisor.start()"),
+            activation_source.index("self.strategy_runtime.start()"),
+        )
 
 
 if __name__ == "__main__":

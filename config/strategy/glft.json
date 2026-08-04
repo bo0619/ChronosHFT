@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "strategy.glft",
+  "version": 1,
   "strategy": {
     "glft": {
       "_comment": "Paper uses configured A/k only as a labeled proxy. Live ignores public aggTrade and requires a hashed LIVE_BINANCE_RPI_ACK exposure artifact.",

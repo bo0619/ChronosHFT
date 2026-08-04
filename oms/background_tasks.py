@@ -708,6 +708,35 @@ class OMSBackgroundTaskExecutor:
 class OMSBackgroundTaskManager(OMSComponent):
     """Own OMS admission policy and fail-closed handling for background work."""
 
+    OWNER_READS = frozenset(
+        {
+            "_audit",
+            "_background_tasks",
+            "_close_outbound_gate_locked",
+            "_lifecycle_generation",
+            "_sync_capability_mode",
+            "last_freeze_reason",
+            "last_halt_reason",
+            "lock",
+            "manual_rearm_required",
+            "state",
+        }
+    )
+    OWNER_WRITES = frozenset(
+        {
+            "_lifecycle_generation",
+            "last_freeze_reason",
+            "last_halt_reason",
+            "manual_rearm_required",
+            "state",
+        }
+    )
+    LOCAL_STATE = frozenset({"_background_task_rejection_count"})
+
+    def __init__(self, owner):
+        super().__init__(owner)
+        self._background_task_rejection_count = 0
+
     def _latch_background_task_failure(
         self,
         key: str,

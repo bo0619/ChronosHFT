@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 from risk.independent_supervisor import IndependentRiskSupervisor
+from risk.sidecar_protocol import SidecarProtocol
 from risk.sidecar_status import SidecarStatusProjection
 
 
@@ -37,6 +38,7 @@ def test_disabled_projection_is_healthy_and_preserves_safe_defaults():
     assert snapshot["process_alive"] is False
     assert snapshot["pid"] is None
     assert snapshot["healthy"] is True
+    assert snapshot["protocol_handshake_complete"] is False
     assert snapshot["status_age_sec"] is None
     assert snapshot["risk_action"] == "NONE"
     assert snapshot["funding_action"] == "NONE"
@@ -47,15 +49,18 @@ def test_disabled_projection_is_healthy_and_preserves_safe_defaults():
 
 
 def test_enabled_projection_requires_a_live_process_and_fresh_status():
-    last_status = {
-        "healthy": True,
-        "reason": "",
-        "exchange_healthy": True,
-        "risk_action": "NONE",
-        "risk_metrics": {"open_order_count": 0},
-        "state_path": "reported-state.json",
-        "last_stop_cancel_ok": True,
-    }
+    last_status = SidecarProtocol.child_status(
+        {
+            "healthy": True,
+            "reason": "",
+            "exchange_healthy": True,
+            "risk_action": "NONE",
+            "risk_metrics": {"open_order_count": 0},
+            "state_path": "reported-state.json",
+            "last_stop_cancel_ok": True,
+        },
+        handshake_complete=True,
+    )
 
     snapshot = _build(
         last_status=last_status,
@@ -65,6 +70,11 @@ def test_enabled_projection_requires_a_live_process_and_fresh_status():
     assert snapshot["process_alive"] is True
     assert snapshot["pid"] == 4321
     assert snapshot["healthy"] is True
+    assert snapshot["protocol_version"] == SidecarProtocol.VERSION
+    assert set(snapshot["protocol_capabilities"]) == (
+        SidecarProtocol.CHILD_CAPABILITIES
+    )
+    assert snapshot["protocol_handshake_complete"] is True
     assert snapshot["status_age_sec"] == 2.0
     assert snapshot["state_path"] == "reported-state.json"
     assert snapshot["last_stop_cancel_ok"] is True
@@ -91,6 +101,21 @@ def test_projection_copies_nested_risk_metrics_for_callers():
     snapshot["risk_metrics"]["gross_notional"] = 99.0
 
     assert last_status["risk_metrics"] == {"gross_notional": 10.0}
+
+
+def test_enabled_projection_rejects_unconfirmed_protocol_handshake():
+    last_status = SidecarProtocol.child_status(
+        {"healthy": True},
+        handshake_complete=False,
+    )
+
+    snapshot = _build(
+        last_status=last_status,
+        last_status_received_at=100.0,
+    )
+
+    assert snapshot["protocol_handshake_complete"] is False
+    assert snapshot["healthy"] is False
 
 
 def test_supervisor_facade_uses_its_patchable_monotonic_clock():

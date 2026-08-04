@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "system.logging",
+  "version": 1,
   "system": {
     "log_level": "INFO",
     "log_path": "logs",

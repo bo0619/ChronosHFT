@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "account",
+  "version": 1,
   "account": {
     "leverage": 8,
     "margin_type": "ISOLATED",

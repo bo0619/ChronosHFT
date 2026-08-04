@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "alerts",
+  "version": 1,
   "alert": {
     "active": false,
     "telegram_token": "",

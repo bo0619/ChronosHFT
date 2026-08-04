@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "strategy.avellaneda_stoikov",
+  "version": 1,
   "strategy": {
     "avellaneda_stoikov": {
       "_comment": "Registered Paper alternative; not concurrent with GLFT. Adaptive A-S uses a configured A proxy only for size because A cancels from the optimal-price condition.",

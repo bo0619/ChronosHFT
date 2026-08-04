@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "system.time_sync",
+  "version": 1,
   "system": {
     "time_sync": {
       "_comment": "Software HFT clock: Binance multi-sample calibration anchors exchange epoch to perf_counter_ns. Startup and every risk-increasing order fail closed unless healthy.",

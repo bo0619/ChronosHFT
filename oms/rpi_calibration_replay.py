@@ -22,9 +22,34 @@ from .journal import JournalCorruptionError
 class RpiCalibrationReplay(OMSComponent):
     """Rebuild RPI calibration quota state from the durable OMS journal.
 
-    The owner proxy is intentionally narrow in lifecycle: replay reads and
-    restores OMS state, while live permit enforcement remains with the OMS.
+    Its declared context permits replay to read OMS policy and calibration
+    state; live permit enforcement remains with the runtime component.
     """
+
+    OWNER_READS = frozenset(
+        {
+            "RPI_CALIBRATION_ACTIVATION_PAYLOAD_KEYS",
+            "RPI_CALIBRATION_BYPASS_PAYLOAD_KEYS",
+            "RPI_CALIBRATION_EXPIRY_PAYLOAD_KEYS",
+            "RPI_CALIBRATION_JOURNAL_SCHEMA",
+            "RPI_CALIBRATION_MODEL",
+            "RPI_CALIBRATION_PERMIT_KEYS",
+            "RPI_CALIBRATION_POLICY_KEYS",
+            "RPI_CALIBRATION_RESERVATION_PAYLOAD_KEYS",
+            "RPI_CALIBRATION_SIGNATURE_KEYS",
+            "RPI_CALIBRATION_STAGE",
+            "RPI_CALIBRATION_STRATEGY_ID",
+            "RPI_CALIBRATION_VENUE",
+            "USDT_MICRO_SCALE",
+            "_decimal_text",
+            "_parse_utc_exchange_ns",
+            "_positive_decimal",
+            "_require_exact_mapping_keys",
+            "_require_sha256",
+            "_rpi_calibration",
+            "_usdt_to_microu",
+        }
+    )
 
     @staticmethod
     def _journal_int(

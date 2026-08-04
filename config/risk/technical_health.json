@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "risk.technical_health",
+  "version": 1,
   "risk": {
     "tech_health": {
       "max_latency_ms": 1200,

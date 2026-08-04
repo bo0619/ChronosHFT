@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "system.admin_control",
+  "version": 1,
   "system": {
     "admin_control": {
       "_comment": "Bound local dashboard/CLI command artifacts; these are diagnostic copies, not the durable OMS audit journal.",

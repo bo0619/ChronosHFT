@@ -126,6 +126,28 @@ def test_configuration_assembles_parent_and_child_settings():
     ).hexdigest()
 
 
+def test_missing_sidecar_caps_inherit_canonical_risk_defaults():
+    configuration = _build(
+        {
+            "risk": {
+                "risk_control_heartbeat": {
+                    "enabled": True,
+                    "required_source": "independent_supervisor",
+                },
+                "independent_supervisor": {
+                    "enabled": True,
+                    "api_key": "risk-key",
+                    "api_secret": "risk-secret",
+                },
+            }
+        }
+    )
+
+    assert configuration.child_settings["max_daily_loss"] == 500.0
+    assert configuration.child_settings["max_account_gross_notional"] == 0.0
+    assert configuration.child_settings["max_drawdown_pct"] == 0.0
+
+
 def test_configuration_preserves_parent_timing_floors():
     configuration = _build(
         {
@@ -201,6 +223,45 @@ def test_non_finite_parent_timing_fails_with_original_field_label():
                 }
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "root_value", "sidecar_value", "message"),
+    [
+        ("max_account_gross_notional", 500.0, 0.0, "must be positive"),
+        ("max_daily_loss", 100.0, 101.0, "must not exceed"),
+        ("max_drawdown_pct", 0.1, float("inf"), "finite number"),
+    ],
+)
+def test_enabled_sidecar_caps_must_be_positive_finite_and_no_wider_than_root(
+    field,
+    root_value,
+    sidecar_value,
+    message,
+):
+    config = {
+        "risk": {
+            "limits": {
+                "max_account_gross_notional": 500.0,
+                "max_daily_loss": 100.0,
+                "max_drawdown_pct": 0.1,
+                field: root_value,
+            },
+            "risk_control_heartbeat": {
+                "enabled": True,
+                "required_source": "independent_supervisor",
+            },
+            "independent_supervisor": {
+                "enabled": True,
+                "api_key": "risk-key",
+                "api_secret": "risk-secret",
+                field: sidecar_value,
+            },
+        }
+    }
+
+    with pytest.raises(ValueError, match=message):
+        _build(config)
 
 
 def test_top_level_configuration_is_immutable():

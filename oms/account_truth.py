@@ -31,6 +31,73 @@ from .order import Order
 class OMSAccountTruth(OMSComponent):
     """Own recovery of exchange orders, fills and account cash flows."""
 
+    OWNER_READS = frozenset(
+        {
+            "_apply_event",
+            "_audit",
+            "_emit_order_update",
+            "_fail_closed_on_journal_error",
+            "_ensure_symbol_guard_records_locked",
+            "_normalize_remote_open_orders",
+            "_order_truth_resolution_inflight",
+            "_record_order_snapshot",
+            "_schedule_rpi_calibration_runtime_enforcement",
+            "_shutdown_requested",
+            "_stopped",
+            "_submit_background_task",
+            "_unknown_not_found_counts",
+            "_write_tombstone",
+            "account",
+            "audit_logger",
+            "cancel_order",
+            "clear_symbol_freeze",
+            "config",
+            "exchange_id_map",
+            "execution_ids",
+            "exposure",
+            "external_cash_flow_assets",
+            "external_cash_flow_ids",
+            "external_cash_flow_max_pages",
+            "external_cash_flow_poll_interval_sec",
+            "external_cash_flow_recovery_lookback_ms",
+            "external_cash_flow_recovery_overlap_ms",
+            "external_cash_flow_scan_end_ms",
+            "external_cash_flow_truth_enabled",
+            "external_income_types",
+            "freeze_system",
+            "gateway",
+            "journal",
+            "last_external_cash_flow_poll_at",
+            "lock",
+            "order_monitor",
+            "orders",
+            "paper_trade_database",
+            "query_income_history",
+            "query_order",
+            "query_user_trades",
+            "rest_confirmed_execution_ids",
+            "trade_cursors",
+            "trade_recovery_id_overlap",
+            "trade_recovery_lookback_ms",
+            "trade_recovery_overlap_ms",
+            "trade_scan_end_ms",
+            "trade_tail_expected_ids",
+            "trade_tail_verification_attempts",
+            "trade_tail_verification_delay_sec",
+            "trade_tail_verification_inflight",
+            "trade_tail_verification_retry_sec",
+            "trigger_reconcile",
+            "unknown_order_min_not_found",
+            "unknown_order_resolution_timeout_sec",
+        }
+    )
+    OWNER_WRITES = frozenset(
+        {
+            "external_cash_flow_scan_end_ms",
+            "last_external_cash_flow_poll_at",
+        }
+    )
+
     @staticmethod
     def _finite_truth_float(
         value,

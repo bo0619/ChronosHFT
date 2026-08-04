@@ -19,7 +19,11 @@ from oms.engine import OMS
 from oms.initializer import OMSInitializer
 from oms.journal import OMSJournal
 from oms.order import Order
-from oms.paper_trade_database import LEGACY_RUN_ID, PaperTradeDatabase
+from oms.paper_trade_database import (
+    LEGACY_RUN_ID,
+    PaperTradeDatabase,
+    PaperTradeDatabaseError,
+)
 from scripts.query_paper_trades import main as query_main
 from scripts.query_paper_trades import query_observations
 from scripts.query_paper_trades import query_rows
@@ -646,221 +650,97 @@ def test_database_records_calibration_observations_as_structured_rows(tmp_path):
     assert queried_markets[0]["basis_bps"] == 19.9800266
 
 
-def test_schema_v1_is_migrated_in_place_without_losing_runs(tmp_path):
+@pytest.mark.parametrize("legacy_version", [1, 2, 3, 4])
+def test_legacy_schema_requires_offline_projection_rebuild(
+    tmp_path,
+    legacy_version,
+):
     config = make_config(tmp_path)
     journal = OMSJournal(config)
     first = PaperTradeDatabase(config, journal)
-    first_run_id = first.run_id
-    assert first.close(clean_shutdown=True, reason="before_migration")
+    assert first.close(clean_shutdown=True, reason="before_schema_downgrade")
 
     path = Path(config["paper_trade_database"]["path"])
-    upgraded_fill_columns = (
-        "fill_trigger",
-        "market_trade_id",
-        "market_trade_price",
-        "market_trade_qty",
-        "market_trade_exchange_time",
-        "market_trade_received_time",
-        "market_trade_clock_offset_ms",
-        "market_trade_transport_latency_ms",
-        "market_trade_local_age_ms",
-        "queue_ahead_before",
-        "best_bid_at_fill",
-        "best_ask_at_fill",
-        "mid_at_fill",
-        "quote_age_ms",
-    )
     with sqlite3.connect(path) as connection:
-        for column in upgraded_fill_columns:
-            connection.execute(f"ALTER TABLE paper_fills DROP COLUMN {column}")
-        for column in ("software_version", "code_revision"):
-            connection.execute(f"ALTER TABLE paper_runs DROP COLUMN {column}")
-        for table in (
-            "paper_order_events",
-            "paper_strategy_samples",
-            "paper_fill_markouts",
-            "paper_account_samples",
-            "paper_system_events",
-            "paper_market_samples",
-        ):
-            connection.execute(f"DROP TABLE {table}")
-        connection.execute("PRAGMA user_version=1")
+        connection.execute(f"PRAGMA user_version={legacy_version}")
         connection.execute(
-            "UPDATE projection_metadata SET value='1' WHERE key='schema_version'"
+            "UPDATE projection_metadata SET value=? WHERE key='schema_version'",
+            (str(legacy_version),),
         )
 
-    second = PaperTradeDatabase(config, journal)
-    assert second.close(clean_shutdown=True, reason="after_migration")
-    with sqlite3.connect(path) as connection:
-        version = connection.execute("PRAGMA user_version").fetchone()[0]
-        columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(paper_fills)")
-        }
-        tables = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
-        }
-        run_columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(paper_runs)")
-        }
-        recovered_run = connection.execute(
-            "SELECT run_id FROM paper_runs WHERE run_id = ?",
-            (first_run_id,),
-        ).fetchone()
-    assert version == 4
-    assert set(upgraded_fill_columns) <= columns
-    assert {"software_version", "code_revision"} <= run_columns
-    assert {
-        "paper_order_events",
-        "paper_strategy_samples",
-        "paper_fill_markouts",
-        "paper_account_samples",
-        "paper_system_events",
-        "paper_market_samples",
-    } <= tables
-    assert recovered_run == (first_run_id,)
+    with pytest.raises(PaperTradeDatabaseError, match="offline rebuild"):
+        PaperTradeDatabase(config, journal)
 
 
-def test_schema_v2_is_migrated_to_v4_with_all_telemetry(tmp_path):
+def test_projection_rejects_replacement_journal_identity(tmp_path):
+    config = make_config(tmp_path)
+    original = OMSJournal(config)
+    database = PaperTradeDatabase(config, original)
+    assert database.close(clean_shutdown=True, reason="identity_test")
+
+    replacement_config = make_config(tmp_path)
+    replacement_config["oms"]["journal_path"] = str(
+        tmp_path / "replacement-journal"
+    )
+    replacement = OMSJournal(replacement_config)
+
+    with pytest.raises(PaperTradeDatabaseError, match="different journal_id"):
+        PaperTradeDatabase(replacement_config, replacement)
+
+
+def test_projection_rejects_same_sequence_with_different_hash(tmp_path):
     config = make_config(tmp_path)
     journal = OMSJournal(config)
-    first = PaperTradeDatabase(config, journal)
-    assert first.close(clean_shutdown=True, reason="before_v4_migration")
+    database = PaperTradeDatabase(config, journal)
+    payload = execution_payload(run_id=database.run_id)
+    sequence = journal.append("execution_record", payload)
+    metadata = journal.commit_metadata(sequence)
+    assert database.record_execution(
+        sequence,
+        payload,
+        journal_ts=metadata["ts"],
+        journal_hash=metadata["hash"],
+    )
+    assert database.close(clean_shutdown=True, reason="collision_test")
 
-    path = Path(config["paper_trade_database"]["path"])
-    fill_columns = (
-        "market_trade_exchange_time",
-        "market_trade_received_time",
-        "market_trade_clock_offset_ms",
-        "market_trade_transport_latency_ms",
-        "market_trade_local_age_ms",
-    )
-    order_columns = ("order_type", "reduce_only", "tag")
-    strategy_columns = (
-        "best_bid_qty",
-        "best_ask_qty",
-        "orderbook_exchange_time",
-        "orderbook_received_time",
-        "orderbook_corrected_received_time",
-        "orderbook_dispatch_time",
-        "orderbook_received_monotonic",
-        "orderbook_dispatch_monotonic",
-        "strategy_callback_monotonic",
-        "clock_offset_ms",
-        "transport_latency_ms",
-        "gateway_processing_latency_ms",
-        "strategy_queue_latency_ms",
-        "callback_age_ms",
-        "strategy_compute_latency_ms",
-        "formula_version",
-        "units_version",
-        "intensity_source",
-    )
-    run_columns = ("software_version", "code_revision")
-    with sqlite3.connect(path) as connection:
-        for table, columns in (
-            ("paper_fills", fill_columns),
-            ("paper_order_events", order_columns),
-            ("paper_strategy_samples", strategy_columns),
-            ("paper_runs", run_columns),
-        ):
-            for column in columns:
-                connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
-        connection.execute("DROP TABLE paper_account_samples")
-        connection.execute("DROP TABLE paper_system_events")
-        connection.execute("DROP TABLE paper_market_samples")
-        connection.execute("PRAGMA user_version=2")
+    with sqlite3.connect(config["paper_trade_database"]["path"]) as connection:
         connection.execute(
-            "UPDATE projection_metadata SET value='2' WHERE key='schema_version'"
+            """
+            UPDATE projection_journal_records SET journal_hash = ?
+            WHERE journal_id = ? AND journal_seq = ?
+            """,
+            ("0" * 64, journal.journal_id, sequence),
         )
 
-    second = PaperTradeDatabase(config, journal)
-    assert second.close(clean_shutdown=True, reason="after_v4_migration")
-    with sqlite3.connect(path) as connection:
-        version = connection.execute("PRAGMA user_version").fetchone()[0]
-        tables = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
-        }
-        restored = {}
-        for table in (
-            "paper_fills",
-            "paper_order_events",
-            "paper_strategy_samples",
-            "paper_runs",
-        ):
-            restored[table] = {
-                row[1]
-                for row in connection.execute(f"PRAGMA table_info({table})")
-            }
-    assert version == 4
-    assert set(fill_columns) <= restored["paper_fills"]
-    assert set(order_columns) <= restored["paper_order_events"]
-    assert set(strategy_columns) <= restored["paper_strategy_samples"]
-    assert set(run_columns) <= restored["paper_runs"]
-    assert {
-        "paper_account_samples",
-        "paper_system_events",
-        "paper_market_samples",
-    } <= tables
+    with pytest.raises(PaperTradeDatabaseError, match="collision"):
+        PaperTradeDatabase(config, journal)
 
 
-def test_schema_v3_is_migrated_to_v4_without_losing_runs(tmp_path):
+def test_offline_rebuild_creates_new_v5_projection_without_journal_writes(
+    tmp_path,
+):
     config = make_config(tmp_path)
     journal = OMSJournal(config)
-    first = PaperTradeDatabase(config, journal)
-    first_run_id = first.run_id
-    assert first.close(clean_shutdown=True, reason="before_v3_to_v4_migration")
+    database = PaperTradeDatabase(config, journal)
+    payload = execution_payload(run_id=database.run_id)
+    journal.append("execution_record", payload)
+    assert database.close(clean_shutdown=True, reason="offline_rebuild_source")
+    head_before = journal.health_snapshot()["next_seq"]
+    destination = tmp_path / "rebuilt.sqlite3"
 
-    path = Path(config["paper_trade_database"]["path"])
-    strategy_columns = ("formula_version", "units_version", "intensity_source")
-    run_columns = ("software_version", "code_revision")
-    with sqlite3.connect(path) as connection:
-        for column in strategy_columns:
-            connection.execute(
-                f"ALTER TABLE paper_strategy_samples DROP COLUMN {column}"
-            )
-        for column in run_columns:
-            connection.execute(f"ALTER TABLE paper_runs DROP COLUMN {column}")
-        connection.execute("DROP TABLE paper_market_samples")
-        connection.execute("PRAGMA user_version=3")
-        connection.execute(
-            "UPDATE projection_metadata SET value='3' WHERE key='schema_version'"
-        )
+    receipt = PaperTradeDatabase.rebuild_offline(
+        config,
+        journal,
+        destination_path=destination,
+    )
 
-    second = PaperTradeDatabase(config, journal)
-    assert second.close(clean_shutdown=True, reason="after_v3_to_v4_migration")
-    with sqlite3.connect(path) as connection:
-        version = connection.execute("PRAGMA user_version").fetchone()[0]
-        tables = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
-        }
-        restored_strategy = {
-            row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(paper_strategy_samples)"
-            )
-        }
-        restored_runs = {
-            row[1] for row in connection.execute("PRAGMA table_info(paper_runs)")
-        }
-        recovered_run = connection.execute(
-            "SELECT run_id FROM paper_runs WHERE run_id = ?",
-            (first_run_id,),
-        ).fetchone()
-
-    assert version == 4
-    assert "paper_market_samples" in tables
-    assert set(strategy_columns) <= restored_strategy
-    assert set(run_columns) <= restored_runs
-    assert recovered_run == (first_run_id,)
+    assert journal.health_snapshot()["next_seq"] == head_before
+    assert receipt["schema_version"] == 5
+    assert receipt["journal_id"] == journal.journal_id
+    assert receipt["fill_count"] == 1
+    with sqlite3.connect(destination) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0] == 1
 
 
 def test_backfill_repairs_missing_run_start_sequence(tmp_path):

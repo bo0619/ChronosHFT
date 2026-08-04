@@ -45,15 +45,28 @@ class BinanceSidecarClockOwner(Protocol):
 class BinanceSidecarClock:
     """Validate clock samples and maintain a monotonic exchange-time anchor."""
 
-    __slots__ = ("_finite_float", "_owner")
+    __slots__ = (
+        "_finite_float",
+        "_monotonic",
+        "_owner",
+        "_sleep",
+        "_wall_time",
+    )
 
     def __init__(
         self,
         owner: BinanceSidecarClockOwner,
         finite_float: Callable[[object, str], float],
+        *,
+        wall_time: Callable[[], float] | None = None,
+        monotonic: Callable[[], float] | None = None,
+        sleep: Callable[[float], None] | None = None,
     ):
         self._owner = owner
         self._finite_float = finite_float
+        self._wall_time = wall_time or (lambda: time.time())
+        self._monotonic = monotonic or (lambda: time.perf_counter())
+        self._sleep = sleep or (lambda seconds: time.sleep(seconds))
 
     def collect_samples(self, *, emergency: bool = False):
         owner = self._owner
@@ -96,8 +109,8 @@ class BinanceSidecarClock:
         samples = []
         errors = []
         for index in range(sample_count):
-            started_monotonic = time.perf_counter()
-            started_ms = time.time() * 1000.0
+            started_monotonic = self._monotonic()
+            started_ms = self._wall_time() * 1000.0
             if emergency:
                 server_time_response = owner.rest.get_server_time(
                     emergency=True
@@ -109,8 +122,8 @@ class BinanceSidecarClock:
                 dict,
                 "server_time",
             )
-            finished_ms = time.time() * 1000.0
-            finished_monotonic = time.perf_counter()
+            finished_ms = self._wall_time() * 1000.0
+            finished_monotonic = self._monotonic()
             if not ok:
                 errors.append(reason)
             else:
@@ -148,7 +161,7 @@ class BinanceSidecarClock:
                                 }
                             )
             if index + 1 < sample_count and spacing_ms > 0.0:
-                time.sleep(spacing_ms / 1000.0)
+                self._sleep(spacing_ms / 1000.0)
         if len(samples) < min_samples:
             reason = errors[-1] if errors else "clock_sample_quorum_failed"
             return None, reason
@@ -175,8 +188,6 @@ class BinanceSidecarClock:
         }, ""
 
     def sync(self, *, emergency: bool = False):
-        from infrastructure.time_service import time_service
-
         owner = self._owner
         sample, reason = owner._collect_clock_samples(
             emergency=emergency,
@@ -231,8 +242,8 @@ class BinanceSidecarClock:
             return False, reason
 
         offset_ms = float(sample["offset_ms"])
-        anchor_monotonic = time.perf_counter()
-        anchor_wall_ms = time.time() * 1000.0
+        anchor_monotonic = self._monotonic()
+        anchor_wall_ms = self._wall_time() * 1000.0
         anchor_epoch_ms = anchor_wall_ms + offset_ms
         if not all(
             math.isfinite(value)
@@ -349,10 +360,6 @@ class BinanceSidecarClock:
         owner.clock_offset_ms = offset_ms
         owner._clock_anchor_epoch_ms = anchor_epoch_ms
         owner._clock_anchor_monotonic = anchor_monotonic
-        time_service.offset = owner.clock_offset_ms
-        time_service.last_sync_time = anchor_wall_ms / 1000.0
-        time_service.last_rtt_ms = owner.clock_rtt_ms
-        time_service.last_error = ""
         owner.last_clock_sync_monotonic = anchor_monotonic
         owner.clock_reason = ""
         return True, ""
@@ -363,7 +370,7 @@ class BinanceSidecarClock:
             return True, ""
         age = max(
             0.0,
-            time.perf_counter()
+            self._monotonic()
             - float(
                 getattr(owner, "last_clock_sync_monotonic", 0.0) or 0.0
             ),

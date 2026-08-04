@@ -25,6 +25,52 @@ from .component import OMSComponent
 class OMSOrderPolicy(OMSComponent):
     """Own pre-trade gates, mode adaptation and emergency reduce-only policy."""
 
+    OWNER_READS = frozenset(
+        {
+            "_audit",
+            "_ensure_capability_mode_consistent",
+            "_get_capability_block_reason",
+            "_submit_internal_order",
+            "_venue_dead_man_switch_health_locked",
+            "account",
+            "can_open_new_risk",
+            "capability_mode",
+            "degraded_aggressive_to_passive",
+            "duplicate_intent_window_sec",
+            "emergency_flatten_cooldown_sec",
+            "exchange_self_trade_prevention_mode",
+            "exposure",
+            "get_strategy_freeze_reason",
+            "get_symbol_freeze_reason",
+            "get_venue_freeze_reason",
+            "last_emergency_flatten_ts",
+            "last_risk_control_heartbeat_monotonic",
+            "local_self_cross_check_enabled",
+            "lock",
+            "margin_health_enabled",
+            "margin_health_require_snapshot",
+            "margin_reduce_only_ratio",
+            "margin_snapshot_max_age_sec",
+            "max_strategy_active_orders",
+            "max_strategy_symbol_active_orders",
+            "max_symbol_active_orders",
+            "max_total_active_orders",
+            "orders",
+            "paper_trade_database",
+            "query_positions",
+            "require_explicit_strategy_budget",
+            "require_healthy_clock",
+            "risk_control_heartbeat_enabled",
+            "risk_control_heartbeat_max_age_sec",
+            "risk_control_heartbeat_reason",
+            "risk_control_heartbeat_status",
+            "self_trade_prevention_enabled",
+            "strategy_risk_budgets",
+            "strategy_risk_budgets_enabled",
+            "venue_dead_man_switch_enabled",
+        }
+    )
+
     def _get_clock_health_rejection_locked(self, intent: OrderIntent) -> str:
         if intent.reduce_only or not self.require_healthy_clock:
             return ""

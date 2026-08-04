@@ -2,7 +2,16 @@ import queue
 
 import pytest
 
+from risk.sidecar_protocol import SidecarProtocol
 from risk.sidecar_runtime import SidecarRuntime
+
+
+def _message(message_type, session_id="session-1", **payload):
+    return SidecarProtocol.parent_message(
+        message_type,
+        session_id,
+        **payload,
+    )
 
 
 class _CommandCore:
@@ -34,52 +43,22 @@ class _CommandCore:
 def test_command_dispatch_routes_only_the_active_session():
     core = _CommandCore()
     commands = [
-        {
-            "type": "HEARTBEAT",
-            "session_id": "session-1",
-            "sequence": 7,
-            "sent_monotonic": 12.5,
-        },
-        {
-            "type": "QUIESCE",
-            "session_id": "session-1",
-            "request_id": "q1",
-            "reason": "operator",
-        },
-        {
-            "type": "RESUME_SHUTDOWN",
-            "session_id": "session-1",
-            "request_id": "r1",
-            "reason": "truth_drift",
-        },
-        {
-            "type": "STOP",
-            "session_id": "session-1",
-            "request_id": "s1",
-            "cancel_orders": False,
-        },
-        {
-            "type": "PREPARE_REARM",
-            "session_id": "session-1",
-            "request_id": "p1",
-            "reason": "operator_ack",
-        },
-        {
-            "type": "COMMIT_REARM",
-            "session_id": "session-1",
-            "request_id": "c1",
-            "token": "token-1",
-        },
-        {
-            "type": "ABORT_REARM",
-            "session_id": "session-1",
-            "token": "token-2",
-        },
-        {
-            "type": "STOP",
-            "session_id": "old-session",
-            "request_id": "ignored",
-        },
+        _message("HEARTBEAT", sequence=7, sent_monotonic=12.5),
+        _message("QUIESCE", request_id="q1", reason="operator"),
+        _message(
+            "RESUME_SHUTDOWN",
+            request_id="r1",
+            reason="truth_drift",
+        ),
+        _message("STOP", request_id="s1", cancel_orders=False),
+        _message(
+            "PREPARE_REARM",
+            request_id="p1",
+            reason="operator_ack",
+        ),
+        _message("COMMIT_REARM", request_id="c1", token="token-1"),
+        _message("ABORT_REARM", token="token-2"),
+        _message("STOP", "old-session", request_id="ignored"),
     ]
     command_queue = queue.Queue()
     for command in commands:
@@ -98,21 +77,40 @@ def test_command_dispatch_routes_only_the_active_session():
     ]
 
 
+def test_command_dispatch_ignores_malformed_and_unknown_messages():
+    core = _CommandCore()
+
+    assert SidecarRuntime.dispatch_command(core, None, "session-1") is False
+    assert (
+        SidecarRuntime.dispatch_command(
+            core,
+            _message("UNKNOWN"),
+            "session-1",
+        )
+        is False
+    )
+    assert (
+        SidecarRuntime.dispatch_command(
+            core,
+            _message(
+                "STOP",
+                request_id="stop-1",
+                cancel_orders="false",
+            ),
+            "session-1",
+        )
+        is False
+    )
+    assert core.calls == []
+
+
 def test_heartbeat_channel_applies_only_the_latest_message():
     heartbeat_queue = queue.Queue()
     heartbeat_queue.put(
-        {
-            "session_id": "session-1",
-            "sequence": 1,
-            "sent_monotonic": 10.0,
-        }
+        _message("HEARTBEAT", sequence=1, sent_monotonic=10.0)
     )
     heartbeat_queue.put(
-        {
-            "session_id": "session-1",
-            "sequence": 3,
-            "sent_monotonic": 12.0,
-        }
+        _message("HEARTBEAT", sequence=3, sent_monotonic=12.0)
     )
     core = _CommandCore()
 
@@ -123,6 +121,26 @@ def test_heartbeat_channel_applies_only_the_latest_message():
     )
 
     assert core.calls == [("HEARTBEAT", 3, 12.0)]
+
+
+def test_heartbeat_channel_ignores_malformed_messages_without_exiting():
+    heartbeat_queue = queue.Queue()
+    heartbeat_queue.put(
+        _message("HEARTBEAT", sequence=4, sent_monotonic=13.0)
+    )
+    heartbeat_queue.put(None)
+    heartbeat_queue.put(
+        _message("HEARTBEAT", sequence="5", sent_monotonic=14.0)
+    )
+    core = _CommandCore()
+
+    SidecarRuntime.drain_latest_heartbeat(
+        heartbeat_queue,
+        core,
+        "session-1",
+    )
+
+    assert core.calls == [("HEARTBEAT", 4, 13.0)]
 
 
 def _status():
@@ -218,7 +236,9 @@ def test_runtime_publishes_initial_and_terminal_status_then_closes_clients():
     SidecarRuntime.run(
         command_queue,
         status_queue,
-        {"session_id": "session-1", "status_interval_sec": 1.0},
+        SidecarProtocol.with_launch_contract(
+            {"session_id": "session-1", "status_interval_sec": 1.0}
+        ),
         exchange,
         snapshot_exchange=snapshot_exchange,
         heartbeat_queue=None,
@@ -240,6 +260,19 @@ def test_runtime_publishes_initial_and_terminal_status_then_closes_clients():
     assert all(item[0] is status_queue for item in published)
     assert all(item[1]["session_id"] == "session-1" for item in published)
     assert all(item[1]["pid"] == 4321 for item in published)
+    assert all(
+        item[1]["protocol_version"] == SidecarProtocol.VERSION
+        for item in published
+    )
+    assert all(
+        item[1]["protocol_handshake_complete"] is True
+        for item in published
+    )
+    assert all(
+        set(item[1]["capabilities"])
+        == SidecarProtocol.CHILD_CAPABILITIES
+        for item in published
+    )
     assert sleeps == [0.05]
     assert workers[0].started is True
     assert workers[0].stopped is True
@@ -257,7 +290,7 @@ def test_live_exchange_requires_a_distinct_snapshot_client():
         SidecarRuntime.run(
             queue.Queue(),
             object(),
-            {},
+            SidecarProtocol.with_launch_contract({}),
             exchange,
             snapshot_exchange=None,
             heartbeat_queue=None,

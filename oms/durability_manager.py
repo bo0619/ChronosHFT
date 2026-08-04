@@ -19,6 +19,43 @@ from .order import Order
 class OMSDurabilityManager(OMSComponent):
     """Own durable command outcomes and journal-failure containment."""
 
+    OWNER_READS = frozenset(
+        {
+            "_account_cancel_symbols",
+            "_cancel_all_orders_unchecked",
+            "_close_outbound_gate_locked",
+            "_ensure_symbol_guard_records_locked",
+            "_lifecycle_generation",
+            "_outbound_all_order_seal_reason",
+            "_outbound_gate_holds",
+            "_refresh_symbol_guard_effective_locked",
+            "_symbol_guard_owner",
+            "_wait_for_outbound_order_sends",
+            "audit_logger",
+            "capability_mode",
+            "capability_reason",
+            "event_engine",
+            "last_freeze_reason",
+            "last_halt_reason",
+            "lock",
+            "manual_rearm_required",
+            "state",
+            "symbol_guard_epoch_counters",
+        }
+    )
+    OWNER_WRITES = frozenset(
+        {
+            "_lifecycle_generation",
+            "_outbound_all_order_seal_reason",
+            "capability_mode",
+            "capability_reason",
+            "last_freeze_reason",
+            "last_halt_reason",
+            "manual_rearm_required",
+            "state",
+        }
+    )
+
     def _record_command_result(
         self,
         command_id: str,

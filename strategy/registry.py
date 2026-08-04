@@ -241,10 +241,21 @@ def create_primary_strategy(
     config: Mapping[str, Any],
 ) -> Any:
     """Validate registrations and construct the sole primary strategy."""
+    from strategy.contracts import coerce_strategy_execution_port
+
     strategy_config = _strategy_config(config)
     registered_models = registered_model_keys(config)
     primary_model = _primary_model_key(strategy_config, registered_models)
     merged_config = effective_primary_strategy_config(config)
+    execution = coerce_strategy_execution_port(oms)
+    resolved_config = deepcopy(dict(config))
+    if "execution" not in resolved_config and "paper_trade" not in resolved_config:
+        compatibility_config = getattr(oms, "config", {})
+        if isinstance(compatibility_config, Mapping):
+            resolved_config = _deep_merge(
+                compatibility_config,
+                resolved_config,
+            )
 
     if primary_model == "glft":
         from strategy.model_readiness import (
@@ -274,14 +285,20 @@ def create_primary_strategy(
             )
         from strategy.glft import GLFTStrategy
 
-        strategy = GLFTStrategy(engine, oms, strategy_config=merged_config)
+        strategy = GLFTStrategy(
+            engine,
+            execution,
+            strategy_config=merged_config,
+            resolved_config=resolved_config,
+        )
     elif primary_model == "avellaneda_stoikov":
         from strategy.avellaneda_stoikov import AvellanedaStoikovStrategy
 
         strategy = AvellanedaStoikovStrategy(
             engine,
-            oms,
+            execution,
             strategy_config=merged_config,
+            resolved_config=resolved_config,
         )
     else:  # pragma: no cover - guarded by registry validation above.
         raise AssertionError(f"No strategy builder for {primary_model!r}")

@@ -29,6 +29,96 @@ from .rpi_calibration_manager import RpiCalibrationManager
 class RpiCalibrationRuntime(OMSComponent):
     """Own live calibration quotas, loss caps and terminal verification."""
 
+    OWNER_READS = frozenset(
+        {
+            "RPI_CALIBRATION_JOURNAL_SCHEMA",
+            "RPI_CALIBRATION_MODEL",
+            "RPI_CALIBRATION_STAGE",
+            "RPI_CALIBRATION_STRATEGY_ID",
+            "RPI_CALIBRATION_VENUE",
+            "_account_cancel_symbols",
+            "_audit",
+            "_backfill_trade_history",
+            "_cancel_all_orders_unchecked",
+            "_cancel_orders_matching",
+            "_close_outbound_gate_locked",
+            "_decimal_text",
+            "_fail_closed_on_journal_error",
+            "_normalize_remote_open_orders",
+            "_outbound_gate_condition",
+            "_outbound_order_sends_inflight",
+            "_positive_decimal",
+            "_rpi_calibration",
+            "_rpi_calibration_budget_exhausted",
+            "_rpi_calibration_cumulative_notional_microu",
+            "_rpi_calibration_effective_loss_cap_microu",
+            "_rpi_calibration_enforcement_inflight",
+            "_rpi_calibration_enforcement_thread",
+            "_rpi_calibration_expired",
+            "_rpi_calibration_expiry_reason",
+            "_rpi_calibration_last_reserved_exchange_ns",
+            "_rpi_calibration_peak_observed_loss_microu",
+            "_rpi_calibration_permit_activated",
+            "_rpi_calibration_permit_start_notional_microu",
+            "_rpi_calibration_permit_start_order_count",
+            "_rpi_calibration_reservation_exchange_ns",
+            "_rpi_calibration_reservation_ids",
+            "_rpi_calibration_reserved_order_count",
+            "_rpi_calibration_restart_rearm_blocked",
+            "_rpi_calibration_start_equity_microu",
+            "_rpi_calibration_start_external_cash_flow_microu",
+            "_rpi_calibration_terminal_cancel_sweep_completed",
+            "_rpi_calibration_terminal_empty_snapshots",
+            "_rpi_calibration_terminal_generation",
+            "_rpi_calibration_terminal_pending_reason",
+            "_rpi_calibration_terminal_verified",
+            "_rpi_calibration_ttl_cancel_oids",
+            "_shutdown_requested",
+            "_stopped",
+            "_submit_background_task",
+            "_wait_for_outbound_risk_sends",
+            "account",
+            "audit_logger",
+            "cancel_order",
+            "emergency_reduce_only_flatten",
+            "exposure",
+            "external_cash_flow_max_age_sec",
+            "external_cash_flow_truth_enabled",
+            "get_outbound_gate_snapshot",
+            "lock",
+            "orders",
+            "query_open_orders",
+            "query_positions",
+            "shutdown_cancel_settle_interval_sec",
+            "shutdown_empty_snapshots_required",
+        }
+    )
+    OWNER_WRITES = frozenset(
+        {
+            "_rpi_calibration_budget_exhausted",
+            "_rpi_calibration_cumulative_notional_microu",
+            "_rpi_calibration_effective_loss_cap_microu",
+            "_rpi_calibration_enforcement_inflight",
+            "_rpi_calibration_enforcement_thread",
+            "_rpi_calibration_expired",
+            "_rpi_calibration_expiry_reason",
+            "_rpi_calibration_last_reserved_exchange_ns",
+            "_rpi_calibration_peak_observed_loss_microu",
+            "_rpi_calibration_permit_activated",
+            "_rpi_calibration_permit_start_notional_microu",
+            "_rpi_calibration_permit_start_order_count",
+            "_rpi_calibration_reserved_order_count",
+            "_rpi_calibration_restart_rearm_blocked",
+            "_rpi_calibration_start_equity_microu",
+            "_rpi_calibration_start_external_cash_flow_microu",
+            "_rpi_calibration_terminal_cancel_sweep_completed",
+            "_rpi_calibration_terminal_empty_snapshots",
+            "_rpi_calibration_terminal_generation",
+            "_rpi_calibration_terminal_pending_reason",
+            "_rpi_calibration_terminal_verified",
+        }
+    )
+
     USDT_MICRO_SCALE = RpiCalibrationManager.USDT_MICRO_SCALE
     _finite_decimal = staticmethod(RpiCalibrationManager._finite_decimal)
 
@@ -1416,4 +1506,3 @@ class RpiCalibrationRuntime(OMSComponent):
             self._rpi_calibration_enforcement_thread = enforcement_thread
         published.set()
         return True
-

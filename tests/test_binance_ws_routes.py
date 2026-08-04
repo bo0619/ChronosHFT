@@ -147,6 +147,19 @@ class BinanceWebSocketRouteTests(unittest.TestCase):
             any(thread.is_alive() for thread in api.stream_threads.values())
         )
 
+    def test_closed_transport_cannot_be_started_again(self):
+        api = BinanceWsApi(lambda _message: None, lambda _error: None)
+
+        self.assertTrue(api.close())
+        with patch.object(api, "_run") as run:
+            self.assertFalse(api.start_market_stream(["BTCUSDT"]))
+            self.assertFalse(api.start_user_stream("late-listen-key"))
+
+        run.assert_not_called()
+        self.assertFalse(api.active)
+        self.assertTrue(api.close_requested)
+        self.assertEqual(api.stream_threads, {})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "oms",
+  "version": 1,
   "oms": {
     "reconcile_min_interval_sec": 5.0,
     "reconcile_api_failure_threshold": 3,

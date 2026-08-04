@@ -81,6 +81,7 @@ from risk.independent_supervisor import (
     run_sidecar_loop,
 )
 from risk.manager import RiskManager
+from risk.sidecar_protocol import SidecarProtocol
 from strategy.base import StrategyTemplate
 
 
@@ -303,7 +304,18 @@ class DummyOMS:
         }
 
     def can_open_new_risk(self):
-        return True
+        return not any(
+            (
+                self.symbol_guards,
+                self.venue_guards,
+                self.strategy_guards,
+                self.strategy_symbol_guards,
+                self.mode_constraints,
+            )
+        )
+
+    def is_shutdown_started(self):
+        return False
 
     def can_renew_venue_dead_man_switch(self):
         return True
@@ -2337,7 +2349,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             "flat_verification_checks": 1,
         }
         settings.update(overrides)
-        return settings
+        return SidecarProtocol.with_launch_contract(settings)
 
     @staticmethod
     def make_daily_snapshot(equity, cash_flow, captured_at):
@@ -2349,6 +2361,8 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             "positions": [],
             "open_orders": [],
             "external_cash_flow_total": cash_flow,
+            "daily_external_cash_flow_total": cash_flow,
+            "deployment_external_cash_flow_total": cash_flow,
             "captured_at": captured_at,
         }
 
@@ -3640,10 +3654,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             self.assertTrue(ok, reason)
             self.assertEqual(submitted, 1)
             self.assertGreater(exchange.last_clock_sync_monotonic, 0.0)
-            self.assertAlmostEqual(
-                time_service.offset,
-                exchange.clock_offset_ms,
-            )
+            self.assertEqual(time_service.offset, original_offset)
             self.assertGreater(exchange.clock_offset_ms, 500.0)
         finally:
             time_service.offset = original_offset
@@ -3941,12 +3952,12 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             orphan_exit_sec=0.20,
         )
         command_queue.put(
-            {
-                "type": "HEARTBEAT",
-                "session_id": "test-session",
-                "sequence": 1,
-                "sent_monotonic": time.perf_counter(),
-            }
+            SidecarProtocol.parent_message(
+                "HEARTBEAT",
+                "test-session",
+                sequence=1,
+                sent_monotonic=time.perf_counter(),
+            )
         )
         worker = threading.Thread(
             target=run_sidecar_loop,
@@ -3965,12 +3976,12 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         ):
             heartbeat_sequence += 1
             command_queue.put(
-                {
-                    "type": "HEARTBEAT",
-                    "session_id": "test-session",
-                    "sequence": heartbeat_sequence,
-                    "sent_monotonic": time.perf_counter(),
-                }
+                SidecarProtocol.parent_message(
+                    "HEARTBEAT",
+                    "test-session",
+                    sequence=heartbeat_sequence,
+                    sent_monotonic=time.perf_counter(),
+                )
             )
             try:
                 status = status_queue.get(timeout=0.03)
@@ -4013,12 +4024,12 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         process.start()
         try:
             command_queue.put(
-                {
-                    "type": "HEARTBEAT",
-                    "session_id": "spawn-session",
-                    "sequence": 1,
-                    "sent_monotonic": time.perf_counter(),
-                }
+                SidecarProtocol.parent_message(
+                    "HEARTBEAT",
+                    "spawn-session",
+                    sequence=1,
+                    sent_monotonic=time.perf_counter(),
+                )
             )
             deadline = time.time() + 5.0
             status = {}
@@ -4029,20 +4040,20 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             self.assertTrue(status["healthy"])
             self.assertEqual(status["parent_sequence"], 1)
             command_queue.put(
-                {
-                    "type": "HEARTBEAT",
-                    "session_id": "spawn-session",
-                    "sequence": 2,
-                    "sent_monotonic": time.perf_counter(),
-                }
+                SidecarProtocol.parent_message(
+                    "HEARTBEAT",
+                    "spawn-session",
+                    sequence=2,
+                    sent_monotonic=time.perf_counter(),
+                )
             )
             command_queue.put(
-                {
-                    "type": "QUIESCE",
-                    "session_id": "spawn-session",
-                    "request_id": "spawn-quiesce",
-                    "reason": "test_complete",
-                }
+                SidecarProtocol.parent_message(
+                    "QUIESCE",
+                    "spawn-session",
+                    request_id="spawn-quiesce",
+                    reason="test_complete",
+                )
             )
             deadline = time.time() + 5.0
             while time.time() < deadline:
@@ -4051,20 +4062,20 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                     break
             self.assertTrue(status.get("quiesced"))
             command_queue.put(
-                {
-                    "type": "HEARTBEAT",
-                    "session_id": "spawn-session",
-                    "sequence": 3,
-                    "sent_monotonic": time.perf_counter(),
-                }
+                SidecarProtocol.parent_message(
+                    "HEARTBEAT",
+                    "spawn-session",
+                    sequence=3,
+                    sent_monotonic=time.perf_counter(),
+                )
             )
             command_queue.put(
-                {
-                    "type": "STOP",
-                    "session_id": "spawn-session",
-                    "request_id": "spawn-stop",
-                    "cancel_orders": False,
-                }
+                SidecarProtocol.parent_message(
+                    "STOP",
+                    "spawn-session",
+                    request_id="spawn-stop",
+                    cancel_orders=False,
+                )
             )
             process.join(5.0)
             self.assertFalse(process.is_alive())
@@ -4245,12 +4256,15 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         supervisor = IndependentRiskSupervisor(DummyOMS(), config)
         supervisor.status_queue = queue.Queue()
         supervisor.status_queue.put(
-            {
-                "session_id": supervisor.session_id,
-                "sequence": 1,
-                "healthy": "true",
-                "reason": "",
-            }
+            SidecarProtocol.child_status(
+                {
+                    "session_id": supervisor.session_id,
+                    "sequence": 1,
+                    "healthy": "true",
+                    "reason": "",
+                },
+                handshake_complete=True,
+            )
         )
 
         supervisor._drain_status(time.perf_counter())
@@ -4263,21 +4277,24 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
 
         captured_at = time.perf_counter()
         supervisor.status_queue.put(
-            {
-                "session_id": supervisor.session_id,
-                "sequence": 2,
-                "healthy": True,
-                "reason": "",
-                "reported_at": time.time(),
-                "risk_action": "NONE",
-                "stage": "ARMED",
-                "exchange_healthy": True,
-                "kill_latched": False,
-                "quiesced": False,
-                "risk_snapshot_sequence": 1,
-                "risk_snapshot_captured_monotonic": captured_at,
-                "risk_metrics": {},
-            }
+            SidecarProtocol.child_status(
+                {
+                    "session_id": supervisor.session_id,
+                    "sequence": 2,
+                    "healthy": True,
+                    "reason": "",
+                    "reported_at": time.time(),
+                    "risk_action": "NONE",
+                    "stage": "ARMED",
+                    "exchange_healthy": True,
+                    "kill_latched": False,
+                    "quiesced": False,
+                    "risk_snapshot_sequence": 1,
+                    "risk_snapshot_captured_monotonic": captured_at,
+                    "risk_metrics": {},
+                },
+                handshake_complete=True,
+            )
         )
 
         supervisor._drain_status(captured_at)

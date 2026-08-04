@@ -20,7 +20,7 @@ from infrastructure.logger import logger
 from infrastructure.paper_trade import validate_paper_trade_database_config
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 LEGACY_RUN_ID = "legacy-journal-import"
 SOFTWARE_VERSION = "0.1.0"
 
@@ -114,6 +114,85 @@ class PaperTradeDatabase:
 
     _STOP = object()
 
+    @classmethod
+    def rebuild_offline(
+        cls,
+        config: dict,
+        journal,
+        *,
+        destination_path: str | os.PathLike | None = None,
+    ) -> dict:
+        """Build a new v5 projection without starting runtime services."""
+        database_config = validate_paper_trade_database_config(config)
+        configured_path = destination_path or database_config.get("path")
+        if not str(configured_path or "").strip():
+            raise ValueError("Paper projection destination path is required")
+        path = Path(str(configured_path)).resolve()
+        if path.exists():
+            raise PaperTradeDatabaseError(
+                "Offline Paper projection destination already exists"
+            )
+        journal_id = str(getattr(journal, "journal_id", "") or "")
+        try:
+            journal_id = str(uuid.UUID(journal_id))
+        except ValueError as exc:
+            raise PaperTradeDatabaseError(
+                "Offline Paper rebuild requires a v3 OMS journal"
+            ) from exc
+
+        instance = cls.__new__(cls)
+        instance.path = path
+        instance.journal_path = Path(str(journal.path)).resolve()
+        instance.journal_id = journal_id
+        instance.sqlite_timeout_sec = max(
+            0.1,
+            float(database_config.get("sqlite_timeout_sec", 5.0) or 5.0),
+        )
+        instance._journal = journal
+        instance._projection_high_water_seq = 0
+        instance._projection_high_water_hash = ""
+        instance._backfilled_fill_count = 0
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with closing(instance._connect()) as connection, connection:
+                instance._create_schema(connection)
+                for record in journal.iter_records():
+                    instance._project_historical_record(connection, record)
+                check = str(
+                    connection.execute("PRAGMA quick_check").fetchone()[0]
+                )
+                if check.lower() != "ok":
+                    raise PaperTradeDatabaseError(
+                        f"Offline Paper projection integrity failure: {check}"
+                    )
+                run_count = int(
+                    connection.execute("SELECT COUNT(*) FROM paper_runs").fetchone()[0]
+                )
+                fill_count = int(
+                    connection.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0]
+                )
+                connection.commit()
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                connection.execute("PRAGMA journal_mode=DELETE")
+        except Exception:
+            for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+                try:
+                    candidate.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "journal_id": journal_id,
+            "projection_high_water_seq": instance._projection_high_water_seq,
+            "projection_high_water_hash": instance._projection_high_water_hash,
+            "run_count": run_count,
+            "fill_count": fill_count,
+            "sha256": digest,
+            "path": str(path),
+        }
+
     def __init__(self, config: dict, journal, failure_callback=None) -> None:
         database_config = validate_paper_trade_database_config(config)
         if not database_config.get("enabled", False):
@@ -135,6 +214,13 @@ class PaperTradeDatabase:
             raise ValueError("paper_trade_database.path is required")
         self.path = Path(configured_path).resolve()
         self.journal_path = Path(str(journal.path)).resolve()
+        self.journal_id = str(getattr(journal, "journal_id", "") or "").strip()
+        try:
+            self.journal_id = str(uuid.UUID(self.journal_id))
+        except ValueError as exc:
+            raise ValueError(
+                "paper_trade_database requires a v3 OMS journal identity"
+            ) from exc
         if self.path == self.journal_path:
             raise ValueError(
                 "paper_trade_database.path must differ from oms.journal_path"
@@ -243,17 +329,13 @@ class PaperTradeDatabase:
         self._last_space_error = ""
         self._failure_notified = False
         self._thread = None
+        self._projection_high_water_seq = 0
+        self._projection_high_water_hash = ""
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self._ensure_disk_space(1024 * 1024)
-            stream_records = getattr(journal, "iter_records", None)
-            historical_records = (
-                stream_records()
-                if callable(stream_records)
-                else iter(journal.read_all())
-            )
-            self._bootstrap(historical_records)
+            self._bootstrap()
             start_seq = journal.append("paper_run_started", self.run_payload())
             if not start_seq:
                 raise PaperTradeDatabaseError(
@@ -290,9 +372,22 @@ class PaperTradeDatabase:
 
     def _create_schema(self, connection) -> None:
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if version not in {0, 1, 2, 3, SCHEMA_VERSION}:
+        existing_tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if version == 0 and existing_tables.intersection(
+            {"paper_fills", "paper_runs", "projection_metadata"}
+        ):
             raise PaperTradeDatabaseError(
-                f"Unsupported Paper trade database schema version: {version}"
+                "Unversioned Paper projection requires an offline rebuild"
+            )
+        if version not in {0, SCHEMA_VERSION}:
+            raise PaperTradeDatabaseError(
+                "Paper projection schema requires an offline rebuild: "
+                f"found v{version}, expected v{SCHEMA_VERSION}"
             )
         connection.executescript(
             """
@@ -303,6 +398,7 @@ class PaperTradeDatabase:
 
             CREATE TABLE IF NOT EXISTS paper_runs (
                 run_id TEXT PRIMARY KEY,
+                journal_id TEXT NOT NULL,
                 started_at_utc TEXT NOT NULL,
                 stopped_at_utc TEXT,
                 status TEXT NOT NULL,
@@ -318,8 +414,9 @@ class PaperTradeDatabase:
             );
 
             CREATE TABLE IF NOT EXISTS paper_fills (
-                journal_seq INTEGER PRIMARY KEY,
-                journal_hash TEXT,
+                journal_id TEXT NOT NULL,
+                journal_seq INTEGER NOT NULL,
+                journal_hash TEXT NOT NULL,
                 journal_ts_utc TEXT NOT NULL,
                 recorded_at_utc TEXT NOT NULL,
                 run_id TEXT NOT NULL REFERENCES paper_runs(run_id),
@@ -362,7 +459,17 @@ class PaperTradeDatabase:
                 best_ask_at_fill REAL,
                 mid_at_fill REAL,
                 quote_age_ms REAL,
-                raw_payload_json TEXT NOT NULL
+                raw_payload_json TEXT NOT NULL,
+                PRIMARY KEY(journal_id, journal_seq)
+            );
+
+            CREATE TABLE IF NOT EXISTS projection_journal_records (
+                journal_id TEXT NOT NULL,
+                journal_seq INTEGER NOT NULL,
+                journal_hash TEXT NOT NULL,
+                record_kind TEXT NOT NULL,
+                projected_at_utc TEXT NOT NULL,
+                PRIMARY KEY(journal_id, journal_seq)
             );
 
             CREATE TABLE IF NOT EXISTS paper_order_events (
@@ -532,7 +639,7 @@ class PaperTradeDatabase:
             );
 
             CREATE INDEX IF NOT EXISTS idx_paper_fills_run_seq
-                ON paper_fills(run_id, journal_seq);
+                ON paper_fills(run_id, journal_id, journal_seq);
             CREATE INDEX IF NOT EXISTS idx_paper_fills_symbol_time
                 ON paper_fills(symbol, exchange_time);
             CREATE INDEX IF NOT EXISTS idx_paper_fills_execution_id
@@ -555,7 +662,6 @@ class PaperTradeDatabase:
                 ON paper_market_samples(run_id, symbol, sample_time);
             """
         )
-        self._migrate_to_v4(connection)
         connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
         metadata = dict(
@@ -568,17 +674,37 @@ class PaperTradeDatabase:
             raise PaperTradeDatabaseError(
                 "Configured database belongs to a different application"
             )
-        configured_journal = metadata.get("journal_path")
-        if configured_journal not in {None, str(self.journal_path)}:
+        configured_journal_id = metadata.get("journal_id")
+        if configured_journal_id not in {None, self.journal_id}:
             raise PaperTradeDatabaseError(
-                "Configured database is already bound to a different OMS journal"
+                "Paper projection is bound to a different journal_id; "
+                "rebuild it offline before replacing the journal"
             )
+        if configured_journal_id is None:
+            row_count = sum(
+                int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in ("paper_runs", "paper_fills")
+            )
+            if row_count:
+                raise PaperTradeDatabaseError(
+                    "Paper projection has data but no journal identity; "
+                    "an offline rebuild is required"
+                )
         connection.executemany(
             "INSERT OR REPLACE INTO projection_metadata(key, value) VALUES (?, ?)",
             (
                 ("product", "ChronosHFT.paper_trades"),
                 ("schema_version", str(SCHEMA_VERSION)),
+                ("journal_id", self.journal_id),
                 ("journal_path", str(self.journal_path)),
+                (
+                    "projection_high_water_seq",
+                    metadata.get("projection_high_water_seq", "0"),
+                ),
+                (
+                    "projection_high_water_hash",
+                    metadata.get("projection_high_water_hash", ""),
+                ),
             ),
         )
 
@@ -654,7 +780,7 @@ class PaperTradeDatabase:
                     f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
                 )
 
-    def _bootstrap(self, records) -> None:
+    def _bootstrap(self) -> None:
         detected_at = self.started_at_utc
         with closing(self._connect()) as connection, connection:
             self._create_schema(connection)
@@ -678,6 +804,55 @@ class PaperTradeDatabase:
                 """,
                 (detected_at,),
             )
+            metadata = dict(
+                connection.execute(
+                    "SELECT key, value FROM projection_metadata"
+                ).fetchall()
+            )
+            try:
+                high_water_seq = int(
+                    metadata.get("projection_high_water_seq", "0") or 0
+                )
+            except (TypeError, ValueError) as exc:
+                raise PaperTradeDatabaseError(
+                    "Invalid Paper projection high-water sequence"
+                ) from exc
+            high_water_hash = str(
+                metadata.get("projection_high_water_hash", "") or ""
+            )
+            if high_water_seq < 0 or (
+                high_water_seq > 0 and len(high_water_hash) != 64
+            ):
+                raise PaperTradeDatabaseError(
+                    "Invalid Paper projection high-water identity"
+                )
+            journal_health = self._journal.health_snapshot()
+            journal_head_seq = int(journal_health.get("next_seq", 1) or 1) - 1
+            journal_head_hash = str(journal_health.get("last_hash", "") or "")
+            if high_water_seq > journal_head_seq:
+                raise PaperTradeDatabaseError(
+                    "Paper projection high-water is ahead of the OMS journal"
+                )
+            if (
+                high_water_seq == journal_head_seq
+                and high_water_seq > 0
+                and high_water_hash != journal_head_hash
+            ):
+                raise PaperTradeDatabaseError(
+                    "Paper projection high-water hash conflicts with the OMS journal"
+                )
+            self._projection_high_water_seq = high_water_seq
+            self._projection_high_water_hash = high_water_hash
+            stream_records = getattr(self._journal, "iter_records", None)
+            if callable(stream_records):
+                records = stream_records(
+                    start_seq=high_water_seq + 1,
+                    expected_prev_hash=(
+                        high_water_hash if high_water_seq else None
+                    ),
+                )
+            else:
+                records = iter(self._journal.read_all())
             for record_index, record in enumerate(records):
                 if record_index % 256 == 0:
                     bootstrap_reserve = 1024 * 1024
@@ -687,13 +862,14 @@ class PaperTradeDatabase:
             connection.execute(
                 """
                 INSERT INTO paper_runs(
-                    run_id, started_at_utc, status, clean_shutdown,
+                    run_id, journal_id, started_at_utc, status, clean_shutdown,
                     config_sha256, symbols_json, initial_balance_usdt,
                     software_version, code_revision, journal_path
-                ) VALUES (?, ?, 'running', NULL, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, 'running', NULL, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self.run_id,
+                    self.journal_id,
                     self.started_at_utc,
                     self.config_sha256,
                     _canonical_json(self.symbols),
@@ -707,6 +883,78 @@ class PaperTradeDatabase:
             self._disk_free_bytes = None
         self._ensure_disk_space(0)
 
+    def _record_projection_identity(
+        self,
+        connection,
+        *,
+        journal_seq: int,
+        journal_hash: str,
+        record_kind: str,
+    ) -> bool:
+        journal_seq = int(journal_seq)
+        journal_hash = str(journal_hash or "")
+        if journal_seq <= 0 or len(journal_hash) != 64:
+            raise PaperTradeDatabaseError(
+                "Paper projection received an invalid journal identity"
+            )
+        existing = connection.execute(
+            """
+            SELECT journal_hash FROM projection_journal_records
+            WHERE journal_id = ? AND journal_seq = ?
+            """,
+            (self.journal_id, journal_seq),
+        ).fetchone()
+        if existing is not None:
+            if str(existing[0]) != journal_hash:
+                raise PaperTradeDatabaseError(
+                    "Paper projection collision: identical journal sequence "
+                    "has a different hash"
+                )
+            return False
+        connection.execute(
+            """
+            INSERT INTO projection_journal_records(
+                journal_id, journal_seq, journal_hash, record_kind,
+                projected_at_utc
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                self.journal_id,
+                journal_seq,
+                journal_hash,
+                str(record_kind or ""),
+                _utc_now(),
+            ),
+        )
+        if journal_seq == self._projection_high_water_seq + 1:
+            next_seq = journal_seq
+            next_hash = journal_hash
+            while True:
+                following = connection.execute(
+                    """
+                    SELECT journal_hash FROM projection_journal_records
+                    WHERE journal_id = ? AND journal_seq = ?
+                    """,
+                    (self.journal_id, next_seq + 1),
+                ).fetchone()
+                if following is None:
+                    break
+                next_seq += 1
+                next_hash = str(following[0])
+            self._projection_high_water_seq = next_seq
+            self._projection_high_water_hash = next_hash
+            connection.executemany(
+                """
+                INSERT OR REPLACE INTO projection_metadata(key, value)
+                VALUES (?, ?)
+                """,
+                (
+                    ("projection_high_water_seq", str(next_seq)),
+                    ("projection_high_water_hash", next_hash),
+                ),
+            )
+        return True
+
     def _project_historical_record(self, connection, record: dict) -> None:
         if not isinstance(record, dict):
             return
@@ -719,6 +967,20 @@ class PaperTradeDatabase:
         except (TypeError, ValueError):
             return
         if journal_seq <= 0:
+            return
+        record_journal_id = str(record.get("journal_id", "") or "")
+        if record_journal_id != self.journal_id:
+            raise PaperTradeDatabaseError(
+                "Paper projection record journal_id mismatch"
+            )
+        journal_hash = str(record.get("hash", "") or "")
+        inserted_identity = self._record_projection_identity(
+            connection,
+            journal_seq=journal_seq,
+            journal_hash=journal_hash,
+            record_kind=kind,
+        )
+        if not inserted_identity:
             return
 
         if kind == "paper_run_started":
@@ -734,7 +996,7 @@ class PaperTradeDatabase:
             inserted = self._insert_fill(
                 connection,
                 journal_seq=journal_seq,
-                journal_hash=str(record.get("hash", "") or "") or None,
+                journal_hash=journal_hash,
                 journal_ts=str(record.get("ts", "") or "") or _utc_now(),
                 payload=payload,
             )
@@ -782,11 +1044,11 @@ class PaperTradeDatabase:
         connection.execute(
             """
             INSERT INTO paper_runs(
-                run_id, started_at_utc, status, clean_shutdown,
+                run_id, journal_id, started_at_utc, status, clean_shutdown,
                 config_sha256, symbols_json, initial_balance_usdt,
                 software_version, code_revision, journal_path,
                 start_journal_seq
-            ) VALUES (?, ?, 'interrupted', 0, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, 'interrupted', 0, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id) DO UPDATE SET
                 start_journal_seq = COALESCE(
                     paper_runs.start_journal_seq,
@@ -795,6 +1057,7 @@ class PaperTradeDatabase:
             """,
             (
                 run_id,
+                self.journal_id,
                 started_at_utc or _utc_now(),
                 str(payload.get("config_sha256", "") or ""),
                 _canonical_json(payload.get("symbols", [])),
@@ -826,7 +1089,8 @@ class PaperTradeDatabase:
         cursor = connection.execute(
             """
             INSERT INTO paper_fills(
-                journal_seq, journal_hash, journal_ts_utc, recorded_at_utc,
+                journal_id, journal_seq, journal_hash, journal_ts_utc,
+                recorded_at_utc,
                 run_id, execution_id, venue, strategy_id, client_oid,
                 exchange_oid, trade_id, symbol, side, fill_qty, fill_price,
                 fill_notional, cum_filled_qty, exchange_status, exchange_time,
@@ -845,11 +1109,12 @@ class PaperTradeDatabase:
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?
             )
-            ON CONFLICT(journal_seq) DO NOTHING
+            ON CONFLICT(journal_id, journal_seq) DO NOTHING
             """,
             (
+                self.journal_id,
                 int(journal_seq),
                 journal_hash,
                 journal_ts,
@@ -901,6 +1166,18 @@ class PaperTradeDatabase:
                 _canonical_json(payload),
             ),
         )
+        if cursor.rowcount == 0:
+            existing = connection.execute(
+                """
+                SELECT journal_hash FROM paper_fills
+                WHERE journal_id = ? AND journal_seq = ?
+                """,
+                (self.journal_id, int(journal_seq)),
+            ).fetchone()
+            if existing is None or str(existing[0]) != str(journal_hash or ""):
+                raise PaperTradeDatabaseError(
+                    "Paper fill projection hash collision"
+                )
         return cursor.rowcount == 1
 
     def _insert_order_event(self, connection, payload: dict) -> bool:
@@ -1244,6 +1521,7 @@ class PaperTradeDatabase:
     def run_payload(self) -> dict:
         return {
             "paper_run_id": self.run_id,
+            "journal_id": self.journal_id,
             "started_at_utc": self.started_at_utc,
             "config_sha256": self.config_sha256,
             "symbols": list(self.symbols),
@@ -1261,6 +1539,9 @@ class PaperTradeDatabase:
         journal_ts: str = "",
         journal_hash: str = "",
     ) -> bool:
+        if len(str(journal_hash or "")) != 64:
+            self._set_failure("execution_projection_missing_journal_hash")
+            return False
         with self._close_lock:
             if not self._accepting or self._closed:
                 return False
@@ -1547,6 +1828,12 @@ class PaperTradeDatabase:
         kind = item[0]
         if kind == "execution":
             _, journal_seq, journal_ts, journal_hash, payload = item
+            self._record_projection_identity(
+                connection,
+                journal_seq=journal_seq,
+                journal_hash=str(journal_hash or ""),
+                record_kind="execution_record",
+            )
             inserted = self._insert_fill(
                 connection,
                 journal_seq=journal_seq,
@@ -1706,6 +1993,9 @@ class PaperTradeDatabase:
                 "enabled": True,
                 "healthy": self._healthy,
                 "path": str(self.path),
+                "journal_id": self.journal_id,
+                "projection_high_water_seq": self._projection_high_water_seq,
+                "projection_high_water_hash": self._projection_high_water_hash,
                 "run_id": self.run_id,
                 "queue_depth": self._queue.qsize(),
                 "write_batch_size": self.write_batch_size,

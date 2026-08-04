@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "system.resource_monitor",
+  "version": 1,
   "system": {
     "resource_monitor": {
       "_comment": "Sample Linux /proc at low frequency; sustained aggregate memory, thread, or file-descriptor exhaustion freezes new risk on AWS t3.small.",

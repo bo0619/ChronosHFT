@@ -1,5 +1,7 @@
 """Read-only parent-side status projection for the risk sidecar."""
 
+from risk.sidecar_protocol import SidecarProtocol
+
 
 class SidecarStatusProjection:
     @staticmethod
@@ -21,6 +23,10 @@ class SidecarStatusProjection:
             if last_status_received_at > 0.0
             else None
         )
+        handshake_complete = (
+            process_alive
+            and SidecarProtocol.has_compatible_child_contract(last_status)
+        )
         return {
             "enabled": enabled,
             "process_alive": process_alive,
@@ -28,10 +34,16 @@ class SidecarStatusProjection:
                 parent_heartbeat_suspended_reason
             ),
             "pid": getattr(process, "pid", None),
+            "protocol_version": last_status.get("protocol_version"),
+            "protocol_capabilities": list(
+                last_status.get("capabilities", []) or []
+            ),
+            "protocol_handshake_complete": handshake_complete,
             "healthy": bool(
                 not enabled
                 or (
                     process_alive
+                    and handshake_complete
                     and last_status.get("healthy", False)
                     and status_age is not None
                     and status_age <= status_max_age_sec
@@ -89,6 +101,21 @@ class SidecarStatusProjection:
             "state_generation": int(
                 last_status.get("state_generation", 0) or 0
             ),
+            "writer_epoch": int(
+                last_status.get("writer_epoch", 0) or 0
+            ),
+            "owner_epoch": int(
+                last_status.get("owner_epoch", 0) or 0
+            ),
+            "safety_epoch": int(
+                last_status.get("safety_epoch", 0) or 0
+            ),
+            "state_sha256": str(
+                last_status.get("state_sha256", "") or ""
+            ),
+            "state_store_v2": bool(
+                last_status.get("state_store_v2", False)
+            ),
             "state_recovered": bool(
                 last_status.get("state_recovered", False)
             ),
@@ -97,6 +124,10 @@ class SidecarStatusProjection:
             ),
             "state_persist_error": str(
                 last_status.get("state_persist_error", "") or ""
+            ),
+            "last_flat_proof": last_status.get("last_flat_proof"),
+            "last_flat_proof_error": str(
+                last_status.get("last_flat_proof_error", "") or ""
             ),
             "risk_metrics": dict(
                 last_status.get("risk_metrics", {}) or {}

@@ -26,6 +26,61 @@ from .order import Order
 class OMSExchangeEventProcessor(OMSComponent):
     """Own deterministic exchange-event and recovered-command application."""
 
+    OWNER_READS = frozenset(
+        {
+            "CASH_FLOW_DIRTY_REASONS",
+            "_account_state_event_time",
+            "_audit",
+            "_emit_order_update",
+            "_emit_position_update",
+            "_enforce_symbol_guard",
+            "_exchange_account_event_time",
+            "_exchange_position_event_time",
+            "_execution_id",
+            "_fail_closed_on_journal_error",
+            "_get_fill_commission",
+            "_has_active_orders_locked",
+            "_install_symbol_guard_locked",
+            "_lifecycle_generation",
+            "_position_state_event_time",
+            "_queue_reconcile_request_locked",
+            "_record_execution",
+            "_record_order_snapshot",
+            "_schedule_rpi_calibration_runtime_enforcement",
+            "_schedule_trade_tail_verification",
+            "_submit_background_task",
+            "_sync_capability_mode",
+            "_write_tombstone",
+            "account",
+            "config",
+            "event_engine",
+            "event_log",
+            "event_log_evictions",
+            "event_log_max",
+            "exchange_id_map",
+            "execution_ids",
+            "exposure",
+            "last_freeze_reason",
+            "lock",
+            "mark_external_cash_flow_truth_unavailable",
+            "order_monitor",
+            "orders",
+            "state",
+            "terminated_oids",
+            "trigger_reconcile",
+        }
+    )
+    OWNER_WRITES = frozenset(
+        {
+            "_account_state_event_time",
+            "_exchange_account_event_time",
+            "_lifecycle_generation",
+            "event_log_evictions",
+            "last_freeze_reason",
+            "state",
+        }
+    )
+
     _SUPPORTED_ORDER_UPDATE_STATUSES = {
         "NEW",
         "PARTIALLY_FILLED",

@@ -18,6 +18,20 @@ from .order import Order
 class OMSStatePublisher(OMSComponent):
     """Own audit context and event payload publication for OMS state."""
 
+    OWNER_READS = frozenset(
+        {
+            "audit_logger",
+            "capability_mode",
+            "capability_reason",
+            "event_engine",
+            "exposure",
+            "lock",
+            "mode_override",
+            "mode_override_reason",
+            "state",
+        }
+    )
+
     @staticmethod
     def _serialize_intent(intent: OrderIntent) -> dict:
         return {

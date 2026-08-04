@@ -12,6 +12,11 @@ from infrastructure.config_scaling import (
     load_root_config,
     normalize_root_config_preapproval,
 )
+from infrastructure.config_schema import (
+    CONFIG_DOCUMENT_VERSION,
+    CONFIG_FRAGMENT_SCHEMA,
+    CONFIG_UNKNOWN_KEY_POLICY,
+)
 from infrastructure.live_config_guard import (
     validate_live_account_equity_truth,
     validate_live_flat_start_truth,
@@ -750,15 +755,25 @@ class LiveConfigGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             (root / "execution.json").write_text(
-                json.dumps({"execution": {"mode": "paper"}}),
+                json.dumps(
+                    {
+                        "$schema": CONFIG_FRAGMENT_SCHEMA,
+                        "fragment": "execution",
+                        "version": 1,
+                        "execution": {"mode": "paper"},
+                    }
+                ),
                 encoding="utf-8",
             )
-            (root / "system.json").write_text(
-                json.dumps({"system": {"log_level": "INFO"}}),
-                encoding="utf-8",
-            )
-            (root / "dashboard.json").write_text(
-                json.dumps({"system": {"web_dashboard": {"port": 8765}}}),
+            (root / "symbols.json").write_text(
+                json.dumps(
+                    {
+                        "$schema": CONFIG_FRAGMENT_SCHEMA,
+                        "fragment": "symbols",
+                        "version": 1,
+                        "symbols": ["BTCUSDT"],
+                    }
+                ),
                 encoding="utf-8",
             )
             manifest = root / "config.json"
@@ -766,10 +781,19 @@ class LiveConfigGuardTests(unittest.TestCase):
                 json.dumps(
                     {
                         "schema": CONFIG_MANIFEST_SCHEMA,
+                        "config_version": CONFIG_DOCUMENT_VERSION,
+                        "unknown_keys": CONFIG_UNKNOWN_KEY_POLICY,
                         "includes": [
-                            "execution.json",
-                            "system.json",
-                            "dashboard.json",
+                            {
+                                "path": "execution.json",
+                                "fragment": "execution",
+                                "version": 1,
+                            },
+                            {
+                                "path": "symbols.json",
+                                "fragment": "symbols",
+                                "version": 1,
+                            },
                         ],
                     }
                 ),
@@ -779,38 +803,50 @@ class LiveConfigGuardTests(unittest.TestCase):
             loaded = load_config_document(manifest)
 
         self.assertEqual(loaded["execution"]["mode"], "paper")
-        self.assertEqual(loaded["system"]["log_level"], "INFO")
-        self.assertEqual(loaded["system"]["web_dashboard"]["port"], 8765)
+        self.assertEqual(loaded["symbols"], ["BTCUSDT"])
 
     def test_config_manifest_rejects_duplicate_leaf_and_traversal(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            (root / "one.json").write_text(
-                json.dumps({"system": {"log_level": "INFO"}}),
-                encoding="utf-8",
-            )
-            (root / "two.json").write_text(
-                json.dumps({"system": {"log_level": "DEBUG"}}),
-                encoding="utf-8",
-            )
             manifest = root / "config.json"
             manifest.write_text(
                 json.dumps(
                     {
                         "schema": CONFIG_MANIFEST_SCHEMA,
-                        "includes": ["one.json", "two.json"],
+                        "config_version": CONFIG_DOCUMENT_VERSION,
+                        "unknown_keys": CONFIG_UNKNOWN_KEY_POLICY,
+                        "includes": [
+                            {
+                                "path": "one.json",
+                                "fragment": "execution",
+                                "version": 1,
+                            },
+                            {
+                                "path": "two.json",
+                                "fragment": "execution",
+                                "version": 1,
+                            },
+                        ],
                     }
                 ),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(ValueError, "duplicate config field"):
+            with self.assertRaisesRegex(ValueError, "duplicate fragment identity"):
                 load_config_document(manifest)
 
             manifest.write_text(
                 json.dumps(
                     {
                         "schema": CONFIG_MANIFEST_SCHEMA,
-                        "includes": ["../outside.json"],
+                        "config_version": CONFIG_DOCUMENT_VERSION,
+                        "unknown_keys": CONFIG_UNKNOWN_KEY_POLICY,
+                        "includes": [
+                            {
+                                "path": "../outside.json",
+                                "fragment": "execution",
+                                "version": 1,
+                            }
+                        ],
                     }
                 ),
                 encoding="utf-8",
@@ -818,7 +854,7 @@ class LiveConfigGuardTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "manifest directory"):
                 load_config_document(manifest)
 
-    def test_fragmented_live_config_fails_closed(self):
+    def test_obsolete_fragmented_live_config_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             (root / "live.json").write_text(
@@ -835,13 +871,13 @@ class LiveConfigGuardTests(unittest.TestCase):
             manifest.write_text(
                 json.dumps(
                     {
-                        "schema": CONFIG_MANIFEST_SCHEMA,
+                        "schema": "chronoshft.config_manifest.v1",
                         "includes": ["live.json"],
                     }
                 ),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(ValueError, "Paper-only"):
+            with self.assertRaisesRegex(ValueError, "obsolete config manifest"):
                 load_root_config(manifest)
 
     def test_resolved_state_paths_reject_parent_traversal_and_aliases(self):
@@ -1121,6 +1157,33 @@ class LiveConfigGuardTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(ValueError, expected):
                     validate_live_runtime_config(config)
+
+    def test_sidecar_risk_caps_cannot_disable_or_weaken_root_limits(self):
+        cases = (
+            ("max_account_gross_notional", 0.0, "positive and finite"),
+            ("max_daily_loss", 2.01, "must not exceed"),
+            ("max_drawdown_pct", float("inf"), "nonnegative and finite"),
+        )
+        for field, value, expected in cases:
+            with self.subTest(field=field):
+                config = safe_live_config()
+                config["risk"]["independent_supervisor"][field] = value
+
+                with self.assertRaisesRegex(ValueError, expected):
+                    validate_live_runtime_config(config)
+
+    def test_sidecar_cap_check_does_not_mask_invalid_root_limit(self):
+        config = safe_live_config()
+        config["risk"]["limits"]["max_drawdown_pct"] = "invalid"
+        config["risk"]["independent_supervisor"][
+            "max_drawdown_pct"
+        ] = 0.01
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"risk\.limits\.max_drawdown_pct must be nonnegative and finite",
+        ):
+            validate_live_runtime_config(config)
 
     def test_independent_supervisor_credentials_must_be_separate(self):
         cases = (
@@ -1558,7 +1621,10 @@ class LiveConfigGuardTests(unittest.TestCase):
             "infrastructure.live_config_guard."
             "validate_live_canary_local_evidence"
         ), patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+            loaded = load_root_config(
+                "config.json",
+                allow_unversioned_offline=True,
+            )
 
         self.assertEqual(loaded["symbols"], ["BTCUSDT"])
 
@@ -1570,7 +1636,10 @@ class LiveConfigGuardTests(unittest.TestCase):
             "validate_live_canary_local_evidence"
         ), patch("builtins.open", mock_open(read_data=json.dumps(payload))):
             with self.assertRaisesRegex(ValueError, "independent_supervisor.enabled"):
-                load_root_config("config.json")
+                load_root_config(
+                    "config.json",
+                    allow_unversioned_offline=True,
+                )
 
     def test_root_live_loader_rejects_inline_credentials_without_echoing(self):
         payload = safe_live_config()
@@ -1582,7 +1651,10 @@ class LiveConfigGuardTests(unittest.TestCase):
         )
         with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
             with self.assertRaisesRegex(ValueError, "must not be stored inline") as caught:
-                load_root_config("config.json")
+                load_root_config(
+                    "config.json",
+                    allow_unversioned_offline=True,
+                )
         for value in secret_values:
             self.assertNotIn(value, str(caught.exception))
 
@@ -1644,7 +1716,10 @@ class LiveConfigGuardTests(unittest.TestCase):
             "infrastructure.config_scaling.validate_live_calibration_approval"
         ), patch("builtins.open", mock_open(read_data=json.dumps(payload))):
             with self.assertRaisesRegex(ValueError, "offline_evidence_path"):
-                load_root_config("config.json")
+                load_root_config(
+                    "config.json",
+                    allow_unversioned_offline=True,
+                )
 
     def test_root_loader_keeps_paper_mode_exempt(self):
         payload = {
@@ -1654,7 +1729,10 @@ class LiveConfigGuardTests(unittest.TestCase):
         }
 
         with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config("config.json")
+            loaded = load_root_config(
+                "config.json",
+                allow_unversioned_offline=True,
+            )
 
         self.assertEqual(loaded["execution"]["mode"], "paper")
         self.assertFalse(loaded["risk"]["independent_supervisor"]["enabled"])

@@ -1,5 +1,7 @@
 import queue
 
+from risk.sidecar_protocol import SidecarProtocol
+
 
 class SidecarTransport:
     """Parent-side process and queue transport for the risk sidecar."""
@@ -40,6 +42,7 @@ class SidecarTransport:
         process_target,
         perf_counter,
     ) -> None:
+        SidecarProtocol.validate_launch_contract(owner.settings)
         owner.context = multiprocessing_module.get_context("spawn")
         owner.command_queue = owner.context.Queue(maxsize=32)
         owner.heartbeat_queue = owner.context.Queue(maxsize=1)
@@ -141,12 +144,12 @@ class SidecarTransport:
         request_id = request_id_factory(16)
         enqueued = reliable_put(
             owner.command_queue,
-            {
-                "type": command_type,
-                "session_id": owner.session_id,
-                "request_id": request_id,
+            SidecarProtocol.parent_message(
+                command_type,
+                owner.session_id,
+                request_id=request_id,
                 **payload,
-            },
+            ),
             owner.control_enqueue_timeout_sec,
         )
         if not enqueued:
@@ -198,11 +201,11 @@ class SidecarTransport:
             return False
         return reliable_put(
             owner.command_queue,
-            {
-                "type": "ABORT_REARM",
-                "session_id": owner.session_id,
-                "token": str(token or ""),
-            },
+            SidecarProtocol.parent_message(
+                "ABORT_REARM",
+                owner.session_id,
+                token=str(token or ""),
+            ),
             owner.control_enqueue_timeout_sec,
         )
 

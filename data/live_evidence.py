@@ -23,6 +23,7 @@ from event.type import (
     ExchangeAccountUpdate,
     MarkPriceData,
 )
+from governance.deployment_identity import deployment_config_sha256
 from infrastructure.logger import logger
 from infrastructure.single_writer_fence import SingleWriterFence
 
@@ -736,8 +737,6 @@ class LiveEvidenceRecorder:
         self._session_id = uuid.uuid4().hex
         self._deployment_id = deployment_id
         self._symbols = symbols
-
-        from strategy.model_readiness import deployment_config_sha256
 
         self._deployment_config_sha256 = deployment_config_sha256(config)
         oms = config.get("oms", {})

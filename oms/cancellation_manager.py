@@ -15,6 +15,50 @@ from .journal import JournalError
 class OMSCancellationManager(OMSComponent):
     """Own cancel dispatch, retries and verified account-wide cancellation."""
 
+    OWNER_READS = frozenset(
+        {
+            "OUTBOUND_CANCEL",
+            "_apply_exchange_order_snapshot",
+            "_audit",
+            "_deferred_cancel_all_symbols",
+            "_deferred_cancel_oids",
+            "_emit_order_update",
+            "_fail_closed_on_journal_error",
+            "_get_capability_block_reason",
+            "_known_account_order_symbols",
+            "_latch_journal_failure",
+            "_normalize_remote_open_orders",
+            "_notify_order_state_safely",
+            "_on_order_truth_check",
+            "_outbound_budget",
+            "_record_command_prepared",
+            "_record_command_result",
+            "_record_order_snapshot",
+            "_shutdown_cancel_verified",
+            "_shutdown_requested",
+            "_stopped",
+            "_submit_background_task",
+            "_submit_cancel_requested_oids",
+            "_submit_settlement_inflight_oids",
+            "_wait_for_outbound_order_sends",
+            "can_cancel_orders",
+            "config",
+            "freeze_symbol",
+            "gateway",
+            "get_outbound_gate_snapshot",
+            "lock",
+            "order_monitor",
+            "orders",
+            "outbound_message_window_sec",
+            "shutdown_cancel_settle_interval_sec",
+            "shutdown_cancel_timeout_sec",
+            "shutdown_empty_snapshots_required",
+            "symbol_guards",
+            "trigger_reconcile",
+        }
+    )
+    OWNER_WRITES = frozenset({"_shutdown_cancel_verified"})
+
     def _schedule_cancel_order_retry(self, client_oid: str) -> bool:
         with self.lock:
             if self._stopped or client_oid in self._deferred_cancel_oids:

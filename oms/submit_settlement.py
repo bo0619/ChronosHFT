@@ -27,6 +27,76 @@ from .order import Order
 class OMSSubmitSettlement(OMSComponent):
     """Own final send fencing, ambiguity handling and durable settlement."""
 
+    OWNER_READS = frozenset(
+        {
+            "OUTBOUND_NEW_ORDER",
+            "OUTBOUND_REDUCE_ORDER",
+            "_audit",
+            "_close_outbound_gate_locked",
+            "_emit_order_update",
+            "_ensure_symbol_guard_records_locked",
+            "_fail_closed_on_journal_error",
+            "_get_clock_health_rejection_locked",
+            "_get_margin_health_rejection_locked",
+            "_get_order_block_reason",
+            "_get_risk_control_heartbeat_rejection_locked",
+            "_get_self_trade_prevention_rejection_locked",
+            "_get_venue_dead_man_switch_rejection_locked",
+            "_latch_journal_failure",
+            "_lifecycle_generation",
+            "_observe_rpi_calibration_loss_locked",
+            "_on_order_truth_check",
+            "_outbound_all_order_seal_reason",
+            "_outbound_budget",
+            "_outbound_gate_condition",
+            "_outbound_gate_epoch",
+            "_outbound_gate_holds",
+            "_outbound_gate_open",
+            "_outbound_gate_reason",
+            "_record_command_result",
+            "_record_order_snapshot",
+            "_refresh_outbound_gate_locked",
+            "_refresh_symbol_guard_effective_locked",
+            "_rpi_calibration",
+            "_rpi_calibration_effective_loss_cap_microu",
+            "_rpi_calibration_expired",
+            "_rpi_calibration_expiry_reason",
+            "_rpi_calibration_peak_observed_loss_microu",
+            "_rpi_calibration_permit_activated",
+            "_rpi_calibration_reservation_ids",
+            "_rpi_calibration_restart_rearm_blocked",
+            "_shutdown_reason",
+            "_shutdown_requested",
+            "_stopped",
+            "_submit_background_task",
+            "_submit_cancel_requested_oids",
+            "_submit_settlement_inflight_oids",
+            "_symbol_guard_owner",
+            "_sync_capability_mode",
+            "_write_tombstone",
+            "account",
+            "cancel_order",
+            "capability_mode",
+            "degraded_aggressive_to_passive",
+            "event_engine",
+            "exchange_id_map",
+            "exposure",
+            "freeze_symbol",
+            "gateway",
+            "last_freeze_reason",
+            "lock",
+            "order_monitor",
+            "orders",
+            "state",
+            "symbol_guard_epoch_counters",
+            "symbol_guards",
+            "trigger_reconcile",
+        }
+    )
+    OWNER_WRITES = frozenset(
+        {"_lifecycle_generation", "last_freeze_reason", "state"}
+    )
+
     def _normalize_submit_command(self, raw_result) -> GatewayCommandResult:
         if isinstance(raw_result, GatewayCommandResult):
             return raw_result

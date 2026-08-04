@@ -1,0 +1,11 @@
+{
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "system.shutdown",
+  "version": 1,
+  "system": {
+    "shutdown": {
+      "max_attempts": 3,
+      "retry_interval_sec": 0.5
+    }
+  }
+}

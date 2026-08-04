@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "strategy.capital_scaling",
+  "version": 1,
   "strategy": {
     "_comment_capital_scaling": "The tracked Paper profile uses 100x the 100 USDT reference envelope: 1% quote notional, 5% inventory/gross cap, and 1% daily-loss cap.",
     "capital_multiplier": 100.0,

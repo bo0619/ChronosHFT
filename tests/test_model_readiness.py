@@ -16,6 +16,8 @@ from data.oos_reconstruction import (
     RAW_OOS_EVIDENCE_SCHEMA,
 )
 from event.type import OrderBook
+from governance.canonical import canonical_config_digest
+from governance.release_manifest import write_release_manifest
 from infrastructure.config_scaling import (
     load_root_config,
     normalize_root_config_preapproval,
@@ -62,6 +64,9 @@ from strategy.model_readiness import (
     verify_ed25519_signature,
 )
 from tests.test_live_config_guard import safe_live_config
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _canonical_json(value):
@@ -1093,6 +1098,11 @@ class ModelReadinessTests(unittest.TestCase):
             artifact_sha256 = sha256_file(artifact)
             source_data_sha256 = sha256_file(source_data)
             oos_sha256 = oos_evidence_sha256(oos)
+            release_manifest_path = root / "release-manifest.json"
+            release_manifest = write_release_manifest(
+                PROJECT_ROOT,
+                release_manifest_path,
+            )
             manifest = {
                 "schema": CALIBRATION_APPROVAL_SCHEMA,
                 "model": model,
@@ -1124,6 +1134,9 @@ class ModelReadinessTests(unittest.TestCase):
                 ),
                 "formula_sha256": implementation_sha256,
                 "strategy_config_sha256": policy_sha256,
+                "canonical_config_sha256": canonical_config_digest(config),
+                "release_manifest_path": release_manifest_path.name,
+                "release_digest": release_manifest["release_digest"],
             }
             _attach_test_signature(manifest)
             manifest_path.write_text(
@@ -1215,7 +1228,7 @@ class ModelReadinessTests(unittest.TestCase):
             changed_policy["strategy"]["target_order_notional"] = 9.0
             with self.assertRaisesRegex(
                 ValueError,
-                "strategy configuration SHA-256 mismatch",
+                "canonical config digest mismatch",
             ):
                 validate_live_calibration_approval(
                     changed_policy,
@@ -1237,7 +1250,7 @@ class ModelReadinessTests(unittest.TestCase):
             ] = 4.0
             with self.assertRaisesRegex(
                 ValueError,
-                "deployment configuration SHA-256 mismatch",
+                "canonical config digest mismatch",
             ):
                 validate_live_calibration_approval(
                     changed_deployment,
@@ -1288,7 +1301,7 @@ class ModelReadinessTests(unittest.TestCase):
                     config_path=root / "config.json",
                 )
 
-    def test_paper_root_load_does_not_require_live_manifest(self):
+    def test_unversioned_paper_config_requires_explicit_offline_opt_in(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "paper.json"
             config_path.write_text(
@@ -1306,7 +1319,12 @@ class ModelReadinessTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            loaded = load_root_config(str(config_path))
+            with self.assertRaisesRegex(ValueError, "strict"):
+                load_root_config(str(config_path))
+            loaded = load_root_config(
+                str(config_path),
+                allow_unversioned_offline=True,
+            )
 
         self.assertEqual(loaded["execution"]["mode"], "paper")
         requirements = readiness_requirements(loaded["strategy"], "glft")
@@ -1331,7 +1349,7 @@ class ModelReadinessTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(ValueError, "manifest_path"):
+            with self.assertRaisesRegex(ValueError, "strict"):
                 load_root_config(str(config_path))
 
     @staticmethod

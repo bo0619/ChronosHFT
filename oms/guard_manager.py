@@ -10,6 +10,48 @@ from .component import OMSComponent
 class OMSGuardManager(OMSComponent):
     """Own layered trading guards and guarded recovery transitions."""
 
+    OWNER_READS = frozenset(
+        {
+            "_account_cancel_symbols",
+            "_audit",
+            "_cancel_all_orders_unchecked",
+            "_get_order_block_reason",
+            "_recovered_guard_cleanup_snapshot",
+            "_refresh_outbound_gate_locked",
+            "_shutdown_requested",
+            "_stopped",
+            "_wait_for_outbound_risk_sends",
+            "can_open_new_risk",
+            "cancel_order",
+            "gateway",
+            "halt_system",
+            "lock",
+            "orders",
+            "recovered_guard_cleanup_pending",
+            "strategy_guards",
+            "strategy_symbol_guards",
+            "symbol_guard_epoch_counters",
+            "symbol_guard_epochs",
+            "symbol_guard_records",
+            "symbol_guards",
+            "trigger_reconcile",
+            "venue_guard_epoch_counters",
+            "venue_guard_epochs",
+            "venue_guard_records",
+            "venue_guards",
+        }
+    )
+    OWNER_WRITES = frozenset(
+        {
+            "_recovered_guard_cleanup_snapshot",
+            "recovered_guard_cleanup_pending",
+            "symbol_guard_epoch_counters",
+            "symbol_guard_records",
+            "venue_guard_epoch_counters",
+            "venue_guard_records",
+        }
+    )
+
     @staticmethod
     def _symbol_guard_owner(reason: str) -> str:
         reason = str(reason or "").strip()
@@ -880,4 +922,3 @@ class OMSGuardManager(OMSComponent):
             ]
         for client_oid in client_oids:
             self.cancel_order(client_oid)
-

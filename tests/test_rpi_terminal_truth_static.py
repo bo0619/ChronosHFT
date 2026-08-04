@@ -12,6 +12,7 @@ OMS_IMPLEMENTATION = (
     ROOT / "oms" / "submit_settlement.py",
     ROOT / "oms" / "cancellation_manager.py",
     ROOT / "oms" / "account_truth.py",
+    ROOT / "oms" / "outbound_gate.py",
     ROOT / "oms" / "lifecycle_controller.py",
     ROOT / "oms" / "rpi_calibration_runtime.py",
     ENGINE,
@@ -21,8 +22,13 @@ REST_API = ROOT / "gateway" / "binance" / "rest_api.py"
 LIVE_GATEWAY = ROOT / "gateway" / "binance" / "gateway.py"
 PAPER_GATEWAY = ROOT / "gateway" / "binance" / "paper_gateway.py"
 SYSTEM_HEALTH = ROOT / "infrastructure" / "system_health.py"
+RUNTIME_BINDINGS = ROOT / "infrastructure" / "runtime_bindings.py"
+RUNTIME_APPLICATION = ROOT / "infrastructure" / "runtime_application.py"
 MAIN = ROOT / "main.py"
-RISK_SUPERVISOR = ROOT / "risk" / "independent_supervisor.py"
+SIDECAR_CORE = ROOT / "risk" / "sidecar_core.py"
+SIDECAR_SUPERVISOR = ROOT / "risk" / "sidecar_supervisor.py"
+SIDECAR_CONTROL_STATE = ROOT / "risk" / "sidecar_control_state.py"
+SIDECAR_OBSERVATION = ROOT / "risk" / "sidecar_observation.py"
 RPI_MANAGER = ROOT / "oms" / "rpi_calibration_manager.py"
 
 
@@ -724,16 +730,29 @@ def test_halt_handoff_reaches_sidecar_and_has_stale_parent_fallback():
     assert 'message.startswith("HALT:")' in health_segment
     assert 'supervisor_result.get("persisted") is True' in health_segment
 
-    main_source = MAIN.read_text(encoding="utf-8")
+    bindings_source = RUNTIME_BINDINGS.read_text(encoding="utf-8")
+    bindings_tree = ast.parse(bindings_source)
+    execution_handler = _function(
+        bindings_tree,
+        "on_system_health_execution",
+    )
     assert (
-        "handle_system_health_event(\n"
-        "            e,\n"
-        "            risk_controller,\n"
-        "            oms_system,\n"
-        "            risk_supervisor,"
-    ) in main_source
+        "self.system_health_handler(\n"
+        "            event,\n"
+        "            self.risk_controller,\n"
+        "            self.oms,\n"
+        "            self.risk_supervisor,"
+    ) in _source_for(execution_handler, bindings_source)
 
-    supervisor_source = RISK_SUPERVISOR.read_text(encoding="utf-8")
+    main_source = MAIN.read_text(encoding="utf-8")
+    assert "event_bindings_type=RuntimeEventBindings" in main_source
+    application_source = RUNTIME_APPLICATION.read_text(encoding="utf-8")
+    assert "services.factories.event_bindings_type(" in application_source
+    assert "risk_controller=self.risk_controller" in application_source
+    assert "risk_supervisor=self.risk_supervisor" in application_source
+    assert "bindings.register_all()" in application_source
+
+    supervisor_source = SIDECAR_SUPERVISOR.read_text(encoding="utf-8")
     supervisor_tree = ast.parse(supervisor_source)
     resume = _function(supervisor_tree, "resume_shutdown_guard")
     send_heartbeat = _function(supervisor_tree, "_send_heartbeat")
@@ -819,7 +838,7 @@ def test_terminal_verified_is_published_only_after_durable_audit():
 
 
 def test_sidecar_quiesce_keeps_exchange_truth_and_can_take_over():
-    source = RISK_SUPERVISOR.read_text(encoding="utf-8")
+    source = SIDECAR_CORE.read_text(encoding="utf-8")
     tree = ast.parse(source)
     quiesced = _function(tree, "_step_quiesced")
     quiesced_source = _source_for(quiesced, source)
@@ -831,15 +850,23 @@ def test_sidecar_quiesce_keeps_exchange_truth_and_can_take_over():
         "_exchange_snapshot_valid(",
         "_account_truth_counts(",
         "_update_parent_stale_state(",
+        "self.control.quiesce_takeover_reason(",
         "_takeover_from_quiesce(",
     ):
         assert required_call in quiesced_source
+
+    control_source = SIDECAR_CONTROL_STATE.read_text(encoding="utf-8")
+    control_tree = ast.parse(control_source)
+    takeover_reason = _source_for(
+        _function(control_tree, "quiesce_takeover_reason"),
+        control_source,
+    )
     for takeover_condition in (
         "not parent_healthy",
         "not exchange_valid",
         "open_order_count or nonzero_position_count",
     ):
-        assert takeover_condition in quiesced_source
+        assert takeover_condition in takeover_reason
     assert quiesced_source.index("_takeover_from_quiesce(") < (
         quiesced_source.index("return self.step(")
     )
@@ -847,15 +874,15 @@ def test_sidecar_quiesce_keeps_exchange_truth_and_can_take_over():
 
 
 def test_sidecar_quiesce_takeover_latches_kill_before_persistence():
-    source = RISK_SUPERVISOR.read_text(encoding="utf-8")
+    source = SIDECAR_CONTROL_STATE.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    takeover = _function(tree, "_takeover_from_quiesce")
+    takeover = _function(tree, "takeover_from_quiesce")
     persist_calls = [
         node
         for node in ast.walk(takeover)
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_persist_durable_state"
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "persist"
     ]
     assert len(persist_calls) == 1
     persist_line = persist_calls[0].lineno
@@ -878,45 +905,51 @@ def test_sidecar_quiesce_takeover_latches_kill_before_persistence():
         "stage",
         "flat_verification_count",
         "last_verified_snapshot_sequence",
-        "last_cancel_attempt_at",
-        "last_flatten_attempt_at",
     ):
         assert attribute in assignments
         assert assignments[attribute].lineno < persist_line
 
     takeover_source = _source_for(takeover, source)
-    assert "self.quiesced = False" in takeover_source
-    assert "self.kill_latched = True" in takeover_source
-    assert 'self.stage = "FLATTENING"' in takeover_source
-    assert "force=True" in takeover_source
+    assert "state.quiesced = False" in takeover_source
+    assert "state.kill_latched = True" in takeover_source
+    assert 'state.stage = "FLATTENING"' in takeover_source
+    assert "ControlEffects(True, True)" in takeover_source
+
+    runtime_source = SIDECAR_CORE.read_text(encoding="utf-8")
+    runtime_tree = ast.parse(runtime_source)
+    runtime_takeover = _source_for(
+        _function(runtime_tree, "_takeover_from_quiesce"),
+        runtime_source,
+    )
+    persist_adapter = _source_for(
+        _function(runtime_tree, "_persist_control_transition"),
+        runtime_source,
+    )
+    assert "self._persist_control_transition" in runtime_takeover
+    assert "self._apply_control_effects(effects)" in runtime_takeover
+    assert '_persist_durable_state(event, force=True)' in persist_adapter
 
 
 def test_sidecar_orphan_exit_requires_fresh_post_stale_flat_proof():
-    source = RISK_SUPERVISOR.read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    step = _function(tree, "step")
-    keep_running_assignments = [
-        node
-        for node in ast.walk(step)
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name)
-            and target.id == "keep_running"
-            for target in node.targets
-        )
-    ]
-    assert len(keep_running_assignments) == 1
-    exit_expression = ast.unparse(keep_running_assignments[0].value)
+    control_source = SIDECAR_CONTROL_STATE.read_text(encoding="utf-8")
+    control_tree = ast.parse(control_source)
+    keep_running = _function(control_tree, "should_keep_running")
+    return_node = next(
+        node for node in ast.walk(keep_running) if isinstance(node, ast.Return)
+    )
+    exit_expression = ast.unparse(return_node.value)
     for required_truth in (
         "exchange_valid",
         "open_order_count == 0",
         "nonzero_position_count == 0",
-        "self.flat_verification_count >= self.flat_verification_checks",
-        "self.last_verified_snapshot_sequence == self.risk_snapshot_sequence",
-        "self.last_verified_snapshot_sequence > self.parent_stale_snapshot_sequence",
+        "state.flat_verification_count >= self.flat_verification_checks",
+        "state.last_verified_snapshot_sequence == risk_snapshot_sequence",
+        "state.last_verified_snapshot_sequence > parent_stale_snapshot_sequence",
     ):
         assert required_truth in exit_expression
 
+    source = SIDECAR_CORE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
     parent_state = _function(tree, "_update_parent_stale_state")
     parent_source = _source_for(parent_state, source)
     assert (
@@ -924,30 +957,32 @@ def test_sidecar_orphan_exit_requires_fresh_post_stale_flat_proof():
         "                self.risk_snapshot_sequence\n"
         "            )"
     ) in parent_source
-    assert "self.flat_verification_count = 0" in parent_source
-    assert "self.last_verified_snapshot_sequence = 0" in parent_source
+    assert "self.control.reset_flat_verification()" in parent_source
 
-    step_source = _source_for(step, source)
-    invalidation_start = step_source.index(
-        'self.stage == "FLAT_VERIFIED"'
+    advance_source = _source_for(
+        _function(control_tree, "advance_risk_stage"),
+        control_source,
     )
-    invalidation_end = step_source.index(
-        "if self.stage != \"FLAT_VERIFIED\"",
+    invalidation_start = advance_source.index(
+        'state.stage == "FLAT_VERIFIED"'
+    )
+    invalidation_end = advance_source.index(
+        'if state.stage != "FLAT_VERIFIED"',
         invalidation_start,
     )
-    invalidation = step_source[invalidation_start:invalidation_end]
+    invalidation = advance_source[invalidation_start:invalidation_end]
     assert "not exchange_valid" in invalidation
-    assert "self.flat_verification_count = 0" in invalidation
-    assert "self.last_verified_snapshot_sequence = 0" in invalidation
+    assert "state.flat_verification_count = 0" in invalidation
+    assert "state.last_verified_snapshot_sequence = 0" in invalidation
     assert (
         "parent_healthy\n"
-        "                            or self.risk_snapshot_sequence\n"
-        "                            > self.parent_stale_snapshot_sequence"
-    ) in step_source
+        "                            or risk_snapshot_sequence\n"
+        "                            > parent_stale_snapshot_sequence"
+    ) in advance_source
 
 
 def test_sidecar_stop_waits_for_newer_independent_flat_snapshot():
-    source = RISK_SUPERVISOR.read_text(encoding="utf-8")
+    source = SIDECAR_CORE.read_text(encoding="utf-8")
     tree = ast.parse(source)
     stop = _function(tree, "_complete_stop_request")
     stop_source = _source_for(stop, source)
@@ -955,14 +990,28 @@ def test_sidecar_stop_waits_for_newer_independent_flat_snapshot():
     assert "_service_exchange_risk(" in stop_source
     assert "_exchange_snapshot_valid(" in stop_source
     assert "_account_truth_counts(" in stop_source
-    assert (
-        "self.risk_snapshot_sequence\n"
-        "                <= self.quiesce_snapshot_sequence"
-    ) in stop_source
+    force_start = stop_source.index("force=(")
+    force_end = stop_source.index("),", force_start)
+    force_source = stop_source[force_start:force_end]
+    assert "self.risk_snapshot_sequence" in force_source
+    assert "self.quiesce_snapshot_sequence" in force_source
     assert "return None" in stop_source
-    assert stop_source.count("_takeover_from_quiesce(") >= 2
-    assert "stop_without_cancel_requires_quiesced" in stop_source
+    assert stop_source.count("_takeover_from_quiesce(") == 1
     assert "stop_after_cancel_requires_fresh_quiesce" in stop_source
+
+    control_source = SIDECAR_CONTROL_STATE.read_text(encoding="utf-8")
+    control_tree = ast.parse(control_source)
+    stop_plan = _source_for(
+        _function(control_tree, "stop_plan"),
+        control_source,
+    )
+    assert "risk_snapshot_sequence <= state.quiesce_snapshot_sequence" in (
+        stop_plan
+    )
+    assert 'return StopPlan("WAIT")' in stop_plan
+    assert "not exchange_valid" in stop_plan
+    assert "open_order_count or nonzero_position_count" in stop_plan
+    assert "stop_without_cancel_requires_quiesced" in stop_plan
 
     quiesced = _function(tree, "_step_quiesced")
     quiesced_source = _source_for(quiesced, source)
@@ -972,12 +1021,14 @@ def test_sidecar_stop_waits_for_newer_independent_flat_snapshot():
         takeover_start,
     )
     takeover_segment = quiesced_source[takeover_start:recursive_step]
-    assert "if self.stop_requested:" in takeover_segment
-    assert "self._set_stop_result(" in takeover_segment
-    assert "self.stop_requested = False" in takeover_segment
+    assert "self.control.fail_pending_stop_after_takeover(" in (
+        takeover_segment
+    )
 
-    snapshot_valid = _function(tree, "_exchange_snapshot_valid")
-    snapshot_source = _source_for(snapshot_valid, source)
+    observation_source = SIDECAR_OBSERVATION.read_text(encoding="utf-8")
+    observation_tree = ast.parse(observation_source)
+    snapshot_valid = _function(observation_tree, "snapshot_valid")
+    snapshot_source = _source_for(snapshot_valid, observation_source)
     for required_field in (
         "self.exchange_healthy",
         "self.risk_snapshot_sequence > 0",

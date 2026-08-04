@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "system.strategy_runtime",
+  "version": 1,
   "system": {
     "strategy_runtime": {
       "_comment": "Bound strategy control truth in memory and freeze/cancel fail-closed before a stalled strategy can exhaust a small AWS instance.",

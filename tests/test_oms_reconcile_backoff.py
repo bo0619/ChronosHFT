@@ -11,6 +11,7 @@ if "requests" not in sys.modules:
 
 from event.type import LifecycleState
 from oms.engine import OMS
+from oms.exchange_snapshot import ExchangeTruthSnapshot
 
 
 class DummyEngine:
@@ -110,6 +111,67 @@ class OMSReconcileBackoffTests(unittest.TestCase):
             oms._execute_reconcile(None)
             self.assertEqual(oms.state, LifecycleState.HALTED)
             self.assertTrue(oms.manual_rearm_required)
+        finally:
+            oms.stop()
+
+    def test_snapshot_change_during_backfill_never_triggers_full_reset(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        account = {
+            "totalWalletBalance": 1000.0,
+            "availableBalance": 1000.0,
+        }
+
+        def snapshot(signature, positions, end_time_ms):
+            return ExchangeTruthSnapshot(
+                open_orders=[],
+                account=account,
+                positions=positions,
+                signature=signature,
+                capture_started_ms=end_time_ms - 1.0,
+                account_floor=end_time_ms / 1000.0,
+                positions_floor=end_time_ms / 1000.0,
+                end_time_ms=end_time_ms,
+                attempt=2,
+            )
+
+        captures = iter(
+            [
+                snapshot(((), (), 1000.0), [], 1000.0),
+                snapshot(
+                    ((("BTCUSDT", 1.0, 100.0),), (), 1000.0),
+                    [
+                        {
+                            "symbol": "BTCUSDT",
+                            "positionAmt": 1.0,
+                            "entryPrice": 100.0,
+                        }
+                    ],
+                    1100.0,
+                ),
+            ]
+        )
+        try:
+            oms.account.force_sync(1000.0, 0.0, 1000.0)
+            oms.state = LifecycleState.RECONCILING
+            oms.reconciler._snapshot_collector.capture = (
+                lambda **_kwargs: next(captures)
+            )
+            oms._backfill_trade_history = lambda **_kwargs: True
+            oms._perform_full_reset = lambda: self.fail(
+                "unstable truth must not trigger full reset"
+            )
+            scheduled = []
+            oms._schedule_reconcile_retry = (
+                lambda reason, suspicious_oid=None, delay_sec=None: (
+                    scheduled.append(reason)
+                )
+            )
+
+            oms._execute_reconcile(None)
+
+            self.assertEqual(oms.state, LifecycleState.FROZEN)
+            self.assertEqual(oms.consecutive_reconcile_api_failures, 1)
+            self.assertEqual(scheduled, ["Reconcile API retry"])
         finally:
             oms.stop()
 

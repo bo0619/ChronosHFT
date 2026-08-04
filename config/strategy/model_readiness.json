@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "strategy.model_readiness",
+  "version": 1,
   "strategy": {
     "model_readiness": {
       "_comment": "Paper collects samples in OBSERVE_ONLY until each symbol is ready. Live additionally requires hashed genuine-RPI exposure and OOS evidence; live approval remains intentionally disabled.",

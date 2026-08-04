@@ -93,6 +93,11 @@ def test_core_status_projection_preserves_the_complete_protocol_contract():
         "stage": "FLAT_VERIFIED",
         "state_path": "state.json",
         "state_generation": 4,
+        "writer_epoch": 0,
+        "owner_epoch": 0,
+        "safety_epoch": 0,
+        "state_sha256": "",
+        "state_store_v2": False,
         "state_recovered": True,
         "state_load_error": "",
         "state_persist_error": "persist-error",
@@ -114,6 +119,8 @@ def test_core_status_projection_preserves_the_complete_protocol_contract():
         "flat_verification_count": 3,
         "flat_verification_checks": 3,
         "last_verified_snapshot_sequence": 10,
+        "last_flat_proof": None,
+        "last_flat_proof_error": "",
         "risk_snapshot_sequence": 10,
         "quiesce_snapshot_sequence": 9,
         "risk_snapshot_captured_at": 1_000.0,
@@ -172,7 +179,7 @@ def test_core_private_status_method_remains_a_compatible_facade():
     expected = {"healthy": True}
 
     with patch(
-        "risk.independent_supervisor.RiskSidecarStatusProjection.build",
+        "risk.sidecar_core.RiskSidecarStatusProjection.build",
         return_value=expected,
     ) as build:
         result = core._status(True, "ok", "NONE", 12.0)

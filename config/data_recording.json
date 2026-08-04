@@ -1,4 +1,7 @@
 {
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "data_recording",
+  "version": 1,
   "record_data": true,
   "data_recorder": {
     "_comment": "Bound the isolated HDF5 writer for AWS t3.small and preserve the same disk reserve as OMS persistence.",

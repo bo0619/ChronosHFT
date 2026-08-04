@@ -24,15 +24,47 @@ from .order import Order
 class OMSJournalRebuilder(OMSComponent):
     """Own the deterministic journal-to-memory reconstruction pass."""
 
+    OWNER_READS = frozenset(
+        {
+            "TOMBSTONE_MAX",
+            "_apply_recovered_command_result",
+            "_apply_recovered_execution",
+            "_finalize_rpi_calibration_replay",
+            "_mode_constraint_key",
+            "_mode_rank",
+            "_new_rpi_calibration_replay_state",
+            "_remember_terminated_oid",
+            "_replay_rpi_calibration_record",
+            "_symbol_guard_owner",
+            "_venue_guard_owner",
+            "account",
+            "exchange_id_map",
+            "execution_ids",
+            "exposure",
+            "journal",
+            "lock",
+            "order_monitor",
+            "orders",
+            "terminated_oid_queue",
+            "terminated_oids",
+        }
+    )
+
     def rebuild_from_log(self):
-        stream_records = getattr(self.journal, "iter_records", None)
-        records = iter(
-            stream_records(respect_replay_policy=True)
-            if callable(stream_records)
-            else self.journal.load()
-        )
+        checkpoint = None
+        recovery_plan = getattr(self.journal, "recovery_plan", None)
+        if callable(recovery_plan) and self.journal.replay_on_startup:
+            checkpoint, recovery_records = recovery_plan()
+            records = iter(recovery_records)
+        else:
+            stream_records = getattr(self.journal, "iter_records", None)
+            records = iter(
+                stream_records(respect_replay_policy=True)
+                if callable(stream_records)
+                else self.journal.load()
+            )
         first_record = next(records, None)
-        if first_record is None:
+        if first_record is None and checkpoint is None:
             calibration_replay = (
                 self._new_rpi_calibration_replay_state()
             )
@@ -72,7 +104,23 @@ class OMSJournalRebuilder(OMSComponent):
                 ),
             }
 
-        records = chain((first_record,), records)
+        records = (
+            chain((first_record,), records)
+            if first_record is not None
+            else records
+        )
+        checkpoint_summary = (
+            checkpoint.get("summary", {})
+            if isinstance(checkpoint, dict)
+            else {}
+        )
+        if not isinstance(checkpoint_summary, dict):
+            raise JournalCorruptionError(
+                "OMS recovery checkpoint summary must be an object"
+            )
+        checkpoint_anchor_seq = int(
+            (checkpoint or {}).get("anchor_seq", 0) or 0
+        )
         latest_order_records = {}
         latest_order_record_indexes = {}
         terminal_order_oids = OrderedDict()
@@ -108,8 +156,167 @@ class OMSJournalRebuilder(OMSComponent):
         external_cash_flow_ids = set()
         external_cash_flow_scan_end_ms = 0
         calibration_replay = self._new_rpi_calibration_replay_state()
-        record_count = 0
+        checkpoint_calibration = checkpoint_summary.get("rpi_calibration")
+        if checkpoint_calibration is not None and not isinstance(
+            checkpoint_calibration,
+            dict,
+        ):
+            raise JournalCorruptionError(
+                "OMS checkpoint rpi_calibration must be an object"
+            )
+        calibration_tail_seen = False
+        record_count = checkpoint_anchor_seq
         last_record_kind = ""
+        last_record_payload = {}
+
+        if checkpoint_summary:
+            if checkpoint_summary.get("state_version") != 1:
+                raise JournalCorruptionError(
+                    "Unsupported OMS checkpoint state version"
+                )
+            active_orders = checkpoint_summary.get("active_orders", [])
+            if not isinstance(active_orders, list):
+                raise JournalCorruptionError(
+                    "OMS checkpoint active_orders must be an array"
+                )
+            for payload in active_orders:
+                if not isinstance(payload, dict):
+                    raise JournalCorruptionError(
+                        "OMS checkpoint order snapshot must be an object"
+                    )
+                client_oid = str(payload.get("client_oid", "") or "")
+                if not client_oid or client_oid in latest_order_records:
+                    raise JournalCorruptionError(
+                        "OMS checkpoint contains an invalid or duplicate order"
+                    )
+                latest_order_records[client_oid] = payload
+                latest_order_record_indexes[client_oid] = checkpoint_anchor_seq
+
+            checkpoint_terminal_oids = checkpoint_summary.get(
+                "terminated_oids",
+                [],
+            )
+            if not isinstance(checkpoint_terminal_oids, list):
+                raise JournalCorruptionError(
+                    "OMS checkpoint terminated_oids must be an array"
+                )
+            for value in checkpoint_terminal_oids:
+                oid = str(value or "")
+                if oid:
+                    terminal_order_oids[oid] = None
+
+            checkpoint_execution_ids = checkpoint_summary.get(
+                "execution_ids",
+                [],
+            )
+            if not isinstance(checkpoint_execution_ids, list):
+                raise JournalCorruptionError(
+                    "OMS checkpoint execution_ids must be an array"
+                )
+            replayed_execution_ids.update(
+                str(value) for value in checkpoint_execution_ids if str(value)
+            )
+
+            checkpoint_exposure = checkpoint_summary.get(
+                "strategy_exposure",
+                [],
+            )
+            if not isinstance(checkpoint_exposure, list):
+                raise JournalCorruptionError(
+                    "OMS checkpoint strategy_exposure must be an array"
+                )
+            for item in checkpoint_exposure:
+                if not isinstance(item, dict):
+                    raise JournalCorruptionError(
+                        "OMS checkpoint exposure row must be an object"
+                    )
+                key = (
+                    str(item.get("strategy_id", "") or ""),
+                    str(item.get("symbol", "") or "").upper(),
+                )
+                try:
+                    quantity = float(item.get("quantity", 0.0) or 0.0)
+                    average_price = float(
+                        item.get("average_price", 0.0) or 0.0
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise JournalCorruptionError(
+                        "OMS checkpoint exposure contains invalid values"
+                    ) from exc
+                if (
+                    not all(key)
+                    or not math.isfinite(quantity)
+                    or not math.isfinite(average_price)
+                ):
+                    raise JournalCorruptionError(
+                        "OMS checkpoint exposure contains invalid values"
+                    )
+                strategy_positions[key] = quantity
+                strategy_average_prices[key] = average_price
+
+            last_lifecycle = str(checkpoint_summary.get("state", "") or "") or None
+            last_freeze_reason = str(
+                checkpoint_summary.get("last_freeze_reason", "") or ""
+            )
+            last_halt_reason = str(
+                checkpoint_summary.get("last_halt_reason", "") or ""
+            )
+            manual_rearm_required = bool(
+                checkpoint_summary.get("manual_rearm_required", False)
+            )
+            symbol_guards = dict(checkpoint_summary.get("symbol_guards", {}) or {})
+            symbol_guard_records = dict(
+                checkpoint_summary.get("symbol_guard_records", {}) or {}
+            )
+            venue_guards = dict(checkpoint_summary.get("venue_guards", {}) or {})
+            venue_guard_records = dict(
+                checkpoint_summary.get("venue_guard_records", {}) or {}
+            )
+            strategy_guards = dict(
+                checkpoint_summary.get("strategy_guards", {}) or {}
+            )
+            strategy_symbol_guards = dict(
+                checkpoint_summary.get("strategy_symbol_guards", {}) or {}
+            )
+            mode_override = str(
+                checkpoint_summary.get("mode_override", "") or ""
+            )
+            mode_override_reason = str(
+                checkpoint_summary.get("mode_override_reason", "") or ""
+            )
+            mode_constraint_generation = int(
+                checkpoint_summary.get("mode_constraint_generation", 0) or 0
+            )
+            mode_constraints = dict(
+                checkpoint_summary.get("mode_constraints", {}) or {}
+            )
+            trade_cursors = {
+                str(key).upper(): int(value)
+                for key, value in dict(
+                    checkpoint_summary.get("trade_cursors", {}) or {}
+                ).items()
+            }
+            trade_scan_end_ms = {
+                str(key).upper(): int(value)
+                for key, value in dict(
+                    checkpoint_summary.get("trade_scan_end_ms", {}) or {}
+                ).items()
+            }
+            external_cash_flow_total = float(
+                checkpoint_summary.get("external_cash_flow_total", 0.0) or 0.0
+            )
+            external_cash_flow_ids = {
+                str(value)
+                for value in checkpoint_summary.get(
+                    "external_cash_flow_ids",
+                    [],
+                )
+                if str(value)
+            }
+            external_cash_flow_scan_end_ms = int(
+                checkpoint_summary.get("external_cash_flow_scan_end_ms", 0)
+                or 0
+            )
 
         def replay_strategy_execution(
             execution_payload,
@@ -176,17 +383,20 @@ class OMSJournalRebuilder(OMSComponent):
             OrderStatus.EXPIRED.value,
         }
         tombstone_limit = max(1, int(self.TOMBSTONE_MAX or 1))
-        for record_index, record in enumerate(records):
+        for tail_index, record in enumerate(records):
+            record_index = checkpoint_anchor_seq + tail_index
             record_count = record_index + 1
             payload = record.get("payload", {})
             kind = record.get("kind")
             last_record_kind = kind
+            last_record_payload = payload
             if self._replay_rpi_calibration_record(
                 kind,
                 payload,
                 calibration_replay,
                 record_index,
             ):
+                calibration_tail_seen = True
                 continue
             if kind == "order_snapshot":
                 client_oid = payload.get("client_oid")
@@ -750,11 +960,30 @@ class OMSJournalRebuilder(OMSComponent):
                         self._remember_terminated_oid(order.exchange_oid)
                         recovered_terminal_ids += 1
 
+            for terminal_oid in terminal_order_oids:
+                if (
+                    terminal_oid in self.orders
+                    or terminal_oid in self.exchange_id_map
+                    or terminal_oid in self.terminated_oids
+                ):
+                    continue
+                self._remember_terminated_oid(terminal_oid)
+                recovered_terminal_ids += 1
+
             self.execution_ids.intersection_update(retained_execution_ids)
             self.exposure.update_open_orders(self.orders)
             self.account.calculate()
 
         clean_shutdown = last_record_kind == "oms_stopped"
+        if clean_shutdown and int(
+            last_record_payload.get("shutdown_protocol_version", 1) or 1
+        ) >= 2:
+            components = last_record_payload.get("components")
+            clean_shutdown = bool(
+                isinstance(components, dict)
+                and components
+                and all(value is True for value in components.values())
+            )
         summary = {
             "records": record_count,
             "recovered_orders": len(latest_order_records),
@@ -790,9 +1019,14 @@ class OMSJournalRebuilder(OMSComponent):
             "external_cash_flow_total": external_cash_flow_total,
             "external_cash_flow_ids": sorted(external_cash_flow_ids),
             "external_cash_flow_scan_end_ms": external_cash_flow_scan_end_ms,
-            "rpi_calibration": self._finalize_rpi_calibration_replay(
-                calibration_replay,
-                dirty_shutdown=not clean_shutdown,
+            "rpi_calibration": (
+                checkpoint_calibration
+                if checkpoint_calibration is not None
+                and not calibration_tail_seen
+                else self._finalize_rpi_calibration_replay(
+                    calibration_replay,
+                    dirty_shutdown=not clean_shutdown,
+                )
             ),
         }
         if recovered_terminal_ids:

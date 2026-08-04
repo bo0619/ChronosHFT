@@ -297,9 +297,26 @@ class TimeService:
         return max(1, int(numeric))
 
     def register_listener(self, listener):
+        if not callable(listener):
+            raise TypeError("time service listener must be callable")
         with self._state_lock:
+            added = listener not in self.listeners
             if listener not in self.listeners:
                 self.listeners.append(listener)
+        active = True
+
+        def unsubscribe():
+            nonlocal active
+            with self._state_lock:
+                if not active:
+                    return False
+                active = False
+                if added and listener in self.listeners:
+                    self.listeners.remove(listener)
+                    return True
+                return False
+
+        return unsubscribe
 
     def clear_listeners(self):
         with self._state_lock:
