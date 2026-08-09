@@ -12,6 +12,7 @@ from event.type import (
 from infrastructure.logger import logger
 
 from .component import OMSComponent
+from .shutdown_coordinator import OMSShutdownCoordinator
 
 
 class OMSLifecycleController(OMSComponent):
@@ -21,71 +22,34 @@ class OMSLifecycleController(OMSComponent):
         {
             "_account_cancel_symbols",
             "_audit",
-            "_background_tasks",
             "_cancel_all_orders_unchecked",
             "_close_outbound_gate_locked",
-            "_deferred_cancel_all_symbols",
-            "_deferred_cancel_oids",
             "_ensure_venue_dead_man_switch_armed",
             "_fail_closed_on_journal_error",
-            "_order_truth_resolution_inflight",
             "_perform_full_reset",
-            "_refresh_outbound_gate_locked",
-            "_rpi_calibration_snapshot_locked",
-            "_shutdown_cancel_verified",
-            "_shutdown_reason",
-            "_shutdown_requested",
-            "_submit_cancel_requested_oids",
-            "_submit_settlement_inflight_oids",
             "_sync_capability_mode",
-            "_wait_for_outbound_order_sends",
             "_wait_for_outbound_risk_sends",
             "account",
-            "capability_mode",
             "can_query_exchange",
             "event_engine",
-            "execution_ids",
-            "exposure",
             "gateway",
+            "guard_store",
+            "last_freeze_reason",
+            "last_halt_reason",
+            "lifecycle_store",
             "lock",
-            "mode_constraint_generation",
-            "mode_constraints",
-            "mode_override",
-            "mode_override_reason",
-            "order_monitor",
-            "orders",
-            "outbound_gate_drain_timeout_sec",
-            "paper_trade_database",
+            "manual_rearm_required",
             "rebuild_summary",
             "reconciler",
-            "single_writer_fence",
-            "strategy_guards",
-            "strategy_symbol_guards",
-            "symbol_guard_records",
+            "state",
             "symbol_guards",
-            "terminated_oids",
-            "trade_cursors",
-            "trade_scan_end_ms",
-            "trade_tail_verification_inflight",
             "trigger_reconcile",
             "venue_guards",
-            "venue_guard_records",
-            "external_cash_flow_ids",
-            "external_cash_flow_scan_end_ms",
-            "journal",
         }
     )
     OWNER_WRITES = frozenset(
         {
-            "_lifecycle_generation",
-            "_outbound_all_order_seal_reason",
-            "_stopped",
-            "last_freeze_reason",
-            "last_halt_reason",
-            "manual_rearm_required",
-            "reconcile_retry_scheduled",
             "recovered_guard_cleanup_pending",
-            "state",
         }
     )
 
@@ -113,14 +77,18 @@ class OMSLifecycleController(OMSComponent):
             ):
                 return False
             logger.warning("[OMS] Bootstrapping into guarded reconcile mode")
-            self.state = LifecycleState.FROZEN
+            freeze_reason = (
+                self.last_freeze_reason or "Recovered guarded state"
+            )
+            self.lifecycle_store.transition(
+                LifecycleState.FROZEN,
+                last_freeze_reason=freeze_reason,
+            )
             self._sync_capability_mode("bootstrap_guarded")
             self.recovered_guard_cleanup_pending = True
-            if not self.last_freeze_reason:
-                self.last_freeze_reason = "Recovered guarded state"
             self._audit(
                 "bootstrap_guarded",
-                reason=self.last_freeze_reason,
+                reason=freeze_reason,
                 recovered=self.rebuild_summary,
             )
             self.trigger_reconcile("Recovered guarded state")
@@ -186,8 +154,7 @@ class OMSLifecycleController(OMSComponent):
         return bool(
             self.symbol_guards
             or self.venue_guards
-            or self.strategy_guards
-            or self.strategy_symbol_guards
+            or self.guard_store.has_active()
         )
 
 
@@ -198,14 +165,16 @@ class OMSLifecycleController(OMSComponent):
                 self._close_outbound_gate_locked(reason)
                 return
 
-            previous_state = self.state
-            self._lifecycle_generation += 1
-            self.state = LifecycleState.FROZEN
+            previous = self.lifecycle_store.transition(
+                LifecycleState.FROZEN,
+                increment_generation=True,
+                last_freeze_reason=reason,
+            )
+            previous_state = previous.state
             try:
                 self._sync_capability_mode(reason)
             except Exception as exc:
                 audit_error = exc
-            self.last_freeze_reason = reason
 
         if audit_error is not None:
             self._fail_closed_on_journal_error(
@@ -261,20 +230,26 @@ class OMSLifecycleController(OMSComponent):
         emit_halt_event = False
         audit_error = None
         with self.lock:
-            self._lifecycle_generation += 1
             if self.state == LifecycleState.HALTED:
-                self.last_halt_reason = reason
-                self.manual_rearm_required = True
+                self.lifecycle_store.transition(
+                    LifecycleState.HALTED,
+                    increment_generation=True,
+                    manual_rearm_required=True,
+                    last_halt_reason=reason,
+                )
                 try:
                     self._sync_capability_mode(reason)
                     self._audit("halt_reasserted", reason=reason)
                 except Exception as exc:
                     audit_error = exc
             else:
-                self.state = LifecycleState.HALTED
-                self.manual_rearm_required = True
-                self.last_halt_reason = reason
-                self.last_freeze_reason = ""
+                self.lifecycle_store.transition(
+                    LifecycleState.HALTED,
+                    increment_generation=True,
+                    manual_rearm_required=True,
+                    last_halt_reason=reason,
+                    last_freeze_reason="",
+                )
                 logger.critical(f"OMS HALTED: {reason}")
                 try:
                     self._sync_capability_mode(reason)
@@ -334,8 +309,10 @@ class OMSLifecycleController(OMSComponent):
                 except Exception as exc:
                     audit_error = exc
                 if audit_error is None:
-                    self.state = LifecycleState.RECONCILING
-                    self._lifecycle_generation += 1
+                    self.lifecycle_store.transition(
+                        LifecycleState.RECONCILING,
+                        increment_generation=True,
+                    )
                     try:
                         self._sync_capability_mode(
                             f"manual_rearm:{reason}"
@@ -358,8 +335,11 @@ class OMSLifecycleController(OMSComponent):
         self._perform_full_reset()
         with self.lock:
             if self.state == LifecycleState.LIVE:
-                self.manual_rearm_required = False
-                self.last_halt_reason = ""
+                self.lifecycle_store.transition(
+                    LifecycleState.LIVE,
+                    manual_rearm_required=False,
+                    last_halt_reason="",
+                )
                 try:
                     self._audit(
                         "rearm_completed",
@@ -371,7 +351,10 @@ class OMSLifecycleController(OMSComponent):
                 if audit_error is None:
                     return True
 
-            self.manual_rearm_required = True
+            self.lifecycle_store.transition(
+                self.state,
+                manual_rearm_required=True,
+            )
         if audit_error is not None:
             self._fail_closed_on_journal_error(
                 audit_error,
@@ -380,244 +363,12 @@ class OMSLifecycleController(OMSComponent):
         return False
 
     def _shutdown_checkpoint_summary(self) -> dict:
-        """Capture the complete in-memory recovery surface after drain."""
-        with self.lock:
-            strategy_exposure = []
-            average_prices = self.exposure.strategy_avg_prices
-            for key, quantity in sorted(
-                self.exposure.strategy_net_positions.items(),
-                key=lambda item: tuple(str(part) for part in item[0]),
-            ):
-                strategy_id, symbol = key
-                strategy_exposure.append(
-                    {
-                        "strategy_id": str(strategy_id),
-                        "symbol": str(symbol),
-                        "quantity": float(quantity),
-                        "average_price": float(average_prices.get(key, 0.0)),
-                    }
-                )
-            calibration_snapshot = self._rpi_calibration_snapshot_locked()
-            return {
-                "state_version": 1,
-                "state": self.state.value,
-                "capability_mode": self.capability_mode.value,
-                "manual_rearm_required": bool(self.manual_rearm_required),
-                "last_freeze_reason": str(self.last_freeze_reason or ""),
-                "last_halt_reason": str(self.last_halt_reason or ""),
-                "active_orders": [
-                    order.to_record()
-                    for _client_oid, order in sorted(self.orders.items())
-                ],
-                "terminated_oids": sorted(str(oid) for oid in self.terminated_oids),
-                "execution_ids": sorted(str(value) for value in self.execution_ids),
-                "strategy_exposure": strategy_exposure,
-                "symbol_guards": dict(self.symbol_guards),
-                "symbol_guard_records": dict(self.symbol_guard_records),
-                "venue_guards": dict(self.venue_guards),
-                "venue_guard_records": dict(self.venue_guard_records),
-                "strategy_guards": dict(self.strategy_guards),
-                "strategy_symbol_guards": dict(self.strategy_symbol_guards),
-                "mode_override": str(self.mode_override or ""),
-                "mode_override_reason": str(self.mode_override_reason or ""),
-                "mode_constraint_generation": int(
-                    self.mode_constraint_generation or 0
-                ),
-                "mode_constraints": dict(self.mode_constraints),
-                "trade_cursors": dict(self.trade_cursors),
-                "trade_scan_end_ms": dict(self.trade_scan_end_ms),
-                "external_cash_flow_total": float(
-                    self.account.external_cash_flow_total or 0.0
-                ),
-                "external_cash_flow_ids": sorted(
-                    str(value) for value in self.external_cash_flow_ids
-                ),
-                "external_cash_flow_scan_end_ms": int(
-                    self.external_cash_flow_scan_end_ms or 0
-                ),
-                "rpi_calibration": calibration_snapshot,
-            }
+        return self._spawn_component(
+            OMSShutdownCoordinator
+        ).checkpoint_summary()
 
     def stop(self, clean_shutdown: bool = False, reason: str = ""):
-        with self.lock:
-            self._stopped = True
-            self._outbound_all_order_seal_reason = reason or "oms_stop"
-            self._close_outbound_gate_locked("oms_stop", hold="stopped")
-        shutdown_started_persisted = True
-        try:
-            self._audit(
-                "shutdown_started",
-                state=self.state.value,
-                reason=reason or self._shutdown_reason or "oms_stop",
-                clean_requested=bool(clean_shutdown),
-                cancel_verified=bool(self._shutdown_cancel_verified),
-            )
-        except Exception as exc:
-            shutdown_started_persisted = False
-            logger.critical(
-                "[OMS] Shutdown start could not be persisted: "
-                f"{type(exc).__name__}:{exc}"
-            )
-        drained = self._wait_for_outbound_order_sends("oms_stop")
-        background_tasks_stopped = self._background_tasks.shutdown(
-            timeout=self.outbound_gate_drain_timeout_sec
+        return self._spawn_component(OMSShutdownCoordinator).stop(
+            clean_shutdown,
+            reason,
         )
-        if not background_tasks_stopped:
-            logger.critical(
-                "[OMS] Bounded background executor did not stop cleanly"
-            )
-        with self.lock:
-            self.reconcile_retry_scheduled = False
-            self._submit_settlement_inflight_oids.clear()
-            self._submit_cancel_requested_oids.clear()
-            self._deferred_cancel_oids.clear()
-            self._deferred_cancel_all_symbols.clear()
-            self.trade_tail_verification_inflight.clear()
-            self._order_truth_resolution_inflight.clear()
-        clean_shutdown = bool(
-            clean_shutdown
-            and shutdown_started_persisted
-            and drained
-            and background_tasks_stopped
-            and self._shutdown_requested
-            and self._shutdown_cancel_verified
-        )
-        paper_database = getattr(self, "paper_trade_database", None)
-        paper_run_id = (
-            str(getattr(paper_database, "run_id", "") or "")
-            if paper_database is not None
-            else ""
-        )
-        paper_audit_fields = (
-            {"paper_run_id": paper_run_id} if paper_run_id else {}
-        )
-        order_monitor_stopped = True
-        try:
-            monitor_result = self.order_monitor.stop()
-            order_monitor_stopped = monitor_result is not False
-        except Exception as exc:
-            order_monitor_stopped = False
-            logger.critical(
-                "[OMS] Order monitor did not stop cleanly: "
-                f"{type(exc).__name__}:{exc}"
-            )
-
-        paper_database_stopped = True
-        if paper_database is not None:
-            try:
-                paper_database_stopped = bool(
-                    paper_database.close(
-                        clean_shutdown=bool(
-                            clean_shutdown and order_monitor_stopped
-                        ),
-                        reason=reason or self._shutdown_reason or "oms_stop",
-                    )
-                )
-            except Exception as exc:
-                paper_database_stopped = False
-                logger.critical(
-                    "[OMS] Paper trade database did not stop cleanly: "
-                    f"{type(exc).__name__}:{exc}"
-                )
-
-        components = {
-            "shutdown_started_persisted": bool(
-                shutdown_started_persisted
-            ),
-            "outbound_sends_drained": bool(drained),
-            "background_tasks_stopped": bool(background_tasks_stopped),
-            "order_monitor_stopped": bool(order_monitor_stopped),
-            "paper_trade_database_stopped": bool(
-                paper_database_stopped
-            ),
-            "cancel_verified": bool(self._shutdown_cancel_verified),
-        }
-        checkpoint_committed = False
-        if clean_shutdown and all(components.values()):
-            try:
-                checkpoint = self.journal.commit_checkpoint(
-                    self._shutdown_checkpoint_summary()
-                )
-                checkpoint_committed = bool(checkpoint.get("checkpoint_sha256"))
-            except Exception as exc:
-                logger.critical(
-                    "[OMS] Final recovery checkpoint could not be committed: "
-                    f"{type(exc).__name__}:{exc}"
-                )
-        components["checkpoint_committed"] = checkpoint_committed
-        resources_stopped = all(components.values())
-        audit_ok = True
-        try:
-            if clean_shutdown and resources_stopped:
-                self._audit(
-                    "oms_stopped",
-                    shutdown_protocol_version=3,
-                    state=self.state.value,
-                    reason=reason or self._shutdown_reason,
-                    cancel_verified=True,
-                    components=components,
-                    manual_rearm_required=self.manual_rearm_required,
-                    symbol_guard_count=len(self.symbol_guards),
-                    venue_guard_count=len(self.venue_guards),
-                    strategy_guard_count=len(self.strategy_guards),
-                    strategy_symbol_guard_count=len(
-                        self.strategy_symbol_guards
-                    ),
-                    **paper_audit_fields,
-                )
-            else:
-                self._audit(
-                    "shutdown_incomplete",
-                    shutdown_protocol_version=3,
-                    state=self.state.value,
-                    reason=(
-                        reason
-                        or self._shutdown_reason
-                        or "oms_stop_without_verification"
-                    ),
-                    components=components,
-                    **paper_audit_fields,
-                )
-        except Exception as exc:
-            audit_ok = False
-            logger.critical(
-                "[OMS] Shutdown completion could not be persisted: "
-                f"{type(exc).__name__}:{exc}"
-            )
-
-        with self.lock:
-            self._refresh_outbound_gate_locked("oms_stopped")
-
-        fence_released = True
-        if (
-            self.single_writer_fence is not None
-            and getattr(self.single_writer_fence, "handle", None) is not None
-        ):
-            try:
-                release_result = self.single_writer_fence.release()
-                fence_released = release_result is not False
-            except Exception as exc:
-                fence_released = False
-                logger.critical(
-                    "[OMS] Single-writer fence release failed: "
-                    f"{type(exc).__name__}:{exc}"
-                )
-
-        stopped = bool(
-            background_tasks_stopped
-            and order_monitor_stopped
-            and paper_database_stopped
-            and fence_released
-        )
-        return {
-            "stopped": stopped,
-            "drained": bool(drained),
-            "background_tasks_stopped": bool(background_tasks_stopped),
-            "paper_trade_database_stopped": bool(paper_database_stopped),
-            "clean": bool(
-                clean_shutdown
-                and resources_stopped
-                and audit_ok
-                and fence_released
-            ),
-        }

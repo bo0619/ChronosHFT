@@ -16,10 +16,11 @@ from data.oos_reconstruction import (
     RAW_OOS_EVIDENCE_SCHEMA,
 )
 from event.type import OrderBook
+from governance import calibration_artifact as calibration_artifact_port
 from governance.canonical import canonical_config_digest
 from governance.release_manifest import write_release_manifest
 from infrastructure.config_scaling import (
-    load_root_config,
+    load_root_config as _load_root_config,
     normalize_root_config_preapproval,
 )
 from infrastructure.rpi_calibration_permit import (
@@ -60,13 +61,30 @@ from strategy.model_readiness import (
     readiness_requirements,
     sha256_file,
     strategy_policy_sha256,
-    validate_live_calibration_approval,
+    validate_live_calibration_approval as _validate_live_calibration_approval,
     verify_ed25519_signature,
 )
 from tests.test_live_config_guard import safe_live_config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+TEST_CASH_FLOW_DEPLOYMENT_START_MS = 1_753_248_000_000
+
+
+def load_root_config(*args, **kwargs):
+    kwargs.setdefault(
+        "calibration_artifact_port",
+        calibration_artifact_port,
+    )
+    return _load_root_config(*args, **kwargs)
+
+
+def validate_live_calibration_approval(*args, **kwargs):
+    kwargs.setdefault(
+        "calibration_artifact_port",
+        calibration_artifact_port,
+    )
+    return _validate_live_calibration_approval(*args, **kwargs)
 
 
 def _canonical_json(value):
@@ -152,10 +170,20 @@ def _set_test_state_paths(config, lane):
             },
         }
     )
-    config.setdefault("risk", {}).setdefault(
+    supervisor = config.setdefault("risk", {}).setdefault(
         "independent_supervisor",
         {},
-    )["state_path"] = f"{base}/risk-supervisor-state.json"
+    )
+    supervisor.update(
+        {
+            "state_store_root": f"{base}/risk-sidecar-v2",
+            "account_scope_id": f"{deployment_id}-account-scope",
+            "state_genesis_id": f"{deployment_id}-{lane}-genesis",
+            "cash_flow_deployment_start_ms": (
+                TEST_CASH_FLOW_DEPLOYMENT_START_MS
+            ),
+        }
+    )
     system = config.setdefault("system", {})
     system.setdefault("admin_control", {})["path"] = f"{base}/admin"
     system.setdefault("evidence_recorder", {}).update(
@@ -711,9 +739,9 @@ class ModelReadinessTests(unittest.TestCase):
                 60_000,
             ),
             (
-                "state path",
-                ("risk", "independent_supervisor", "state_path"),
-                "storage/live/other/risk_state.json",
+                "state store root",
+                ("risk", "independent_supervisor", "state_store_root"),
+                "storage/live/other/risk-sidecar-v2",
             ),
             ("strategy", ("strategy", "glft", "gamma"), 0.2),
             (

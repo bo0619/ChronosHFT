@@ -6,11 +6,14 @@ import ntpath
 import os
 import re
 import stat
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from governance.state_paths import (
+    validate_live_state_path_bindings as _validate_live_state_path_bindings,
+)
 from infrastructure.external_alerts import validate_https_webhook_url
 from infrastructure.paper_trade import is_paper_trade
 from infrastructure.rpi_policy import effective_rpi_route_enabled
@@ -528,8 +531,8 @@ def validate_live_external_alert_config(
                 writer_fence.get("path"),
             ),
             (
-                "risk.independent_supervisor.state_path",
-                supervisor.get("state_path"),
+                "risk.independent_supervisor.state_store_root",
+                supervisor.get("state_store_root"),
             ),
             (
                 "system.evidence_recorder.path",
@@ -740,96 +743,7 @@ def validate_live_state_path_bindings(
     *,
     base_dir: str | Path | None = None,
 ) -> dict[str, str]:
-    """Resolve and bind all durable Live state files to one deployment."""
-    live_launch = _section(config, "live_launch")
-    oms = _section(config, "oms")
-    risk = _section(config, "risk")
-    supervisor = _section(risk, "independent_supervisor")
-    writer_fence = _section(oms, "single_writer_fence")
-    system = _section(config, "system")
-    evidence = _section(system, "evidence_recorder")
-    evidence_fence = _section(evidence, "single_writer_fence")
-    admin_control = _section(system, "admin_control")
-    alert = _section(config, "alert")
-    deployment_id = str(
-        live_launch.get("deployment_id", "") or ""
-    ).strip()
-    if not _DEPLOYMENT_ID_RE.fullmatch(deployment_id):
-        raise ValueError(
-            "live_launch.deployment_id must be 6-128 path-safe characters"
-        )
-
-    raw_paths = {
-        "oms.journal_path": oms.get("journal_path"),
-        "oms.single_writer_fence.path": writer_fence.get("path"),
-        "risk.independent_supervisor.state_path": supervisor.get("state_path"),
-        "system.evidence_recorder.path": evidence.get("path"),
-        "system.evidence_recorder.single_writer_fence.path": (
-            evidence_fence.get("path")
-        ),
-        "system.admin_control.path": admin_control.get("path"),
-        "alert.failure_spool_path": alert.get("failure_spool_path"),
-    }
-    identities: dict[str, str] = {}
-    resolved_parts: dict[str, tuple[str, ...]] = {}
-    for field, raw_path in raw_paths.items():
-        try:
-            identity, parts = _resolved_path_identity(
-                raw_path,
-                base_dir=base_dir,
-            )
-        except ValueError as exc:
-            raise ValueError(f"{field} {exc}") from exc
-        identities[field] = identity
-        resolved_parts[field] = parts
-
-    deployment_component = os.path.normcase(deployment_id)
-    unbound = [
-        field
-        for field, parts in resolved_parts.items()
-        if deployment_component not in parts
-    ]
-    if unbound:
-        raise ValueError(
-            "state paths must contain deployment_id as a resolved path "
-            "component: " + ", ".join(unbound)
-        )
-
-    journal_raw = str(raw_paths["oms.journal_path"] or "").strip()
-    expected_fence, _ = _resolved_path_identity(
-        f"{journal_raw}.lock",
-        base_dir=base_dir,
-    )
-    if identities["oms.single_writer_fence.path"] != expected_fence:
-        raise ValueError(
-            "oms.single_writer_fence.path must resolve to "
-            "oms.journal_path + '.lock'"
-        )
-
-    evidence_raw = str(
-        raw_paths["system.evidence_recorder.path"] or ""
-    ).strip()
-    expected_evidence_fence, _ = _resolved_path_identity(
-        f"{evidence_raw}.lock",
-        base_dir=base_dir,
-    )
-    if (
-        identities[
-            "system.evidence_recorder.single_writer_fence.path"
-        ]
-        != expected_evidence_fence
-    ):
-        raise ValueError(
-            "system.evidence_recorder.single_writer_fence.path must resolve "
-            "to system.evidence_recorder.path + '.lock'"
-        )
-
-    if len(set(identities.values())) != len(identities):
-        raise ValueError(
-            "all durable Live state, journal, fence, and alert spool paths "
-            "must resolve to different files"
-        )
-    return identities
+    return _validate_live_state_path_bindings(config, base_dir=base_dir)
 
 
 def _reject_json_constant(value: str) -> None:
@@ -2369,6 +2283,7 @@ def validate_live_runtime_config(
     config: dict,
     *,
     config_path: str | Path | None = None,
+    target_config_normalizer: Callable[[dict], Mapping] | None = None,
     require_local_evidence: bool = False,
     now_utc: datetime | None = None,
     external_alert_environ: Mapping[str, str] | None = None,
@@ -2732,8 +2647,6 @@ def validate_live_runtime_config(
             "risk.independent_supervisor.flatten_enabled must be true"
         )
     for field in (
-        "state_required",
-        "state_fsync",
         "daily_loss_enabled",
         "clock_sync_enabled",
         "liquidation_proximity_enabled",
@@ -2743,16 +2656,47 @@ def validate_live_runtime_config(
             violations.append(
                 f"risk.independent_supervisor.{field} must be true"
             )
-    supervisor_state_path = str(
-        supervisor.get("state_path", "") or ""
-    ).strip()
-    if not supervisor_state_path:
+    legacy_state_fields = tuple(
+        field
+        for field in ("state_path", "state_required", "state_fsync")
+        if field in supervisor
+    )
+    if legacy_state_fields:
         violations.append(
-            "risk.independent_supervisor.state_path must be configured"
+            "risk.independent_supervisor legacy state fields are unsupported: "
+            + ",".join(legacy_state_fields)
         )
-    elif _uses_paper_state_path(supervisor_state_path):
+    supervisor_state_root = str(
+        supervisor.get("state_store_root", "") or ""
+    ).strip()
+    if not supervisor_state_root:
         violations.append(
-            "risk.independent_supervisor.state_path must not use Paper state"
+            "risk.independent_supervisor.state_store_root must be configured"
+        )
+    elif _uses_paper_state_path(supervisor_state_root):
+        violations.append(
+            "risk.independent_supervisor.state_store_root must not use Paper "
+            "state"
+        )
+    if not str(supervisor.get("account_scope_id", "") or "").strip():
+        violations.append(
+            "risk.independent_supervisor.account_scope_id must be configured"
+        )
+    if not str(supervisor.get("state_genesis_id", "") or "").strip():
+        violations.append(
+            "risk.independent_supervisor.state_genesis_id must be configured"
+        )
+    cash_flow_deployment_start_ms = supervisor.get(
+        "cash_flow_deployment_start_ms"
+    )
+    if (
+        isinstance(cash_flow_deployment_start_ms, bool)
+        or not isinstance(cash_flow_deployment_start_ms, int)
+        or cash_flow_deployment_start_ms <= 0
+    ):
+        violations.append(
+            "risk.independent_supervisor.cash_flow_deployment_start_ms must "
+            "be a positive integer"
         )
 
     primary_api_key = str(config.get("api_key", "") or "").strip()
@@ -2979,6 +2923,11 @@ def validate_live_runtime_config(
                 "rpi_calibration_canary runtime validation requires the "
                 "exact config_path for independent permit revalidation"
             )
+        elif not callable(target_config_normalizer):
+            violations.append(
+                "rpi_calibration_canary runtime validation requires an "
+                "injected target config normalizer"
+            )
         else:
             try:
                 from infrastructure.rpi_calibration_permit import (
@@ -2989,6 +2938,7 @@ def validate_live_runtime_config(
                     load_and_validate_rpi_calibration_permit(
                         config,
                         config_path=config_path,
+                        target_config_normalizer=target_config_normalizer,
                         now_utc=now_utc,
                     )
                 )

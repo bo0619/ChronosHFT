@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Protocol
@@ -34,6 +33,8 @@ class BinanceSidecarTruthOwner(Protocol):
     cash_flow_max_pages: int
     cash_flow_poll_interval_sec: float
     cash_flow_deployment_start_ms: int
+    cash_flow_overlap_ms: int
+    cash_flow_ledger: object | None
     _last_cash_flow_poll_monotonic: float
     _cached_external_cash_flow_total: float
     _cached_daily_external_cash_flow_total: float
@@ -51,6 +52,10 @@ class BinanceSidecarTruthOwner(Protocol):
     clock_rtt_ms: float
     clock_uncertainty_ms: float
     clock_offset_dispersion_ms: float
+
+    def _monotonic(self) -> float: ...
+
+    def _wall_time(self) -> float: ...
 
     def _ensure_exchange_clock(self, force: bool = False): ...
 
@@ -180,13 +185,13 @@ class BinanceSidecarTruthReader:
         return tuple(sorted(rows))
 
     def corrected_now(self) -> tuple[float, float] | None:
-        observed_monotonic = time.perf_counter()
+        observed_monotonic = self._owner._monotonic()
         correct = getattr(self._owner, "_corrected_epoch_at", None)
         corrected = (
             correct(observed_monotonic) if callable(correct) else None
         )
         if corrected is None:
-            wall_time = getattr(self._owner, "_wall_time", time.time)
+            wall_time = self._owner._wall_time
             corrected = float(wall_time())
         try:
             corrected = float(corrected)
@@ -217,7 +222,7 @@ class BinanceSidecarTruthReader:
             )
             if not ok:
                 return False, {}, reason
-            received_monotonic = time.perf_counter()
+            received_monotonic = owner._monotonic()
             corrected_received_epoch = owner._corrected_epoch_at(
                 received_monotonic
             )
@@ -566,9 +571,22 @@ class BinanceSidecarTruthReader:
         start_time_ms: int,
         end_time_ms: int,
     ):
+        ok, events, reason = self._collect_external_cash_flow_events(
+            start_time_ms,
+            end_time_ms,
+        )
+        if not ok:
+            return False, 0.0, reason
+        return True, sum(float(event["amount"]) for event in events), ""
+
+    def _collect_external_cash_flow_events(
+        self,
+        start_time_ms: int,
+        end_time_ms: int,
+    ):
         owner = self._owner
-        total = 0.0
-        seen = set()
+        events = []
+        seen: dict[str, str] = {}
         limit = 1000
         for page in range(1, owner.cash_flow_max_pages + 1):
             ok, rows, reason = owner._response_payload(
@@ -582,10 +600,10 @@ class BinanceSidecarTruthReader:
                 "income_history",
             )
             if not ok:
-                return False, 0.0, reason
+                return False, [], reason
             for row in rows:
                 if not isinstance(row, dict):
-                    return False, 0.0, "income_history_row_invalid"
+                    return False, [], "income_history_row_invalid"
                 income_type = str(
                     row.get(
                         "incomeType",
@@ -599,23 +617,49 @@ class BinanceSidecarTruthReader:
                 if asset not in owner.cash_flow_assets:
                     return (
                         False,
-                        0.0,
+                        [],
                         f"cash_flow_asset_unsupported:{asset or 'empty'}",
                     )
                 identity = owner._income_identity(row)
-                if identity in seen:
-                    continue
-                seen.add(identity)
                 try:
                     amount = float(row.get("income", 0.0) or 0.0)
-                except (TypeError, ValueError):
-                    return False, 0.0, "cash_flow_amount_invalid"
+                    event_time_ms = int(row["time"])
+                    raw = json.dumps(
+                        row,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                except (KeyError, TypeError, ValueError):
+                    return False, [], "cash_flow_event_invalid"
                 if not math.isfinite(amount):
-                    return False, 0.0, "cash_flow_amount_non_finite"
-                total += amount
+                    return False, [], "cash_flow_amount_non_finite"
+                if event_time_ms < 0:
+                    return False, [], "cash_flow_event_time_invalid"
+                raw_sha256 = hashlib.sha256(raw).hexdigest()
+                previous_digest = seen.get(identity)
+                if previous_digest is not None:
+                    if previous_digest != raw_sha256:
+                        return (
+                            False,
+                            [],
+                            "cash_flow_event_identity_collision",
+                        )
+                    continue
+                seen[identity] = raw_sha256
+                events.append(
+                    {
+                        "event_id": identity,
+                        "event_time_ms": event_time_ms,
+                        "asset": asset,
+                        "amount": amount,
+                        "raw_sha256": raw_sha256,
+                    }
+                )
             if len(rows) < limit:
-                return True, total, ""
-        return False, 0.0, "income_history_page_limit_exceeded"
+                return True, events, ""
+        return False, [], "income_history_page_limit_exceeded"
 
     def get_cached_external_cash_flow_truth(self):
         owner = self._owner
@@ -654,10 +698,41 @@ class BinanceSidecarTruthReader:
                 or 30.0
             ),
         )
+        ledger = getattr(owner, "cash_flow_ledger", None)
+        ledger_cursor = None
+        if ledger is not None:
+            try:
+                ledger_cursor = ledger.cash_flow_cursor()
+            except Exception as exc:
+                return (
+                    False,
+                    None,
+                    "cash_flow_ledger_unavailable:"
+                    f"{type(exc).__name__}:{exc}",
+                )
         if (
             initialized
             and cache_day == risk_day
             and now_monotonic - last_poll < interval
+            and (
+                ledger_cursor is None
+                or (
+                    int(
+                        getattr(owner, "_cash_flow_cache_generation", 0)
+                        or 0
+                    )
+                    == int(ledger_cursor["generation"])
+                    and int(
+                        getattr(
+                            owner,
+                            "_cash_flow_cache_complete_through_ms",
+                            -1,
+                        )
+                        or -1
+                    )
+                    == int(ledger_cursor["complete_through_ms"])
+                )
+            )
         ):
             return (
                 True,
@@ -695,6 +770,86 @@ class BinanceSidecarTruthReader:
                         )
                         or end_time_ms
                     ),
+                    captured_monotonic=now_monotonic,
+                ),
+                "",
+            )
+
+        if ledger_cursor is not None:
+            deployment_start_ms = int(
+                getattr(owner, "cash_flow_deployment_start_ms", 0) or 0
+            )
+            if deployment_start_ms <= 0:
+                return (
+                    False,
+                    None,
+                    "cash_flow_deployment_start_missing",
+                )
+            if int(ledger_cursor["start_time_ms"]) != deployment_start_ms:
+                return (
+                    False,
+                    None,
+                    "cash_flow_ledger_deployment_identity_mismatch",
+                )
+            overlap_ms = max(
+                60_000,
+                int(getattr(owner, "cash_flow_overlap_ms", 86_400_000)),
+            )
+            complete_through_ms = int(
+                ledger_cursor["complete_through_ms"]
+            )
+            refresh_start_ms = max(
+                deployment_start_ms,
+                complete_through_ms - overlap_ms + 1,
+            )
+            ok, events, reason = self._collect_external_cash_flow_events(
+                refresh_start_ms,
+                end_time_ms,
+            )
+            if not ok:
+                return False, None, reason
+            try:
+                generation = ledger.commit_cash_flow_refresh(
+                    events,
+                    start_time_ms=refresh_start_ms,
+                    complete_through_ms=end_time_ms,
+                )
+                daily_total = ledger.cash_flow_total(
+                    day_start_ms,
+                    end_time_ms,
+                )
+                deployment_total = ledger.cash_flow_total(
+                    deployment_start_ms,
+                    end_time_ms,
+                )
+            except Exception as exc:
+                return (
+                    False,
+                    None,
+                    "cash_flow_ledger_commit_failed:"
+                    f"{type(exc).__name__}:{exc}",
+                )
+            owner._cached_external_cash_flow_total = float(daily_total)
+            owner._cached_daily_external_cash_flow_total = float(daily_total)
+            owner._cached_deployment_external_cash_flow_total = float(
+                deployment_total
+            )
+            owner._deployment_cash_flow_carry = 0.0
+            owner._cash_flow_cache_day = risk_day
+            owner._cash_flow_cache_generation = int(generation)
+            owner._cash_flow_cache_complete_through_ms = end_time_ms
+            owner._last_cash_flow_poll_monotonic = now_monotonic
+            owner._cash_flow_cache_initialized = True
+            return (
+                True,
+                CashFlowTruth(
+                    risk_day=risk_day,
+                    daily_external_cash_flow_total=float(daily_total),
+                    deployment_external_cash_flow_total=float(
+                        deployment_total
+                    ),
+                    ledger_generation=int(generation),
+                    complete_through_ms=end_time_ms,
                     captured_monotonic=now_monotonic,
                 ),
                 "",
@@ -769,7 +924,7 @@ class BinanceSidecarTruthReader:
     def get_open_orders_snapshot(self):
         owner = self._owner
         symbols = tuple(getattr(owner, "symbols", ()) or ())
-        now = time.perf_counter()
+        now = owner._monotonic()
         last_full_audit = float(
             getattr(
                 owner,

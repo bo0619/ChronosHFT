@@ -14,6 +14,20 @@ def _message(message_type, session_id="session-1", **payload):
     )
 
 
+def _runtime_settings(**overrides):
+    return SidecarProtocol.with_launch_contract(
+        {
+            "session_id": "session-1",
+            "state_store_root": "state-v2",
+            "account_scope_id": "account-1",
+            "deployment_id": "deployment-1",
+            "state_genesis_id": "genesis-1",
+            "cash_flow_deployment_start_ms": 1_700_000_000_000,
+            **overrides,
+        }
+    )
+
+
 class _CommandCore:
     def __init__(self):
         self.calls = []
@@ -206,10 +220,11 @@ class _SnapshotWorker:
 
 
 class _StepCore:
-    def __init__(self, exchange, settings, *, snapshot_worker):
+    def __init__(self, exchange, settings, *, snapshot_worker, clock):
         self.exchange = exchange
         self.settings = settings
         self.snapshot_worker = snapshot_worker
+        self.clock = clock
         self.steps = 0
 
     def step(self, now):
@@ -236,9 +251,7 @@ def test_runtime_publishes_initial_and_terminal_status_then_closes_clients():
     SidecarRuntime.run(
         command_queue,
         status_queue,
-        SidecarProtocol.with_launch_contract(
-            {"session_id": "session-1", "status_interval_sec": 1.0}
-        ),
+        _runtime_settings(status_interval_sec=1.0),
         exchange,
         snapshot_exchange=snapshot_exchange,
         heartbeat_queue=None,
@@ -290,7 +303,7 @@ def test_live_exchange_requires_a_distinct_snapshot_client():
         SidecarRuntime.run(
             queue.Queue(),
             object(),
-            SidecarProtocol.with_launch_contract({}),
+            _runtime_settings(),
             exchange,
             snapshot_exchange=None,
             heartbeat_queue=None,

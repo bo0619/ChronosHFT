@@ -351,6 +351,14 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                         "monitor_check_interval_sec": POSITIVE,
                         "risk_rejection_log_interval_sec": POSITIVE,
                         "event_log_max": POSITIVE_INT,
+                        "journal_format_version": _integer(3, 3),
+                        "journal_require_existing": BOOL,
+                        "journal_segment_max_records": POSITIVE_INT,
+                        "journal_segment_max_bytes": POSITIVE_INT,
+                        "journal_max_frame_bytes": _integer(
+                            1,
+                            (2**32) - 1,
+                        ),
                         "journal_min_free_bytes": NONNEGATIVE_INT,
                         "journal_space_check_interval_sec": POSITIVE,
                         "tombstone_max": NONNEGATIVE_INT,
@@ -431,6 +439,25 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
         )
     },
     "risk.core": {1: _object({"risk": _object({"active": BOOL})})},
+    "risk.independent_supervisor": {
+        1: _object(
+            {
+                "risk": _object(
+                    {
+                        "independent_supervisor": _object(
+                            {
+                                "enabled": BOOL,
+                                "state_store_root": NONEMPTY_TEXT,
+                                "account_scope_id": NONEMPTY_TEXT,
+                                "state_genesis_id": NONEMPTY_TEXT,
+                                "cash_flow_deployment_start_ms": POSITIVE_INT,
+                            }
+                        )
+                    }
+                )
+            }
+        )
+    },
     "risk.limits": {
         1: _object(
             {"risk": _object({"limits": _object({"max_drawdown_pct": PROBABILITY})})}
@@ -1586,6 +1613,13 @@ def validate_composed_config(config: Mapping[str, object]) -> None:
     ):
         violations.append(
             "oms.trade_recovery_overlap_ms must not exceed trade_recovery_lookback_ms"
+        )
+    if oms and oms.get("journal_max_frame_bytes", 0) > oms.get(
+        "journal_segment_max_bytes", 0
+    ):
+        violations.append(
+            "oms.journal_max_frame_bytes must not exceed "
+            "journal_segment_max_bytes"
         )
 
     for model_name in ("glft", "avellaneda_stoikov"):

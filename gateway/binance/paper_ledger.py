@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import time
-from collections import deque
-from typing import Protocol
+from dataclasses import dataclass
+from typing import Callable
 
-from event.type import ExchangeAccountUpdate, ExchangeOrderUpdate, OrderBook
+from event.type import ExchangeAccountUpdate, ExchangeOrderUpdate
 from infrastructure.logger import logger
 
+from .paper_matching import PaperVenueState
 from .paper_state import (
     PaperOrder,
     PaperPosition,
@@ -16,64 +17,47 @@ from .paper_state import (
 )
 
 
-class PaperLedgerOwner(Protocol):
-    """Gateway state and callbacks required by the Paper ledger."""
-
-    _orders: dict[str, PaperOrder]
-    _exchange_to_client: dict[str, str]
-    _positions: dict[str, PaperPosition]
-    _books: dict[str, OrderBook]
-    _balances: dict[str, float]
-    _trades: deque[dict]
-    _event_sequence: int
-    _paper_trade_sequence: int
-    _worker_running: bool
+@dataclass(frozen=True, slots=True)
+class PaperLedgerConfig:
     balance_asset: str
-    symbols: list[str]
     max_order_history: int
 
-    def _reduce_only_fill_cap(self, order: PaperOrder): ...
 
-    def _fee_rate(self, order: PaperOrder, is_maker: bool): ...
+@dataclass(frozen=True, slots=True)
+class PaperLedgerPort:
+    """Calculations and effects the single-writer ledger may request."""
 
-    def _apply_position_fill(
-        self,
-        symbol: str,
-        side: str,
-        quantity: float,
-        price: float,
-    ): ...
-
-    def _quote_asset(self, symbol: str): ...
-
-    def _mark_price(self, symbol: str): ...
-
-    def _emit_order_event(self, order: PaperOrder, **kwargs): ...
-
-    def _emit_account_update(self, symbol: str, **kwargs): ...
-
-    def _remove_from_later_local_queue(
-        self,
-        order: PaperOrder,
-        removed_quantity: float,
-    ): ...
-
-    def _account_metrics(self): ...
-
-    def _submit_worker(self, kind: str, payload) -> bool: ...
-
-    def on_order_update(self, update: ExchangeOrderUpdate): ...
-
-    def on_account_update(self, update: ExchangeAccountUpdate): ...
+    reduce_only_fill_cap: Callable[[PaperOrder], float]
+    fee_rate: Callable[[PaperOrder, bool], float]
+    quote_asset: Callable[[str], str]
+    mark_price: Callable[[str], float]
+    remove_from_later_local_queue: Callable[[PaperOrder, float], object]
+    account_metrics: Callable[[], dict]
+    worker_running: Callable[[], bool]
+    symbols: Callable[[], tuple[str, ...]]
+    submit_worker: Callable[[str, object], bool]
+    publish_order_update: Callable[[ExchangeOrderUpdate], None]
+    publish_account_update: Callable[[ExchangeAccountUpdate], None]
 
 
 class PaperLedger:
     """Apply fills atomically on the Paper matching worker."""
 
-    __slots__ = ("_owner",)
+    __slots__ = ("_config", "_port", "_state")
 
-    def __init__(self, owner: PaperLedgerOwner):
-        self._owner = owner
+    def __init__(
+        self,
+        state: PaperVenueState,
+        port: PaperLedgerPort,
+        config: PaperLedgerConfig,
+    ):
+        self._state = state
+        self._port = port
+        self._config = config
+
+    @property
+    def state(self) -> PaperVenueState:
+        return self._state
 
     def apply_fill(
         self,
@@ -84,17 +68,18 @@ class PaperLedger:
         is_maker: bool,
         fill_context: dict | None = None,
     ):
-        owner = self._owner
+        state = self._state
+        port = self._port
         quantity = min(
             float(quantity),
             order.remaining,
-            owner._reduce_only_fill_cap(order),
+            port.reduce_only_fill_cap(order),
         )
         if quantity <= 1e-12:
             return False
         transaction_time = time.time()
         context = dict(fill_context) if isinstance(fill_context, dict) else {}
-        book = owner._books.get(order.request.symbol)
+        book = state.books.get(order.request.symbol)
         best_bid_at_fill = None
         best_ask_at_fill = None
         if book is not None:
@@ -110,17 +95,17 @@ class PaperLedger:
             0.0,
             (time.perf_counter() - order.created_monotonic) * 1000.0,
         )
-        realized_pnl = owner._apply_position_fill(
+        realized_pnl = self.apply_position_fill(
             order.request.symbol,
             order.request.side,
             quantity,
             float(price),
         )
-        fee_rate = owner._fee_rate(order, is_maker)
+        fee_rate = port.fee_rate(order, is_maker)
         commission = quantity * float(price) * fee_rate
-        quote_asset = owner._quote_asset(order.request.symbol)
-        owner._balances.setdefault(quote_asset, 0.0)
-        owner._balances[quote_asset] += realized_pnl - commission
+        quote_asset = port.quote_asset(order.request.symbol)
+        state.balances.setdefault(quote_asset, 0.0)
+        state.balances[quote_asset] += realized_pnl - commission
 
         order.cum_filled_qty += quantity
         order.cumulative_cost += quantity * float(price)
@@ -130,8 +115,8 @@ class PaperLedger:
             "FILLED" if order.remaining <= 1e-9 else "PARTIALLY_FILLED"
         )
 
-        owner._paper_trade_sequence += 1
-        paper_trade_id = owner._paper_trade_sequence
+        state.paper_trade_sequence += 1
+        paper_trade_id = state.paper_trade_sequence
         trade_payload = {
             "symbol": order.request.symbol,
             "id": paper_trade_id,
@@ -148,8 +133,8 @@ class PaperLedger:
             "_simulated": True,
             "_fillModel": order.fill_model,
         }
-        owner._trades.append(trade_payload)
-        owner._emit_order_event(
+        state.trades.append(trade_payload)
+        self.emit_order_event(
             order,
             status=order.status,
             filled_qty=quantity,
@@ -193,7 +178,7 @@ class PaperLedger:
             mid_at_fill=mid_at_fill,
             quote_age_ms=quote_age_ms,
         )
-        owner._emit_account_update(
+        self.emit_account_update(
             order.request.symbol,
             transaction_time=transaction_time,
             reason="ORDER",
@@ -207,8 +192,7 @@ class PaperLedger:
         quantity: float,
         price: float,
     ) -> float:
-        owner = self._owner
-        position = owner._positions.setdefault(symbol, PaperPosition())
+        position = self._state.positions.setdefault(symbol, PaperPosition())
         current = float(position.quantity)
         average = float(position.entry_price)
         signed_quantity = quantity if side == "BUY" else -quantity
@@ -243,14 +227,13 @@ class PaperLedger:
         return realized
 
     def expire_order(self, order: PaperOrder, reason: str):
-        owner = self._owner
         if not order.active:
             return False
         removed = order.remaining
         order.status = "EXPIRED"
         order.update_ms = int(time.time() * 1000)
-        owner._remove_from_later_local_queue(order, removed)
-        owner._emit_order_event(
+        self._port.remove_from_later_local_queue(order, removed)
+        self.emit_order_event(
             order,
             status="EXPIRED",
             transaction_time=order.update_ms / 1000.0,
@@ -259,14 +242,13 @@ class PaperLedger:
         return True
 
     def cancel_order(self, order: PaperOrder, reason: str):
-        owner = self._owner
         if not order.active:
             return False
         removed = order.remaining
         order.status = "CANCELED"
         order.update_ms = int(time.time() * 1000)
-        owner._remove_from_later_local_queue(order, removed)
-        owner._emit_order_event(
+        self._port.remove_from_later_local_queue(order, removed)
+        self.emit_order_event(
             order,
             status="CANCELED",
             transaction_time=order.update_ms / 1000.0,
@@ -302,9 +284,9 @@ class PaperLedger:
         mid_at_fill: float | None = None,
         quote_age_ms: float | None = None,
     ):
-        owner = self._owner
-        owner._event_sequence += 1
-        owner.on_order_update(
+        state = self._state
+        state.event_sequence += 1
+        self._port.publish_order_update(
             ExchangeOrderUpdate(
                 client_oid=order.client_oid,
                 exchange_oid=order.exchange_oid,
@@ -314,7 +296,7 @@ class PaperLedger:
                 filled_price=float(filled_price),
                 cum_filled_qty=float(order.cum_filled_qty),
                 update_time=float(transaction_time),
-                seq=owner._event_sequence,
+                seq=state.event_sequence,
                 commission=commission,
                 commission_asset=commission_asset,
                 realized_pnl=realized_pnl,
@@ -349,8 +331,8 @@ class PaperLedger:
         transaction_time: float,
         reason: str,
     ):
-        owner = self._owner
-        metrics = owner._account_metrics()
+        state = self._state
+        metrics = self._port.account_metrics()
         balances = {
             asset: {
                 "wallet_balance": float(wallet),
@@ -358,18 +340,18 @@ class PaperLedger:
                     metrics["available_by_asset"].get(asset, wallet)
                 ),
             }
-            for asset, wallet in owner._balances.items()
+            for asset, wallet in state.balances.items()
         }
-        position = owner._positions.get(symbol, PaperPosition())
-        mark = owner._mark_price(symbol)
+        position = state.positions.get(symbol, PaperPosition())
+        mark = self._port.mark_price(symbol)
         unrealized = (
             (mark - position.entry_price) * position.quantity
             if mark > 0.0 and abs(position.quantity) > 1e-12
             else 0.0
         )
-        owner.on_account_update(
+        self._port.publish_account_update(
             ExchangeAccountUpdate(
-                asset=owner.balance_asset,
+                asset=self._config.balance_asset,
                 wallet_balance=float(metrics["wallet_balance"]),
                 available_balance=float(metrics["available_balance"]),
                 balances=balances,
@@ -386,14 +368,13 @@ class PaperLedger:
         )
 
     def emit_full_account_update(self, reason: str):
-        owner = self._owner
-        if not owner._worker_running:
+        if not self._port.worker_running():
             return False
-        return owner._submit_worker("emit_full_account", reason)
+        return self._port.submit_worker("emit_full_account", reason)
 
     def emit_full_account_update_internal(self, reason: str):
-        owner = self._owner
-        metrics = owner._account_metrics()
+        state = self._state
+        metrics = self._port.account_metrics()
         balances = {
             asset: {
                 "wallet_balance": float(wallet),
@@ -401,12 +382,12 @@ class PaperLedger:
                     metrics["available_by_asset"].get(asset, wallet)
                 ),
             }
-            for asset, wallet in owner._balances.items()
+            for asset, wallet in state.balances.items()
         }
         positions = {}
-        for symbol in owner.symbols:
-            position = owner._positions.get(symbol, PaperPosition())
-            mark = owner._mark_price(symbol)
+        for symbol in self._port.symbols():
+            position = state.positions.get(symbol, PaperPosition())
+            mark = self._port.mark_price(symbol)
             positions[symbol] = {
                 "volume": float(position.quantity),
                 "entry_price": float(position.entry_price),
@@ -416,9 +397,9 @@ class PaperLedger:
                     else 0.0
                 ),
             }
-        owner.on_account_update(
+        self._port.publish_account_update(
             ExchangeAccountUpdate(
-                asset=owner.balance_asset,
+                asset=self._config.balance_asset,
                 wallet_balance=float(metrics["wallet_balance"]),
                 available_balance=float(metrics["available_balance"]),
                 balances=balances,
@@ -430,18 +411,18 @@ class PaperLedger:
         return True
 
     def prune_terminal_orders(self):
-        owner = self._owner
-        excess = len(owner._orders) - owner.max_order_history
+        state = self._state
+        excess = len(state.orders) - self._config.max_order_history
         if excess <= 0:
             return
         removable = sorted(
             (
                 order
-                for order in owner._orders.values()
+                for order in state.orders.values()
                 if order.status in TERMINAL_ORDER_STATUSES
             ),
             key=lambda order: (order.update_ms, order.accept_seq),
         )
         for order in removable[:excess]:
-            owner._orders.pop(order.client_oid, None)
-            owner._exchange_to_client.pop(order.exchange_oid, None)
+            state.orders.pop(order.client_oid, None)
+            state.exchange_to_client.pop(order.exchange_oid, None)

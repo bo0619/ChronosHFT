@@ -1,5 +1,4 @@
 """Explicit application assembly for the ChronosHFT process runtime."""
-
 from __future__ import annotations
 
 import time
@@ -34,6 +33,7 @@ class RuntimePlatformServices:
     run_startup_blocked_dashboard: Callable
     monotonic: Callable[[], float]
     sleep: Callable[[float], None]
+    domain_ports: Any = None
 
 
 @dataclass(frozen=True)

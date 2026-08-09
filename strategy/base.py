@@ -16,9 +16,9 @@ from event.type import (
     TradeData,
     EVENT_LOG,
 )
-from data.ref_data import ref_data_manager
 from infrastructure.commission_truth import resolve_passive_fee_rate
 from infrastructure.paper_trade import is_paper_trade
+from infrastructure.runtime_ports import ReferenceDataPort
 from strategy.contracts import (
     StrategyExecutionPort,
     StrategyStateSnapshot,
@@ -38,8 +38,10 @@ class StrategyTemplate:
         name="Strategy",
         *,
         resolved_config: dict | None = None,
-        reference_data=ref_data_manager,
+        reference_data: ReferenceDataPort,
     ):
+        if reference_data is None:
+            raise TypeError("reference_data port is required")
         self.engine = engine
         self.execution: StrategyExecutionPort = (
             coerce_strategy_execution_port(execution)

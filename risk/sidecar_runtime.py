@@ -2,6 +2,7 @@
 
 import queue
 
+from risk.runtime_clock import FunctionRuntimeClock
 from risk.sidecar_protocol import SidecarProtocol
 
 
@@ -153,7 +154,12 @@ class SidecarRuntime:
         getpid,
         sleep,
     ) -> None:
-        SidecarProtocol.validate_launch_contract(settings)
+        SidecarProtocol.validate_runtime_state_contract(settings)
+        clock = FunctionRuntimeClock(
+            monotonic_fn=perf_counter,
+            wall_time_fn=wall_time,
+            sleep_fn=sleep,
+        )
         session_id = str(settings.get("session_id", "") or "")
         status_interval_sec = max(
             0.05,
@@ -171,7 +177,7 @@ class SidecarRuntime:
                 "risk sidecar requires an isolated snapshot exchange client"
             )
         snapshot_worker = snapshot_worker_factory(snapshot_exchange)
-        snapshot_worker.start()
+        snapshot_worker_started = False
         status_sequence = 0
         last_status_at = 0.0
         last_status_signature = None
@@ -182,7 +188,13 @@ class SidecarRuntime:
                 exchange,
                 settings,
                 snapshot_worker=snapshot_worker,
+                clock=clock,
             )
+            cash_flow_ledger = getattr(core, "state_store", None)
+            if cash_flow_ledger is not None:
+                snapshot_exchange.cash_flow_ledger = cash_flow_ledger
+            snapshot_worker.start()
+            snapshot_worker_started = True
             while True:
                 cls.drain_commands(command_queue, core, session_id)
                 cls.drain_latest_heartbeat(
@@ -191,7 +203,7 @@ class SidecarRuntime:
                     session_id,
                 )
 
-                now = perf_counter()
+                now = clock.monotonic()
                 status, keep_running = core.step(now)
                 signature = cls.status_signature(status)
                 if (
@@ -208,7 +220,7 @@ class SidecarRuntime:
                                 "session_id": session_id,
                                 "sequence": status_sequence,
                                 "pid": getpid(),
-                                "reported_at": wall_time(),
+                                "reported_at": clock.wall_time(),
                             },
                             handshake_complete=True,
                         ),
@@ -217,9 +229,11 @@ class SidecarRuntime:
                     last_status_signature = signature
                 if not keep_running:
                     break
-                sleep(loop_interval_sec)
+                clock.sleep(loop_interval_sec)
         finally:
-            snapshot_stopped = snapshot_worker.stop()
+            snapshot_stopped = (
+                snapshot_worker.stop() if snapshot_worker_started else True
+            )
             close_core = getattr(core, "close", None)
             if callable(close_core):
                 close_core()

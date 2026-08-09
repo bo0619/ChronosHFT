@@ -55,8 +55,8 @@ def test_tracked_manifest_versions_every_fragment():
     assert manifest["schema"] == CURRENT_CONFIG_MANIFEST_SCHEMA
     assert manifest["config_version"] == CONFIG_DOCUMENT_VERSION
     assert manifest["unknown_keys"] == CONFIG_UNKNOWN_KEY_POLICY
-    assert len(manifest["includes"]) == 30
-    assert len({entry["fragment"] for entry in manifest["includes"]}) == 30
+    assert len(manifest["includes"]) == 31
+    assert len({entry["fragment"] for entry in manifest["includes"]}) == 31
 
     for entry in manifest["includes"]:
         fragment = json.loads(
@@ -77,6 +77,11 @@ def test_tracked_manifest_is_validated_before_startup_and_metadata_is_stripped()
     assert configured["execution"]["mode"] == "paper"
     assert configured["account"]["initial_balance_usdt"] == 10_000.0
     assert configured["risk"]["limits"]["max_daily_loss"] == 100.0
+    assert raw["oms"]["journal_format_version"] == 3
+    assert raw["oms"]["journal_require_existing"] is False
+    assert raw["risk"]["independent_supervisor"]["state_genesis_id"] == (
+        "paper-local-disabled-v1"
+    )
 
 
 @pytest.mark.parametrize(
@@ -231,6 +236,58 @@ def test_fragment_rejects_numeric_values_outside_declared_range():
             expected_fragment="account",
             expected_version=1,
             source="account.json",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("journal_format_version", 2, "at least 3"),
+        ("journal_require_existing", 1, "JSON boolean"),
+        ("journal_segment_max_records", 0, "at least 1"),
+        ("journal_segment_max_bytes", 0, "at least 1"),
+        ("journal_max_frame_bytes", 2**32, "at most"),
+    ],
+)
+def test_oms_fragment_rejects_invalid_v3_journal_contract(field, value, match):
+    tracked = json.loads(
+        (REPOSITORY_ROOT / "config/oms.json").read_text(encoding="utf-8")
+    )
+    tracked["oms"][field] = value
+
+    with pytest.raises(ConfigSchemaError, match=match):
+        validate_fragment_document(
+            tracked,
+            expected_fragment="oms",
+            expected_version=1,
+            source="config/oms.json",
+        )
+
+
+def test_independent_supervisor_fragment_requires_v2_state_identity():
+    tracked = json.loads(
+        (
+            REPOSITORY_ROOT / "config/risk/independent_supervisor.json"
+        ).read_text(encoding="utf-8")
+    )
+    del tracked["risk"]["independent_supervisor"]["state_genesis_id"]
+
+    with pytest.raises(ConfigSchemaError, match="state_genesis_id"):
+        validate_fragment_document(
+            tracked,
+            expected_fragment="risk.independent_supervisor",
+            expected_version=1,
+            source="config/risk/independent_supervisor.json",
+        )
+
+    tracked["risk"]["independent_supervisor"]["state_genesis_id"] = "g1"
+    tracked["risk"]["independent_supervisor"]["state_path"] = "legacy.json"
+    with pytest.raises(ConfigSchemaError, match="state_path is an unknown field"):
+        validate_fragment_document(
+            tracked,
+            expected_fragment="risk.independent_supervisor",
+            expected_version=1,
+            source="config/risk/independent_supervisor.json",
         )
 
 

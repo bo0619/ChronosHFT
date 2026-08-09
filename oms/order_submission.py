@@ -9,7 +9,6 @@ from infrastructure.logger import logger
 
 from event.type import (
     CommandOutcome,
-    GatewayCommandResult,
     OrderIntent,
     OrderRequest,
     OrderStatus,
@@ -28,7 +27,6 @@ from .submission_transaction import (
     SubmissionTerminalOutcome,
     SubmissionTransaction,
 )
-
 
 class OMSOrderSubmission(OMSComponent):
     """Own prepare, fence, dispatch and durable submit settlement."""
@@ -77,6 +75,7 @@ class OMSOrderSubmission(OMSComponent):
             "max_concurrent_symbols",
             "max_pos_notional",
             "order_monitor",
+            "order_store",
             "orders",
             "risk_rejection_log_interval_sec",
             "state",
@@ -133,6 +132,148 @@ class OMSOrderSubmission(OMSComponent):
         except SubmissionFinalizationError as exc:
             logger.critical(f"[OMS] {exc}")
             raise
+
+    def _complete_submission(
+        self,
+        transaction: SubmissionTransaction,
+        outcome: SubmissionTerminalOutcome,
+        order: Order,
+    ) -> None:
+        try:
+            try:
+                transaction.settled_durable()
+            finally:
+                self._finalize_submission(transaction, outcome)
+        except BaseException:
+            self._finish_submit_settlement(
+                order,
+                "submission_phase_transition_failure",
+            )
+            raise
+
+    def _finalize_pre_dispatch_exception(
+        self,
+        *,
+        transaction: SubmissionTransaction,
+        order: Order | None,
+        error: BaseException,
+        context: str,
+        snapshot_source: str,
+        symbol: str,
+        command_id: str,
+        prepare_committed: bool,
+        snapshot_extra: dict | None = None,
+    ) -> None:
+        journal_failure = None
+        if prepare_committed and order is not None:
+            try:
+                self._record_command_result(
+                    command_id,
+                    "SUBMIT",
+                    order,
+                    CommandOutcome.REJECTED,
+                    error_code="PRE_DISPATCH_EXCEPTION",
+                    error_message=(
+                        f"{type(error).__name__}:{str(error)[:512]}"
+                    ),
+                )
+            except JournalError as result_error:
+                self._latch_journal_failure(
+                    result_error,
+                    f"{context}_result",
+                    symbol,
+                )
+                journal_failure = result_error
+            except BaseException as result_error:
+                transaction.record_gate_failure(
+                    f"{context}_result",
+                    result_error,
+                )
+        try:
+            cleanup_journal_failure = (
+                self._cleanup_pre_dispatch_submit_exception(
+                    order,
+                    error,
+                    context,
+                    snapshot_source,
+                    **(snapshot_extra or {}),
+                )
+            )
+            if journal_failure is None:
+                journal_failure = cleanup_journal_failure
+        except BaseException as cleanup_error:
+            if order is not None:
+                transaction.record_gate_failure(context, cleanup_error)
+            else:
+                logger.critical(
+                    "[OMS] Pre-dispatch cleanup failed before order "
+                    f"creation: {type(cleanup_error).__name__}:"
+                    f"{cleanup_error}"
+                )
+        finally:
+            self._finalize_submission(
+                transaction,
+                SubmissionTerminalOutcome.FAILED_CLOSED,
+            )
+        if journal_failure is None:
+            return
+        try:
+            self._fail_closed_on_journal_error(
+                journal_failure,
+                f"{context}_cleanup",
+                symbol,
+            )
+        except BaseException as fail_closed_error:
+            logger.critical(
+                "[OMS] Pre-dispatch cleanup could not complete fail-closed: "
+                f"{type(fail_closed_error).__name__}:{fail_closed_error}"
+            )
+
+    def _finalize_post_dispatch_exception(
+        self,
+        *,
+        transaction: SubmissionTransaction,
+        order: Order,
+        command_id: str,
+        error: BaseException,
+        context: str,
+        snapshot_source: str,
+        symbol: str,
+        exchange_oid: str = "",
+        snapshot_extra: dict | None = None,
+    ) -> None:
+        journal_failure = None
+        try:
+            journal_failure = self._settle_post_dispatch_submit_exception(
+                order,
+                command_id,
+                error,
+                context,
+                snapshot_source,
+                exchange_oid=exchange_oid,
+                **(snapshot_extra or {}),
+            )
+        except BaseException as settlement_error:
+            transaction.record_gate_failure(context, settlement_error)
+        finally:
+            self._finalize_submission(
+                transaction,
+                SubmissionTerminalOutcome.UNKNOWN,
+            )
+        if journal_failure is None:
+            return
+        try:
+            self._fail_closed_on_journal_error(
+                journal_failure,
+                context,
+                symbol,
+            )
+        except BaseException as fail_closed_error:
+            logger.critical(
+                "[OMS] Post-dispatch settlement could not complete "
+                "fail-closed: "
+                f"{type(fail_closed_error).__name__}:{fail_closed_error}"
+            )
 
     def _log_risk_rejection(self, risk_reason: str) -> None:
         if not str(risk_reason).startswith("Concurrent Symbol Limit:"):
@@ -224,7 +365,7 @@ class OMSOrderSubmission(OMSComponent):
                 error_message=reason,
                 **audit_extra,
             )
-            self.orders.pop(order.client_oid, None)
+            self.order_store.remove(order.client_oid)
             self.exposure.update_open_orders(self.orders)
             self.account.calculate()
         self._notify_order_state_safely(order, "submit_permit_rejected")
@@ -260,6 +401,7 @@ class OMSOrderSubmission(OMSComponent):
         )
         return_adapter = InternalSubmissionReturnAdapter()
         prepared_records = None
+        prepare_committed = False
         order_send_risk_increasing = not request.reduce_only
         permit_epoch = None
         allow_shutdown_emergency = bool(
@@ -295,8 +437,8 @@ class OMSOrderSubmission(OMSComponent):
                         quantity=request.volume,
                         reason=intent.tag,
                     )
-                self.orders[client_oid] = order
                 order.mark_submitting()
+                self.order_store.add(order)
                 self.exposure.update_open_orders(self.orders)
                 self.account.calculate()
                 self._schedule_rpi_calibration_runtime_enforcement(
@@ -314,8 +456,9 @@ class OMSOrderSubmission(OMSComponent):
             self._record_submit_prepared_batch(
                 prepared_records,
             )
-            self.order_monitor.track_prepared_order(order)
+            prepare_committed = True
             transaction.prepared_durable()
+            self.order_monitor.track_prepared_order(order)
 
             with self.lock:
                 permit_epoch, permit_rejection = (
@@ -365,12 +508,11 @@ class OMSOrderSubmission(OMSComponent):
                         order.mark_rejected_locally(
                             "durable_journal_unavailable"
                         )
-                    self.orders.pop(client_oid, None)
+                    self.order_store.remove(client_oid)
                     self.exposure.update_open_orders(self.orders)
                     self.account.calculate()
             except BaseException as cleanup_exc:
-                self._close_gate_after_submit_settlement_failure(
-                    order,
+                transaction.record_gate_failure(
                     "prepare_internal_submit_journal_cleanup",
                     cleanup_exc,
                 )
@@ -396,42 +538,17 @@ class OMSOrderSubmission(OMSComponent):
                 )
             return False
         except BaseException as exc:
-            cleanup_journal_failure = None
-            try:
-                cleanup_journal_failure = (
-                    self._cleanup_pre_dispatch_submit_exception(
-                        order,
-                        exc,
-                        "prepare_internal_submit_exception",
-                        snapshot_source,
-                        **audit_extra,
-                    )
-                )
-            except BaseException as cleanup_exc:
-                self._close_gate_after_submit_settlement_failure(
-                    order,
-                    "prepare_internal_submit_exception",
-                    cleanup_exc,
-                )
-            finally:
-                self._finalize_submission(
-                    transaction,
-                    SubmissionTerminalOutcome.FAILED_CLOSED,
-                )
-            if cleanup_journal_failure is not None:
-                try:
-                    self._fail_closed_on_journal_error(
-                        cleanup_journal_failure,
-                        "prepare_internal_submit_exception_cleanup",
-                        intent.symbol,
-                    )
-                except BaseException as fail_closed_exc:
-                    logger.critical(
-                        "[OMS] Internal pre-dispatch cleanup could not "
-                        "complete fail-closed: "
-                        f"{type(fail_closed_exc).__name__}:"
-                        f"{fail_closed_exc}"
-                    )
+            self._finalize_pre_dispatch_exception(
+                transaction=transaction,
+                order=order,
+                error=exc,
+                context="prepare_internal_submit_exception",
+                snapshot_source=snapshot_source,
+                symbol=intent.symbol,
+                command_id=command_id,
+                prepare_committed=prepare_committed,
+                snapshot_extra=audit_extra,
+            )
             raise
 
         try:
@@ -445,43 +562,16 @@ class OMSOrderSubmission(OMSComponent):
             )
             transaction.dispatched()
         except BaseException as exc:
-            settlement_journal_failure = None
-            try:
-                settlement_journal_failure = (
-                    self._settle_post_dispatch_submit_exception(
-                        order,
-                        command_id,
-                        exc,
-                        "dispatch_internal_submit_exception",
-                        snapshot_source,
-                        **audit_extra,
-                    )
-                )
-            except BaseException as settlement_exc:
-                self._close_gate_after_submit_settlement_failure(
-                    order,
-                    "dispatch_internal_submit_exception",
-                    settlement_exc,
-                )
-            finally:
-                self._finalize_submission(
-                    transaction,
-                    SubmissionTerminalOutcome.FAILED_CLOSED,
-                )
-            if settlement_journal_failure is not None:
-                try:
-                    self._fail_closed_on_journal_error(
-                        settlement_journal_failure,
-                        "dispatch_internal_submit_exception",
-                        intent.symbol,
-                    )
-                except BaseException as fail_closed_exc:
-                    logger.critical(
-                        "[OMS] Internal post-dispatch failure could not "
-                        "complete fail-closed: "
-                        f"{type(fail_closed_exc).__name__}:"
-                        f"{fail_closed_exc}"
-                    )
+            self._finalize_post_dispatch_exception(
+                transaction=transaction,
+                order=order,
+                command_id=command_id,
+                error=exc,
+                context="dispatch_internal_submit_exception",
+                snapshot_source=snapshot_source,
+                symbol=intent.symbol,
+                snapshot_extra=audit_extra,
+            )
             raise
 
         try:
@@ -505,8 +595,7 @@ class OMSOrderSubmission(OMSComponent):
                     if order.status == OrderStatus.SUBMITTING:
                         order.mark_submit_unknown("result_not_durable")
             except BaseException as cleanup_exc:
-                self._close_gate_after_submit_settlement_failure(
-                    order,
+                transaction.record_gate_failure(
                     "result_internal_submit_journal_cleanup",
                     cleanup_exc,
                 )
@@ -557,15 +646,14 @@ class OMSOrderSubmission(OMSComponent):
                     )
                 )
             except BaseException as settlement_exc:
-                self._close_gate_after_submit_settlement_failure(
-                    order,
+                transaction.record_gate_failure(
                     "result_internal_submit_exception",
                     settlement_exc,
                 )
             finally:
                 self._finalize_submission(
                     transaction,
-                    SubmissionTerminalOutcome.FAILED_CLOSED,
+                    SubmissionTerminalOutcome.UNKNOWN,
                 )
             if settlement_journal_failure is not None:
                 try:
@@ -627,8 +715,7 @@ class OMSOrderSubmission(OMSComponent):
                                 "ack_snapshot_not_durable"
                             )
                 except BaseException as cleanup_exc:
-                    self._close_gate_after_submit_settlement_failure(
-                        order,
+                    transaction.record_gate_failure(
                         "snapshot_internal_submit_ack_journal_cleanup",
                         cleanup_exc,
                     )
@@ -680,15 +767,14 @@ class OMSOrderSubmission(OMSComponent):
                         )
                     )
                 except BaseException as settlement_exc:
-                    self._close_gate_after_submit_settlement_failure(
-                        order,
+                    transaction.record_gate_failure(
                         "snapshot_internal_submit_ack_exception",
                         settlement_exc,
                     )
                 finally:
                     self._finalize_submission(
                         transaction,
-                        SubmissionTerminalOutcome.FAILED_CLOSED,
+                        SubmissionTerminalOutcome.UNKNOWN,
                     )
                 if settlement_journal_failure is not None:
                     try:
@@ -706,10 +792,10 @@ class OMSOrderSubmission(OMSComponent):
                         )
                 raise
 
-            transaction.settled_durable()
-            self._finalize_submission(
+            self._complete_submission(
                 transaction,
                 SubmissionTerminalOutcome.ACKNOWLEDGED,
+                order,
             )
 
             self._notify_order_state_safely(
@@ -828,15 +914,14 @@ class OMSOrderSubmission(OMSComponent):
                         )
                     )
                 except BaseException as settlement_exc:
-                    self._close_gate_after_submit_settlement_failure(
-                        order,
+                    transaction.record_gate_failure(
                         "snapshot_internal_submit_unknown_exception",
                         settlement_exc,
                     )
                 finally:
                     self._finalize_submission(
                         transaction,
-                        SubmissionTerminalOutcome.FAILED_CLOSED,
+                        SubmissionTerminalOutcome.UNKNOWN,
                     )
                 if settlement_journal_failure is not None:
                     try:
@@ -853,10 +938,10 @@ class OMSOrderSubmission(OMSComponent):
                             f"{fail_closed_exc}"
                         )
                 raise
-            transaction.settled_durable()
-            self._finalize_submission(
+            self._complete_submission(
                 transaction,
                 SubmissionTerminalOutcome.UNKNOWN,
+                order,
             )
             self._notify_order_state_safely(
                 order,
@@ -921,7 +1006,7 @@ class OMSOrderSubmission(OMSComponent):
                     **audit_extra,
                 )
                 if not transport_rejection_superseded:
-                    self.orders.pop(client_oid, None)
+                    self.order_store.remove(client_oid)
                     self.exposure.update_open_orders(self.orders)
                     self.account.calculate()
         except JournalError as exc:
@@ -966,15 +1051,14 @@ class OMSOrderSubmission(OMSComponent):
                     )
                 )
             except BaseException as settlement_exc:
-                self._close_gate_after_submit_settlement_failure(
-                    order,
+                transaction.record_gate_failure(
                     "snapshot_internal_submit_rejected_exception",
                     settlement_exc,
                 )
             finally:
                 self._finalize_submission(
                     transaction,
-                    SubmissionTerminalOutcome.FAILED_CLOSED,
+                    SubmissionTerminalOutcome.UNKNOWN,
                 )
             if settlement_journal_failure is not None:
                 try:
@@ -991,14 +1075,14 @@ class OMSOrderSubmission(OMSComponent):
                         f"{fail_closed_exc}"
                     )
             raise
-        transaction.settled_durable()
-        self._finalize_submission(
+        self._complete_submission(
             transaction,
             (
                 SubmissionTerminalOutcome.ACKNOWLEDGED
                 if transport_rejection_superseded
                 else SubmissionTerminalOutcome.REJECTED
             ),
+            order,
         )
         self._notify_order_state_safely(
             order,
@@ -1042,8 +1126,18 @@ class OMSOrderSubmission(OMSComponent):
             **payload,
         )
         return False
+
     def submit_order(self, intent: OrderIntent) -> OrderSubmitResult:
         client_oid = str(uuid.uuid4())
+        transaction = self._new_submission_transaction(
+            client_oid=client_oid,
+            admission_policy=SubmissionAdmissionPolicy.STRATEGY,
+        )
+        return_adapter = StrategySubmissionReturnAdapter(
+            client_oid=client_oid,
+            state_value=lambda: self.state.value,
+            result_type=OrderSubmitResult,
+        )
         original_intent = intent
         order = None
         request = None
@@ -1051,11 +1145,12 @@ class OMSOrderSubmission(OMSComponent):
         rejection_extra = {}
         rejection_intent = intent
         command_id = f"SUBMIT:{client_oid}"
-        order_send_permit = False
+        permit_epoch = None
         order_send_risk_increasing = not intent.reduce_only
         calibration_terminal_reason = ""
         final_calibration_terminal_reason = ""
         prepared_records = None
+        prepare_committed = False
 
         # Risk evaluation and exposure reservation are one critical section.
         # Every concurrent submit sees earlier accepted-but-not-yet-ACKed orders.
@@ -1069,7 +1164,6 @@ class OMSOrderSubmission(OMSComponent):
                 if not rejection_reason:
                     intent, rejection_reason = self.adapt_intent_for_trading_mode(intent)
                     rejection_intent = original_intent if rejection_reason else intent
-
                 if not rejection_reason:
                     valid, rejection_reason = self.validator.validate_params(intent)
                     rejection_intent = intent
@@ -1115,16 +1209,6 @@ class OMSOrderSubmission(OMSComponent):
                     )
 
                 if not rejection_reason:
-                    order_send_risk_increasing = not intent.reduce_only
-                    permit_epoch, rejection_reason = (
-                        self._acquire_outbound_order_send_permit_locked(
-                            risk_increasing=order_send_risk_increasing,
-                            symbol=intent.symbol,
-                        )
-                    )
-                    order_send_permit = permit_epoch is not None
-
-                if not rejection_reason:
                     request = OrderRequest(
                         symbol=intent.symbol,
                         price=intent.price,
@@ -1149,11 +1233,12 @@ class OMSOrderSubmission(OMSComponent):
 
                 if not rejection_reason:
                     order = Order(client_oid, intent)
-                    self.orders[client_oid] = order
                     order.mark_submitting()
+                    self.order_store.add(order)
                     self.exposure.update_open_orders(self.orders)
                     self.account.calculate()
                     self._submit_settlement_inflight_oids.add(client_oid)
+                    self._bind_submission_cleanup(transaction, order)
                     prepared_records = self._build_submit_prepared_records(
                         command_id,
                         order,
@@ -1162,28 +1247,58 @@ class OMSOrderSubmission(OMSComponent):
                     )
 
             if rejection_reason:
-                if order_send_permit:
-                    self._release_outbound_order_send_permit(
-                        risk_increasing=order_send_risk_increasing,
-                        symbol=intent.symbol,
-                    )
-                    order_send_permit = False
                 if calibration_terminal_reason:
                     self.expire_rpi_calibration_permit(
                         calibration_terminal_reason
                     )
-                return self._reject_intent_locally(
+                rejection = self._reject_intent_locally(
                     rejection_intent,
                     client_oid,
                     rejection_reason,
                     **rejection_extra,
                 )
+                self._finalize_submission(
+                    transaction,
+                    SubmissionTerminalOutcome.REJECTED,
+                )
+                return rejection
 
             # The durable command intent is committed before the first byte is
             # sent to the venue. Recovery queries by client_oid and never
             # blindly resends an ambiguous command.
             self._record_submit_prepared_batch(prepared_records)
+            prepare_committed = True
+            transaction.prepared_durable()
             self.order_monitor.track_prepared_order(order)
+
+            with self.lock:
+                permit_epoch, permit_rejection = (
+                    self._acquire_outbound_order_send_permit_locked(
+                        risk_increasing=order_send_risk_increasing,
+                        symbol=intent.symbol,
+                    )
+                )
+            if permit_rejection:
+                self._settle_prepared_permit_rejection(
+                    transaction=transaction,
+                    order=order,
+                    request=request,
+                    reason=permit_rejection,
+                    snapshot_source="accepted",
+                    audit_kind="order_message_budget_rejected",
+                    audit_extra={},
+                )
+                return return_adapter.result(
+                    accepted=False,
+                    reason=permit_rejection,
+                )
+            transaction.permit_acquired(
+                permit_epoch,
+                lambda: self._release_outbound_order_send_permit(
+                    risk_increasing=order_send_risk_increasing,
+                    symbol=intent.symbol,
+                ),
+            )
         except JournalError as exc:
             self._latch_journal_failure(
                 exc,
@@ -1199,13 +1314,12 @@ class OMSOrderSubmission(OMSComponent):
                         order.mark_rejected_locally(
                             "durable_journal_unavailable"
                         )
-                    self.orders.pop(client_oid, None)
+                    self.order_store.remove(client_oid)
                     self.exposure.update_open_orders(self.orders)
                     self.account.calculate()
             except BaseException as cleanup_exc:
                 if order is not None:
-                    self._close_gate_after_submit_settlement_failure(
-                        order,
+                    transaction.record_gate_failure(
                         "prepare_submit_journal_cleanup",
                         cleanup_exc,
                     )
@@ -1220,12 +1334,10 @@ class OMSOrderSubmission(OMSComponent):
                     order,
                     "prepare_submit_journal_failure",
                 )
-            if order_send_permit:
-                self._release_outbound_order_send_permit(
-                    risk_increasing=order_send_risk_increasing,
-                    symbol=intent.symbol,
-                )
-                order_send_permit = False
+            self._finalize_submission(
+                transaction,
+                SubmissionTerminalOutcome.FAILED_CLOSED,
+            )
             try:
                 self._fail_closed_on_journal_error(
                     exc,
@@ -1245,50 +1357,16 @@ class OMSOrderSubmission(OMSComponent):
                 state=self.state.value,
             )
         except BaseException as exc:
-            cleanup_journal_failure = None
-            try:
-                cleanup_journal_failure = (
-                    self._cleanup_pre_dispatch_submit_exception(
-                        order,
-                        exc,
-                        "prepare_submit_exception",
-                        "accepted",
-                    )
-                )
-            except BaseException as cleanup_exc:
-                if order is not None:
-                    self._close_gate_after_submit_settlement_failure(
-                        order,
-                        "prepare_submit_exception",
-                        cleanup_exc,
-                    )
-                else:
-                    logger.critical(
-                        "[OMS] Pre-dispatch submit cleanup failed before "
-                        f"order creation: {type(cleanup_exc).__name__}:"
-                        f"{cleanup_exc}"
-                    )
-            finally:
-                if order_send_permit:
-                    self._release_outbound_order_send_permit(
-                        risk_increasing=order_send_risk_increasing,
-                        symbol=intent.symbol,
-                    )
-                    order_send_permit = False
-            if cleanup_journal_failure is not None:
-                try:
-                    self._fail_closed_on_journal_error(
-                        cleanup_journal_failure,
-                        "prepare_submit_exception_cleanup",
-                        intent.symbol,
-                    )
-                except BaseException as fail_closed_exc:
-                    logger.critical(
-                        "[OMS] Pre-dispatch submit cleanup could not "
-                        "complete fail-closed: "
-                        f"{type(fail_closed_exc).__name__}:"
-                        f"{fail_closed_exc}"
-                    )
+            self._finalize_pre_dispatch_exception(
+                transaction=transaction,
+                order=order,
+                error=exc,
+                context="prepare_submit_exception",
+                snapshot_source="accepted",
+                symbol=intent.symbol,
+                command_id=command_id,
+                prepare_committed=prepare_committed,
+            )
             raise
 
         try:
@@ -1302,45 +1380,17 @@ class OMSOrderSubmission(OMSComponent):
                 permit_epoch=permit_epoch,
                 risk_increasing=order_send_risk_increasing,
             )
+            transaction.dispatched()
         except BaseException as exc:
-            settlement_journal_failure = None
-            try:
-                settlement_journal_failure = (
-                    self._settle_post_dispatch_submit_exception(
-                        order,
-                        command_id,
-                        exc,
-                        "dispatch_submit_exception",
-                        "accepted",
-                    )
-                )
-            except BaseException as settlement_exc:
-                self._close_gate_after_submit_settlement_failure(
-                    order,
-                    "dispatch_submit_exception",
-                    settlement_exc,
-                )
-            finally:
-                if order_send_permit:
-                    self._release_outbound_order_send_permit(
-                        risk_increasing=order_send_risk_increasing,
-                        symbol=intent.symbol,
-                    )
-                    order_send_permit = False
-            if settlement_journal_failure is not None:
-                try:
-                    self._fail_closed_on_journal_error(
-                        settlement_journal_failure,
-                        "dispatch_submit_exception",
-                        intent.symbol,
-                    )
-                except BaseException as fail_closed_exc:
-                    logger.critical(
-                        "[OMS] Post-dispatch submit failure could not "
-                        "complete fail-closed: "
-                        f"{type(fail_closed_exc).__name__}:"
-                        f"{fail_closed_exc}"
-                    )
+            self._finalize_post_dispatch_exception(
+                transaction=transaction,
+                order=order,
+                command_id=command_id,
+                error=exc,
+                context="dispatch_submit_exception",
+                snapshot_source="accepted",
+                symbol=intent.symbol,
+            )
             raise
 
         try:
@@ -1364,8 +1414,7 @@ class OMSOrderSubmission(OMSComponent):
                     if order.status == OrderStatus.SUBMITTING:
                         order.mark_submit_unknown("result_not_durable")
             except BaseException as cleanup_exc:
-                self._close_gate_after_submit_settlement_failure(
-                    order,
+                transaction.record_gate_failure(
                     "result_submit_journal_cleanup",
                     cleanup_exc,
                 )
@@ -1373,12 +1422,10 @@ class OMSOrderSubmission(OMSComponent):
                 order,
                 "result_submit_journal_failure",
             )
-            if order_send_permit:
-                self._release_outbound_order_send_permit(
-                    risk_increasing=order_send_risk_increasing,
-                    symbol=intent.symbol,
-                )
-                order_send_permit = False
+            self._finalize_submission(
+                transaction,
+                SubmissionTerminalOutcome.UNKNOWN,
+            )
             try:
                 self._fail_closed_on_journal_error(
                     exc,
@@ -1421,18 +1468,15 @@ class OMSOrderSubmission(OMSComponent):
                     )
                 )
             except BaseException as settlement_exc:
-                self._close_gate_after_submit_settlement_failure(
-                    order,
+                transaction.record_gate_failure(
                     "result_submit_exception",
                     settlement_exc,
                 )
             finally:
-                if order_send_permit:
-                    self._release_outbound_order_send_permit(
-                        risk_increasing=order_send_risk_increasing,
-                        symbol=intent.symbol,
-                    )
-                    order_send_permit = False
+                self._finalize_submission(
+                    transaction,
+                    SubmissionTerminalOutcome.UNKNOWN,
+                )
             if settlement_journal_failure is not None:
                 try:
                     self._fail_closed_on_journal_error(
@@ -1490,17 +1534,14 @@ class OMSOrderSubmission(OMSComponent):
                                 "ack_snapshot_not_durable"
                             )
                 except BaseException as cleanup_exc:
-                    self._close_gate_after_submit_settlement_failure(
-                        order,
+                    transaction.record_gate_failure(
                         "snapshot_submit_ack_journal_cleanup",
                         cleanup_exc,
                     )
-                if order_send_permit:
-                    self._release_outbound_order_send_permit(
-                        risk_increasing=order_send_risk_increasing,
-                        symbol=intent.symbol,
-                    )
-                    order_send_permit = False
+                self._finalize_submission(
+                    transaction,
+                    SubmissionTerminalOutcome.UNKNOWN,
+                )
                 self._notify_order_state_safely(
                     order,
                     "snapshot_submit_ack_failure",
@@ -1548,18 +1589,15 @@ class OMSOrderSubmission(OMSComponent):
                         )
                     )
                 except BaseException as settlement_exc:
-                    self._close_gate_after_submit_settlement_failure(
-                        order,
+                    transaction.record_gate_failure(
                         "snapshot_submit_ack_exception",
                         settlement_exc,
                     )
                 finally:
-                    if order_send_permit:
-                        self._release_outbound_order_send_permit(
-                            risk_increasing=order_send_risk_increasing,
-                            symbol=intent.symbol,
-                        )
-                        order_send_permit = False
+                    self._finalize_submission(
+                        transaction,
+                        SubmissionTerminalOutcome.UNKNOWN,
+                    )
                 if settlement_journal_failure is not None:
                     try:
                         self._fail_closed_on_journal_error(
@@ -1576,12 +1614,11 @@ class OMSOrderSubmission(OMSComponent):
                         )
                 raise
 
-            if order_send_permit:
-                self._release_outbound_order_send_permit(
-                    risk_increasing=order_send_risk_increasing,
-                    symbol=intent.symbol,
-                )
-                order_send_permit = False
+            self._complete_submission(
+                transaction,
+                SubmissionTerminalOutcome.ACKNOWLEDGED,
+                order,
+            )
 
             self._notify_order_state_safely(
                 order,
@@ -1652,12 +1689,10 @@ class OMSOrderSubmission(OMSComponent):
                     "snapshot_submit_unknown",
                     intent.symbol,
                 )
-                if order_send_permit:
-                    self._release_outbound_order_send_permit(
-                        risk_increasing=order_send_risk_increasing,
-                        symbol=intent.symbol,
-                    )
-                    order_send_permit = False
+                self._finalize_submission(
+                    transaction,
+                    SubmissionTerminalOutcome.UNKNOWN,
+                )
                 self._notify_order_state_safely(
                     order,
                     "snapshot_submit_unknown_failure",
@@ -1705,18 +1740,15 @@ class OMSOrderSubmission(OMSComponent):
                         )
                     )
                 except BaseException as settlement_exc:
-                    self._close_gate_after_submit_settlement_failure(
-                        order,
+                    transaction.record_gate_failure(
                         "snapshot_submit_unknown_exception",
                         settlement_exc,
                     )
                 finally:
-                    if order_send_permit:
-                        self._release_outbound_order_send_permit(
-                            risk_increasing=order_send_risk_increasing,
-                            symbol=intent.symbol,
-                        )
-                        order_send_permit = False
+                    self._finalize_submission(
+                        transaction,
+                        SubmissionTerminalOutcome.UNKNOWN,
+                    )
                 if settlement_journal_failure is not None:
                     try:
                         self._fail_closed_on_journal_error(
@@ -1732,12 +1764,11 @@ class OMSOrderSubmission(OMSComponent):
                             f"{fail_closed_exc}"
                         )
                 raise
-            if order_send_permit:
-                self._release_outbound_order_send_permit(
-                    risk_increasing=order_send_risk_increasing,
-                    symbol=intent.symbol,
-                )
-                order_send_permit = False
+            self._complete_submission(
+                transaction,
+                SubmissionTerminalOutcome.UNKNOWN,
+                order,
+            )
             self._notify_order_state_safely(
                 order,
                 "submit_unknown",
@@ -1806,7 +1837,7 @@ class OMSOrderSubmission(OMSComponent):
                     ),
                 )
                 if not transport_rejection_superseded:
-                    self.orders.pop(client_oid, None)
+                    self.order_store.remove(client_oid)
                     self.exposure.update_open_orders(self.orders)
                     self.account.calculate()
         except JournalError as exc:
@@ -1815,12 +1846,10 @@ class OMSOrderSubmission(OMSComponent):
                 "snapshot_submit_rejected",
                 intent.symbol,
             )
-            if order_send_permit:
-                self._release_outbound_order_send_permit(
-                    risk_increasing=order_send_risk_increasing,
-                    symbol=intent.symbol,
-                )
-                order_send_permit = False
+            self._finalize_submission(
+                transaction,
+                SubmissionTerminalOutcome.FAILED_CLOSED,
+            )
             self._notify_order_state_safely(
                 order,
                 "snapshot_submit_rejected_failure",
@@ -1861,18 +1890,15 @@ class OMSOrderSubmission(OMSComponent):
                     )
                 )
             except BaseException as settlement_exc:
-                self._close_gate_after_submit_settlement_failure(
-                    order,
+                transaction.record_gate_failure(
                     "snapshot_submit_rejected_exception",
                     settlement_exc,
                 )
             finally:
-                if order_send_permit:
-                    self._release_outbound_order_send_permit(
-                        risk_increasing=order_send_risk_increasing,
-                        symbol=intent.symbol,
-                    )
-                    order_send_permit = False
+                self._finalize_submission(
+                    transaction,
+                    SubmissionTerminalOutcome.UNKNOWN,
+                )
             if settlement_journal_failure is not None:
                 try:
                     self._fail_closed_on_journal_error(
@@ -1888,12 +1914,15 @@ class OMSOrderSubmission(OMSComponent):
                         f"{fail_closed_exc}"
                     )
             raise
-        if order_send_permit:
-            self._release_outbound_order_send_permit(
-                risk_increasing=order_send_risk_increasing,
-                symbol=intent.symbol,
-            )
-            order_send_permit = False
+        self._complete_submission(
+            transaction,
+            (
+                SubmissionTerminalOutcome.ACKNOWLEDGED
+                if transport_rejection_superseded
+                else SubmissionTerminalOutcome.REJECTED
+            ),
+            order,
+        )
         self._notify_order_state_safely(
             order,
             "submit_rejected",

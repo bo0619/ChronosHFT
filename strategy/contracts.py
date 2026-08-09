@@ -126,11 +126,21 @@ class OMSStrategyExecutionAdapter:
 
     def state_snapshot(self, strategy_id: str) -> StrategyStateSnapshot:
         exposure = getattr(self._oms, "exposure", None)
+        snapshot_reader = getattr(exposure, "snapshot", None)
+        exposure_snapshot = snapshot_reader() if callable(snapshot_reader) else None
         raw_positions = _copy_mapping(
-            getattr(exposure, "net_positions", {})
+            getattr(
+                exposure_snapshot if exposure_snapshot is not None else exposure,
+                "net_positions",
+                {},
+            )
         )
         raw_strategy_positions = _copy_mapping(
-            getattr(exposure, "strategy_net_positions", {})
+            getattr(
+                exposure_snapshot if exposure_snapshot is not None else exposure,
+                "strategy_net_positions",
+                {},
+            )
         )
         strategy_id = str(strategy_id or "")
         positions = {

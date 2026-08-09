@@ -260,6 +260,10 @@ class OMSJournal:
 
     def _open_v3_storage(self) -> None:
         legacy_path = Path(self.path).resolve()
+        if self.manifest_path.exists() and legacy_path.exists():
+            raise JournalCorruptionError(
+                "OMS journal has mixed v3 and legacy layouts"
+            )
         if not self.manifest_path.exists():
             residual_v3 = (
                 self.segment_directory.exists()

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from alpha.rpi_intensity import (
     RPIExposureBin,
@@ -98,6 +98,50 @@ LIVE_MAX_MARKOUT_LAG_MS = 2_000
 LIVE_MAX_PNL_CROSSCHECK_TOLERANCE_USDT = Decimal("0.000001")
 
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+class CalibrationArtifactPort(Protocol):
+    """Offline artifact operations required by Live approval validation."""
+
+    CalibrationArtifactError: type[Exception]
+
+    def load_effective_deployment_config(
+        self,
+        path: str | Path,
+    ) -> dict[str, Any]: ...
+
+    def authorized_journal_fence(self, *args, **kwargs): ...
+
+    def validate_rpi_calibration_journal_unlocked(
+        self,
+        *args,
+        **kwargs,
+    ): ...
+
+
+def _require_calibration_artifact_port(
+    port: CalibrationArtifactPort | None,
+) -> type[Exception]:
+    if port is None:
+        raise ValueError("calibration artifact port must be injected")
+    for name in (
+        "load_effective_deployment_config",
+        "authorized_journal_fence",
+        "validate_rpi_calibration_journal_unlocked",
+    ):
+        if not callable(getattr(port, name, None)):
+            raise ValueError(
+                f"calibration artifact port is missing {name}"
+            )
+    error_type = getattr(port, "CalibrationArtifactError", None)
+    if not isinstance(error_type, type) or not issubclass(
+        error_type,
+        Exception,
+    ):
+        raise ValueError(
+            "calibration artifact port has an invalid error contract"
+        )
+    return error_type
 _SIGNER_KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$")
 _MODEL_ALIASES = {
     "glft": "glft",
@@ -257,6 +301,7 @@ def _validate_live_calibration_approval_with_fence_held(
     now_utc: datetime | None = None,
     signature_verifier: ApprovalSignatureVerifier | None = None,
     expected_locked_journal_path: Path | None = None,
+    calibration_artifact_port: CalibrationArtifactPort,
 ) -> dict[str, Any]:
     strategy = config.get("strategy", {})
     if not isinstance(strategy, Mapping):
@@ -485,6 +530,7 @@ def _validate_live_calibration_approval_with_fence_held(
         target_deployment_config_path=config_file,
         expected_locked_journal_path=expected_locked_journal_path,
         evidence_document=source_evidence_document,
+        calibration_artifact_port=calibration_artifact_port,
     )
     if not math.isclose(
         data_duration,
@@ -569,6 +615,7 @@ def _approval_journal_fence_inputs(
     config: Mapping[str, Any],
     *,
     config_path: str | Path,
+    calibration_artifact_port: CalibrationArtifactPort,
 ) -> tuple[Path, Mapping[str, Any], Path] | None:
     strategy = config.get("strategy")
     if not isinstance(strategy, Mapping) or canonical_model_key(
@@ -625,12 +672,10 @@ def _approval_journal_fence_inputs(
         calibration_path_value,
     )
 
-    from governance.calibration_artifact import (
-        load_effective_deployment_config,
-    )
-
-    calibration_config = load_effective_deployment_config(
-        calibration_path
+    calibration_config = (
+        calibration_artifact_port.load_effective_deployment_config(
+            calibration_path
+        )
     )
     journal_path = _resolve_path(source_path.parent, journal_path_value)
     return journal_path, calibration_config, calibration_path
@@ -643,19 +688,20 @@ def validate_live_calibration_approval(
     approved_formula_versions: set[str] | frozenset[str] | None = None,
     now_utc: datetime | None = None,
     signature_verifier: ApprovalSignatureVerifier | None = None,
+    calibration_artifact_port: CalibrationArtifactPort | None = None,
 ) -> dict[str, Any]:
     """Validate the complete approval graph under the journal writer fence."""
-    from governance.calibration_artifact import (
-        CalibrationArtifactError,
-        authorized_journal_fence,
+    artifact_error = _require_calibration_artifact_port(
+        calibration_artifact_port
     )
 
     try:
         fence_inputs = _approval_journal_fence_inputs(
             config,
             config_path=config_path,
+            calibration_artifact_port=calibration_artifact_port,
         )
-    except CalibrationArtifactError as exc:
+    except artifact_error as exc:
         raise ValueError(
             f"GLFT calibration config validation failed: {exc}"
         ) from exc
@@ -667,11 +713,12 @@ def validate_live_calibration_approval(
             now_utc=now_utc,
             signature_verifier=signature_verifier,
             expected_locked_journal_path=None,
+            calibration_artifact_port=calibration_artifact_port,
         )
 
     journal_path, calibration_config, calibration_path = fence_inputs
     try:
-        with authorized_journal_fence(
+        with calibration_artifact_port.authorized_journal_fence(
             journal_path,
             calibration_config=calibration_config,
             calibration_config_path=calibration_path,
@@ -683,8 +730,9 @@ def validate_live_calibration_approval(
                 now_utc=now_utc,
                 signature_verifier=signature_verifier,
                 expected_locked_journal_path=journal_path,
+                calibration_artifact_port=calibration_artifact_port,
             )
-    except CalibrationArtifactError as exc:
+    except artifact_error as exc:
         raise ValueError(
             f"GLFT source journal fence validation failed: {exc}"
         ) from exc
@@ -1578,6 +1626,7 @@ def _validate_glft_source_evidence(
     target_deployment_config_path: Path,
     expected_locked_journal_path: Path | None,
     evidence_document: Mapping[str, Any],
+    calibration_artifact_port: CalibrationArtifactPort,
 ) -> dict[str, Any]:
     if not configured_symbols:
         raise ValueError("GLFT source evidence requires configured symbols")
@@ -1664,17 +1713,16 @@ def _validate_glft_source_evidence(
         evidence.get("calibration_config_sha256"),
         "GLFT source evidence calibration_config_sha256",
     )
-    from governance.calibration_artifact import (
-        CalibrationArtifactError,
-        load_effective_deployment_config,
-        validate_rpi_calibration_journal_unlocked,
+    artifact_error = _require_calibration_artifact_port(
+        calibration_artifact_port
     )
-
     try:
-        calibration_config = load_effective_deployment_config(
-            calibration_config_path
+        calibration_config = (
+            calibration_artifact_port.load_effective_deployment_config(
+                calibration_config_path
+            )
         )
-    except CalibrationArtifactError as exc:
+    except artifact_error as exc:
         raise ValueError(
             f"GLFT calibration config validation failed: {exc}"
         ) from exc
@@ -1931,7 +1979,7 @@ def _validate_glft_source_evidence(
         # across this replay and every downstream artifact/signature check.
         for symbol in configured_symbols:
             journal_summaries.append(
-                validate_rpi_calibration_journal_unlocked(
+                calibration_artifact_port.validate_rpi_calibration_journal_unlocked(
                     journal_path,
                     symbol=symbol,
                     calibration_config=calibration_config,
@@ -1942,7 +1990,7 @@ def _validate_glft_source_evidence(
                     ),
                 )
             )
-    except CalibrationArtifactError as exc:
+    except artifact_error as exc:
         raise ValueError(
             f"GLFT source journal validation failed: {exc}"
         ) from exc
@@ -2986,6 +3034,7 @@ __all__ = [
     "IMPLEMENTED_UNITS_VERSION",
     "LIVE_APPROVED_FORMULA_VERSIONS",
     "ApprovalSignatureVerifier",
+    "CalibrationArtifactPort",
     "ReadinessRequirements",
     "SymbolReadiness",
     "apply_model_readiness_defaults",

@@ -579,7 +579,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
     def test_windows_case_alias_between_state_files_is_rejected(self):
         config = _live_config_fixture()
         journal = config["oms"]["journal_path"]
-        config["risk"]["independent_supervisor"]["state_path"] = (
+        config["risk"]["independent_supervisor"]["state_store_root"] = (
             journal.upper()
         )
         evidence = _passing_evidence(config)

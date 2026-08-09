@@ -51,6 +51,44 @@ def test_launch_contract_round_trip_declares_both_sides_capabilities():
     )
 
 
+def _runtime_contract(**overrides):
+    return SidecarProtocol.with_launch_contract(
+        {
+            "session_id": "session-1",
+            "state_store_root": "state-v2",
+            "account_scope_id": "account-1",
+            "deployment_id": "deployment-1",
+            "state_genesis_id": "genesis-1",
+            "cash_flow_deployment_start_ms": 1_700_000_000_000,
+            **overrides,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("override", "error"),
+    [
+        ({"state_path": "legacy.json"}, "legacy_state_fields_unsupported"),
+        ({"state_store_root": ""}, "runtime_state_store_root_missing"),
+        ({"account_scope_id": ""}, "runtime_account_scope_id_missing"),
+        ({"deployment_id": ""}, "runtime_deployment_id_missing"),
+        ({"state_genesis_id": ""}, "runtime_state_genesis_id_missing"),
+        (
+            {"cash_flow_deployment_start_ms": 0},
+            "runtime_cash_flow_deployment_start_ms_invalid",
+        ),
+    ],
+)
+def test_runtime_state_contract_rejects_missing_or_legacy_state(
+    override,
+    error,
+):
+    with pytest.raises(ValueError, match=error):
+        SidecarProtocol.validate_runtime_state_contract(
+            _runtime_contract(**override)
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "error"),
     [

@@ -11,6 +11,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from infrastructure.runtime_ports import ClockPort, ReferenceDataPort
+
 
 @dataclass(frozen=True)
 class StrategyRegistration:
@@ -239,6 +241,9 @@ def create_primary_strategy(
     engine: Any,
     oms: Any,
     config: Mapping[str, Any],
+    *,
+    clock: ClockPort,
+    reference_data: ReferenceDataPort,
 ) -> Any:
     """Validate registrations and construct the sole primary strategy."""
     from strategy.contracts import coerce_strategy_execution_port
@@ -290,6 +295,8 @@ def create_primary_strategy(
             execution,
             strategy_config=merged_config,
             resolved_config=resolved_config,
+            clock=clock,
+            reference_data=reference_data,
         )
     elif primary_model == "avellaneda_stoikov":
         from strategy.avellaneda_stoikov import AvellanedaStoikovStrategy
@@ -299,6 +306,8 @@ def create_primary_strategy(
             execution,
             strategy_config=merged_config,
             resolved_config=resolved_config,
+            clock=clock,
+            reference_data=reference_data,
         )
     else:  # pragma: no cover - guarded by registry validation above.
         raise AssertionError(f"No strategy builder for {primary_model!r}")

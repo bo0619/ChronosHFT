@@ -21,6 +21,11 @@
     "monitor_check_interval_sec": 1.0,
     "risk_rejection_log_interval_sec": 5.0,
     "event_log_max": 2048,
+    "journal_format_version": 3,
+    "journal_require_existing": false,
+    "journal_segment_max_records": 100000,
+    "journal_segment_max_bytes": 268435456,
+    "journal_max_frame_bytes": 67108864,
     "journal_min_free_bytes": 536870912,
     "journal_space_check_interval_sec": 1.0,
     "tombstone_max": 2000

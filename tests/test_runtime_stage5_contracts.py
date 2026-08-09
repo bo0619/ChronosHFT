@@ -4,8 +4,14 @@ from threading import Event
 import pytest
 
 from infrastructure.runtime_readiness import RuntimeReadinessEvaluator
+from infrastructure.runtime_ports import (
+    ClockPort,
+    MarketCachePort,
+    ReferenceDataPort,
+)
 from infrastructure.runtime_telemetry import TelemetryPublisher
 from infrastructure.time_service import TimeService
+from main import build_runtime_application
 from strategy.avellaneda_stoikov import AvellanedaStoikovStrategy
 from strategy.contracts import OMSStrategyExecutionAdapter
 from strategy.glft import GLFTStrategy
@@ -50,7 +56,13 @@ def test_market_maker_constructor_requires_resolved_strategy_config(
     strategy_type,
 ):
     with pytest.raises(TypeError, match="resolved"):
-        strategy_type(object(), object(), None)
+        strategy_type(
+            object(),
+            object(),
+            None,
+            clock=object(),
+            reference_data=object(),
+        )
 
 
 def test_readiness_evaluator_fails_closed_for_unknown_required_component():
@@ -141,3 +153,22 @@ def test_time_service_listener_unsubscribe_is_owned_and_idempotent():
     assert first not in service.listeners
     assert second in service.listeners
     service.clear_listeners()
+
+
+def test_composition_root_injects_one_domain_port_bundle():
+    application = build_runtime_application({})
+    services = application.services
+    ports = services.platform.domain_ports
+
+    assert isinstance(ports.clock, ClockPort)
+    assert isinstance(ports.market_cache, MarketCachePort)
+    assert isinstance(ports.reference_data, ReferenceDataPort)
+    assert services.factories.ref_data_manager is ports.reference_data
+    assert services.factories.oms_type.keywords["market_cache"] is (
+        ports.market_cache
+    )
+    strategy_keywords = (
+        services.factories.create_primary_strategy.keywords
+    )
+    assert strategy_keywords["clock"] is ports.clock
+    assert strategy_keywords["reference_data"] is ports.reference_data

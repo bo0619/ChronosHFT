@@ -108,9 +108,6 @@ INDEPENDENT_RISK_SUPERVISOR_DEFAULTS = {
     "parent_loss_flatten_delay_sec": 3.0,
     "flatten_retry_sec": 2.0,
     "flat_verification_checks": 2,
-    "state_path": "storage/risk/independent_supervisor_state.json",
-    "state_required": True,
-    "state_fsync": True,
     "rearm_prepare_ttl_sec": 10.0,
     "rearm_command_timeout_sec": 5.0,
     "daily_loss_enabled": True,
@@ -1009,6 +1006,7 @@ def load_root_config(
     path: str = "config.json",
     *,
     allow_unversioned_offline: bool = False,
+    calibration_artifact_port=None,
 ) -> dict:
     config_path = os.path.abspath(os.fspath(path))
     raw, is_manifest = _load_config_document(config_path)
@@ -1027,12 +1025,16 @@ def load_root_config(
                 load_and_validate_rpi_calibration_permit(
                     configured,
                     config_path=config_path,
+                    target_config_normalizer=(
+                        normalize_root_config_preapproval
+                    ),
                 )
             )
         elif stage == CANARY_STAGE:
             approval = validate_live_calibration_approval(
                 configured,
                 config_path=config_path,
+                calibration_artifact_port=calibration_artifact_port,
             )
             runtime_calibration = approval.get("_runtime_calibration")
             if runtime_calibration is not None:
@@ -1050,5 +1052,6 @@ def load_root_config(
     return validate_live_runtime_config(
         configured,
         config_path=config_path,
+        target_config_normalizer=normalize_root_config_preapproval,
         require_local_evidence=not is_paper_trade(configured),
     )

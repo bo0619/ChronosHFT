@@ -178,8 +178,8 @@ def test_core_observation_fields_are_not_duplicated_on_owner():
 
     assert isinstance(core.observation, SidecarObservationController)
     assert owned_fields.isdisjoint(core.__dict__)
-    core.exchange_healthy = True
-    core.risk_snapshot_sequence = 7
+    core.observation.exchange_healthy = True
+    core.observation.risk_snapshot_sequence = 7
     assert core.observation.exchange_healthy
     assert core.observation.risk_snapshot_sequence == 7
     assert "owner" not in core.observation.__dict__

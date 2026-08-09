@@ -19,6 +19,7 @@ class BinanceSidecarExchangeConfiguration:
     cash_flow_max_pages: int
     cash_flow_poll_interval_sec: float
     cash_flow_deployment_start_ms: int
+    cash_flow_overlap_ms: int
     seed_deployment_cash_flow_total: float
     full_open_orders_audit_interval_sec: float
     clock_sync_enabled: bool
@@ -235,6 +236,13 @@ class BinanceSidecarExchangeConfiguration:
                 0,
                 int(settings.get("cash_flow_deployment_start_ms", 0) or 0),
             ),
+            cash_flow_overlap_ms=max(
+                60_000,
+                int(
+                    settings.get("cash_flow_overlap_ms", 86_400_000)
+                    or 86_400_000
+                ),
+            ),
             seed_deployment_cash_flow_total=finite_float(
                 settings.get("seed_deployment_cash_flow_total", 0.0) or 0.0,
                 "seed_deployment_cash_flow_total",
@@ -276,6 +284,8 @@ class BinanceSidecarExchangeConfiguration:
         owner.cash_flow_deployment_start_ms = (
             self.cash_flow_deployment_start_ms
         )
+        owner.cash_flow_overlap_ms = self.cash_flow_overlap_ms
+        owner.cash_flow_ledger = None
         owner._last_cash_flow_poll_monotonic = 0.0
         owner._cached_external_cash_flow_total = 0.0
         owner._cached_daily_external_cash_flow_total = 0.0

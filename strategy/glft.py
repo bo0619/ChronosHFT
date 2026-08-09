@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -28,7 +27,6 @@ from alpha.rpi_intensity import (
     estimate_rpi_intensity,
 )
 from alpha.signal import MultiHorizonPredictor
-from data.ref_data import ref_data_manager
 from event.type import (
     EVENT_STRATEGY_UPDATE,
     AggTradeData,
@@ -43,11 +41,19 @@ from event.type import (
     TradeData,
 )
 from infrastructure.paper_trade import is_paper_trade
-from infrastructure.time_service import time_service
+from infrastructure.runtime_ports import ClockPort, ReferenceDataPort
+from strategy.adaptive_pipeline import (
+    AdaptivePipelineInput,
+    AdaptiveQuotePipeline,
+)
 from strategy.base import StrategyTemplate
 from strategy.model_readiness import (
     evaluate_symbol_readiness,
     readiness_requirements,
+)
+from strategy.quote_decision import (
+    QuoteDecisionEngine,
+    QuoteDecisionInput,
 )
 from strategy.quote_math import (
     ADAPTIVE_GLFT_FORMULA_VERSION,
@@ -55,7 +61,6 @@ from strategy.quote_math import (
     PORTFOLIO_GLFT_FORMULA_VERSION,
     GLFTQuoteScenario,
     UNITS_VERSION,
-    depths_bps_to_prices,
     glft_quote_offsets,
     portfolio_glft_quote_offsets,
     robust_adaptive_portfolio_glft_quote_offsets,
@@ -116,8 +121,11 @@ class GLFTStrategy(StrategyTemplate):
         execution,
         strategy_config,
         *,
+        clock: ClockPort,
+        reference_data: ReferenceDataPort,
         resolved_config=None,
-        clock=time_service,
+        quote_decision_engine=None,
+        adaptive_pipeline=None,
     ):
         if not isinstance(strategy_config, dict):
             raise TypeError("resolved GLFT strategy config must be an object")
@@ -126,8 +134,15 @@ class GLFTStrategy(StrategyTemplate):
             execution,
             "GLFT_MultiScale",
             resolved_config=resolved_config,
+            reference_data=reference_data,
         )
+        if clock is None:
+            raise TypeError("clock port is required")
         self.clock = clock
+        self.quote_decision_engine = (
+            quote_decision_engine or QuoteDecisionEngine()
+        )
+        self.adaptive_pipeline = adaptive_pipeline or AdaptiveQuotePipeline()
         self.strat_conf = dict(strategy_config)
 
         raw_glft_config = self.strat_conf.get("glft", {})
@@ -883,8 +898,8 @@ class GLFTStrategy(StrategyTemplate):
             reference_price=reference_price,
         )
 
-    @staticmethod
     def _scale_safe_volume(
+        self,
         symbol: str,
         safe_volume: float,
         multiplier: float,
@@ -897,10 +912,13 @@ class GLFTStrategy(StrategyTemplate):
         bounded_multiplier = min(1.0, max(0.0, float(multiplier)))
         if bounded_multiplier >= 1.0:
             return safe_volume
-        info = ref_data_manager.get_info(symbol)
+        info = self.reference_data.get_info(symbol)
         if info is None:
             return 0.0
-        scaled = ref_data_manager.round_qty(symbol, safe_volume * bounded_multiplier)
+        scaled = self.reference_data.round_qty(
+            symbol,
+            safe_volume * bounded_multiplier,
+        )
         min_qty = max(0.0, float(info.min_qty or 0.0))
         min_notional = max(5.0, float(info.min_notional or 0.0))
         if (
@@ -1055,7 +1073,7 @@ class GLFTStrategy(StrategyTemplate):
             timing["strategy_compute_latency_ms"] = max(
                 0.0,
                 (
-                    time.perf_counter_ns() / 1_000_000_000.0
+                    self.clock.monotonic_ns() / 1_000_000_000.0
                     - float(callback_monotonic)
                 )
                 * 1000.0,
@@ -1450,7 +1468,7 @@ class GLFTStrategy(StrategyTemplate):
         ):
             return
 
-        now = time.perf_counter()
+        now = self.clock.monotonic()
         if not self.live_mode:
             self.latest_market_timing[symbol] = (
                 self._market_timing_snapshot(
@@ -1690,26 +1708,28 @@ class GLFTStrategy(StrategyTemplate):
                 if flow_adverse is not None
                 else 0.0
             )
-            adaptive_context = {
-                "bid_A_per_s": A
-                * self.adaptive_bid_A_multiplier
-                * bid_hawkes,
-                "ask_A_per_s": A
-                * self.adaptive_ask_A_multiplier
-                * ask_hawkes,
-                "bid_k_per_bps": k * self.adaptive_bid_k_multiplier,
-                "ask_k_per_bps": k * self.adaptive_ask_k_multiplier,
-                "bid_adverse_cost_bps": (
-                    bid_markout.adverse_cost_bps
-                    + bid_queue_estimate.latency_cost_bps
-                    + bid_flow_cost
-                ),
-                "ask_adverse_cost_bps": (
-                    ask_markout.adverse_cost_bps
-                    + ask_queue_estimate.latency_cost_bps
-                    + ask_flow_cost
-                ),
-            }
+            adaptive_context = self.adaptive_pipeline.build(
+                AdaptivePipelineInput(
+                    base_A_per_s=A,
+                    base_k_per_bps=k,
+                    bid_A_multiplier=self.adaptive_bid_A_multiplier,
+                    ask_A_multiplier=self.adaptive_ask_A_multiplier,
+                    bid_k_multiplier=self.adaptive_bid_k_multiplier,
+                    ask_k_multiplier=self.adaptive_ask_k_multiplier,
+                    bid_hawkes_multiplier=bid_hawkes,
+                    ask_hawkes_multiplier=ask_hawkes,
+                    bid_markout_cost_bps=bid_markout.adverse_cost_bps,
+                    ask_markout_cost_bps=ask_markout.adverse_cost_bps,
+                    bid_queue_cost_bps=(
+                        bid_queue_estimate.latency_cost_bps
+                    ),
+                    ask_queue_cost_bps=(
+                        ask_queue_estimate.latency_cost_bps
+                    ),
+                    bid_flow_cost_bps=bid_flow_cost,
+                    ask_flow_cost_bps=ask_flow_cost,
+                )
+            ).as_formula_context()
             adaptive_runtime = {
                 "enabled": True,
                 "hawkes": self.adaptive_hawkes.summary(symbol, now),
@@ -1791,42 +1811,31 @@ class GLFTStrategy(StrategyTemplate):
             symbol,
             passive_tif,
         )
-        effective_min_spread_bps = max(
-            self.min_spread_bps,
-            passive_fee_bps,
-        )
-        effective_half_spread_bps = max(
-            formula_quote.half_spread_bps,
-            effective_min_spread_bps / 2.0,
-        )
-        target_bid, target_ask = depths_bps_to_prices(
-            fair_mid,
-            effective_half_spread_bps - formula_quote.center_offset_bps,
-            effective_half_spread_bps + formula_quote.center_offset_bps,
-        )
-
-        info = ref_data_manager.get_info(symbol)
+        info = self.reference_data.get_info(symbol)
         if info is None:
             return
         tick = float(info.tick_size or 0.0)
         if tick <= 0.0:
             return
-        target_bid = ref_data_manager.round_price(
-            symbol,
-            target_bid,
-            direction="down",
-        )
-        target_ask = ref_data_manager.round_price(
-            symbol,
-            target_ask,
-            direction="up",
-        )
-        if target_bid >= ask_1:
-            target_bid = ask_1 - tick
-        if target_ask <= bid_1:
-            target_ask = bid_1 + tick
-        if target_bid <= 0.0 or target_bid >= target_ask:
+        try:
+            decision = self.quote_decision_engine.decide(
+                QuoteDecisionInput(
+                    reference_price=fair_mid,
+                    best_bid=bid_1,
+                    best_ask=ask_1,
+                    tick_size=tick,
+                    configured_min_spread_bps=self.min_spread_bps,
+                    passive_fee_bps=passive_fee_bps,
+                    formula_quote=formula_quote,
+                )
+            )
+        except (TypeError, ValueError):
             return
+        if decision is None:
+            return
+        target_bid = decision.target_bid
+        target_ask = decision.target_ask
+        effective_min_spread_bps = decision.effective_min_spread_bps
 
         bid_order_vol = self._calculate_safe_vol(
             symbol,
@@ -1936,7 +1945,7 @@ class GLFTStrategy(StrategyTemplate):
             "mode": passive_tif,
             "time_in_force": passive_tif,
             "use_rpi": self.use_rpi,
-            "rpi_supported": ref_data_manager.supports_rpi(symbol),
+            "rpi_supported": self.reference_data.supports_rpi(symbol),
             "mid_price": mid,
             "best_bid": bid_1,
             "best_ask": ask_1,
@@ -2237,7 +2246,7 @@ class GLFTStrategy(StrategyTemplate):
             reference_price=mid,
         )
         if reduce_only:
-            volume = ref_data_manager.round_qty(
+            volume = self.reference_data.round_qty(
                 symbol,
                 min(volume, abs(current_position)),
             )
@@ -2361,7 +2370,7 @@ class GLFTStrategy(StrategyTemplate):
         mid: float,
         depth_bps: float,
     ) -> float:
-        info = ref_data_manager.get_info(symbol)
+        info = self.reference_data.get_info(symbol)
         if info is None:
             return 0.0
         direction = -1.0 if side == Side.BUY else 1.0
@@ -2409,7 +2418,7 @@ class GLFTStrategy(StrategyTemplate):
             "mode": "RPI_CALIBRATION_CANARY",
             "time_in_force": TIF_RPI,
             "use_rpi": True,
-            "rpi_supported": ref_data_manager.supports_rpi(symbol),
+            "rpi_supported": self.reference_data.supports_rpi(symbol),
             "mid_price": mid,
             "best_bid": best_bid,
             "best_ask": best_ask,
@@ -2541,7 +2550,7 @@ class GLFTStrategy(StrategyTemplate):
             "mode": "OBSERVE_ONLY",
             "time_in_force": "",
             "use_rpi": self.use_rpi,
-            "rpi_supported": ref_data_manager.supports_rpi(symbol),
+            "rpi_supported": self.reference_data.supports_rpi(symbol),
             "mid_price": mid,
             "best_bid": best_bid,
             "best_ask": best_ask,
@@ -2692,11 +2701,11 @@ class GLFTStrategy(StrategyTemplate):
         state = self.quote_state[symbol]
         if not self.can_submit_orders(symbol):
             return
-        info = ref_data_manager.get_info(symbol)
+        info = self.reference_data.get_info(symbol)
         if info is None:
             return
         tick = float(info.tick_size or 0.0)
-        now = time.perf_counter()
+        now = self.clock.monotonic()
         time_in_force = time_in_force or self.resolve_passive_time_in_force(
             symbol,
             use_rpi=self.use_rpi,
@@ -2790,7 +2799,7 @@ class GLFTStrategy(StrategyTemplate):
         sign = -1.0 if trade.maker_is_buyer else 1.0
         event_monotonic = self._positive_snapshot_time(
             trade.received_monotonic
-        ) or time.perf_counter()
+        ) or self.clock.monotonic()
         previous = self._decayed_orderflow_imbalance(
             trade.symbol,
             event_monotonic,
@@ -3103,7 +3112,7 @@ class GLFTStrategy(StrategyTemplate):
                 state["ask_volume"] = None
 
     def on_trade(self, trade: TradeData):
-        now_monotonic = time.perf_counter()
+        now_monotonic = self.clock.monotonic()
         self.last_fill_time[trade.symbol] = now_monotonic
         if self.adaptive_enabled:
             self.adaptive_markout.record_fill(

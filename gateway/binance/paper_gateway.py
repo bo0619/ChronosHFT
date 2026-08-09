@@ -56,9 +56,19 @@ from .constants import (
     EP_RPI_DEPTH,
     REST_URL_MAIN,
 )
-from .paper_book_sync import PaperBookSynchronizer
-from .paper_ledger import PaperLedger
-from .paper_matching import PaperMatchingEngine
+from .paper_book_sync import (
+    PaperBookFeedConfig,
+    PaperBookFeedPort,
+    PaperBookFeedState,
+    PaperBookSynchronizer,
+)
+from .paper_ledger import PaperLedger, PaperLedgerConfig, PaperLedgerPort
+from .paper_matching import (
+    PaperMatchingEngine,
+    PaperMatchingPolicy,
+    PaperMatchingPort,
+    PaperVenueState,
+)
 from .paper_state import (
     EngineCommand as _EngineCommand,
     PaperOrder as _PaperOrder,
@@ -184,6 +194,96 @@ class BinancePaperGateway(BaseGateway):
 
     supports_outbound_send_guard = True
 
+    # Compatibility views for diagnostics and existing recovery tooling. The
+    # synchronizer remains the sole owner of the underlying mutable state.
+    @property
+    def orderbooks(self):
+        return self._book_feed_state.orderbooks
+
+    @orderbooks.setter
+    def orderbooks(self, value):
+        self._book_feed_state.orderbooks = value
+
+    @property
+    def ws_buffer(self):
+        return self._book_feed_state.ws_buffer
+
+    @ws_buffer.setter
+    def ws_buffer(self, value):
+        self._book_feed_state.ws_buffer = value
+
+    @property
+    def book_resyncing(self):
+        return self._book_feed_state.resyncing
+
+    @book_resyncing.setter
+    def book_resyncing(self, value):
+        self._book_feed_state.resyncing = value
+
+    @property
+    def book_recovery_generation(self):
+        return self._book_feed_state.recovery_generation
+
+    @book_recovery_generation.setter
+    def book_recovery_generation(self, value):
+        self._book_feed_state.recovery_generation = value
+
+    @property
+    def book_recovery_tokens(self):
+        return self._book_feed_state.recovery_tokens
+
+    @book_recovery_tokens.setter
+    def book_recovery_tokens(self, value):
+        self._book_feed_state.recovery_tokens = value
+
+    @property
+    def _book_recovery_token(self):
+        return self._book_feed_state.recovery_token
+
+    @_book_recovery_token.setter
+    def _book_recovery_token(self, value):
+        self._book_feed_state.recovery_token = int(value)
+
+    @property
+    def _book_generation(self):
+        return self._book_feed_state.generation
+
+    @_book_generation.setter
+    def _book_generation(self, value):
+        self._book_feed_state.generation = int(value)
+
+    @property
+    def _book_lock(self):
+        return self._book_feed_state.lock
+
+    @_book_lock.setter
+    def _book_lock(self, value):
+        self._book_feed_state.replace_lock(value)
+
+    @property
+    def _book_recovery_threads(self):
+        return self._book_feed_state.recovery_threads
+
+    @_book_recovery_threads.setter
+    def _book_recovery_threads(self, value):
+        self._book_feed_state.recovery_threads = value
+
+    @property
+    def _book_recovery_stop(self):
+        return self._book_feed_state.recovery_stop
+
+    @_book_recovery_stop.setter
+    def _book_recovery_stop(self, value):
+        self._book_feed_state.recovery_stop = value
+
+    @property
+    def _last_ws_mark_received_monotonic(self):
+        return self._book_feed_state.last_ws_mark_received_monotonic
+
+    @_last_ws_mark_received_monotonic.setter
+    def _last_ws_mark_received_monotonic(self, value):
+        self._book_feed_state.last_ws_mark_received_monotonic = value
+
     def __init__(self, event_engine, config: dict, market_data_config: dict | None = None):
         super().__init__(event_engine, "BINANCE_PAPER")
         self.config = dict(config or {})
@@ -275,8 +375,6 @@ class BinancePaperGateway(BaseGateway):
                 or 3.0
             ),
         )
-        self._book_recovery_threads = set()
-        self._book_recovery_stop = threading.Event()
         self.max_book_buffer = max(
             100,
             int(
@@ -418,25 +516,15 @@ class BinancePaperGateway(BaseGateway):
         self.balance_asset = configured_balance_asset or self._default_balance_asset(
             self.symbols
         )
-        self._balances = {self.balance_asset: self.initial_balance}
-
         self.rest = _PublicBinanceRest(
             timeout_sec=float(self.paper_config.get("public_rest_timeout_sec", 5.0) or 5.0)
         )
         self.ws: BinanceWsApi | None = None
-        self.orderbooks: dict[str, LocalOrderBook] = {}
-        self.ws_buffer: dict[str, list[dict] | None] = {}
-        self.book_resyncing: set[str] = set()
-        self.book_recovery_generation: dict[str, int] = {}
-        self.book_recovery_tokens: dict[str, int] = {}
-        self._book_recovery_token = 0
-        self._book_generation = 0
-        self._book_lock = threading.RLock()
+        self._book_feed_state = PaperBookFeedState(symbols=tuple(self.symbols))
         self._lifecycle_lock = threading.RLock()
         self._fault_lock = threading.Lock()
         self._fault_epoch = 0
         self._closing = False
-        self._last_ws_mark_received_monotonic: dict[str, float] = {}
         self._mark_fallback_stop = threading.Event()
         self._mark_fallback_thread: threading.Thread | None = None
 
@@ -445,26 +533,102 @@ class BinancePaperGateway(BaseGateway):
         self._worker_running = False
         self._worker_stop_requested = False
 
-        # The following state is owned exclusively by the matching thread.
-        self._orders: dict[str, _PaperOrder] = {}
-        self._exchange_to_client: dict[str, str] = {}
-        self._positions: dict[str, _PaperPosition] = {}
-        self._books: dict[str, OrderBook] = {}
-        self._liquidity: dict[str, dict[str, dict[float, float]]] = {}
-        self._marks: dict[str, float] = {}
-        self._last_market_trade_id: dict[str, int] = {}
-        self._trades: deque[dict] = deque(maxlen=self.max_trade_history)
-        self._dms_deadlines: dict[str, float] = {}
-        # A symbol-wide cancel is a venue barrier.  Orders staged before the
-        # barrier must not become active after the OMS durability commit.
-        self._cancel_generations: dict[str, int] = {}
-        self._accept_sequence = 0
-        self._exchange_sequence = 0
-        self._event_sequence = 0
-        self._paper_trade_sequence = 0
-        self._book_sync = PaperBookSynchronizer(self)
-        self._ledger = PaperLedger(self)
-        self._matching = PaperMatchingEngine(self)
+        self._venue_state = PaperVenueState(
+            balances={self.balance_asset: self.initial_balance},
+            trades=deque(maxlen=self.max_trade_history),
+        )
+        # Legacy facade views. PaperVenueState owns these objects; gateway and
+        # ledger methods operate on the same single-writer collections.
+        self._balances = self._venue_state.balances
+        self._orders = self._venue_state.orders
+        self._exchange_to_client = self._venue_state.exchange_to_client
+        self._positions = self._venue_state.positions
+        self._books = self._venue_state.books
+        self._liquidity = self._venue_state.liquidity
+        self._marks = self._venue_state.marks
+        self._last_market_trade_id = self._venue_state.last_market_trade_id
+        self._trades = self._venue_state.trades
+        self._dms_deadlines = self._venue_state.dms_deadlines
+        self._cancel_generations = self._venue_state.cancel_generations
+        self._book_sync = PaperBookSynchronizer(
+            self._book_feed_state,
+            PaperBookFeedPort(
+                fetch_depth_snapshot=lambda symbol: self.rest.get_depth_snapshot(symbol),
+                submit_worker=lambda kind, payload: self._submit_worker(kind, payload),
+                stamp_market_dispatch=self._stamp_market_dispatch,
+                publish_market_data=lambda event_type, data: self.on_market_data(
+                    event_type,
+                    data,
+                ),
+                publish_health=lambda reason: self.event_engine.put(
+                    Event(EVENT_SYSTEM_HEALTH, reason)
+                ),
+                report_fault=lambda reason: self._fault(reason),
+                launch_recovery=lambda recovery: self._launch_book_recovery(recovery),
+                run_recovery=lambda symbol, generation, token: self._run_book_recovery(
+                    symbol,
+                    generation,
+                    token,
+                ),
+                resync_book=lambda symbol, **kwargs: self._resync_book(
+                    symbol,
+                    **kwargs,
+                ),
+                publish_book_update=lambda generation, **kwargs: (
+                    self._publish_book_update(generation, **kwargs)
+                ),
+            ),
+            PaperBookFeedConfig(
+                publish_depth_levels=self.publish_depth_levels,
+                emit_full_orderbook_events=self.emit_full_orderbook_events,
+                max_orderbook_levels_per_side=self.max_orderbook_levels_per_side,
+                max_delta_levels_per_side=self.max_delta_levels_per_side,
+                max_book_buffer=self.max_book_buffer,
+                max_book_recovery_threads=self.max_book_recovery_threads,
+                book_recovery_join_timeout_sec=self.book_recovery_join_timeout_sec,
+            ),
+        )
+        self._ledger = PaperLedger(
+            self._venue_state,
+            PaperLedgerPort(
+                reduce_only_fill_cap=lambda order: self._reduce_only_fill_cap(order),
+                fee_rate=lambda order, is_maker: self._fee_rate(order, is_maker),
+                quote_asset=lambda symbol: self._quote_asset(symbol),
+                mark_price=lambda symbol: self._mark_price(symbol),
+                remove_from_later_local_queue=lambda order, quantity: (
+                    self._remove_from_later_local_queue(order, quantity)
+                ),
+                account_metrics=lambda: self._account_metrics(),
+                worker_running=lambda: self._worker_running,
+                symbols=lambda: tuple(self.symbols),
+                submit_worker=lambda kind, payload: self._submit_worker(kind, payload),
+                publish_order_update=lambda update: self.on_order_update(update),
+                publish_account_update=lambda update: self.on_account_update(update),
+            ),
+            PaperLedgerConfig(
+                balance_asset=self.balance_asset,
+                max_order_history=self.max_order_history,
+            ),
+        )
+        self._matching = PaperMatchingEngine(
+            self._venue_state,
+            PaperMatchingPort(
+                apply_fill=lambda *args, **kwargs: self._apply_fill(
+                    *args,
+                    **kwargs,
+                ),
+                expire_order=lambda order, reason: self._expire_order(order, reason),
+            ),
+            PaperMatchingPolicy(
+                rpi_fill_model=self.rpi_fill_model,
+                cancel_ahead_fraction=self.cancel_ahead_fraction,
+                market_order_max_slippage_bps=self.market_order_max_slippage_bps,
+                maker_fee=self.maker_fee,
+                taker_fee=self.taker_fee,
+                rpi_commission_rate=self.rpi_commission_rate,
+                rpi_commission_rates=dict(self.rpi_commission_rates),
+            ),
+        )
 
         # OMS writes these attributes during construction.
         self.target_leverage = self.leverage
@@ -1069,12 +1233,9 @@ class BinancePaperGateway(BaseGateway):
         *,
         worker_kind: str,
     ) -> bool:
-        # Serialize the final generation check, matching enqueue, and public
-        # emission against lifecycle reset.  The worker validates the same
-        # generation again when it dequeues the command.
-        with self._book_lock:
-            if self._book_generation != generation:
-                return False
+        if not self._book_sync.claim_dispatch(generation):
+            return False
+        try:
             self._stamp_market_dispatch(data)
             if not self._submit_worker(
                 worker_kind,
@@ -1083,6 +1244,8 @@ class BinancePaperGateway(BaseGateway):
                 return False
             self.on_market_data(event_type, data)
             return True
+        finally:
+            self._book_sync.release_dispatch()
 
     def _book_generation_matches_locked(self, expected_generation):
         return self._book_sync.generation_matches_locked(expected_generation)
@@ -1096,28 +1259,30 @@ class BinancePaperGateway(BaseGateway):
         expected_generation,
         expected_fault_epoch,
     ) -> bool:
-        with self._book_lock:
-            if not self._book_generation_matches_locked(expected_generation):
-                return False
-        with self._fault_lock:
-            if (
-                self._closing
-                or self.ws is not expected_ws
-                or not self.active
-                or self.state == GatewayState.ERROR
-                or self._fault_epoch != expected_fault_epoch
-                or self._book_generation != expected_generation
-            ):
-                return False
-            self._accepting_orders = True
-            self.set_state(GatewayState.READY)
-            return True
+        if not self._book_sync.claim_dispatch(expected_generation):
+            return False
+        try:
+            with self._fault_lock:
+                if (
+                    self._closing
+                    or self.ws is not expected_ws
+                    or not self.active
+                    or self.state == GatewayState.ERROR
+                    or self._fault_epoch != expected_fault_epoch
+                    or self._book_generation != expected_generation
+                ):
+                    return False
+                self._accepting_orders = True
+                self.set_state(GatewayState.READY)
+                return True
+        finally:
+            self._book_sync.release_dispatch()
 
     def _invalidate_public_book_lifecycle(self):
         return self._book_sync.invalidate_lifecycle()
 
     def _reset_public_books(self):
-        return self._book_sync.reset_books()
+        return self._book_sync.reset_books(self.symbols)
 
     def _resync_book(
         self,
@@ -1552,23 +1717,29 @@ class BinancePaperGateway(BaseGateway):
             return self._set_dms_internal(symbol, countdown_ms)
         if kind == "book":
             generation, book = payload
-            with self._book_lock:
-                if generation != self._book_generation:
-                    return False
+            if not self._book_sync.claim_dispatch(generation):
+                return False
+            try:
                 return self._on_book(book)
+            finally:
+                self._book_sync.release_dispatch()
         if kind == "market_trade":
             generation, trade = payload
-            with self._book_lock:
-                if generation != self._book_generation:
-                    return False
+            if not self._book_sync.claim_dispatch(generation):
+                return False
+            try:
                 return self._on_market_trade(trade)
+            finally:
+                self._book_sync.release_dispatch()
         if kind == "mark":
             generation, mark = payload
-            with self._book_lock:
-                if generation != self._book_generation:
-                    return False
+            if not self._book_sync.claim_dispatch(generation):
+                return False
+            try:
                 self._marks[mark.symbol] = float(mark.mark_price or 0.0)
                 return True
+            finally:
+                self._book_sync.release_dispatch()
         if kind == "query":
             query_name, args = payload
             return self._query_internal(query_name, args)
@@ -1662,9 +1833,9 @@ class BinancePaperGateway(BaseGateway):
                 ),
             )
 
-        self._accept_sequence += 1
-        self._exchange_sequence += 1
-        exchange_oid = f"PAPER-{self._exchange_sequence:020d}"
+        self._venue_state.accept_sequence += 1
+        self._venue_state.exchange_sequence += 1
+        exchange_oid = f"PAPER-{self._venue_state.exchange_sequence:020d}"
         now_ms = int(time.time() * 1000)
         now_monotonic = time.perf_counter()
         if request.time_in_force == TIF_RPI:
@@ -1679,7 +1850,7 @@ class BinancePaperGateway(BaseGateway):
             client_oid=client_oid,
             exchange_oid=exchange_oid,
             request=request,
-            accept_seq=self._accept_sequence,
+            accept_seq=self._venue_state.accept_sequence,
             created_ms=now_ms,
             created_monotonic=now_monotonic,
             update_ms=now_ms,
@@ -2372,14 +2543,7 @@ class BinancePaperGateway(BaseGateway):
             if self._closing:
                 return
             self._fault_epoch += 1
-        # Fault and book state have independent epochs. Never hold both locks:
-        # book recovery paths are allowed to report a fault while owning the
-        # book lock, and nested acquisition would create an ABBA cycle.
-        with self._book_lock:
-            self._book_generation += 1
-            self.book_resyncing.clear()
-            self.book_recovery_generation.clear()
-            self.book_recovery_tokens.clear()
+        self._invalidate_public_book_lifecycle()
         self.set_state(GatewayState.ERROR)
         self.event_engine.put(
             Event(

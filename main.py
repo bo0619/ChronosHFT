@@ -5,6 +5,7 @@ import time
 import webbrowser
 from decimal import Decimal, InvalidOperation
 
+from data.cache import data_cache
 from data.live_evidence import LiveEvidenceRecorder, RecorderGroup
 from data.recorder import DataRecorder
 from data.ref_data import ref_data_manager
@@ -13,6 +14,7 @@ from event.type import OMSCapabilityMode
 from gateway.binance.gateway import BinanceGateway
 from gateway.binance.rate_limit_budget import BinanceRateLimitBudget
 from gateway.binance.truth_provider import BinanceTruthSnapshotProvider
+from governance import calibration_artifact as calibration_artifact_port
 from infrastructure.admin_control import (
     AdminControlServer,
     coordinated_rearm,
@@ -53,6 +55,10 @@ from infrastructure.runtime_control_loop import (
 )
 from infrastructure.runtime_failure_policy import RuntimeFailurePolicy
 from infrastructure.runtime_resources import RuntimeResources
+from infrastructure.runtime_ports import (
+    compose_runtime_domain,
+    read_clock_health,
+)
 from infrastructure.runtime_shutdown import (
     RuntimeShutdownCoordinator,
     RuntimeShutdownServices,
@@ -110,7 +116,7 @@ def parse_cli_args(argv=None):
 
 
 def load_config(path="config.json"):
-    return load_root_config(path)
+    return load_root_config(path, calibration_artifact_port=calibration_artifact_port)
 
 
 def bootstrap_or_rearm(
@@ -698,18 +704,6 @@ def build_gateway_bundle(engine, config, market_data_config):
     return gateway, truth_provider
 
 
-def read_clock_health(clock_service):
-    """Read clock telemetry without dispatching health listeners."""
-    health_reader = getattr(clock_service, "health_snapshot", None)
-    if not callable(health_reader):
-        return {}
-    try:
-        health = health_reader(notify_listeners=False)
-    except TypeError:
-        health = health_reader()
-    return health if isinstance(health, dict) else {}
-
-
 def start_local_dashboard(
     web_dashboard,
     web_dashboard_config,
@@ -1020,6 +1014,14 @@ def enforce_live_evidence_health(recorder, oms_system) -> bool:
 
 
 def build_runtime_application(runtime=None) -> RuntimeApplication:
+    domain = compose_runtime_domain(
+        time_service,
+        data_cache,
+        ref_data_manager,
+        OMS,
+        create_primary_strategy,
+    )
+    domain_ports = domain.ports
     return RuntimeApplication(
         runtime,
         RuntimeApplicationServices(
@@ -1042,17 +1044,18 @@ def build_runtime_application(runtime=None) -> RuntimeApplication:
                 ),
                 monotonic=time.perf_counter,
                 sleep=time.sleep,
+                domain_ports=domain_ports,
             ),
             factories=RuntimeFactoryServices(
                 event_engine_type=EventEngine,
                 build_gateway_bundle=build_gateway_bundle,
-                oms_type=OMS,
+                oms_type=domain.oms_type,
                 risk_manager_type=RiskManager,
                 failure_policy_type=RuntimeFailurePolicy,
                 independent_risk_supervisor_type=(
                     IndependentRiskSupervisor
                 ),
-                create_primary_strategy=create_primary_strategy,
+                create_primary_strategy=domain.strategy_factory,
                 strategy_runtime_type=StrategyRuntime,
                 data_recorder_type=DataRecorder,
                 process_resource_monitor_type=ProcessResourceMonitor,
@@ -1062,7 +1065,7 @@ def build_runtime_application(runtime=None) -> RuntimeApplication:
                 venue_supervisor_type=VenueSupervisor,
                 admin_control_server_type=AdminControlServer,
                 local_web_dashboard_type=LocalWebDashboard,
-                ref_data_manager=ref_data_manager,
+                ref_data_manager=domain_ports.reference_data,
                 watchdog_state_type=RuntimeWatchdogState,
                 event_bindings_type=RuntimeEventBindings,
             ),

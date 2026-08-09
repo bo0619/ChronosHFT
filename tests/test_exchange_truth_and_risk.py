@@ -82,6 +82,7 @@ from risk.independent_supervisor import (
 )
 from risk.manager import RiskManager
 from risk.sidecar_protocol import SidecarProtocol
+from risk.sidecar_state_store import SidecarStateStore, SidecarStateStoreError
 from strategy.base import StrategyTemplate
 
 
@@ -480,7 +481,12 @@ class ExchangeTruthTests(unittest.TestCase):
     @staticmethod
     def make_strategy(cancel_result=True):
         oms = DummyStrategyOms(cancel_result)
-        strategy = StrategyTemplate(DummyEngine(), oms, name="test")
+        strategy = StrategyTemplate(
+            DummyEngine(),
+            oms,
+            name="test",
+            reference_data=object(),
+        )
         strategy.active_orders = {
             "btc-1": OrderIntent("test", "BTCUSDT", Side.BUY, 100.0, 1.0),
             "btc-2": OrderIntent("test", "BTCUSDT", Side.SELL, 101.0, 1.0),
@@ -589,7 +595,7 @@ class ExchangeTruthTests(unittest.TestCase):
             order.mark_submitting()
             order.mark_pending_ack("ex-close")
             order.mark_new("ex-close", update_time=1.0, seq=1)
-            oms.orders[order.client_oid] = order
+            oms.order_store.add(order)
             oms.exchange_id_map[order.exchange_oid] = order
 
             update = ExchangeOrderUpdate(
@@ -976,7 +982,7 @@ class ExchangeTruthTests(unittest.TestCase):
                 OrderIntent("test", "BTCUSDT", Side.BUY, 102.0, 0.25),
             )
             active_order.mark_submitting()
-            oms.orders[active_order.client_oid] = active_order
+            oms.order_store.add(active_order)
 
             update = ExchangeAccountUpdate(
                 asset="",
@@ -1076,7 +1082,7 @@ class ExchangeTruthTests(unittest.TestCase):
                 OrderIntent("test", "BTCUSDT", Side.BUY, 100.0, 1.0),
             )
             active_order.mark_submitting()
-            oms.orders[active_order.client_oid] = active_order
+            oms.order_store.add(active_order)
 
             called = []
             oms.trigger_reconcile = lambda reason, suspicious_oid=None: called.append((reason, suspicious_oid))
@@ -1155,7 +1161,7 @@ class ExchangeTruthTests(unittest.TestCase):
             order.mark_submitting()
             order.mark_pending_ack("ex-buy")
             order.mark_new("ex-buy", update_time=1.0, seq=1)
-            oms.orders[order.client_oid] = order
+            oms.order_store.add(order)
             oms.exchange_id_map[order.exchange_oid] = order
 
             account_update = ExchangeAccountUpdate(
@@ -1209,7 +1215,7 @@ class ExchangeTruthTests(unittest.TestCase):
             order.mark_submitting()
             order.mark_pending_ack("ex-newer")
             order.mark_new("ex-newer", update_time=1.0, seq=1)
-            oms.orders[order.client_oid] = order
+            oms.order_store.add(order)
             oms.exchange_id_map[order.exchange_oid] = order
 
             fill_update = ExchangeOrderUpdate(
@@ -2352,6 +2358,38 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         return SidecarProtocol.with_launch_contract(settings)
 
     @staticmethod
+    def provision_state_store(
+        root,
+        *,
+        deployment_id="deployment-test",
+        initial_payload=None,
+    ):
+        payload = {
+            "schema_version": 2,
+            "kill_latched": False,
+            "kill_reason": "",
+            "stage": "ARMED",
+            "quiesced": False,
+            "cash_flow_deployment_start_ms": 1_700_000_000_000,
+        }
+        if initial_payload:
+            payload.update(initial_payload)
+        receipt = SidecarStateStore.provision(
+            root,
+            account_scope_id="account-test",
+            deployment_id=deployment_id,
+            initial_payload=payload,
+            genesis_id="genesis-test",
+        )
+        return {
+            "state_store_root": os.fspath(root),
+            "account_scope_id": "account-test",
+            "deployment_id": deployment_id,
+            "state_genesis_id": receipt["genesis_id"],
+            "cash_flow_deployment_start_ms": 1_700_000_000_000,
+        }
+
+    @staticmethod
     def make_daily_snapshot(equity, cash_flow, captured_at):
         return {
             "account": {
@@ -2850,7 +2888,10 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
 
         self.assertTrue(reset["healthy"])
         self.assertEqual(reset["risk_metrics"]["risk_day"], "2026-07-21")
-        self.assertEqual(core.day_start_equity, 900.0)
+        self.assertEqual(
+            core.observation.account_risk.state.day_start_equity,
+            900.0,
+        )
 
     def test_sidecar_daily_baseline_and_peak_survive_restart(self):
         day_time = datetime(
@@ -2861,10 +2902,8 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             tzinfo=timezone.utc,
         ).timestamp()
         with tempfile.TemporaryDirectory() as tmpdir:
-            state_path = os.path.join(tmpdir, "sidecar-state.json")
             settings = self.make_settings(
-                state_path=state_path,
-                state_required=True,
+                **self.provision_state_store(tmpdir),
                 daily_loss_enabled=True,
                 max_daily_loss=100.0,
                 max_drawdown_pct=0.0,
@@ -2892,6 +2931,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                 now=761.1,
             )
             first.step(now=761.2)
+            first.close()
 
             exchange.risk_snapshot.update(
                 self.make_daily_snapshot(890.0, 0.0, day_time + 120)
@@ -2905,9 +2945,13 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             killed, _ = recovered.step(now=762.1)
 
             self.assertTrue(recovered.state_recovered)
-            self.assertEqual(recovered.day_start_equity, 1000.0)
+            self.assertEqual(
+                recovered.observation.account_risk.state.day_start_equity,
+                1000.0,
+            )
             self.assertEqual(killed["risk_action"], "KILL")
             self.assertIn("daily_loss_kill", killed["reason"])
+            recovered.close()
 
     def test_sidecar_daily_risk_fails_closed_without_cash_flow_truth(self):
         snapshot = {
@@ -3240,11 +3284,8 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
 
     def test_sidecar_kill_latch_survives_restart_until_two_phase_rearm(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            state_path = os.path.join(tmpdir, "sidecar-state.json")
             settings = self.make_settings(
-                state_path=state_path,
-                state_required=True,
-                state_fsync=True,
+                **self.provision_state_store(tmpdir),
             )
             exchange = DummySidecarExchange(
                 risk_snapshot={
@@ -3271,10 +3312,8 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             triggered, _ = first.step(now=500.1)
 
             self.assertTrue(triggered["kill_latched"])
-            self.assertTrue(os.path.exists(state_path))
-            with open(state_path, "r", encoding="utf-8") as handle:
-                persisted = json.load(handle)
-            self.assertTrue(persisted["payload"]["kill_latched"])
+            self.assertGreater(first.state_generation, 0)
+            first.close()
 
             exchange.risk_snapshot["account"] = {
                 "totalMaintMargin": "0",
@@ -3282,8 +3321,8 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             }
             recovered = RiskSidecarCore(exchange, settings, now=501.0)
             self.assertTrue(recovered.state_recovered)
-            self.assertTrue(recovered.kill_latched)
-            self.assertEqual(recovered.stage, "FLATTENING")
+            self.assertTrue(recovered.control.state.kill_latched)
+            self.assertEqual(recovered.control.state.stage, "FLATTENING")
             recovered.receive_parent_heartbeat(
                 1,
                 sent_monotonic=501.1,
@@ -3304,13 +3343,15 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                 now=501.3,
             )
             self.assertTrue(committed, reason)
-            self.assertFalse(recovered.kill_latched)
-            self.assertEqual(recovered.stage, "ARMED")
+            self.assertFalse(recovered.control.state.kill_latched)
+            self.assertEqual(recovered.control.state.stage, "ARMED")
+            recovered.close()
 
             clean_restart = RiskSidecarCore(exchange, settings, now=502.0)
             self.assertTrue(clean_restart.state_recovered)
-            self.assertFalse(clean_restart.kill_latched)
-            self.assertEqual(clean_restart.stage, "ARMED")
+            self.assertFalse(clean_restart.control.state.kill_latched)
+            self.assertEqual(clean_restart.control.state.stage, "ARMED")
+            clean_restart.close()
 
     def test_sidecar_commit_rechecks_exchange_and_refuses_new_position(self):
         exchange = DummySidecarExchange(
@@ -3360,98 +3401,63 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
 
         self.assertFalse(committed)
         self.assertEqual(reason, "positions_remain")
-        self.assertTrue(core.kill_latched)
+        self.assertTrue(core.control.state.kill_latched)
 
-    def test_sidecar_corrupt_durable_state_recovers_fail_closed(self):
+    def test_sidecar_rejects_legacy_runtime_state_fields(self):
+        for field, value in (
+            ("state_path", "sidecar-state.json"),
+            ("state_required", True),
+            ("state_fsync", True),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, field):
+                    RiskSidecarCore(
+                        DummySidecarExchange(),
+                        self.make_settings(**{field: value}),
+                        now=600.0,
+                    )
+
+    def test_sidecar_rollback_anchor_mismatch_refuses_startup(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            state_path = os.path.join(tmpdir, "sidecar-state.json")
-            with open(state_path, "w", encoding="utf-8") as handle:
-                handle.write('{"payload":{"kill_latched":false}}')
             settings = self.make_settings(
-                state_path=state_path,
-                state_required=True,
+                **self.provision_state_store(tmpdir),
             )
+            anchor_path = os.path.join(tmpdir, "rollback-anchor.json")
+            with open(anchor_path, "r", encoding="utf-8") as handle:
+                anchor = json.load(handle)
+            anchor["target_head"]["generation"] += 1
+            with open(anchor_path, "w", encoding="utf-8") as handle:
+                json.dump(anchor, handle, allow_nan=False)
 
-            core = RiskSidecarCore(
-                DummySidecarExchange(),
-                settings,
-                now=600.0,
-            )
-
-            self.assertTrue(core.kill_latched)
-            self.assertEqual(core.stage, "FAILED")
-            self.assertIn("state_checksum_mismatch", core.state_load_error)
-            self.assertTrue(
-                any(".corrupt." in name for name in os.listdir(tmpdir))
-            )
-
-    def test_sidecar_negative_persisted_loss_recovers_fail_closed(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            state_path = os.path.join(tmpdir, "sidecar-state.json")
-            settings = self.make_settings(
-                state_path=state_path,
-                state_required=True,
-            )
-            RiskSidecarCore(
-                DummySidecarExchange(),
-                settings,
-                now=610.0,
-            )
-            with open(state_path, "r", encoding="utf-8") as handle:
-                record = json.load(handle)
-            record["payload"]["deployment_loss"] = -1.0
-            record["sha256"] = RiskSidecarCore._state_checksum(
-                record["payload"]
-            )
-            with open(state_path, "w", encoding="utf-8") as handle:
-                json.dump(record, handle, allow_nan=False)
-
-            recovered = RiskSidecarCore(
-                DummySidecarExchange(),
-                settings,
-                now=611.0,
-            )
-
-            self.assertTrue(recovered.kill_latched)
-            self.assertEqual(recovered.stage, "FAILED")
-            self.assertIn(
-                "state.deployment_loss must be non-negative",
-                recovered.state_load_error,
-            )
-
-    def test_sidecar_state_replace_retries_transient_windows_conflict(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            state_path = os.path.join(tmpdir, "sidecar-state.json")
-            real_replace = os.replace
-            attempts = 0
-
-            def transient_replace(source, destination):
-                nonlocal attempts
-                attempts += 1
-                if attempts < 3:
-                    error = PermissionError("transient state file lock")
-                    error.winerror = 5
-                    raise error
-                return real_replace(source, destination)
-
-            with patch.object(
-                independent_supervisor_module.os,
-                "replace",
-                side_effect=transient_replace,
+            with self.assertRaisesRegex(
+                SidecarStateStoreError,
+                "rollback_anchor_checksum_mismatch",
             ):
-                core = RiskSidecarCore(
+                RiskSidecarCore(
                     DummySidecarExchange(),
-                    self.make_settings(
-                        state_path=state_path,
-                        state_required=True,
-                    ),
-                    now=620.0,
+                    settings,
+                    now=610.0,
                 )
 
-            self.assertEqual(attempts, 3)
-            self.assertTrue(os.path.exists(state_path))
-            self.assertFalse(core.kill_latched)
-            self.assertEqual(core.state_persist_error, "")
+    def test_sidecar_runtime_does_not_initialize_missing_v2_store(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = self.make_settings(
+                state_store_root=tmpdir,
+                account_scope_id="account-test",
+                deployment_id="deployment-test",
+                state_genesis_id="genesis-test",
+            )
+
+            with self.assertRaisesRegex(
+                SidecarStateStoreError,
+                "manifest_missing",
+            ):
+                RiskSidecarCore(
+                    DummySidecarExchange(),
+                    settings,
+                    now=620.0,
+                )
+            self.assertEqual(os.listdir(tmpdir), [])
 
     def test_binance_sidecar_snapshot_and_reduce_only_flatten(self):
         rest = DummyRiskSidecarRest(
@@ -3473,6 +3479,8 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             BinanceRiskSidecarExchange
         )
         exchange.rest = rest
+        exchange._monotonic = time.perf_counter
+        exchange._wall_time = time.time
 
         ok, snapshot, reason = exchange.get_risk_snapshot()
         self.assertTrue(ok, reason)
@@ -3533,6 +3541,8 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             BinanceRiskSidecarExchange
         )
         exchange.rest = FillDuringOpenOrdersRest()
+        exchange._monotonic = time.perf_counter
+        exchange._wall_time = time.time
 
         ok, snapshot, reason = exchange.get_risk_snapshot()
 
@@ -3573,6 +3583,8 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             BinanceRiskSidecarExchange
         )
         exchange.rest = rest
+        exchange._monotonic = time.perf_counter
+        exchange._wall_time = time.time
         exchange.daily_loss_enabled = True
         exchange.cash_flow_income_types = {"TRANSFER"}
         exchange.cash_flow_assets = {"USDT"}
@@ -3603,6 +3615,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             BinanceRiskSidecarExchange
         )
         exchange.rest = rest
+        exchange._monotonic = time.perf_counter
         exchange.symbols = ("BTCUSDT",)
         exchange.full_open_orders_audit_interval_sec = 60.0
         exchange._last_full_open_orders_audit_monotonic = 0.0
@@ -3941,7 +3954,10 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         exchange = DummySidecarExchange(healthy=True)
         command_queue = queue.Queue()
         status_queue = queue.Queue()
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
         settings = self.make_settings(
+            **self.provision_state_store(state_dir.name),
             session_id="test-session",
             status_interval_sec=0.02,
             parent_heartbeat_timeout_sec=0.10,
@@ -4002,15 +4018,13 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         command_queue = context.Queue(maxsize=8)
         status_queue = context.Queue(maxsize=8)
         settings = self.make_settings(
+            **self.provision_state_store(state_dir.name),
             session_id="spawn-session",
             status_interval_sec=0.05,
             parent_heartbeat_timeout_sec=5.0,
             orphan_exit_sec=10.0,
             exchange_poll_interval_sec=0.1,
             exchange_max_age_sec=1.0,
-            state_path=os.path.join(state_dir.name, "sidecar-state.json"),
-            state_required=True,
-            state_fsync=False,
         )
         process = context.Process(
             target=run_sidecar_loop,
@@ -4037,7 +4051,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                 status = status_queue.get(timeout=5.0)
                 if status.get("healthy") and status.get("parent_sequence") == 1:
                     break
-            self.assertTrue(status["healthy"])
+            self.assertTrue(status["healthy"], status)
             self.assertEqual(status["parent_sequence"], 1)
             command_queue.put(
                 SidecarProtocol.parent_message(
@@ -4094,6 +4108,12 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         settings = self.make_settings(
             api_key="risk-key",
             api_secret="risk-secret",
+            session_id="signal-test-session",
+            state_store_root="unused-state-v2",
+            account_scope_id="account-test",
+            deployment_id="deployment-test",
+            state_genesis_id="genesis-test",
+            cash_flow_deployment_start_ms=1_700_000_000_000,
         )
 
         def record_signal(signum, handler):
@@ -4139,6 +4159,11 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
             api_key="risk-key",
             api_secret="risk-secret",
             session_id="signal-failure-session",
+            state_store_root="unused-state-v2",
+            account_scope_id="account-test",
+            deployment_id="deployment-test",
+            state_genesis_id="genesis-test",
+            cash_flow_deployment_start_ms=1_700_000_000_000,
         )
 
         with (
@@ -4172,6 +4197,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         oms = DummyOMS()
         config = {
             "symbols": ["BTCUSDT"],
+            "live_launch": {"deployment_id": "test-deployment"},
             "risk": {
                 "risk_control_heartbeat": {
                     "enabled": True,
@@ -4182,6 +4208,10 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                     "recovery_checks": 2,
                     "api_key": "risk-test-key",
                     "api_secret": "risk-test-secret",
+                    "state_store_root": "storage/test/risk-v2",
+                    "account_scope_id": "test-account",
+                    "state_genesis_id": "test-genesis",
+                    "cash_flow_deployment_start_ms": 1_700_000_000_000,
                 },
             },
         }
@@ -4231,6 +4261,10 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                             "enabled": True,
                             "api_key": "risk-test-key",
                             "api_secret": "risk-test-secret",
+                            "state_store_root": "storage/test/risk-v2",
+                            "account_scope_id": "test-account",
+                            "state_genesis_id": "test-genesis",
+                            "cash_flow_deployment_start_ms": 1_700_000_000_000,
                             field: float("inf"),
                         },
                     },
@@ -4250,6 +4284,10 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                     "enabled": True,
                     "api_key": "risk-test-key",
                     "api_secret": "risk-test-secret",
+                    "state_store_root": "storage/test/risk-v2",
+                    "account_scope_id": "test-account",
+                    "state_genesis_id": "test-genesis",
+                    "cash_flow_deployment_start_ms": 1_700_000_000_000,
                 },
             },
         }
@@ -4316,6 +4354,10 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                     "enabled": True,
                     "api_key": "risk-test-key",
                     "api_secret": "risk-test-secret",
+                    "state_store_root": "storage/test/risk-v2",
+                    "account_scope_id": "test-account",
+                    "state_genesis_id": "test-genesis",
+                    "cash_flow_deployment_start_ms": 1_700_000_000_000,
                 },
             },
         }
@@ -4345,6 +4387,7 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         oms = DummyOMS()
         config = {
             "symbols": ["BTCUSDT"],
+            "live_launch": {"deployment_id": "test-deployment"},
             "risk": {
                 "risk_control_heartbeat": {
                     "enabled": True,
@@ -4359,15 +4402,29 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
                     "flat_verification_checks": 1,
                     "api_key": "risk-test-key",
                     "api_secret": "risk-test-secret",
-                    "state_path": os.path.join(
+                    "state_store_root": os.path.join(
                         state_dir.name,
-                        "sidecar-state.json",
+                        "sidecar-v2",
                     ),
-                    "state_required": True,
-                    "state_fsync": False,
+                    "account_scope_id": "test-account",
+                    "state_genesis_id": "test-genesis",
+                    "cash_flow_deployment_start_ms": 1_700_000_000_000,
                 },
             },
         }
+        SidecarStateStore.provision(
+            config["risk"]["independent_supervisor"]["state_store_root"],
+            account_scope_id="test-account",
+            deployment_id="test-deployment",
+            genesis_id="test-genesis",
+            initial_payload={
+                "schema_version": 2,
+                "kill_latched": False,
+                "stage": "ARMED",
+                "quiesced": False,
+                "cash_flow_deployment_start_ms": 1_700_000_000_000,
+            },
+        )
         supervisor = IndependentRiskSupervisor(oms, config)
         supervisor.command_queue = queue.Queue()
         supervisor.status_queue = queue.Queue()

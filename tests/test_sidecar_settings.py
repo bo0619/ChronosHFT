@@ -8,6 +8,15 @@ import pytest
 from risk.sidecar_settings import SidecarSupervisorConfiguration
 
 
+def _v2_state_identity(deployment_id):
+    return {
+        "state_store_root": f"storage/live/{deployment_id}/risk-v2",
+        "account_scope_id": "account-test",
+        "state_genesis_id": "genesis-test",
+        "cash_flow_deployment_start_ms": 1_700_000_000_000,
+    }
+
+
 def _finite_float(value, label):
     try:
         result = float(value)
@@ -75,6 +84,7 @@ def test_configuration_assembles_parent_and_child_settings():
             },
             "funding_guard": {"enabled": True},
             "independent_supervisor": {
+                **_v2_state_identity("paper-jp"),
                 "enabled": True,
                 "api_key": "risk-key",
                 "api_secret": "risk-secret",
@@ -129,12 +139,14 @@ def test_configuration_assembles_parent_and_child_settings():
 def test_missing_sidecar_caps_inherit_canonical_risk_defaults():
     configuration = _build(
         {
+            "live_launch": {"deployment_id": "deployment-test"},
             "risk": {
                 "risk_control_heartbeat": {
                     "enabled": True,
                     "required_source": "independent_supervisor",
                 },
                 "independent_supervisor": {
+                    **_v2_state_identity("deployment-test"),
                     "enabled": True,
                     "api_key": "risk-key",
                     "api_secret": "risk-secret",
@@ -240,6 +252,7 @@ def test_enabled_sidecar_caps_must_be_positive_finite_and_no_wider_than_root(
     message,
 ):
     config = {
+        "live_launch": {"deployment_id": "deployment-test"},
         "risk": {
             "limits": {
                 "max_account_gross_notional": 500.0,
@@ -252,6 +265,7 @@ def test_enabled_sidecar_caps_must_be_positive_finite_and_no_wider_than_root(
                 "required_source": "independent_supervisor",
             },
             "independent_supervisor": {
+                **_v2_state_identity("deployment-test"),
                 "enabled": True,
                 "api_key": "risk-key",
                 "api_secret": "risk-secret",

@@ -1,5 +1,13 @@
 import ast
+import threading
 from pathlib import Path
+
+from oms.submission_transaction import (
+    SubmissionAdmissionPolicy,
+    SubmissionState,
+    SubmissionTerminalOutcome,
+    SubmissionTransaction,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,10 +34,12 @@ RUNTIME_BINDINGS = ROOT / "infrastructure" / "runtime_bindings.py"
 RUNTIME_APPLICATION = ROOT / "infrastructure" / "runtime_application.py"
 MAIN = ROOT / "main.py"
 SIDECAR_CORE = ROOT / "risk" / "sidecar_core.py"
+SIDECAR_COMMAND_RUNTIME = ROOT / "risk" / "sidecar_command_runtime.py"
 SIDECAR_SUPERVISOR = ROOT / "risk" / "sidecar_supervisor.py"
 SIDECAR_CONTROL_STATE = ROOT / "risk" / "sidecar_control_state.py"
 SIDECAR_OBSERVATION = ROOT / "risk" / "sidecar_observation.py"
 RPI_MANAGER = ROOT / "oms" / "rpi_calibration_manager.py"
+SHUTDOWN_COORDINATOR = ROOT / "oms" / "shutdown_coordinator.py"
 
 
 def _oms_implementation_source() -> str:
@@ -576,78 +586,102 @@ def test_expiry_and_terminal_enforcement_wait_for_submits_to_settle():
 
 
 def test_submit_leases_outlive_transport_and_durable_local_settlement():
-    source = _oms_implementation_source()
-    tree = ast.parse(source)
-    for function_name in ("_submit_internal_order", "submit_order"):
-        function = _function(tree, function_name)
-        dispatch_tries = [
-            node
-            for node in function.body
-            if isinstance(node, ast.Try)
-            and any(
-                isinstance(candidate, ast.Call)
-                and isinstance(candidate.func, ast.Attribute)
-                and candidate.func.attr
-                == "_dispatch_gateway_order_with_final_fence"
-                for candidate in ast.walk(node)
-            )
-        ]
-        assert len(dispatch_tries) == 1
-        assert not dispatch_tries[0].finalbody
-
-        result_calls = [
-            node
-            for node in ast.walk(function)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_record_command_result"
-        ]
-        assert len(result_calls) == 1
-        result_line = result_calls[0].lineno
-
-        outcome_branches = [
-            node
-            for node in function.body
-            if isinstance(node, ast.If)
-            and "command.outcome == CommandOutcome." in ast.unparse(node.test)
-        ]
-        assert len(outcome_branches) == 2
-        for branch in outcome_branches:
-            snapshot_calls = [
-                node
-                for node in ast.walk(branch)
-                if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_record_order_snapshot"
-            ]
-            release_calls = [
-                node
-                for node in ast.walk(branch)
-                if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr
-                == "_release_outbound_order_send_permit"
-            ]
-            assert len(snapshot_calls) == 1
-            assert release_calls
-            assert result_line < snapshot_calls[0].lineno
-            assert all(
-                snapshot_calls[0].lineno < call.lineno
-                for call in release_calls
-            )
-
-        function_source = _source_for(function, source)
-        rejected_snapshot = function_source.index(
-            "transport_rejection_superseded = False"
+    for policy in SubmissionAdmissionPolicy:
+        released = []
+        transaction = SubmissionTransaction(
+            transaction_id=f"SUBMIT:{policy.value}",
+            client_oid=policy.value,
+            admission_policy=policy,
         )
-        rejected_release = function_source.index(
-            "_release_outbound_order_send_permit(",
-            rejected_snapshot,
+        transaction.prepared_durable()
+        transaction.permit_acquired(7, lambda: released.append("permit"))
+        transaction.dispatched()
+
+        assert released == []
+        transaction.settled_durable()
+        assert released == []
+
+        transaction.finalize(SubmissionTerminalOutcome.ACKNOWLEDGED)
+        assert released == ["permit"]
+        assert transaction.snapshot().history == tuple(SubmissionState)
+
+
+def test_every_submission_phase_has_a_non_leaking_fault_barrier():
+    targets = tuple(SubmissionState)[1:]
+    for target in targets:
+        entered = threading.Event()
+        resume = threading.Event()
+        released = []
+
+        def injector(next_state, *, expected=target):
+            if next_state is expected:
+                entered.set()
+                assert resume.wait(2.0)
+
+        transaction = SubmissionTransaction(
+            transaction_id=f"SUBMIT:barrier:{target.value}",
+            client_oid=target.value,
+            admission_policy=SubmissionAdmissionPolicy.STRATEGY,
+            fault_injector=injector,
         )
-        assert function_source.index(
-            "_record_order_snapshot(",
-            rejected_snapshot,
-        ) < rejected_release
+
+        def execute():
+            transaction.prepared_durable()
+            transaction.permit_acquired(
+                11,
+                lambda: released.append("permit"),
+            )
+            transaction.dispatched()
+            transaction.settled_durable()
+            transaction.finalize(SubmissionTerminalOutcome.ACKNOWLEDGED)
+
+        worker = threading.Thread(target=execute)
+        worker.start()
+        assert entered.wait(2.0)
+        assert transaction.state is not target
+        resume.set()
+        worker.join(2.0)
+
+        assert not worker.is_alive()
+        assert transaction.snapshot().history == tuple(SubmissionState)
+        assert released == ["permit"]
+
+
+def test_fault_at_each_submission_phase_has_deterministic_cleanup():
+    targets = tuple(SubmissionState)[1:]
+    for target in targets:
+        released = []
+
+        def injector(next_state, *, expected=target):
+            if next_state is expected:
+                raise OSError(f"fault:{expected.value}")
+
+        transaction = SubmissionTransaction(
+            transaction_id=f"SUBMIT:fault:{target.value}",
+            client_oid=target.value,
+            admission_policy=SubmissionAdmissionPolicy.INTERNAL,
+            fault_injector=injector,
+        )
+        try:
+            transaction.prepared_durable()
+            transaction.permit_acquired(
+                13,
+                lambda: released.append("permit"),
+            )
+            transaction.dispatched()
+            transaction.settled_durable()
+            transaction.finalize(SubmissionTerminalOutcome.ACKNOWLEDGED)
+        except OSError as exc:
+            assert str(exc) == f"fault:{target.value}"
+            if not transaction.finalized:
+                transaction.finalize(
+                    SubmissionTerminalOutcome.FAILED_CLOSED,
+                )
+
+        assert transaction.finalized
+        assert released == (
+            [] if target is SubmissionState.PREPARED_DURABLE else ["permit"]
+        )
 
 
 def test_fail_closed_and_stop_seal_every_new_order_before_draining():
@@ -657,7 +691,6 @@ def test_fail_closed_and_stop_seal_every_new_order_before_draining():
     fence = _function(tree, "_get_final_outbound_send_rejection_locked")
     latch = _function(tree, "_latch_journal_failure_locked")
     fail_closed = _function(tree, "_fail_closed_on_journal_error")
-    stop = _function(tree, "stop")
 
     assert "_outbound_all_order_seal_reason" in _source_for(acquire, source)
     assert "_outbound_all_order_seal_reason" in _source_for(fence, source)
@@ -677,47 +710,42 @@ def test_fail_closed_and_stop_seal_every_new_order_before_draining():
     )
     assert "_account_cancel_symbols()" in fail_source
 
-    stop_source = _source_for(stop, source)
-    assert stop_source.index("self._stopped = True") < stop_source.index(
+    shutdown_source = SHUTDOWN_COORDINATOR.read_text(encoding="utf-8")
+    stop = _function(ast.parse(shutdown_source), "stop")
+    stop_source = _source_for(stop, shutdown_source)
+    assert stop_source.index("owner._stopped = True") < stop_source.index(
         "_wait_for_outbound_order_sends("
     )
 
 
 def test_submit_journal_failures_seal_before_releasing_outbound_lease():
-    source = _oms_implementation_source()
-    tree = ast.parse(source)
-    for function_name in ("_submit_internal_order", "submit_order"):
-        function = _function(tree, function_name)
-        handlers = [
-            node
-            for node in ast.walk(function)
-            if isinstance(node, ast.ExceptHandler)
-            and isinstance(node.type, ast.Name)
-            and node.type.id == "JournalError"
-        ]
-        assert len(handlers) == 5
-        for handler in handlers:
-            latch_calls = [
-                node
-                for node in ast.walk(handler)
-                if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_latch_journal_failure"
-            ]
-            release_calls = [
-                node
-                for node in ast.walk(handler)
-                if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr
-                == "_release_outbound_order_send_permit"
-            ]
-            assert len(latch_calls) == 1
-            assert release_calls
-            assert all(
-                latch_calls[0].lineno < release.lineno
-                for release in release_calls
-            )
+    events = []
+    transaction = SubmissionTransaction(
+        transaction_id="SUBMIT:journal-failure",
+        client_oid="journal-failure",
+        admission_policy=SubmissionAdmissionPolicy.STRATEGY,
+    )
+    transaction.bind_gate_cleanup(
+        lambda context, error: events.append(
+            f"gate:{context}:{type(error).__name__}"
+        )
+    )
+    transaction.prepared_durable()
+    transaction.permit_acquired(9, lambda: events.append("permit_released"))
+    transaction.dispatched()
+
+    events.append("journal_failure_latched")
+    transaction.record_gate_failure(
+        "result_submit_journal_cleanup",
+        OSError("journal unavailable"),
+    )
+    transaction.finalize(SubmissionTerminalOutcome.UNKNOWN)
+
+    assert events == [
+        "journal_failure_latched",
+        "gate:result_submit_journal_cleanup:OSError",
+        "permit_released",
+    ]
 
 
 def test_halt_handoff_reaches_sidecar_and_has_stale_parent_fallback():
@@ -838,10 +866,9 @@ def test_terminal_verified_is_published_only_after_durable_audit():
 
 
 def test_sidecar_quiesce_keeps_exchange_truth_and_can_take_over():
-    source = SIDECAR_CORE.read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    quiesced = _function(tree, "_step_quiesced")
-    quiesced_source = _source_for(quiesced, source)
+    core_source = SIDECAR_CORE.read_text(encoding="utf-8")
+    quiesced = _function(ast.parse(core_source), "_step_quiesced")
+    quiesced_source = _source_for(quiesced, core_source)
 
     assert quiesced_source.index("_service_exchange_risk(") < (
         quiesced_source.index("parent_age =")
@@ -954,7 +981,7 @@ def test_sidecar_orphan_exit_requires_fresh_post_stale_flat_proof():
     parent_source = _source_for(parent_state, source)
     assert (
         "self.parent_stale_snapshot_sequence = (\n"
-        "                self.risk_snapshot_sequence\n"
+        "                self.observation.risk_snapshot_sequence\n"
         "            )"
     ) in parent_source
     assert "self.control.reset_flat_verification()" in parent_source
@@ -982,21 +1009,21 @@ def test_sidecar_orphan_exit_requires_fresh_post_stale_flat_proof():
 
 
 def test_sidecar_stop_waits_for_newer_independent_flat_snapshot():
-    source = SIDECAR_CORE.read_text(encoding="utf-8")
+    source = SIDECAR_COMMAND_RUNTIME.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    stop = _function(tree, "_complete_stop_request")
+    stop = _function(tree, "complete_stop_request")
     stop_source = _source_for(stop, source)
 
-    assert "_service_exchange_risk(" in stop_source
-    assert "_exchange_snapshot_valid(" in stop_source
-    assert "_account_truth_counts(" in stop_source
+    assert "owner._service_exchange_risk(" in stop_source
+    assert "owner._exchange_snapshot_valid(" in stop_source
+    assert "owner._account_truth_counts(" in stop_source
     force_start = stop_source.index("force=(")
     force_end = stop_source.index("),", force_start)
     force_source = stop_source[force_start:force_end]
-    assert "self.risk_snapshot_sequence" in force_source
-    assert "self.quiesce_snapshot_sequence" in force_source
+    assert "truth.risk_snapshot_sequence" in force_source
+    assert "control.quiesce_snapshot_sequence" in force_source
     assert "return None" in stop_source
-    assert stop_source.count("_takeover_from_quiesce(") == 1
+    assert stop_source.count("owner._takeover_from_quiesce(") == 1
     assert "stop_after_cancel_requires_fresh_quiesce" in stop_source
 
     control_source = SIDECAR_CONTROL_STATE.read_text(encoding="utf-8")
@@ -1013,8 +1040,9 @@ def test_sidecar_stop_waits_for_newer_independent_flat_snapshot():
     assert "open_order_count or nonzero_position_count" in stop_plan
     assert "stop_without_cancel_requires_quiesced" in stop_plan
 
-    quiesced = _function(tree, "_step_quiesced")
-    quiesced_source = _source_for(quiesced, source)
+    core_source = SIDECAR_CORE.read_text(encoding="utf-8")
+    quiesced = _function(ast.parse(core_source), "_step_quiesced")
+    quiesced_source = _source_for(quiesced, core_source)
     takeover_start = quiesced_source.index("if takeover_reason:")
     recursive_step = quiesced_source.index(
         "return self.step(",

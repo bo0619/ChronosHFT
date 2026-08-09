@@ -43,9 +43,12 @@ from data.ref_data import ContractInfo, ref_data_manager
 from alpha.factors import GLFTCalibrator
 from alpha.glft_adaptive import FillMarkoutEstimator, estimate_flow_adverse_costs
 from oms.engine import OMS
-from strategy.avellaneda_stoikov import AvellanedaStoikovStrategy
+from oms.order_store import OrderStore
+from strategy.avellaneda_stoikov import (
+    AvellanedaStoikovStrategy as ProductionAvellanedaStoikovStrategy,
+)
 from strategy.base import StrategyTemplate
-from strategy.glft import GLFTStrategy
+from strategy.glft import GLFTStrategy as ProductionGLFTStrategy
 from strategy.quote_math import (
     ADAPTIVE_AS_FORMULA_VERSION,
     ADAPTIVE_GLFT_FORMULA_VERSION,
@@ -53,10 +56,83 @@ from strategy.quote_math import (
 )
 from strategy.registry import (
     canonical_model_key,
-    create_primary_strategy,
+    create_primary_strategy as production_create_primary_strategy,
     strategy_id_for_model,
 )
 from ui.web_dashboard import LocalWebDashboard
+
+
+class StrategyTestClock:
+    """Explicit deterministic ClockPort adapter for direct strategy tests."""
+
+    def __init__(self, monotonic_values=None):
+        self.set_monotonic(monotonic_values)
+
+    def set_monotonic(self, values=None):
+        if values is None:
+            self._monotonic = time.perf_counter
+            return
+        iterator = iter(values)
+        self._monotonic = lambda: float(next(iterator))
+
+    def monotonic(self):
+        return float(self._monotonic())
+
+    @staticmethod
+    def monotonic_ns():
+        return time.perf_counter_ns()
+
+    @staticmethod
+    def wall_time():
+        return time.time()
+
+    @staticmethod
+    def now_seconds():
+        return time.time()
+
+    @staticmethod
+    def sleep(seconds):
+        time.sleep(seconds)
+
+
+class GLFTStrategy(ProductionGLFTStrategy):
+    def __init__(self, *args, clock=None, reference_data=ref_data_manager, **kwargs):
+        clock = StrategyTestClock() if clock is None else clock
+        super().__init__(
+            *args,
+            clock=clock,
+            reference_data=reference_data,
+            **kwargs,
+        )
+
+
+class AvellanedaStoikovStrategy(ProductionAvellanedaStoikovStrategy):
+    def __init__(self, *args, clock=None, reference_data=ref_data_manager, **kwargs):
+        clock = StrategyTestClock() if clock is None else clock
+        super().__init__(
+            *args,
+            clock=clock,
+            reference_data=reference_data,
+            **kwargs,
+        )
+
+
+def create_primary_strategy(
+    engine,
+    oms,
+    config,
+    *,
+    clock=None,
+    reference_data=ref_data_manager,
+):
+    clock = StrategyTestClock() if clock is None else clock
+    return production_create_primary_strategy(
+        engine,
+        oms,
+        config,
+        clock=clock,
+        reference_data=reference_data,
+    )
 
 
 class DispatchingEngine:
@@ -103,6 +179,9 @@ class DummyGateway:
 
 
 class DummyStrategy(StrategyTemplate):
+    def __init__(self, *args, reference_data=ref_data_manager, **kwargs):
+        super().__init__(*args, reference_data=reference_data, **kwargs)
+
     def on_orderbook(self, orderbook):
         return None
 
@@ -224,9 +303,11 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
     def test_avellaneda_cycle_uses_monotonic_time(self):
         engine = DispatchingEngine()
         oms = PassiveQuoteOMS()
+        clock = StrategyTestClock([0.1, 0.5, 1.2])
         strategy = AvellanedaStoikovStrategy(
             engine,
             oms,
+            clock=clock,
             strategy_config={
                 "cycle_interval": 1.0,
                 "lot_multiplier": 1.0,
@@ -239,20 +320,10 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
         )
         orderbook = self.make_orderbook()
 
-        with (
-            patch.dict(
-                ref_data_manager.contracts,
-                {"LTCUSDT": self.make_contract()},
-                clear=True,
-            ),
-            patch(
-                "strategy.avellaneda_stoikov.time.perf_counter",
-                side_effect=[0.1, 0.5, 1.2],
-            ),
-            patch(
-                "strategy.avellaneda_stoikov.time.time",
-                side_effect=AssertionError("wall clock must not gate the cycle"),
-            ),
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"LTCUSDT": self.make_contract()},
+            clear=True,
         ):
             strategy.on_orderbook(orderbook)
             self.assertEqual(len(oms.submitted), 2)
@@ -266,9 +337,11 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
     def test_glft_cooldown_and_fill_defense_use_monotonic_time(self):
         engine = DispatchingEngine()
         oms = PassiveQuoteOMS()
+        clock = StrategyTestClock([0.1, 0.2, 0.31])
         strategy = GLFTStrategy(
             engine,
             oms,
+            clock=clock,
             strategy_config={
                 "cycle_interval": 0.0,
                 "execution": {"min_spread_bps": 5.0},
@@ -276,20 +349,10 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
         )
         orderbook = self.make_orderbook()
 
-        with (
-            patch.dict(
-                ref_data_manager.contracts,
-                {"LTCUSDT": self.make_contract()},
-                clear=True,
-            ),
-            patch(
-                "strategy.glft.time.perf_counter",
-                side_effect=[0.1, 0.2, 0.31],
-            ),
-            patch(
-                "strategy.glft.time.time",
-                side_effect=AssertionError("wall clock must not gate quote cooldown"),
-            ),
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"LTCUSDT": self.make_contract()},
+            clear=True,
         ):
             strategy._update_quotes("LTCUSDT", 99.0, 101.0, 0.1)
             self.assertEqual(len(oms.submitted), 2)
@@ -322,21 +385,12 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
         )
         strategy._update_quotes = lambda *_args, **_kwargs: None
         engine.events.clear()
+        clock.set_monotonic([0.1, 0.2, 1.0, 2.3])
 
-        with (
-            patch.dict(
-                ref_data_manager.contracts,
-                {"LTCUSDT": self.make_contract()},
-                clear=True,
-            ),
-            patch(
-                "strategy.glft.time.perf_counter",
-                side_effect=[0.1, 0.2, 1.0, 2.3],
-            ),
-            patch(
-                "strategy.glft.time.time",
-                side_effect=AssertionError("wall clock must not gate fill defense"),
-            ),
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"LTCUSDT": self.make_contract()},
+            clear=True,
         ):
             strategy.on_orderbook(orderbook)
             strategy.on_trade(
@@ -474,6 +528,7 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
         strategy = GLFTStrategy(
             DispatchingEngine(),
             oms,
+            clock=StrategyTestClock([10.0]),
             strategy_config={
                 "glft": {
                     "adaptive": {
@@ -487,18 +542,17 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
                 }
             },
         )
-        with patch("strategy.glft.time.perf_counter", return_value=10.0):
-            strategy.on_trade(
-                TradeData(
-                    symbol="LTCUSDT",
-                    order_id="client-1",
-                    trade_id="trade-1",
-                    side="BUY",
-                    price=100.0,
-                    volume=0.1,
-                    datetime=datetime.utcnow(),
-                )
+        strategy.on_trade(
+            TradeData(
+                symbol="LTCUSDT",
+                order_id="client-1",
+                trade_id="trade-1",
+                side="BUY",
+                price=100.0,
+                volume=0.1,
+                datetime=datetime.utcnow(),
             )
+        )
         strategy.adaptive_markout.observe_mid(
             symbol="LTCUSDT",
             mid_price=99.9,
@@ -1194,7 +1248,7 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
                 self.assertIn("clock_health:halt", rejected.reason)
                 self.assertEqual(gateway.sent_requests, [])
 
-                oms.exposure.net_positions["BTCUSDT"] = 0.1
+                oms.exposure.force_sync("BTCUSDT", 0.1, 100.0)
                 reduce_result = oms.submit_order(
                     OrderIntent(
                         "clocked",
@@ -1667,7 +1721,7 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         strategy = DummyStrategy(engine, oms)
         engine.register(EVENT_ORDER_UPDATE, lambda event: strategy.on_order(event.data))
         oms.state = LifecycleState.LIVE
-        oms.exposure.net_positions["ETHUSDT"] = 1.2
+        oms.exposure.force_sync("ETHUSDT", 1.2, 100.0)
         try:
             oid = strategy.send_intent(OrderIntent("dummy", "BTCUSDT", Side.BUY, 100.0, 0.4))
 
@@ -1698,7 +1752,7 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             lambda event: strategy.on_order(event.data),
         )
         oms.state = LifecycleState.LIVE
-        oms.exposure.net_positions["ETHUSDT"] = 0.5
+        oms.exposure.force_sync("ETHUSDT", 0.5, 100.0)
         try:
             oid = strategy.send_intent(
                 OrderIntent(
@@ -2150,7 +2204,7 @@ class LiveAcceptanceDashboardTests(unittest.TestCase):
     @staticmethod
     def make_calibration_oms():
         oms = object.__new__(OMS)
-        oms.orders = {}
+        oms.order_store = OrderStore()
         oms._rpi_calibration = {
             "enabled": True,
             "permit_id": "permit-live-001",
@@ -2318,10 +2372,15 @@ class StrategyRegistryTests(unittest.TestCase):
 
     def test_registry_constructs_each_primary_but_only_one_execution_instance(self):
         cases = (
-            ("GLFT_MultiScale", GLFTStrategy, "glft", "GLFT_MultiScale"),
+            (
+                "GLFT_MultiScale",
+                ProductionGLFTStrategy,
+                "glft",
+                "GLFT_MultiScale",
+            ),
             (
                 "as",
-                AvellanedaStoikovStrategy,
+                ProductionAvellanedaStoikovStrategy,
                 "avellaneda_stoikov",
                 "AvellanedaStoikov",
             ),
@@ -2329,13 +2388,18 @@ class StrategyRegistryTests(unittest.TestCase):
 
         for primary, expected_type, model_key, strategy_id in cases:
             with self.subTest(primary=primary):
+                clock = StrategyTestClock()
                 strategy = create_primary_strategy(
                     DispatchingEngine(),
                     PassiveQuoteOMS(),
                     self.make_root_config(primary),
+                    clock=clock,
+                    reference_data=ref_data_manager,
                 )
 
                 self.assertIsInstance(strategy, expected_type)
+                self.assertIs(strategy.clock, clock)
+                self.assertIs(strategy.reference_data, ref_data_manager)
                 self.assertEqual(strategy.name, strategy_id)
                 self.assertEqual(strategy.strategy_id, strategy_id)
                 self.assertEqual(strategy.model_key, model_key)
@@ -2344,6 +2408,53 @@ class StrategyRegistryTests(unittest.TestCase):
                     ("glft", "avellaneda_stoikov"),
                 )
                 self.assertEqual(strategy.execution_role, "primary")
+
+    def test_production_strategy_ports_are_required(self):
+        engine = DispatchingEngine()
+        oms = PassiveQuoteOMS()
+        config = self.make_root_config("GLFT")
+        clock = StrategyTestClock()
+
+        for strategy_type in (
+            ProductionGLFTStrategy,
+            ProductionAvellanedaStoikovStrategy,
+        ):
+            with self.subTest(strategy=strategy_type.__name__, port="clock"):
+                with self.assertRaisesRegex(TypeError, "clock"):
+                    strategy_type(
+                        engine,
+                        oms,
+                        strategy_config={},
+                        reference_data=ref_data_manager,
+                    )
+            with self.subTest(
+                strategy=strategy_type.__name__,
+                port="reference_data",
+            ):
+                with self.assertRaisesRegex(TypeError, "reference_data"):
+                    strategy_type(
+                        engine,
+                        oms,
+                        strategy_config={},
+                        clock=clock,
+                    )
+
+        with self.assertRaisesRegex(TypeError, "clock"):
+            production_create_primary_strategy(
+                engine,
+                oms,
+                config,
+                reference_data=ref_data_manager,
+            )
+        with self.assertRaisesRegex(TypeError, "reference_data"):
+            production_create_primary_strategy(
+                engine,
+                oms,
+                config,
+                clock=clock,
+            )
+        with self.assertRaisesRegex(TypeError, "reference_data"):
+            StrategyTemplate(engine, oms)
 
     def test_registry_deep_merges_shared_and_model_parameters(self):
         glft = create_primary_strategy(

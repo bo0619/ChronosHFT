@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import time
-from typing import Protocol
+from collections import deque
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Callable, Mapping
 
 from event.type import (
     AggTradeData,
@@ -18,55 +21,88 @@ from infrastructure.commission_truth import resolve_passive_fee_rate
 from .paper_state import PaperOrder, PaperPosition
 
 
-class PaperMatchingOwner(Protocol):
-    """Gateway state and ledger callbacks required by the matching engine."""
+@dataclass(slots=True)
+class PaperVenueState:
+    """Mutable state with one owner: the Paper venue worker."""
 
-    _orders: dict[str, PaperOrder]
-    _positions: dict[str, PaperPosition]
-    _books: dict[str, OrderBook]
-    _liquidity: dict[str, dict[str, dict[float, float]]]
-    _last_market_trade_id: dict[str, int]
+    balances: dict[str, float] = field(default_factory=dict)
+    orders: dict[str, PaperOrder] = field(default_factory=dict)
+    exchange_to_client: dict[str, str] = field(default_factory=dict)
+    positions: dict[str, PaperPosition] = field(default_factory=dict)
+    books: dict[str, OrderBook] = field(default_factory=dict)
+    liquidity: dict[str, dict[str, dict[float, float]]] = field(
+        default_factory=dict
+    )
+    marks: dict[str, float] = field(default_factory=dict)
+    last_market_trade_id: dict[str, int] = field(default_factory=dict)
+    trades: deque[dict] = field(default_factory=deque)
+    dms_deadlines: dict[str, float] = field(default_factory=dict)
+    cancel_generations: dict[str, int] = field(default_factory=dict)
+    accept_sequence: int = 0
+    exchange_sequence: int = 0
+    event_sequence: int = 0
+    paper_trade_sequence: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class PaperMatchingPolicy:
+    """Immutable policy input for deterministic matching decisions."""
+
     rpi_fill_model: str
     cancel_ahead_fraction: float
     market_order_max_slippage_bps: float
     maker_fee: float
     taker_fee: float
     rpi_commission_rate: float
-    rpi_commission_rates: dict[str, float]
+    rpi_commission_rates: Mapping[str, float]
 
-    def _apply_fill(
-        self,
-        order: PaperOrder,
-        quantity: float,
-        price: float,
-        *,
-        is_maker: bool,
-        fill_context: dict | None = None,
-    ): ...
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "rpi_commission_rates",
+            MappingProxyType(dict(self.rpi_commission_rates)),
+        )
 
-    def _expire_order(self, order: PaperOrder, reason: str): ...
+
+@dataclass(frozen=True, slots=True)
+class PaperMatchingPort:
+    """Only venue effects matching is allowed to request."""
+
+    apply_fill: Callable[..., object]
+    expire_order: Callable[[PaperOrder, str], object]
 
 
 class PaperMatchingEngine:
     """Select simulated fills without owning balances or event publication."""
 
-    __slots__ = ("_owner",)
+    __slots__ = ("_policy", "_port", "_state")
 
-    def __init__(self, owner: PaperMatchingOwner):
-        self._owner = owner
+    def __init__(
+        self,
+        state: PaperVenueState,
+        port: PaperMatchingPort,
+        policy: PaperMatchingPolicy,
+    ):
+        self._state = state
+        self._port = port
+        self._policy = policy
+
+    @property
+    def state(self) -> PaperVenueState:
+        return self._state
 
     def match_immediate(self, order: PaperOrder):
-        owner = self._owner
+        state = self._state
         if not order.active or not order.committed:
             return
         request = order.request
-        liquidity = owner._liquidity.get(request.symbol)
+        liquidity = state.liquidity.get(request.symbol)
         if not liquidity:
             if request.order_type == "MARKET" or request.time_in_force in {
                 TIF_IOC,
                 TIF_FOK,
             }:
-                owner._expire_order(order, "PAPER_NO_LIQUIDITY")
+                self._port.expire_order(order, "PAPER_NO_LIQUIDITY")
             else:
                 self.insert_into_local_queue(order)
             return
@@ -92,7 +128,7 @@ class PaperMatchingEngine:
             fill_cap = self.reduce_only_fill_cap(order)
             required = min(order.remaining, fill_cap)
             if required <= 1e-12 or known_quantity + 1e-12 < required:
-                owner._expire_order(order, "PAPER_FOK_UNFILLED")
+                self._port.expire_order(order, "PAPER_FOK_UNFILLED")
                 return
 
         for price in eligible_prices:
@@ -109,32 +145,32 @@ class PaperMatchingEngine:
             if quantity <= 1e-12:
                 break
             levels[price] = max(0.0, available - quantity)
-            owner._apply_fill(order, quantity, price, is_maker=False)
+            self._port.apply_fill(order, quantity, price, is_maker=False)
 
         if order.active and order.remaining > 1e-12:
             if request.order_type == "MARKET" or request.time_in_force in {
                 TIF_IOC,
                 TIF_FOK,
             }:
-                owner._expire_order(order, "PAPER_IMMEDIATE_REMAINDER")
+                self._port.expire_order(order, "PAPER_IMMEDIATE_REMAINDER")
             else:
                 self.insert_into_local_queue(order)
 
     def on_market_trade(self, trade: AggTradeData) -> bool:
-        owner = self._owner
+        state = self._state
         if trade.price <= 0.0 or trade.quantity <= 0.0:
             return False
-        last_id = int(owner._last_market_trade_id.get(trade.symbol, -1))
+        last_id = int(state.last_market_trade_id.get(trade.symbol, -1))
         if int(trade.trade_id) >= 0 and int(trade.trade_id) <= last_id:
             return False
         if int(trade.trade_id) >= 0:
-            owner._last_market_trade_id[trade.symbol] = int(trade.trade_id)
+            state.last_market_trade_id[trade.symbol] = int(trade.trade_id)
 
         maker_side = "BUY" if trade.maker_is_buyer else "SELL"
         candidates = sorted(
             (
                 order
-                for order in owner._orders.values()
+                for order in state.orders.values()
                 if order.active
                 and order.committed
                 and order.request.symbol == trade.symbol
@@ -147,7 +183,7 @@ class PaperMatchingEngine:
         for order in candidates:
             if (
                 order.request.time_in_force == TIF_RPI
-                and owner.rpi_fill_model != "public_trade_proxy"
+                and self._policy.rpi_fill_model != "public_trade_proxy"
             ):
                 continue
             price_relation = self.passive_trade_relation(
@@ -157,7 +193,10 @@ class PaperMatchingEngine:
             if price_relation == "not_reached":
                 continue
             if self.reduce_only_fill_cap(order) <= 1e-12:
-                owner._expire_order(order, "PAPER_REDUCE_ONLY_EXHAUSTED")
+                self._port.expire_order(
+                    order,
+                    "PAPER_REDUCE_ONLY_EXHAUSTED",
+                )
                 continue
             ahead_before = max(0.0, order.queue_ahead)
             if price_relation == "through":
@@ -181,7 +220,7 @@ class PaperMatchingEngine:
                 )
             if quantity <= 1e-12:
                 continue
-            owner._apply_fill(
+            self._port.apply_fill(
                 order,
                 quantity,
                 float(order.request.price),
@@ -230,12 +269,12 @@ class PaperMatchingEngine:
         return True
 
     def on_book(self, book: OrderBook) -> bool:
-        owner = self._owner
-        previous = owner._books.get(book.symbol)
-        if previous is not None and owner.cancel_ahead_fraction > 0.0:
+        state = self._state
+        previous = state.books.get(book.symbol)
+        if previous is not None and self._policy.cancel_ahead_fraction > 0.0:
             self.apply_conservative_cancel_ahead(previous, book)
-        owner._books[book.symbol] = book
-        owner._liquidity[book.symbol] = {
+        state.books[book.symbol] = book
+        state.liquidity[book.symbol] = {
             "bids": {
                 float(price): float(qty) for price, qty in book.bids.items()
             },
@@ -269,13 +308,13 @@ class PaperMatchingEngine:
         )
 
     def insert_into_local_queue(self, order: PaperOrder):
-        owner = self._owner
+        state = self._state
         if order.queue_inserted or not order.active or not order.committed:
             return
         self.set_initial_queue_ahead(order)
         order.queue_inserted = True
         order_priority = self.local_queue_priority(order)
-        for candidate in owner._orders.values():
+        for candidate in state.orders.values():
             if (
                 candidate.client_oid != order.client_oid
                 and candidate.active
@@ -287,10 +326,10 @@ class PaperMatchingEngine:
                 candidate.queue_ahead += order.remaining
 
     def set_initial_queue_ahead(self, order: PaperOrder):
-        owner = self._owner
+        state = self._state
         if not order.active or order.request.order_type != "LIMIT":
             return
-        book = owner._books.get(order.request.symbol)
+        book = state.books.get(order.request.symbol)
         if book is None:
             order.queue_ahead = 0.0
             return
@@ -301,7 +340,7 @@ class PaperMatchingEngine:
         )
         local_ahead = sum(
             candidate.remaining
-            for candidate in owner._orders.values()
+            for candidate in state.orders.values()
             if candidate.client_oid != order.client_oid
             and candidate.active
             and candidate.committed
@@ -317,11 +356,11 @@ class PaperMatchingEngine:
         order: PaperOrder,
         removed_quantity: float,
     ):
-        owner = self._owner
+        state = self._state
         if removed_quantity <= 1e-12 or not order.queue_inserted:
             return
         removed_priority = self.local_queue_priority(order)
-        for candidate in owner._orders.values():
+        for candidate in state.orders.values():
             if (
                 candidate.active
                 and candidate.committed
@@ -340,8 +379,8 @@ class PaperMatchingEngine:
         previous: OrderBook,
         current: OrderBook,
     ):
-        owner = self._owner
-        for order in owner._orders.values():
+        state = self._state
+        for order in state.orders.values():
             if (
                 not order.active
                 or not order.committed
@@ -369,7 +408,7 @@ class PaperMatchingEngine:
             order.queue_ahead = max(
                 0.0,
                 order.queue_ahead
-                - reduction * owner.cancel_ahead_fraction,
+                - reduction * self._policy.cancel_ahead_fraction,
             )
 
     @staticmethod
@@ -392,15 +431,15 @@ class PaperMatchingEngine:
         order: PaperOrder,
         external_price: float,
     ) -> bool:
-        owner = self._owner
+        state = self._state
         request = order.request
         if request.order_type == "LIMIT":
             if request.side == "BUY":
                 return external_price <= float(request.price) + 1e-12
             return external_price >= float(request.price) - 1e-12
 
-        book = owner._books.get(request.symbol)
-        if book is None or owner.market_order_max_slippage_bps <= 0.0:
+        book = state.books.get(request.symbol)
+        if book is None or self._policy.market_order_max_slippage_bps <= 0.0:
             return True
         best_price = (
             float(book.get_best_ask()[0])
@@ -412,7 +451,10 @@ class PaperMatchingEngine:
         distance_bps = (
             abs(external_price - best_price) / best_price * 10_000.0
         )
-        return distance_bps <= owner.market_order_max_slippage_bps + 1e-9
+        return (
+            distance_bps
+            <= self._policy.market_order_max_slippage_bps + 1e-9
+        )
 
     @staticmethod
     def passive_trade_relation(
@@ -430,7 +472,7 @@ class PaperMatchingEngine:
     def reduce_only_fill_cap(self, order: PaperOrder) -> float:
         if not order.request.reduce_only:
             return order.remaining
-        position = self._owner._positions.get(
+        position = self._state.positions.get(
             order.request.symbol,
             PaperPosition(),
         )
@@ -441,23 +483,28 @@ class PaperMatchingEngine:
         return 0.0
 
     def fee_rate(self, order: PaperOrder, is_maker: bool) -> float:
-        owner = self._owner
         if order.request.time_in_force == TIF_RPI:
             return self.rpi_fee_rate(order.request.symbol)
-        return max(0.0, owner.maker_fee if is_maker else owner.taker_fee)
+        rate = self._policy.maker_fee if is_maker else self._policy.taker_fee
+        return max(0.0, rate)
 
     def rpi_fee_rate(self, symbol: str) -> float:
-        owner = self._owner
+        policy = self._policy
         return max(
             0.0,
             resolve_passive_fee_rate(
-                maker_rate=owner.maker_fee,
+                maker_rate=policy.maker_fee,
                 symbol=symbol,
                 is_rpi=True,
-                rpi_commission_rates=owner.rpi_commission_rates,
-                default_rpi_commission_rate=owner.rpi_commission_rate,
+                rpi_commission_rates=policy.rpi_commission_rates,
+                default_rpi_commission_rate=policy.rpi_commission_rate,
             ),
         )
 
 
-__all__ = ["PaperMatchingEngine", "PaperMatchingOwner"]
+__all__ = [
+    "PaperMatchingEngine",
+    "PaperMatchingPolicy",
+    "PaperMatchingPort",
+    "PaperVenueState",
+]

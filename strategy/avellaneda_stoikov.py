@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 
@@ -17,7 +16,6 @@ from alpha.glft_adaptive import (
     estimate_flow_adverse_costs,
     optimize_quote_size,
 )
-from data.ref_data import ref_data_manager
 from event.type import (
     EVENT_STRATEGY_UPDATE,
     AggTradeData,
@@ -30,10 +28,19 @@ from event.type import (
     TradeData,
 )
 from infrastructure.paper_trade import is_paper_trade
+from infrastructure.runtime_ports import ClockPort, ReferenceDataPort
+from strategy.adaptive_pipeline import (
+    AdaptivePipelineInput,
+    AdaptiveQuotePipeline,
+)
 from strategy.base import StrategyTemplate
 from strategy.model_readiness import (
     evaluate_symbol_readiness,
     readiness_requirements,
+)
+from strategy.quote_decision import (
+    QuoteDecisionEngine,
+    QuoteDecisionInput,
 )
 from strategy.quote_math import (
     ADAPTIVE_AS_FORMULA_VERSION,
@@ -43,7 +50,6 @@ from strategy.quote_math import (
     UNITS_VERSION,
     adaptive_portfolio_as_quote_offsets,
     as_quote_offsets,
-    depths_bps_to_prices,
     robust_adaptive_portfolio_as_quote_offsets,
 )
 
@@ -76,7 +82,11 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
         execution,
         strategy_config,
         *,
+        clock: ClockPort,
+        reference_data: ReferenceDataPort,
         resolved_config=None,
+        quote_decision_engine=None,
+        adaptive_pipeline=None,
     ):
         if not isinstance(strategy_config, dict):
             raise TypeError(
@@ -87,7 +97,15 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
             execution,
             "AvellanedaStoikov",
             resolved_config=resolved_config,
+            reference_data=reference_data,
         )
+        if clock is None:
+            raise TypeError("clock port is required")
+        self.clock = clock
+        self.quote_decision_engine = (
+            quote_decision_engine or QuoteDecisionEngine()
+        )
+        self.adaptive_pipeline = adaptive_pipeline or AdaptiveQuotePipeline()
         self.config = dict(strategy_config)
         raw_as_config = self.config.get("as_parameters", {})
         self.as_conf = dict(raw_as_config) if isinstance(raw_as_config, dict) else {}
@@ -591,8 +609,8 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
             reference_price=reference_price,
         )
 
-    @staticmethod
     def _scale_safe_volume(
+        self,
         symbol: str,
         safe_volume: float,
         multiplier: float,
@@ -603,10 +621,10 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
         bounded_multiplier = min(1.0, max(0.0, float(multiplier)))
         if bounded_multiplier >= 1.0:
             return safe_volume
-        info = ref_data_manager.get_info(symbol)
+        info = self.reference_data.get_info(symbol)
         if info is None:
             return 0.0
-        scaled = ref_data_manager.round_qty(
+        scaled = self.reference_data.round_qty(
             symbol,
             safe_volume * bounded_multiplier,
         )
@@ -975,7 +993,7 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
             return
 
         mid_price = (bid_1 + ask_1) / 2.0
-        now = time.perf_counter()
+        now = self.clock.monotonic()
         self._update_volatility(ob.symbol, mid_price, ob, now)
         if self.adaptive_enabled:
             self.adaptive_markout.observe_mid(
@@ -1107,30 +1125,28 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
                 if flow_adverse is not None
                 else 0.0
             )
-            adaptive_context = {
-                "bid_A_per_s": (
-                    self.adaptive_base_A_per_s
-                    * self.adaptive_bid_A_multiplier
-                    * bid_hawkes
-                ),
-                "ask_A_per_s": (
-                    self.adaptive_base_A_per_s
-                    * self.adaptive_ask_A_multiplier
-                    * ask_hawkes
-                ),
-                "bid_k_per_bps": self.k * self.adaptive_bid_k_multiplier,
-                "ask_k_per_bps": self.k * self.adaptive_ask_k_multiplier,
-                "bid_adverse_cost_bps": (
-                    bid_markout.adverse_cost_bps
-                    + bid_queue_estimate.latency_cost_bps
-                    + bid_flow_cost
-                ),
-                "ask_adverse_cost_bps": (
-                    ask_markout.adverse_cost_bps
-                    + ask_queue_estimate.latency_cost_bps
-                    + ask_flow_cost
-                ),
-            }
+            adaptive_context = self.adaptive_pipeline.build(
+                AdaptivePipelineInput(
+                    base_A_per_s=self.adaptive_base_A_per_s,
+                    base_k_per_bps=self.k,
+                    bid_A_multiplier=self.adaptive_bid_A_multiplier,
+                    ask_A_multiplier=self.adaptive_ask_A_multiplier,
+                    bid_k_multiplier=self.adaptive_bid_k_multiplier,
+                    ask_k_multiplier=self.adaptive_ask_k_multiplier,
+                    bid_hawkes_multiplier=bid_hawkes,
+                    ask_hawkes_multiplier=ask_hawkes,
+                    bid_markout_cost_bps=bid_markout.adverse_cost_bps,
+                    ask_markout_cost_bps=ask_markout.adverse_cost_bps,
+                    bid_queue_cost_bps=(
+                        bid_queue_estimate.latency_cost_bps
+                    ),
+                    ask_queue_cost_bps=(
+                        ask_queue_estimate.latency_cost_bps
+                    ),
+                    bid_flow_cost_bps=bid_flow_cost,
+                    ask_flow_cost_bps=ask_flow_cost,
+                )
+            ).as_formula_context()
             adaptive_runtime = {
                 "enabled": True,
                 "intensity_source": "CONFIGURED_PAPER_PROXY",
@@ -1204,22 +1220,6 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
             ob.symbol,
             passive_tif,
         )
-        effective_min_spread_bps = max(
-            configured_min_spread_bps,
-            passive_fee_bps,
-        )
-        effective_half_spread_bps = max(
-            formula_quote.half_spread_bps,
-            effective_min_spread_bps / 2.0,
-        )
-        target_bid, target_ask = depths_bps_to_prices(
-            mid_price,
-            effective_half_spread_bps - formula_quote.center_offset_bps,
-            effective_half_spread_bps + formula_quote.center_offset_bps,
-        )
-        quote_center_price = mid_price * math.exp(
-            formula_quote.center_offset_bps / 10_000.0
-        )
         marginal_risk_map = portfolio_risk.get(
             "marginal_inventory_risk_bps",
             {},
@@ -1234,28 +1234,34 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
             inventory_center_offset_bps / 10_000.0
         )
 
-        info = ref_data_manager.get_info(ob.symbol)
+        info = self.reference_data.get_info(ob.symbol)
         if info is None:
             return
         tick = float(info.tick_size or 0.0)
         if tick <= 0.0:
             return
-        target_bid = ref_data_manager.round_price(
-            ob.symbol,
-            target_bid,
-            direction="down",
-        )
-        target_ask = ref_data_manager.round_price(
-            ob.symbol,
-            target_ask,
-            direction="up",
-        )
-        if target_bid >= ask_1:
-            target_bid = ask_1 - tick
-        if target_ask <= bid_1:
-            target_ask = bid_1 + tick
-        if target_bid <= 0.0 or target_bid >= target_ask:
+        try:
+            decision = self.quote_decision_engine.decide(
+                QuoteDecisionInput(
+                    reference_price=mid_price,
+                    best_bid=bid_1,
+                    best_ask=ask_1,
+                    tick_size=tick,
+                    configured_min_spread_bps=(
+                        configured_min_spread_bps
+                    ),
+                    passive_fee_bps=passive_fee_bps,
+                    formula_quote=formula_quote,
+                )
+            )
+        except (TypeError, ValueError):
             return
+        if decision is None:
+            return
+        target_bid = decision.target_bid
+        target_ask = decision.target_ask
+        quote_center_price = decision.quote_center_price
+        effective_min_spread_bps = decision.effective_min_spread_bps
 
         bid_order_vol = self._calculate_safe_vol(
             ob.symbol,
@@ -1411,7 +1417,7 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
             "mode": passive_tif,
             "time_in_force": passive_tif,
             "use_rpi": self.use_rpi,
-            "rpi_supported": ref_data_manager.supports_rpi(ob.symbol),
+            "rpi_supported": self.reference_data.supports_rpi(ob.symbol),
             "mid_price": mid_price,
             "best_bid": bid_1,
             "best_ask": ask_1,
@@ -1603,7 +1609,7 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
             "mode": "OBSERVE_ONLY",
             "time_in_force": "",
             "use_rpi": self.use_rpi,
-            "rpi_supported": ref_data_manager.supports_rpi(symbol),
+            "rpi_supported": self.reference_data.supports_rpi(symbol),
             "mid_price": mid_price,
             "best_bid": best_bid,
             "best_ask": best_ask,
@@ -1636,7 +1642,7 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
         except (TypeError, ValueError):
             event_monotonic = 0.0
         if not math.isfinite(event_monotonic) or event_monotonic <= 0.0:
-            event_monotonic = time.perf_counter()
+            event_monotonic = self.clock.monotonic()
         sign = -1.0 if trade.maker_is_buyer else 1.0
         previous = self._decayed_orderflow_imbalance(
             trade.symbol,
@@ -1667,7 +1673,7 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
             symbol=trade.symbol,
             side=trade.side,
             fill_price=trade.price,
-            observed_at_monotonic=time.perf_counter(),
+            observed_at_monotonic=self.clock.monotonic(),
             client_oid=trade.order_id,
             trade_id=trade.trade_id,
         )

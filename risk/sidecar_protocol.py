@@ -140,6 +140,41 @@ class SidecarProtocol:
         return dict(settings)
 
     @classmethod
+    def validate_runtime_state_contract(cls, settings: dict) -> dict:
+        """Require the durable v2 identity before child construction."""
+        settings = cls.validate_launch_contract(settings)
+        legacy_fields = tuple(
+            field
+            for field in ("state_path", "state_required", "state_fsync")
+            if field in settings
+        )
+        if legacy_fields:
+            raise ValueError(
+                "runtime_legacy_state_fields_unsupported:"
+                + ",".join(legacy_fields)
+            )
+        for field in (
+            "session_id",
+            "state_store_root",
+            "account_scope_id",
+            "deployment_id",
+            "state_genesis_id",
+        ):
+            value = settings.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"runtime_{field}_missing")
+        deployment_start = settings.get("cash_flow_deployment_start_ms")
+        if (
+            isinstance(deployment_start, bool)
+            or not isinstance(deployment_start, int)
+            or deployment_start <= 0
+        ):
+            raise ValueError(
+                "runtime_cash_flow_deployment_start_ms_invalid"
+            )
+        return settings
+
+    @classmethod
     def parent_message(
         cls,
         message_type: str,

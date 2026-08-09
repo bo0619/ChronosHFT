@@ -49,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--target-root", required=True)
     plan_parser.add_argument("--account-scope-id", default="")
     plan_parser.add_argument("--deployment-id", default="")
+    plan_parser.add_argument(
+        "--cash-flow-deployment-start-ms",
+        type=int,
+        default=0,
+    )
     plan_parser.add_argument("--cash-flow-history-complete", action="store_true")
     plan_parser.add_argument("--flat-proof-receipt")
     plan_parser.add_argument("--output", default="")
@@ -80,6 +85,9 @@ def main(argv=None) -> int:
             target_root=args.target_root,
             account_scope_id=args.account_scope_id,
             deployment_id=args.deployment_id,
+            cash_flow_deployment_start_ms=(
+                args.cash_flow_deployment_start_ms
+            ),
             cash_flow_history_complete=args.cash_flow_history_complete,
             flat_proof_receipt=args.flat_proof_receipt,
         )

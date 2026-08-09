@@ -13,8 +13,7 @@ from typing import Any
 MULTI_WRITER_STATE_OWNERS = {
     "_account_state_event_time": "OMSExchangeEventProcessor",
     "_exchange_account_event_time": "OMSExchangeEventProcessor",
-    "_lifecycle_generation": "OMSLifecycleController",
-    "_outbound_all_order_seal_reason": "OMSLifecycleController",
+    "_outbound_all_order_seal_reason": "OMSShutdownCoordinator",
     "_recovered_guard_cleanup_snapshot": "OMSGuardManager",
     "_rpi_calibration_budget_exhausted": "RpiCalibrationRuntime",
     "_rpi_calibration_cumulative_notional_microu": "RpiCalibrationRuntime",
@@ -38,17 +37,24 @@ MULTI_WRITER_STATE_OWNERS = {
     "capability_mode": "OMSCapabilityManager",
     "capability_reason": "OMSCapabilityManager",
     "external_cash_flow_scan_end_ms": "OMSAccountTruth",
-    "last_freeze_reason": "OMSLifecycleController",
-    "last_halt_reason": "OMSLifecycleController",
-    "manual_rearm_required": "OMSLifecycleController",
     "mode_constraint_generation": "OMSCapabilityManager",
     "reconcile_retry_scheduled": "OMSReconciler",
     "recovered_guard_cleanup_pending": "OMSGuardManager",
-    "state": "OMSLifecycleController",
     "symbol_guard_epoch_counters": "OMSGuardManager",
     "symbol_guard_records": "OMSGuardManager",
     "venue_guard_epoch_counters": "OMSGuardManager",
     "venue_guard_records": "OMSGuardManager",
+}
+
+
+# These compatibility attributes remain available on the OMS facade, but
+# their values live inside the named store rather than OMSStateRegistry.
+EXTRACTED_STATE_STORE_OWNERS = {
+    "_lifecycle_generation": "LifecycleStore",
+    "last_freeze_reason": "LifecycleStore",
+    "last_halt_reason": "LifecycleStore",
+    "manual_rearm_required": "LifecycleStore",
+    "state": "LifecycleStore",
 }
 
 
@@ -135,6 +141,7 @@ def build_state_owners(component_types: Iterable[type]) -> dict[str, str]:
         name = component_type.__name__
         component_names.add(name)
         fields = set(component_type.OWNER_WRITES)
+        fields.difference_update(EXTRACTED_STATE_STORE_OWNERS)
         if name == "OMSInitializer":
             initializer_fields.update(fields)
             continue

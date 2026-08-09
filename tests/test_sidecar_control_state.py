@@ -254,23 +254,24 @@ def test_risk_stage_returns_emergency_actions_and_flat_verification():
     assert controller.state.flat_verification_count == 1
 
 
-def test_core_control_fields_are_not_duplicated_on_the_runtime_owner():
+def test_core_control_state_has_an_explicit_owner():
     core = RiskSidecarCore(
         object(),
         {"symbols": ["BTCUSDT"]},
         now=10.0,
     )
 
-    core.kill_latched = True
-    core.kill_reason = "manual_test"
-    core.stage = "FLATTENING"
+    state = core.control.state
+    state.kill_latched = True
+    state.kill_reason = "manual_test"
+    state.stage = "FLATTENING"
 
-    assert core.control.state.kill_latched is True
-    assert core.control.state.kill_reason == "manual_test"
-    assert core.control.state.stage == "FLATTENING"
-    assert "kill_latched" not in core.__dict__
-    assert "kill_reason" not in core.__dict__
-    assert "stage" not in core.__dict__
+    assert state.kill_latched is True
+    assert state.kill_reason == "manual_test"
+    assert state.stage == "FLATTENING"
+    assert not hasattr(core, "kill_latched")
+    assert not hasattr(core, "kill_reason")
+    assert not hasattr(core, "stage")
 
 
 def test_core_quiesce_without_durable_path_fails_closed():
@@ -287,9 +288,10 @@ def test_core_quiesce_without_durable_path_fails_closed():
 
     assert accepted is False
     assert reason == "quiesce_state_path_missing"
-    assert core.quiesced is False
-    assert core.kill_latched is True
-    assert core.kill_reason == "quiesce_state_path_missing"
-    assert core.stage == "FAILED"
-    assert core.last_quiesce_accepted is False
-    assert core.last_quiesce_persisted is False
+    state = core.control.state
+    assert state.quiesced is False
+    assert state.kill_latched is True
+    assert state.kill_reason == "quiesce_state_path_missing"
+    assert state.stage == "FAILED"
+    assert state.last_quiesce_accepted is False
+    assert state.last_quiesce_persisted is False

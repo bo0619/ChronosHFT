@@ -25,6 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from infrastructure.config_scaling import (  # noqa: E402
     normalize_root_config_preapproval,
 )
+from governance import calibration_artifact as calibration_artifact_port  # noqa: E402
 from infrastructure.live_config_guard import (  # noqa: E402
     CANARY_STAGE,
     LIVE_CANARY_ACCOUNT_SOURCE,
@@ -789,6 +790,7 @@ def assess_live_canary_readiness(
             validated_permit = load_and_validate_rpi_calibration_permit(
                 normalized,
                 config_path=path,
+                target_config_normalizer=normalize_root_config_preapproval,
                 now_utc=effective_now,
             )
         except (TypeError, ValueError) as exc:
@@ -810,7 +812,11 @@ def assess_live_canary_readiness(
             )
     elif stage == CANARY_STAGE:
         try:
-            validate_live_calibration_approval(normalized, config_path=path)
+            validate_live_calibration_approval(
+                normalized,
+                config_path=path,
+                calibration_artifact_port=calibration_artifact_port,
+            )
         except (TypeError, ValueError) as exc:
             checks.append(_check("model.live_approval", BLOCKED, str(exc)))
         else:
@@ -845,6 +851,7 @@ def assess_live_canary_readiness(
         validate_live_runtime_config(
             _guard_projection(normalized),
             config_path=path,
+            target_config_normalizer=normalize_root_config_preapproval,
             now_utc=effective_now,
             external_alert_environ=offline_alert_environ,
             runtime_working_dir=path.parent,

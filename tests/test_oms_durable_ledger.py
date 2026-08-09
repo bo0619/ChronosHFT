@@ -2,6 +2,7 @@ import errno
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +26,12 @@ from oms.journal import (
     decode_legacy_journal,
 )
 from oms.order import Order
+from oms.order_submission import OMSOrderSubmission
+from oms.submission_transaction import (
+    SubmissionAdmissionPolicy,
+    SubmissionState,
+    SubmissionTerminalOutcome,
+)
 
 
 class DummyEngine:
@@ -379,6 +386,148 @@ class DurableCommandRecoveryTests(unittest.TestCase):
             finally:
                 oms.stop()
 
+    def test_strategy_and_internal_submits_share_the_linear_transaction(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "oms.jsonl")
+            oms, _gateway = self._make_live_oms(path)
+            captured = []
+            original_factory = OMSOrderSubmission._new_submission_transaction
+
+            def capture_transaction(component, **kwargs):
+                transaction = original_factory(component, **kwargs)
+                captured.append(transaction)
+                return transaction
+
+            try:
+                with patch.object(
+                    OMSOrderSubmission,
+                    "_new_submission_transaction",
+                    capture_transaction,
+                ):
+                    strategy_result = oms.submit_order(
+                        OrderIntent(
+                            "alpha",
+                            "BTCUSDT",
+                            Side.BUY,
+                            100.0,
+                            1.0,
+                        )
+                    )
+                    internal_result = oms._submit_internal_order(
+                        OrderIntent(
+                            "system_internal",
+                            "BTCUSDT",
+                            Side.SELL,
+                            101.0,
+                            0.1,
+                        ),
+                        OrderRequest(
+                            "BTCUSDT",
+                            101.0,
+                            0.1,
+                            "SELL",
+                        ),
+                        "internal-linear-1",
+                        "internal_linear",
+                        "internal_linear",
+                    )
+
+                self.assertTrue(strategy_result.accepted)
+                self.assertTrue(internal_result)
+                self.assertEqual(len(captured), 2)
+                expected_history = tuple(SubmissionState)
+                strategy_snapshot = captured[0].snapshot()
+                internal_snapshot = captured[1].snapshot()
+                self.assertEqual(strategy_snapshot.history, expected_history)
+                self.assertEqual(internal_snapshot.history, expected_history)
+                self.assertEqual(
+                    strategy_snapshot.admission_policy,
+                    SubmissionAdmissionPolicy.STRATEGY,
+                )
+                self.assertEqual(
+                    internal_snapshot.admission_policy,
+                    SubmissionAdmissionPolicy.INTERNAL,
+                )
+                self.assertEqual(
+                    strategy_snapshot.terminal_outcome,
+                    SubmissionTerminalOutcome.ACKNOWLEDGED,
+                )
+                self.assertEqual(
+                    internal_snapshot.terminal_outcome,
+                    SubmissionTerminalOutcome.ACKNOWLEDGED,
+                )
+                gate = oms.get_outbound_gate_snapshot()
+                self.assertEqual(gate["order_sends_inflight"], 0)
+                self.assertEqual(gate["risk_sends_inflight"], 0)
+            finally:
+                oms.stop()
+
+    def test_gate_close_between_prepare_and_permit_is_durably_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "oms.jsonl")
+            oms, gateway = self._make_live_oms(path)
+            prepared = threading.Event()
+            resume = threading.Event()
+            results = []
+            failures = []
+            original_append_batch = oms.journal.append_batch
+
+            def block_after_durable_prepare(records):
+                committed = original_append_batch(records)
+                prepared.set()
+                if not resume.wait(2.0):
+                    raise TimeoutError("test prepare barrier timed out")
+                return committed
+
+            oms.journal.append_batch = block_after_durable_prepare
+
+            def submit():
+                try:
+                    results.append(
+                        oms.submit_order(
+                            OrderIntent(
+                                "alpha",
+                                "BTCUSDT",
+                                Side.BUY,
+                                100.0,
+                                1.0,
+                            )
+                        )
+                    )
+                except BaseException as exc:
+                    failures.append(exc)
+
+            worker = threading.Thread(target=submit)
+            worker.start()
+            try:
+                self.assertTrue(prepared.wait(2.0))
+                self.assertTrue(
+                    oms.close_outbound_gate(
+                        "test_prepare_race",
+                        wait=False,
+                    )
+                )
+                resume.set()
+                worker.join(2.0)
+
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(failures, [])
+                self.assertEqual(len(results), 1)
+                self.assertFalse(results[0].accepted)
+                self.assertIn("outbound_gate_closed", results[0].reason)
+                self.assertEqual(gateway.sent_orders, [])
+                kinds = [record["kind"] for record in oms.journal.load()]
+                self.assertIn("command_prepared", kinds)
+                self.assertIn("command_result", kinds)
+                gate = oms.get_outbound_gate_snapshot()
+                self.assertEqual(gate["order_sends_inflight"], 0)
+                self.assertEqual(gate["risk_sends_inflight"], 0)
+            finally:
+                resume.set()
+                worker.join(2.0)
+                oms.journal.append_batch = original_append_batch
+                oms.stop()
+
     def test_prepared_without_result_recovers_as_submit_unknown(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = os.path.join(temp_dir, "oms.jsonl")
@@ -418,7 +567,7 @@ class DurableCommandRecoveryTests(unittest.TestCase):
                 OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 1.0),
             )
             order.mark_submitting()
-            crashed.orders[order.client_oid] = order
+            crashed.order_store.add(order)
             crashed.journal.append("order_snapshot", order.to_record())
             crashed.journal.commit_checkpoint(
                 crashed.lifecycle_controller._shutdown_checkpoint_summary()
@@ -437,6 +586,45 @@ class DurableCommandRecoveryTests(unittest.TestCase):
                     recovered.journal.health_snapshot()["verified_start_seq"],
                     0,
                 )
+            finally:
+                recovered.stop()
+
+    def test_checkpoint_round_trips_symbol_scoped_strategy_guard(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "oms.jsonl")
+            crashed, _gateway = self._make_live_oms(path)
+            crashed.freeze_strategy(
+                "alpha",
+                "system_health:strategy_stale",
+                symbol="BTCUSDT",
+                cancel_active_orders=False,
+            )
+            summary = (
+                crashed.lifecycle_controller._shutdown_checkpoint_summary()
+            )
+
+            self.assertEqual(
+                summary["strategy_symbol_guards"],
+                {"alpha|BTCUSDT": "system_health:strategy_stale"},
+            )
+            json.dumps(summary, allow_nan=False, sort_keys=True)
+            crashed.journal.commit_checkpoint(summary)
+            crashed.order_monitor.stop()
+
+            recovered = OMS(
+                DummyEngine(),
+                LedgerGateway(),
+                make_config(path),
+            )
+            try:
+                self.assertEqual(
+                    recovered.get_strategy_freeze_reason(
+                        "alpha",
+                        "BTCUSDT",
+                    ),
+                    "system_health:strategy_stale",
+                )
+                self.assertTrue(recovered.guard_store.has_active())
             finally:
                 recovered.stop()
 

@@ -2,7 +2,12 @@ import time
 from collections import deque
 
 from event.type import OrderRequest, TIF_GTX
-from gateway.binance.paper_ledger import PaperLedger
+from gateway.binance.paper_ledger import (
+    PaperLedger,
+    PaperLedgerConfig,
+    PaperLedgerPort,
+)
+from gateway.binance.paper_matching import PaperVenueState
 from gateway.binance.paper_state import PaperOrder
 
 
@@ -32,26 +37,51 @@ def _make_order(client_oid: str, *, accept_seq: int = 1) -> PaperOrder:
 
 
 class _Owner:
-    def __init__(self, *orders):
-        self._orders = {order.client_oid: order for order in orders}
-        self._exchange_to_client = {
-            order.exchange_oid: order.client_oid for order in orders
-        }
-        self._positions = {}
-        self._books = {}
-        self._balances = {"USDT": 1_000.0}
-        self._trades = deque()
-        self._event_sequence = 0
-        self._paper_trade_sequence = 0
+    def __init__(self, *orders, max_order_history=10):
+        self.state = PaperVenueState(
+            orders={order.client_oid: order for order in orders},
+            exchange_to_client={
+                order.exchange_oid: order.client_oid for order in orders
+            },
+            balances={"USDT": 1_000.0},
+            trades=deque(),
+        )
+        self._orders = self.state.orders
+        self._exchange_to_client = self.state.exchange_to_client
+        self._positions = self.state.positions
+        self._books = self.state.books
+        self._balances = self.state.balances
+        self._trades = self.state.trades
         self._worker_running = True
         self.balance_asset = "USDT"
         self.symbols = [SYMBOL]
-        self.max_order_history = 10
+        self.max_order_history = max_order_history
         self.order_updates = []
         self.account_updates = []
         self.queue_removals = []
         self.worker_commands = []
-        self.ledger = PaperLedger(self)
+        self.ledger = PaperLedger(
+            self.state,
+            PaperLedgerPort(
+                reduce_only_fill_cap=self._reduce_only_fill_cap,
+                fee_rate=self._fee_rate,
+                quote_asset=self._quote_asset,
+                mark_price=self._mark_price,
+                remove_from_later_local_queue=(
+                    self._remove_from_later_local_queue
+                ),
+                account_metrics=self._account_metrics,
+                worker_running=lambda: self._worker_running,
+                symbols=lambda: tuple(self.symbols),
+                submit_worker=self._submit_worker,
+                publish_order_update=self.on_order_update,
+                publish_account_update=self.on_account_update,
+            ),
+            PaperLedgerConfig(
+                balance_asset=self.balance_asset,
+                max_order_history=self.max_order_history,
+            ),
+        )
 
     @staticmethod
     def _reduce_only_fill_cap(order):
@@ -153,8 +183,7 @@ def test_terminal_order_pruning_preserves_active_orders():
     oldest.update_ms = 10
     newest.status = "FILLED"
     newest.update_ms = 20
-    owner = _Owner(oldest, newest, active)
-    owner.max_order_history = 2
+    owner = _Owner(oldest, newest, active, max_order_history=2)
 
     owner.ledger.prune_terminal_orders()
 

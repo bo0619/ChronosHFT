@@ -2,6 +2,7 @@
 
 import math
 import multiprocessing
+from pathlib import Path
 import queue
 import secrets
 import time
@@ -10,6 +11,10 @@ from risk.sidecar_health import SidecarOmsHealth
 from risk.sidecar_protocol import SidecarProtocol
 from risk.sidecar_settings import SidecarSupervisorConfiguration
 from risk.sidecar_status import SidecarStatusProjection
+from risk.sidecar_state_store import (
+    AccountWriterFence,
+    SidecarWriterFenceError,
+)
 from risk.sidecar_transport import SidecarTransport
 from risk.sidecar_values import finite_float as _finite_float
 
@@ -69,6 +74,26 @@ class SidecarParentSupervisor:
         )
         self.session_id = secrets.token_hex(16)
         self.settings["session_id"] = self.session_id
+        self.state_store_root = str(
+            self.settings.get("state_store_root", "") or ""
+        ).strip()
+        self.writer_fence_wait_timeout_sec = max(
+            0.0,
+            _finite_float(
+                self.settings.get("writer_fence_wait_timeout_sec", 10.0)
+                or 0.0,
+                "writer_fence_wait_timeout_sec",
+            ),
+        )
+        self.writer_fence_poll_interval_sec = max(
+            0.01,
+            _finite_float(
+                self.settings.get("writer_fence_poll_interval_sec", 0.05)
+                or 0.05,
+                "writer_fence_poll_interval_sec",
+            ),
+        )
+        self.parent_writer_fence = None
         self.context = None
         self.command_queue = None
         self.heartbeat_queue = None
@@ -88,7 +113,10 @@ class SidecarParentSupervisor:
         if not self.enabled:
             return True
         if self.process is not None and self.process.is_alive():
+            if self.parent_writer_fence is not None:
+                self.parent_writer_fence.validate()
             return True
+        self._acquire_account_writer_fences()
         self.last_status = {}
         self.last_status_received_at = 0.0
         self.last_status_protocol_error = ""
@@ -96,15 +124,78 @@ class SidecarParentSupervisor:
         self.recovery_count = 0
         self.heartbeat_sequence = 0
         self.last_heartbeat_sent_at = 0.0
-        SidecarTransport.start_process(
-            self,
-            multiprocessing,
-            self._process_target,
-            time.perf_counter,
-        )
+        try:
+            SidecarTransport.start_process(
+                self,
+                multiprocessing,
+                self._process_target,
+                time.perf_counter,
+            )
+        except BaseException:
+            self._release_parent_writer_fence()
+            raise
         self._send_heartbeat(self.started_at)
         self._apply_oms_health(False, "supervisor_starting")
         return True
+
+    def _acquire_account_writer_fences(self) -> None:
+        if not self.state_store_root:
+            return
+        root = Path(self.state_store_root).resolve()
+        parent_fence = AccountWriterFence(
+            root / "runtime-parent.writer.lock",
+            {
+                "component": "ChronosHFT.Runtime",
+                "account_scope_id": str(
+                    self.settings.get("account_scope_id", "") or ""
+                ),
+                "deployment_id": str(
+                    self.settings.get("deployment_id", "") or ""
+                ),
+                "session_id": self.session_id,
+            },
+        )
+        try:
+            parent_fence.acquire()
+        except SidecarWriterFenceError as exc:
+            self._apply_oms_health(False, "runtime_parent_writer_fence_held")
+            raise RuntimeError("runtime_parent_writer_fence_held") from exc
+        self.parent_writer_fence = parent_fence
+        child_probe = AccountWriterFence(
+            root / "risk-sidecar.writer.lock",
+            {
+                "component": "ChronosHFT.Runtime.StartupProbe",
+                "account_scope_id": str(
+                    self.settings.get("account_scope_id", "") or ""
+                ),
+                "session_id": self.session_id,
+            },
+        )
+        deadline = time.perf_counter() + self.writer_fence_wait_timeout_sec
+        self._apply_oms_health(False, "risk_sidecar_writer_fence_wait")
+        try:
+            while True:
+                try:
+                    child_probe.acquire()
+                except SidecarWriterFenceError as exc:
+                    if time.perf_counter() >= deadline:
+                        raise RuntimeError(
+                            "risk_sidecar_writer_fence_wait_timeout"
+                        ) from exc
+                    time.sleep(self.writer_fence_poll_interval_sec)
+                    continue
+                child_probe.release()
+                return
+        except BaseException:
+            child_probe.release()
+            self._release_parent_writer_fence()
+            raise
+
+    def _release_parent_writer_fence(self) -> None:
+        fence = self.parent_writer_fence
+        self.parent_writer_fence = None
+        if fence is not None:
+            fence.release()
 
     def pulse_parent_heartbeat(self) -> bool:
         """Emit only the liveness pulse, without applying parent-side risk state."""
@@ -322,6 +413,7 @@ class SidecarParentSupervisor:
             }
         process = self.process
         if process is None:
+            self._release_parent_writer_fence()
             return {
                 "accepted": False,
                 "reason": "supervisor_process_missing",
@@ -368,6 +460,7 @@ class SidecarParentSupervisor:
         if process_exited:
             self._apply_oms_health(False, "supervisor_stopped")
             SidecarTransport.close_channels(self)
+            self._release_parent_writer_fence()
         else:
             self._apply_oms_health(
                 False,
@@ -375,4 +468,3 @@ class SidecarParentSupervisor:
                 f"{result.get('reason', 'unknown')}",
             )
         return result
-

@@ -6,44 +6,16 @@ from risk.sidecar_core_status import RiskSidecarStatusProjection
 
 
 def _owner():
-    return SimpleNamespace(
-        risk_reason="risk-reason",
-        funding_action="REDUCE_ONLY",
-        funding_reason="funding-reason",
+    state = SimpleNamespace(
         kill_latched=True,
         kill_reason="kill-reason",
         quiesced=True,
         quiesce_reason="quiesce-reason",
         quiesced_at=90.0,
         stage="FLAT_VERIFIED",
-        state_path="state.json",
-        state_generation=4,
-        state_recovered=True,
-        state_load_error="",
-        state_persist_error="persist-error",
-        risk_metrics={"gross_notional": 12.0},
-        last_parent_sequence=8,
-        last_parent_heartbeat_at=99.0,
-        parent_heartbeat_error="parent-error",
-        parent_stale_since=95.0,
-        parent_stale_snapshot_sequence=6,
-        last_parent_heartbeat_sent_monotonic=98.5,
-        exchange_healthy=1,
-        exchange_reason="exchange-reason",
-        last_exchange_success_at=98.0,
-        last_cancel_ok=False,
-        last_cancel_reason="cancel-reason",
-        last_flatten_ok=True,
-        last_flatten_count=2,
-        last_flatten_reason="flatten-reason",
         flat_verification_count=3,
-        flat_verification_checks=3,
         last_verified_snapshot_sequence=10,
-        risk_snapshot_sequence=10,
         quiesce_snapshot_sequence=9,
-        risk_snapshot_captured_at=1_000.0,
-        risk_snapshot_captured_monotonic=97.0,
-        snapshot_request_inflight_sequence=11,
         last_rearm_request_id="rearm-request",
         last_rearm_phase="COMMIT",
         last_rearm_accepted=False,
@@ -64,6 +36,44 @@ def _owner():
         last_stop_cancel_requested=True,
         last_stop_cancel_attempted=True,
         last_stop_cancel_ok=False,
+    )
+    observation = SimpleNamespace(
+        risk_reason="risk-reason",
+        funding_risk=SimpleNamespace(
+            action="REDUCE_ONLY",
+            reason="funding-reason",
+        ),
+        risk_metrics={"gross_notional": 12.0},
+        exchange_healthy=1,
+        exchange_reason="exchange-reason",
+        last_exchange_success_at=98.0,
+        risk_snapshot_sequence=10,
+        risk_snapshot_captured_at=1_000.0,
+        risk_snapshot_captured_monotonic=97.0,
+        snapshot_request_inflight_sequence=11,
+    )
+    return SimpleNamespace(
+        control=SimpleNamespace(
+            state=state,
+            flat_verification_checks=3,
+        ),
+        observation=observation,
+        state_path="state.json",
+        state_generation=4,
+        state_recovered=True,
+        state_load_error="",
+        state_persist_error="persist-error",
+        last_parent_sequence=8,
+        last_parent_heartbeat_at=99.0,
+        parent_heartbeat_error="parent-error",
+        parent_stale_since=95.0,
+        parent_stale_snapshot_sequence=6,
+        last_parent_heartbeat_sent_monotonic=98.5,
+        last_cancel_ok=False,
+        last_cancel_reason="cancel-reason",
+        last_flatten_ok=True,
+        last_flatten_count=2,
+        last_flatten_reason="flatten-reason",
     )
 
 
@@ -150,15 +160,15 @@ def test_core_status_projection_preserves_the_complete_protocol_contract():
     }
 
     status["risk_metrics"]["gross_notional"] = 99.0
-    assert owner.risk_metrics == {"gross_notional": 12.0}
+    assert owner.observation.risk_metrics == {"gross_notional": 12.0}
 
 
 def test_core_status_age_fields_handle_missing_and_future_timestamps():
     owner = _owner()
     owner.last_parent_heartbeat_at = 101.0
-    owner.last_exchange_success_at = 0.0
-    owner.risk_snapshot_captured_monotonic = 0.0
-    owner.snapshot_request_inflight_sequence = 0
+    owner.observation.last_exchange_success_at = 0.0
+    owner.observation.risk_snapshot_captured_monotonic = 0.0
+    owner.observation.snapshot_request_inflight_sequence = 0
 
     status = RiskSidecarStatusProjection.build(
         owner,

@@ -64,6 +64,7 @@ class OMSExchangeEventProcessor(OMSComponent):
             "lock",
             "mark_external_cash_flow_truth_unavailable",
             "order_monitor",
+            "order_store",
             "orders",
             "state",
             "terminated_oids",
@@ -938,6 +939,7 @@ class OMSExchangeEventProcessor(OMSComponent):
                 return
 
             self.order_monitor.on_order_update(order.client_oid, order.status)
+            self.order_store.reindex(order)
             self.exposure.update_open_orders(self.orders)
             self.account.calculate()
 

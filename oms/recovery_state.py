@@ -24,6 +24,7 @@ class OMSRecoveryStateRestorer(OMSComponent):
             "_sync_capability_mode",
             "_venue_guard_owner",
             "account",
+            "guard_store",
             "rebuild_summary",
         }
     )
@@ -56,8 +57,6 @@ class OMSRecoveryStateRestorer(OMSComponent):
             "mode_constraints",
             "recovered_guard_cleanup_pending",
             "state",
-            "strategy_guards",
-            "strategy_symbol_guards",
             "symbol_guard_epoch_counters",
             "symbol_guard_epochs",
             "symbol_guard_records",
@@ -312,12 +311,10 @@ class OMSRecoveryStateRestorer(OMSComponent):
             }
             self.venue_guard_epoch_counters[venue] = 1
             self._refresh_venue_guard_effective_locked(venue)
-        self.strategy_guards = dict(summary.get("strategy_guards", {}))
-        self.strategy_symbol_guards = {
-            tuple(key.split("|", 1)): value
-            for key, value in summary.get("strategy_symbol_guards", {}).items()
-            if "|" in key
-        }
+        self.guard_store.restore(
+            summary.get("strategy_guards", {}),
+            summary.get("strategy_symbol_guards", {}),
+        )
         self._recovered_guard_cleanup_snapshot = (
             self._capture_guard_cleanup_snapshot_locked()
         )

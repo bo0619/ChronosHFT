@@ -24,12 +24,11 @@ class OMSGuardManager(OMSComponent):
             "can_open_new_risk",
             "cancel_order",
             "gateway",
+            "guard_store",
             "halt_system",
             "lock",
             "orders",
             "recovered_guard_cleanup_pending",
-            "strategy_guards",
-            "strategy_symbol_guards",
             "symbol_guard_epoch_counters",
             "symbol_guard_epochs",
             "symbol_guard_records",
@@ -688,9 +687,11 @@ class OMSGuardManager(OMSComponent):
         symbol = symbol.upper() if symbol else ""
         with self.lock:
             if symbol:
-                key = (strategy_id, symbol)
-                previous_reason = self.strategy_symbol_guards.get(key, "")
-                self.strategy_symbol_guards[key] = reason
+                previous_reason = self.guard_store.freeze(
+                    strategy_id,
+                    reason,
+                    symbol=symbol,
+                )
                 payload = {
                     "strategy_id": strategy_id,
                     "symbol": symbol,
@@ -700,8 +701,10 @@ class OMSGuardManager(OMSComponent):
                 log_message = f"[OMS] Strategy frozen {strategy_id}/{symbol}: {reason}"
                 audit_kind = "strategy_symbol_frozen"
             else:
-                previous_reason = self.strategy_guards.get(strategy_id, "")
-                self.strategy_guards[strategy_id] = reason
+                previous_reason = self.guard_store.freeze(
+                    strategy_id,
+                    reason,
+                )
                 payload = {
                     "strategy_id": strategy_id,
                     "reason": reason,
@@ -732,17 +735,25 @@ class OMSGuardManager(OMSComponent):
                 f"strategy_guarded:{strategy_id}:{symbol}"
             )
 
-    def clear_strategy_freeze(self, strategy_id: str, symbol: str = "", reason: str = ""):
+    def clear_strategy_freeze(
+        self,
+        strategy_id: str,
+        symbol: str = "",
+        reason: str = "",
+        *,
+        expected_reason: str | None = None,
+    ):
         strategy_id = (strategy_id or "").strip()
         if not strategy_id:
             return False
 
         symbol = symbol.upper() if symbol else ""
         with self.lock:
-            if symbol:
-                previous_reason = self.strategy_symbol_guards.pop((strategy_id, symbol), "")
-            else:
-                previous_reason = self.strategy_guards.pop(strategy_id, "")
+            previous_reason = self.guard_store.clear(
+                strategy_id,
+                symbol=symbol,
+                expected_reason=expected_reason,
+            )
             self._refresh_outbound_gate_locked(
                 reason
                 or previous_reason
@@ -770,11 +781,7 @@ class OMSGuardManager(OMSComponent):
             return ""
 
         symbol = symbol.upper() if symbol else ""
-        if symbol:
-            scoped_reason = self.strategy_symbol_guards.get((strategy_id, symbol), "")
-            if scoped_reason:
-                return scoped_reason
-        return self.strategy_guards.get(strategy_id, "")
+        return self.guard_store.reason(strategy_id, symbol=symbol)
 
     def _capture_guard_cleanup_snapshot_locked(self, prefixes=()) -> dict:
         prefixes = tuple(prefixes or ())
@@ -798,6 +805,7 @@ class OMSGuardManager(OMSComponent):
                             int(record.get("epoch", 0) or 0),
                         )
                     )
+        strategy_snapshot = self.guard_store.snapshot()
         return {
             "symbols": symbol_snapshots,
             "venues": [
@@ -811,13 +819,16 @@ class OMSGuardManager(OMSComponent):
             ],
             "strategies": [
                 (strategy_id, guard_reason)
-                for strategy_id, guard_reason in self.strategy_guards.items()
+                for strategy_id, guard_reason in (
+                    strategy_snapshot.strategy_guards
+                )
                 if selected(guard_reason)
             ],
             "strategy_symbols": [
                 (strategy_id, symbol, guard_reason)
-                for (strategy_id, symbol), guard_reason
-                in self.strategy_symbol_guards.items()
+                for strategy_id, symbol, guard_reason in (
+                    strategy_snapshot.strategy_symbol_guards
+                )
                 if selected(guard_reason)
             ],
         }
@@ -846,22 +857,20 @@ class OMSGuardManager(OMSComponent):
                 ):
                     cleared += 1
             for strategy_id, guard_reason in snapshot.get("strategies", []):
-                if self.strategy_guards.get(strategy_id, "") != guard_reason:
-                    continue
-                if self.clear_strategy_freeze(strategy_id, reason=reason):
+                if self.clear_strategy_freeze(
+                    strategy_id,
+                    reason=reason,
+                    expected_reason=guard_reason,
+                ):
                     cleared += 1
             for strategy_id, symbol, guard_reason in snapshot.get(
                 "strategy_symbols", []
             ):
-                if (
-                    self.strategy_symbol_guards.get((strategy_id, symbol), "")
-                    != guard_reason
-                ):
-                    continue
                 if self.clear_strategy_freeze(
                     strategy_id,
                     symbol=symbol,
                     reason=reason,
+                    expected_reason=guard_reason,
                 ):
                     cleared += 1
         return cleared

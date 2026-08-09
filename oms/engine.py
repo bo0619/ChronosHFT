@@ -204,11 +204,62 @@ class OMS:
     def rpi_calibration_runtime(self, runtime: RpiCalibrationRuntime) -> None:
         self.__dict__["_rpi_calibration_runtime"] = runtime
 
-    def __init__(self, event_engine, gateway, config):
+    @property
+    def state(self):
+        return self.lifecycle_store.state
+
+    @state.setter
+    def state(self, value) -> None:
+        self.lifecycle_store.state = value
+
+    @property
+    def _lifecycle_generation(self) -> int:
+        return self.lifecycle_store.generation
+
+    @_lifecycle_generation.setter
+    def _lifecycle_generation(self, value: int) -> None:
+        self.lifecycle_store.generation = value
+
+    @property
+    def manual_rearm_required(self) -> bool:
+        return self.lifecycle_store.manual_rearm_required
+
+    @manual_rearm_required.setter
+    def manual_rearm_required(self, value: bool) -> None:
+        self.lifecycle_store.manual_rearm_required = value
+
+    @property
+    def last_freeze_reason(self) -> str:
+        return self.lifecycle_store.last_freeze_reason
+
+    @last_freeze_reason.setter
+    def last_freeze_reason(self, value: str) -> None:
+        self.lifecycle_store.last_freeze_reason = value
+
+    @property
+    def last_halt_reason(self) -> str:
+        return self.lifecycle_store.last_halt_reason
+
+    @last_halt_reason.setter
+    def last_halt_reason(self, value: str) -> None:
+        self.lifecycle_store.last_halt_reason = value
+
+    @property
+    def orders(self) -> Mapping:
+        """Expose order identity as a read-only compatibility view."""
+
+        return self.order_store.view()
+
+    def __init__(self, event_engine, gateway, config, *, market_cache=None):
         self.__dict__["_component_state"] = OMSStateRegistry(
             self._component_state_field_owners
         )
-        OMSInitializer(self).initialize(event_engine, gateway, config)
+        OMSInitializer(self).initialize(
+            event_engine,
+            gateway,
+            config,
+            market_cache=market_cache,
+        )
 
     def _component_context_for(
         self,

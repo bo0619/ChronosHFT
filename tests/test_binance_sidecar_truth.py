@@ -1,5 +1,3 @@
-from unittest.mock import patch
-
 from risk.binance_sidecar_truth import BinanceSidecarTruthReader
 
 
@@ -39,6 +37,8 @@ class _Owner:
         self._cached_external_cash_flow_total = 7.0
         self._cash_flow_cache_initialized = False
         self.cash_flow_result = (True, 0.0, "")
+        self._monotonic = lambda: 100.0
+        self._wall_time = lambda: 1_700_000_000.0
         self.reader = BinanceSidecarTruthReader(self)
 
     @staticmethod
@@ -99,11 +99,7 @@ def test_failed_cash_flow_refresh_does_not_replace_last_good_cache():
     owner = _Owner(positions)
     owner.cash_flow_result = (False, 0.0, "income_history_status=503")
 
-    with patch(
-        "risk.binance_sidecar_truth.time.perf_counter",
-        return_value=100.0,
-    ):
-        result = owner.reader.get_cached_daily_external_cash_flow()
+    result = owner.reader.get_cached_daily_external_cash_flow()
 
     assert result == (False, 0.0, "income_history_status=503")
     assert owner._cached_external_cash_flow_total == 7.0

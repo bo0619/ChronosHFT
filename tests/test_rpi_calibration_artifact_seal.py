@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pytest
+from governance import calibration_artifact as calibration_artifact_port
 
 from infrastructure.single_writer_fence import (
     SingleWriterFence,
@@ -212,6 +213,7 @@ def test_approval_graph_keeps_writer_fence_held(tmp_path, monkeypatch):
     result = model_readiness.validate_live_calibration_approval(
         config,
         config_path=tmp_path / "live.json",
+        calibration_artifact_port=calibration_artifact_port,
     )
 
     assert result == {"validated": True}

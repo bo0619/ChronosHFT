@@ -430,17 +430,22 @@ split into independently testable components:
 | `risk/binance_sidecar_truth.py` | Consistent account/position/open-order snapshots, funding observations, and deduplicated external cash flow |
 | `risk/binance_sidecar_emergency.py` | Independent emergency DMS/cancel and reduce-only flatten actions |
 | `risk/sidecar_core.py` | Deterministic child-side heartbeat, risk-stage, rearm, and emergency-action coordinator |
-| `risk/sidecar_core_fields.py` | Compatibility field names backed by their owning sidecar controllers |
 | `risk/sidecar_account_risk.py` | Sidecar account, liquidation, daily-loss, and deployment-loss truth |
 | `risk/sidecar_funding_risk.py` | Sidecar funding observations and guard decisions |
 | `risk/sidecar_observation.py` | Snapshot generation fencing, freshness, health, and evaluated risk result ownership |
 | `risk/sidecar_control_state.py` | Kill, quiesce, stop, staged action, and two-phase rearm state machine |
+| `risk/sidecar_command_runtime.py` | STOP and two-phase rearm orchestration over explicit control and truth owners |
 | `risk/sidecar_core_status.py` | Complete read-only child-core status projection, age calculations, and IPC field contract |
 | `risk/sidecar_health.py` | Parent OMS heartbeat propagation, fail-closed mode constraints, and fresh-snapshot recovery gating |
 | `risk/limit_contract.py` | Canonical defaults shared by in-process and sidecar risk caps |
 | `risk/sidecar_policy.py` | Immutable normalized sidecar thresholds, timing limits, funding policy, and deployment identity |
 | `risk/sidecar_process.py` | Child console isolation, dedicated dual-client initialization, failure status publication, and runtime handoff |
-| `risk/sidecar_durable_state.py` | Checksummed identity-bound kill/rearm state, corruption quarantine, fsync, and atomic replacement |
+| `risk/sidecar_durable_state.py` | Isolated legacy v1 JSON decoder used only by offline migration tests and tooling |
+| `risk/sidecar_state_payload.py` | Strict v2 durable payload schema, identity checks, and semantic validation |
+| `risk/sidecar_state_projection.py` | Explicit control/equity projection to and from the v2 state payload |
+| `risk/sidecar_state_store.py` | Account-scoped SQLite CAS, writer fences, hash history, rollback anchors, and cash-flow ledger |
+| `risk/sidecar_flat_proof.py` | Account-wide stable flatness proof capture bound to state and safety epochs |
+| `risk/runtime_clock.py` | Injected monotonic, UTC, and sleep clock for the isolated child runtime |
 | `risk/sidecar_protocol.py` | Versioned launch/capability handshake, wire validation, and request-correlated control ACK decoding |
 | `risk/sidecar_runtime.py` | Child command routing, latest-only heartbeat consumption, status publication, and worker/client cleanup |
 | `risk/sidecar_settings.py` | Parent timeout validation, cross-config child settings assembly, credential fingerprinting, and risk-state seeds |

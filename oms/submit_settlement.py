@@ -86,6 +86,7 @@ class OMSSubmitSettlement(OMSComponent):
             "last_freeze_reason",
             "lock",
             "order_monitor",
+            "order_store",
             "orders",
             "state",
             "symbol_guard_epoch_counters",
@@ -825,7 +826,7 @@ class OMSSubmitSettlement(OMSComponent):
                 )
                 if order.is_terminal():
                     self._write_tombstone(order)
-                    self.orders.pop(order.client_oid, None)
+                    self.order_store.remove(order.client_oid)
                     self.exposure.update_open_orders(self.orders)
                     self.account.calculate()
         except JournalError as journal_exc:
@@ -845,7 +846,7 @@ class OMSSubmitSettlement(OMSComponent):
                             "durable_journal_unavailable"
                         )
                     if order.is_terminal():
-                        self.orders.pop(order.client_oid, None)
+                        self.order_store.remove(order.client_oid)
                         self.exposure.update_open_orders(self.orders)
                         self.account.calculate()
             except BaseException as cleanup_exc:

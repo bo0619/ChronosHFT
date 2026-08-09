@@ -7,6 +7,7 @@ import json
 import math
 import secrets
 import time
+from collections.abc import Iterable, Mapping
 
 from risk.exchange_port import (
     AccountTruthSnapshot,
@@ -31,6 +32,8 @@ class FlatProofEngine:
         required_samples: int = 2,
         settle_interval_sec: float = 0.0,
         proof_ttl_sec: float = 2.0,
+        expected_account_scope_id: str = "",
+        allowed_symbols: Iterable[str] | None = None,
         monotonic=time.perf_counter,
         sleep=time.sleep,
         proof_id_factory=lambda: secrets.token_hex(16),
@@ -39,6 +42,18 @@ class FlatProofEngine:
         self.required_samples = max(2, int(required_samples))
         self.settle_interval_sec = max(0.0, float(settle_interval_sec))
         self.proof_ttl_sec = max(0.05, float(proof_ttl_sec))
+        self.expected_account_scope_id = str(
+            expected_account_scope_id or ""
+        ).strip()
+        self.allowed_symbols = (
+            frozenset(
+                str(symbol or "").strip().upper()
+                for symbol in allowed_symbols
+                if str(symbol or "").strip()
+            )
+            if allowed_symbols is not None
+            else None
+        )
         self._monotonic = monotonic
         self._sleep = sleep
         self._proof_id_factory = proof_id_factory
@@ -73,7 +88,27 @@ class FlatProofEngine:
             raise FlatProofError("flat_proof_snapshot_incomplete")
         if not snapshot.account_wide:
             raise FlatProofError("flat_proof_scope_not_account_wide")
+        account_scope_id = str(snapshot.account_scope_id or "").strip()
+        if not account_scope_id:
+            raise FlatProofError("flat_proof_account_scope_missing")
+        if (
+            self.expected_account_scope_id
+            and account_scope_id != self.expected_account_scope_id
+        ):
+            raise FlatProofError("flat_proof_account_scope_mismatch")
+        self._validate_symbols(snapshot)
         return snapshot
+
+    def _validate_symbols(self, snapshot: AccountTruthSnapshot) -> None:
+        allowed = self.allowed_symbols
+        for row in (*snapshot.positions, *snapshot.open_orders):
+            if not isinstance(row, Mapping):
+                raise FlatProofError("flat_proof_truth_row_invalid")
+            symbol = str(row.get("symbol", "") or "").strip().upper()
+            if not symbol:
+                raise FlatProofError("flat_proof_symbol_missing")
+            if allowed is not None and symbol not in allowed:
+                raise FlatProofError(f"flat_proof_unknown_symbol:{symbol}")
 
     def capture(
         self,
@@ -85,8 +120,12 @@ class FlatProofEngine:
     ) -> FlatProof:
         snapshots = []
         previous_sequence = 0
+        account_scope_id = ""
         for index in range(self.required_samples):
             snapshot = self._read()
+            if account_scope_id and snapshot.account_scope_id != account_scope_id:
+                raise FlatProofError("flat_proof_account_scope_changed")
+            account_scope_id = snapshot.account_scope_id
             if snapshot.captured_monotonic < float(barrier_monotonic):
                 raise FlatProofError("flat_proof_predates_barrier")
             if snapshot.truth_sequence <= previous_sequence:
@@ -108,6 +147,8 @@ class FlatProofEngine:
                 "writer_epoch": version.writer_epoch,
                 "owner_epoch": version.owner_epoch,
                 "safety_epoch": version.safety_epoch,
+                "generation": version.generation,
+                "state_sha256": version.state_sha256,
             },
         }
         digest = hashlib.sha256(
@@ -125,6 +166,8 @@ class FlatProofEngine:
             writer_epoch=version.writer_epoch,
             owner_epoch=version.owner_epoch,
             safety_epoch=version.safety_epoch,
+            generation=version.generation,
+            state_sha256=version.state_sha256,
             first_truth_sequence=snapshots[0].truth_sequence,
             last_truth_sequence=snapshots[-1].truth_sequence,
             sample_count=len(snapshots),

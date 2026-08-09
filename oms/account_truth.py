@@ -70,6 +70,7 @@ class OMSAccountTruth(OMSComponent):
             "last_external_cash_flow_poll_at",
             "lock",
             "order_monitor",
+            "order_store",
             "orders",
             "paper_trade_database",
             "query_income_history",
@@ -449,7 +450,7 @@ class OMSAccountTruth(OMSComponent):
         order = Order(client_oid, intent)
         order.mark_submitting()
         order.mark_new(exchange_oid=exchange_oid)
-        self.orders[client_oid] = order
+        self.order_store.add(order)
         if exchange_oid:
             self.exchange_id_map[exchange_oid] = order
         self._schedule_rpi_calibration_runtime_enforcement(
@@ -730,6 +731,7 @@ class OMSAccountTruth(OMSComponent):
                         update_time=max(original_terminal_time, update.update_time),
                     )
                 self.order_monitor.on_order_update(order.client_oid, order.status)
+                self.order_store.reindex(order)
                 self.exposure.update_open_orders(self.orders)
                 self.account.calculate()
                 self._record_order_snapshot(order, "terminal_restored_after_trade_backfill")

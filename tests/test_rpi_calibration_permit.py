@@ -34,6 +34,7 @@ NOW = datetime(2026, 7, 24, 12, 2, tzinfo=timezone.utc)
 PUBLIC_KEY = b"K" * 32
 KEY_ID = "rpi-permit-test-key"
 AUTHORIZED_BY = "offline-test-operator"
+CASH_FLOW_DEPLOYMENT_START_MS = 1_753_248_000_000
 
 
 def _strategy_config():
@@ -115,9 +116,14 @@ def _configs():
         "risk": {
             "limits": {"max_order_notional": 8.0},
             "independent_supervisor": {
-                "state_path": (
+                "state_store_root": (
                     f"storage/live/{deployment_id}/calibration/"
-                    "risk_supervisor_state.json"
+                    "risk-sidecar-v2"
+                ),
+                "account_scope_id": "rpi-calibration-account-001",
+                "state_genesis_id": "rpi-calibration-genesis-001",
+                "cash_flow_deployment_start_ms": (
+                    CASH_FLOW_DEPLOYMENT_START_MS
                 ),
             },
         },
@@ -136,8 +142,13 @@ def _configs():
     target["oms"]["single_writer_fence"]["path"] = (
         f"storage/live/{deployment_id}/target/oms_journal.jsonl.lock"
     )
-    target["risk"]["independent_supervisor"]["state_path"] = (
-        f"storage/live/{deployment_id}/target/risk_supervisor_state.json"
+    target["risk"]["independent_supervisor"].update(
+        {
+            "state_store_root": (
+                f"storage/live/{deployment_id}/target/risk-sidecar-v2"
+            ),
+            "state_genesis_id": "rpi-target-genesis-001",
+        }
     )
     target["system"]["admin_control"]["path"] = (
         f"storage/live/{deployment_id}/target/admin"
@@ -613,14 +624,18 @@ def test_signature_metadata_and_dedicated_keyring_are_strict():
         _validate(permit, calibration, target, malformed_keyring)
 
 
-def _write_loader_fixture(root: Path):
+def _normalize_target_config(raw):
     from infrastructure.config_scaling import (
         normalize_root_config_preapproval,
     )
 
+    return normalize_root_config_preapproval(raw)
+
+
+def _write_loader_fixture(root: Path):
     raw_calibration, raw_target, _ = _configs()
-    calibration = normalize_root_config_preapproval(raw_calibration)
-    target = normalize_root_config_preapproval(raw_target)
+    calibration = _normalize_target_config(raw_calibration)
+    target = _normalize_target_config(raw_target)
     config_path = root / "calibration.json"
     target_path = root / "target.json"
     permit_path = root / "permit.json"
@@ -644,6 +659,7 @@ def test_loader_reads_relative_bound_files_without_network_or_trading(tmp_path):
         result = load_and_validate_rpi_calibration_permit(
             calibration,
             config_path=config_path,
+            target_config_normalizer=_normalize_target_config,
             now_utc=NOW,
         )
 
@@ -664,6 +680,7 @@ def test_loader_rejects_duplicate_key_in_target_config(tmp_path):
         load_and_validate_rpi_calibration_permit(
             calibration,
             config_path=config_path,
+            target_config_normalizer=_normalize_target_config,
             now_utc=NOW,
         )
 
@@ -682,6 +699,7 @@ def test_loader_rejects_parent_traversal_and_path_aliases(tmp_path):
         load_and_validate_rpi_calibration_permit(
             calibration,
             config_path=config_path,
+            target_config_normalizer=_normalize_target_config,
             now_utc=NOW,
         )
 
@@ -693,5 +711,6 @@ def test_loader_rejects_parent_traversal_and_path_aliases(tmp_path):
         load_and_validate_rpi_calibration_permit(
             calibration,
             config_path=config_path,
+            target_config_normalizer=_normalize_target_config,
             now_utc=NOW,
         )

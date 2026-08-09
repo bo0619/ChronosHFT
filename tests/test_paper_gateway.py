@@ -2132,6 +2132,73 @@ class PaperRuntimeIntegrationTests(unittest.TestCase):
             oms.stop()
             gateway.close()
 
+    def test_book_dispatch_callbacks_run_after_book_lock_release(self):
+        gateway = BinancePaperGateway(
+            DispatchingEngine(),
+            make_gateway_config(),
+        )
+        gateway._start_worker()
+        gateway.active = True
+        gateway._accepting_orders = True
+        gateway.state = GatewayState.READY
+        gateway._call_worker(
+            "book",
+            (gateway._book_generation, make_book()),
+        )
+        self.addCleanup(gateway.close)
+        ownership = []
+
+        def record(name, result=True):
+            ownership.append((name, gateway._book_lock._is_owned()))
+            return result
+
+        gateway._submit_worker = lambda *_args, **_kwargs: record("submit")
+        gateway.on_market_data = lambda *_args, **_kwargs: record("market")
+        public_update = SimpleNamespace(
+            dispatch_timestamp=0.0,
+            dispatch_monotonic=0.0,
+        )
+        self.assertTrue(
+            gateway._publish_public_market_update(
+                gateway._book_generation,
+                EVENT_AGG_TRADE,
+                public_update,
+                worker_kind="market_trade",
+            )
+        )
+
+        gateway._on_market_trade = lambda _trade: record("matching")
+        self.assertTrue(
+            gateway._dispatch_command(
+                "market_trade",
+                (gateway._book_generation, object()),
+            )
+        )
+
+        def fail_enqueue(*_args, **_kwargs):
+            record("fault-entry")
+            gateway._fault("PAPER_LOCK_TEST")
+            return False
+
+        gateway._submit_worker = fail_enqueue
+        self.assertFalse(
+            gateway._publish_public_market_update(
+                gateway._book_generation,
+                EVENT_AGG_TRADE,
+                public_update,
+                worker_kind="market_trade",
+            )
+        )
+        self.assertEqual(
+            ownership,
+            [
+                ("submit", False),
+                ("market", False),
+                ("matching", False),
+                ("fault-entry", False),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

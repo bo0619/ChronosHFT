@@ -88,6 +88,50 @@ class SidecarSupervisorConfiguration:
             raise ValueError(
                 "independent_supervisor requires dedicated API credentials"
             )
+        if enabled:
+            legacy_state_fields = tuple(
+                field
+                for field in ("state_path", "state_required", "state_fsync")
+                if field in supervisor_config
+            )
+            if legacy_state_fields:
+                raise ValueError(
+                    "independent_supervisor legacy state format is unsupported: "
+                    + ",".join(legacy_state_fields)
+                )
+            required_identity = {
+                field: str(supervisor_config.get(field, "") or "").strip()
+                for field in (
+                    "state_store_root",
+                    "account_scope_id",
+                    "state_genesis_id",
+                )
+            }
+            missing_identity = [
+                field for field, value in required_identity.items() if not value
+            ]
+            if missing_identity:
+                raise ValueError(
+                    "independent_supervisor v2 state identity is incomplete: "
+                    + ",".join(missing_identity)
+                )
+            try:
+                deployment_start_ms = int(
+                    supervisor_config.get(
+                        "cash_flow_deployment_start_ms",
+                        0,
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "independent_supervisor.cash_flow_deployment_start_ms "
+                    "must be a positive integer"
+                ) from exc
+            if deployment_start_ms <= 0:
+                raise ValueError(
+                    "independent_supervisor.cash_flow_deployment_start_ms "
+                    "must be a positive integer"
+                )
 
         heartbeat_interval_sec = max(
             0.05,

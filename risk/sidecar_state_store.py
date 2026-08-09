@@ -10,13 +10,18 @@ from pathlib import Path
 import secrets
 import socket
 import sqlite3
+import threading
 import time
 from typing import Mapping
 
 from risk.exchange_port import StateVersion
+from risk.sidecar_state_payload import (
+    SCHEMA_VERSION,
+    SidecarStatePayloadError,
+    parse_sidecar_state_payload,
+)
 
 
-SCHEMA_VERSION = 2
 _SAFETY_INCREASING = "SAFETY_INCREASING"
 _NEUTRAL = "NEUTRAL"
 _RISK_INCREASING = "RISK_INCREASING"
@@ -35,6 +40,22 @@ class SidecarStateCasError(SidecarStateStoreError):
 
 class SidecarWriterFenceError(SidecarStateStoreError):
     """Raised when another sidecar owns the account writer fence."""
+
+
+def _validated_state_payload(
+    payload: Mapping,
+    *,
+    account_scope_id: str,
+    deployment_id: str,
+) -> dict:
+    try:
+        return parse_sidecar_state_payload(
+            payload,
+            account_scope_id=account_scope_id,
+            deployment_id=deployment_id,
+        )
+    except SidecarStatePayloadError as exc:
+        raise SidecarStateStoreError(str(exc)) from exc
 
 
 def _canonical_bytes(value: Mapping) -> bytes:
@@ -193,13 +214,16 @@ class SidecarStateStore:
         self.root = Path(root).resolve()
         self.manifest_path = self.root / "account.manifest.json"
         self.fence_path = self.root / "risk-sidecar.writer.lock"
+        self.parent_fence_path = self.root / "runtime-parent.writer.lock"
         self.database_path = self.root / "state.sqlite3"
         self.anchor_path = self.root / "rollback-anchor.json"
+        self.cash_flow_anchor_path = self.root / "cash-flow-anchor.json"
         self.account_scope_id = str(account_scope_id or "")
         self.deployment_id = str(deployment_id or "")
         self.genesis_id = str(genesis_id or "")
         self.writer_id = str(writer_id or "")
         self.connection: sqlite3.Connection | None = None
+        self._lock = threading.RLock()
         self.fence = AccountWriterFence(
             self.fence_path,
             {
@@ -224,12 +248,13 @@ class SidecarStateStore:
     ) -> dict:
         """Create a new lineage; this is intentionally an offline-only API."""
         root_path = Path(root).resolve()
-        root_path.mkdir(parents=True, exist_ok=True)
         paths = (
             root_path / "account.manifest.json",
             root_path / "risk-sidecar.writer.lock",
+            root_path / "runtime-parent.writer.lock",
             root_path / "state.sqlite3",
             root_path / "rollback-anchor.json",
+            root_path / "cash-flow-anchor.json",
         )
         if any(path.exists() for path in paths):
             raise SidecarStateStoreError("state_lineage_already_exists")
@@ -237,6 +262,12 @@ class SidecarStateStore:
         deployment_id = str(deployment_id or "").strip()
         if not account_scope_id or not deployment_id:
             raise SidecarStateStoreError("state_identity_missing")
+        payload = _validated_state_payload(
+            initial_payload,
+            account_scope_id=account_scope_id,
+            deployment_id=deployment_id,
+        )
+        root_path.mkdir(parents=True, exist_ok=True)
         genesis_id = str(genesis_id or secrets.token_hex(16))
         manifest_payload = {
             "schema_version": SCHEMA_VERSION,
@@ -244,6 +275,8 @@ class SidecarStateStore:
             "genesis_id": genesis_id,
             "state_store_filename": "state.sqlite3",
             "fence_filename": "risk-sidecar.writer.lock",
+            "parent_fence_filename": "runtime-parent.writer.lock",
+            "cash_flow_anchor_filename": "cash-flow-anchor.json",
             "created_at": time.time(),
         }
         manifest = {
@@ -255,10 +288,10 @@ class SidecarStateStore:
             handle.flush()
             os.fsync(handle.fileno())
         AccountWriterFence.provision(paths[1])
-        connection = sqlite3.connect(paths[2])
+        AccountWriterFence.provision(paths[2])
+        connection = sqlite3.connect(paths[3])
         try:
             cls._initialize_schema(connection)
-            payload = dict(initial_payload)
             version_data = {
                 "writer_epoch": 0,
                 "owner_epoch": 0,
@@ -299,6 +332,42 @@ class SidecarStateStore:
                     time.time(),
                 ),
             )
+            ledger_start_ms = max(
+                0,
+                int(payload.get("cash_flow_deployment_start_ms", 0) or 0),
+            )
+            ledger_hash = cls._ledger_hash(
+                previous_hash="",
+                generation=0,
+                start_time_ms=ledger_start_ms,
+                complete_through_ms=ledger_start_ms - 1,
+                event_count=0,
+                total_amount=0.0,
+            )
+            connection.execute(
+                """
+                INSERT INTO cash_flow_cursor (
+                    scope, start_time_ms, complete_through_ms, generation,
+                    ledger_sha256
+                ) VALUES ('external', ?, ?, 0, ?)
+                """,
+                (ledger_start_ms, ledger_start_ms - 1, ledger_hash),
+            )
+            connection.execute(
+                """
+                INSERT INTO cash_flow_history (
+                    scope, generation, start_time_ms, complete_through_ms,
+                    event_count, total_amount, prev_ledger_sha256,
+                    ledger_sha256, committed_at
+                ) VALUES ('external', 0, ?, ?, 0, 0, '', ?, ?)
+                """,
+                (
+                    ledger_start_ms,
+                    ledger_start_ms - 1,
+                    ledger_hash,
+                    time.time(),
+                ),
+            )
             connection.commit()
         finally:
             connection.close()
@@ -308,7 +377,7 @@ class SidecarStateStore:
             "state_sha256": state_hash,
         }
         _write_json_atomic(
-            paths[3],
+            paths[4],
             {
                 "schema_version": SCHEMA_VERSION,
                 "phase": "COMMITTED",
@@ -319,6 +388,24 @@ class SidecarStateStore:
                 "sha256": _sha256({"target_head": target, "target_state": payload}),
             },
         )
+        ledger_target = {
+            "scope": "external",
+            "generation": 0,
+            "start_time_ms": ledger_start_ms,
+            "complete_through_ms": ledger_start_ms - 1,
+            "event_count": 0,
+            "total_amount": 0.0,
+            "ledger_sha256": ledger_hash,
+        }
+        _write_json_atomic(
+            paths[5],
+            {
+                "schema_version": SCHEMA_VERSION,
+                "phase": "COMMITTED",
+                "target": ledger_target,
+                "sha256": _sha256(ledger_target),
+            },
+        )
         return {
             "genesis_id": genesis_id,
             "manifest_sha256": manifest["manifest_sha256"],
@@ -327,6 +414,7 @@ class SidecarStateStore:
 
     @staticmethod
     def _initialize_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         connection.execute("PRAGMA journal_mode=DELETE")
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute("PRAGMA foreign_keys=ON")
@@ -375,12 +463,52 @@ class SidecarStateStore:
                 amount REAL NOT NULL,
                 raw_sha256 TEXT NOT NULL UNIQUE
             );
+            CREATE TABLE cash_flow_cursor (
+                scope TEXT PRIMARY KEY,
+                start_time_ms INTEGER NOT NULL,
+                complete_through_ms INTEGER NOT NULL,
+                generation INTEGER NOT NULL,
+                ledger_sha256 TEXT NOT NULL
+            );
+            CREATE TABLE cash_flow_history (
+                scope TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                start_time_ms INTEGER NOT NULL,
+                complete_through_ms INTEGER NOT NULL,
+                event_count INTEGER NOT NULL,
+                total_amount REAL NOT NULL,
+                prev_ledger_sha256 TEXT NOT NULL,
+                ledger_sha256 TEXT NOT NULL,
+                committed_at REAL NOT NULL,
+                PRIMARY KEY (scope, generation)
+            );
             """
         )
 
     @staticmethod
     def _state_hash(version_data: Mapping, payload: Mapping) -> str:
         return _sha256({"version": dict(version_data), "payload": dict(payload)})
+
+    @staticmethod
+    def _ledger_hash(
+        *,
+        previous_hash: str,
+        generation: int,
+        start_time_ms: int,
+        complete_through_ms: int,
+        event_count: int,
+        total_amount: float,
+    ) -> str:
+        return _sha256(
+            {
+                "previous_hash": str(previous_hash),
+                "generation": int(generation),
+                "start_time_ms": int(start_time_ms),
+                "complete_through_ms": int(complete_through_ms),
+                "event_count": int(event_count),
+                "total_amount": float(total_amount),
+            }
+        )
 
     @staticmethod
     def _version_from_row(row: sqlite3.Row) -> StateVersion:
@@ -407,8 +535,10 @@ class SidecarStateStore:
         for path, label in (
             (self.manifest_path, "manifest"),
             (self.fence_path, "writer_fence"),
+            (self.parent_fence_path, "parent_writer_fence"),
             (self.database_path, "state_database"),
             (self.anchor_path, "rollback_anchor"),
+            (self.cash_flow_anchor_path, "cash_flow_anchor"),
         ):
             if not path.is_file():
                 raise SidecarStateStoreError(f"{label}_missing")
@@ -426,13 +556,18 @@ class SidecarStateStore:
         self.fence.acquire()
         try:
             uri = self.database_path.as_uri() + "?mode=rw"
-            connection = sqlite3.connect(uri, uri=True)
+            connection = sqlite3.connect(
+                uri,
+                uri=True,
+                check_same_thread=False,
+            )
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA synchronous=FULL")
             connection.execute("PRAGMA foreign_keys=ON")
             if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                 raise SidecarStateStoreError("state_database_integrity_failed")
             self.connection = connection
+            self._validate_schema()
             row = self._read_head()
             if row["account_scope_id"] != self.account_scope_id:
                 raise SidecarStateStoreError("state_account_scope_mismatch")
@@ -440,7 +575,11 @@ class SidecarStateStore:
                 raise SidecarStateStoreError("state_genesis_mismatch")
             if row["deployment_id"] != self.deployment_id:
                 raise SidecarStateStoreError("state_deployment_mismatch")
-            payload = json.loads(row["payload_json"])
+            payload = _validated_state_payload(
+                json.loads(row["payload_json"]),
+                account_scope_id=self.account_scope_id,
+                deployment_id=self.deployment_id,
+            )
             current = self._version_from_row(row)
             expected_hash = self._state_hash(
                 {
@@ -453,7 +592,9 @@ class SidecarStateStore:
             )
             if current.state_sha256 != expected_hash:
                 raise SidecarStateStoreError("state_checksum_mismatch")
+            self._validate_history(row)
             self._validate_anchor(row, payload)
+            self._validate_cash_flow_ledger()
             target = self._cas(
                 current,
                 payload,
@@ -467,6 +608,81 @@ class SidecarStateStore:
         except Exception:
             self.close()
             raise
+
+    def _validate_schema(self) -> None:
+        if self.connection is None:
+            raise SidecarStateStoreError("state_store_not_open")
+        user_version = int(
+            self.connection.execute("PRAGMA user_version").fetchone()[0]
+        )
+        if user_version != SCHEMA_VERSION:
+            raise SidecarStateStoreError("state_database_schema_unsupported")
+        expected_tables = {
+            "state_head",
+            "state_history",
+            "command_receipt",
+            "cash_flow_event",
+            "cash_flow_cursor",
+            "cash_flow_history",
+        }
+        actual_tables = {
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if not expected_tables <= actual_tables:
+            raise SidecarStateStoreError("state_database_schema_incomplete")
+
+    def _validate_history(self, head: sqlite3.Row) -> None:
+        if self.connection is None:
+            raise SidecarStateStoreError("state_store_not_open")
+        rows = self.connection.execute(
+            "SELECT * FROM state_history ORDER BY head_revision"
+        ).fetchall()
+        if not rows or int(rows[0]["head_revision"]) != 0:
+            raise SidecarStateStoreError("state_history_genesis_missing")
+        previous_hash = ""
+        previous_revision = -1
+        for row in rows:
+            revision = int(row["head_revision"])
+            if revision != previous_revision + 1:
+                raise SidecarStateStoreError("state_history_revision_gap")
+            if str(row["prev_state_sha256"]) != previous_hash:
+                raise SidecarStateStoreError("state_history_chain_mismatch")
+            try:
+                payload = _validated_state_payload(
+                    json.loads(row["payload_json"]),
+                    account_scope_id=self.account_scope_id,
+                    deployment_id=self.deployment_id,
+                )
+            except (TypeError, ValueError) as exc:
+                raise SidecarStateStoreError(
+                    "state_history_payload_invalid"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise SidecarStateStoreError("state_history_payload_invalid")
+            expected_hash = self._state_hash(
+                {
+                    "writer_epoch": int(row["writer_epoch"]),
+                    "owner_epoch": int(row["owner_epoch"]),
+                    "safety_epoch": int(row["safety_epoch"]),
+                    "generation": int(row["generation"]),
+                },
+                payload,
+            )
+            state_hash = str(row["state_sha256"])
+            if state_hash != expected_hash:
+                raise SidecarStateStoreError(
+                    "state_history_checksum_mismatch"
+                )
+            previous_hash = state_hash
+            previous_revision = revision
+        if (
+            previous_revision != int(head["head_revision"])
+            or previous_hash != str(head["state_sha256"])
+        ):
+            raise SidecarStateStoreError("state_history_head_mismatch")
 
     def _validate_anchor(self, row: sqlite3.Row, payload: Mapping) -> None:
         anchor = _read_json_object(self.anchor_path, "rollback_anchor")
@@ -493,6 +709,74 @@ class SidecarStateStore:
             raise SidecarStateStoreError("rollback_or_split_brain_suspected")
         if anchor.get("phase") != "COMMITTED":
             raise SidecarStateStoreError("rollback_anchor_not_committed")
+
+    def _validate_cash_flow_ledger(self) -> None:
+        if self.connection is None:
+            raise SidecarStateStoreError("state_store_not_open")
+        cursor = self.connection.execute(
+            "SELECT * FROM cash_flow_cursor WHERE scope = 'external'"
+        ).fetchone()
+        if cursor is None:
+            raise SidecarStateStoreError("cash_flow_cursor_missing")
+        rows = self.connection.execute(
+            "SELECT * FROM cash_flow_history WHERE scope = 'external' "
+            "ORDER BY generation"
+        ).fetchall()
+        if not rows or int(rows[0]["generation"]) != 0:
+            raise SidecarStateStoreError("cash_flow_history_genesis_missing")
+        previous_hash = ""
+        previous_generation = -1
+        for row in rows:
+            generation = int(row["generation"])
+            if generation != previous_generation + 1:
+                raise SidecarStateStoreError("cash_flow_history_generation_gap")
+            if str(row["prev_ledger_sha256"]) != previous_hash:
+                raise SidecarStateStoreError("cash_flow_history_chain_mismatch")
+            expected_hash = self._ledger_hash(
+                previous_hash=previous_hash,
+                generation=generation,
+                start_time_ms=int(row["start_time_ms"]),
+                complete_through_ms=int(row["complete_through_ms"]),
+                event_count=int(row["event_count"]),
+                total_amount=float(row["total_amount"]),
+            )
+            if str(row["ledger_sha256"]) != expected_hash:
+                raise SidecarStateStoreError(
+                    "cash_flow_history_checksum_mismatch"
+                )
+            previous_hash = expected_hash
+            previous_generation = generation
+        event_count, total_amount = self.connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM cash_flow_event"
+        ).fetchone()
+        target = {
+            "scope": "external",
+            "generation": int(cursor["generation"]),
+            "start_time_ms": int(cursor["start_time_ms"]),
+            "complete_through_ms": int(cursor["complete_through_ms"]),
+            "event_count": int(event_count),
+            "total_amount": float(total_amount),
+            "ledger_sha256": str(cursor["ledger_sha256"]),
+        }
+        if (
+            previous_generation != target["generation"]
+            or previous_hash != target["ledger_sha256"]
+            or int(rows[-1]["event_count"]) != target["event_count"]
+            or float(rows[-1]["total_amount"]) != target["total_amount"]
+        ):
+            raise SidecarStateStoreError("cash_flow_history_head_mismatch")
+        anchor = _read_json_object(
+            self.cash_flow_anchor_path,
+            "cash_flow_anchor",
+        )
+        if int(anchor.get("schema_version", 0) or 0) != SCHEMA_VERSION:
+            raise SidecarStateStoreError("cash_flow_anchor_schema_unsupported")
+        if anchor.get("phase") != "COMMITTED":
+            raise SidecarStateStoreError("cash_flow_anchor_not_committed")
+        if anchor.get("target") != target:
+            raise SidecarStateStoreError("cash_flow_rollback_suspected")
+        if anchor.get("sha256") != _sha256(target):
+            raise SidecarStateStoreError("cash_flow_anchor_checksum_mismatch")
 
     @staticmethod
     def _head_dict(row: sqlite3.Row) -> dict:
@@ -535,6 +819,28 @@ class SidecarStateStore:
         owner_epoch: int | None = None,
         safety_epoch: int | None = None,
     ) -> StateVersion:
+        with self._lock:
+            return self._cas_locked(
+                expected,
+                payload,
+                event=event,
+                operation_class=operation_class,
+                writer_epoch=writer_epoch,
+                owner_epoch=owner_epoch,
+                safety_epoch=safety_epoch,
+            )
+
+    def _cas_locked(
+        self,
+        expected: StateVersion,
+        payload: Mapping,
+        *,
+        event: str,
+        operation_class: str,
+        writer_epoch: int | None = None,
+        owner_epoch: int | None = None,
+        safety_epoch: int | None = None,
+    ) -> StateVersion:
         if operation_class not in OPERATION_CLASSES:
             raise ValueError("operation_class_invalid")
         self.fence.validate()
@@ -556,7 +862,11 @@ class SidecarStateStore:
             "safety_epoch": safety_epoch,
             "generation": generation,
         }
-        payload = dict(payload)
+        payload = _validated_state_payload(
+            payload,
+            account_scope_id=self.account_scope_id,
+            deployment_id=self.deployment_id,
+        )
         target_hash = self._state_hash(version_data, payload)
         target = StateVersion(state_sha256=target_hash, **version_data)
         base_head = self._head_dict(row)
@@ -658,12 +968,205 @@ class SidecarStateStore:
         self.version = target
         return target
 
+    def cash_flow_cursor(self) -> dict:
+        with self._lock:
+            if self.connection is None:
+                raise SidecarStateStoreError("state_store_not_open")
+            row = self.connection.execute(
+                "SELECT * FROM cash_flow_cursor WHERE scope = 'external'"
+            ).fetchone()
+            if row is None:
+                raise SidecarStateStoreError("cash_flow_cursor_missing")
+            return {
+                "start_time_ms": int(row["start_time_ms"]),
+                "complete_through_ms": int(row["complete_through_ms"]),
+                "generation": int(row["generation"]),
+                "ledger_sha256": str(row["ledger_sha256"]),
+            }
+
+    def cash_flow_total(self, start_time_ms: int, end_time_ms: int) -> float:
+        start_time_ms = int(start_time_ms)
+        end_time_ms = int(end_time_ms)
+        if end_time_ms < start_time_ms:
+            return 0.0
+        with self._lock:
+            if self.connection is None:
+                raise SidecarStateStoreError("state_store_not_open")
+            value = self.connection.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM cash_flow_event "
+                "WHERE event_time_ms >= ? AND event_time_ms <= ?",
+                (start_time_ms, end_time_ms),
+            ).fetchone()[0]
+            return float(value or 0.0)
+
+    def commit_cash_flow_refresh(
+        self,
+        events,
+        *,
+        start_time_ms: int,
+        complete_through_ms: int,
+    ) -> int:
+        start_time_ms = int(start_time_ms)
+        complete_through_ms = int(complete_through_ms)
+        if start_time_ms < 0 or complete_through_ms < start_time_ms:
+            raise SidecarStateStoreError("cash_flow_interval_invalid")
+        normalized: dict[str, tuple[int, str, float, str]] = {}
+        for event in events:
+            if not isinstance(event, Mapping):
+                raise SidecarStateStoreError("cash_flow_event_invalid")
+            event_id = str(event.get("event_id", "") or "")
+            asset = str(event.get("asset", "") or "").upper()
+            raw_sha256 = str(event.get("raw_sha256", "") or "")
+            try:
+                event_time_ms = int(event["event_time_ms"])
+                amount = float(event["amount"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise SidecarStateStoreError("cash_flow_event_invalid") from exc
+            if (
+                not event_id
+                or not asset
+                or len(raw_sha256) != 64
+                or not event_time_ms >= 0
+                or not amount == amount
+                or amount in {float("inf"), float("-inf")}
+            ):
+                raise SidecarStateStoreError("cash_flow_event_invalid")
+            value = (event_time_ms, asset, amount, raw_sha256)
+            existing = normalized.get(event_id)
+            if existing is not None and existing != value:
+                raise SidecarStateStoreError("cash_flow_event_identity_collision")
+            normalized[event_id] = value
+
+        with self._lock:
+            self.fence.validate()
+            connection = self.connection
+            if connection is None:
+                raise SidecarStateStoreError("state_store_not_open")
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    "SELECT * FROM cash_flow_cursor WHERE scope = 'external'"
+                ).fetchone()
+                if cursor is None:
+                    raise SidecarStateStoreError("cash_flow_cursor_missing")
+                if complete_through_ms < int(cursor["complete_through_ms"]):
+                    raise SidecarStateStoreError("cash_flow_cursor_regression")
+                for event_id, value in normalized.items():
+                    event_time_ms, asset, amount, raw_sha256 = value
+                    existing = connection.execute(
+                        "SELECT event_time_ms, asset, amount, raw_sha256 "
+                        "FROM cash_flow_event WHERE event_id = ?",
+                        (event_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        if (
+                            int(existing[0]),
+                            str(existing[1]),
+                            float(existing[2]),
+                            str(existing[3]),
+                        ) != value:
+                            raise SidecarStateStoreError(
+                                "cash_flow_event_identity_collision"
+                            )
+                        continue
+                    raw_owner = connection.execute(
+                        "SELECT event_id FROM cash_flow_event "
+                        "WHERE raw_sha256 = ?",
+                        (raw_sha256,),
+                    ).fetchone()
+                    if raw_owner is not None:
+                        raise SidecarStateStoreError(
+                            "cash_flow_event_digest_collision"
+                        )
+                    connection.execute(
+                        "INSERT INTO cash_flow_event("
+                        "event_id, event_time_ms, asset, amount, raw_sha256"
+                        ") VALUES (?, ?, ?, ?, ?)",
+                        (event_id, event_time_ms, asset, amount, raw_sha256),
+                    )
+                event_count, total_amount = connection.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(amount), 0) "
+                    "FROM cash_flow_event"
+                ).fetchone()
+                generation = int(cursor["generation"]) + 1
+                previous_hash = str(cursor["ledger_sha256"])
+                ledger_start_ms = int(cursor["start_time_ms"])
+                ledger_hash = self._ledger_hash(
+                    previous_hash=previous_hash,
+                    generation=generation,
+                    start_time_ms=ledger_start_ms,
+                    complete_through_ms=complete_through_ms,
+                    event_count=int(event_count),
+                    total_amount=float(total_amount),
+                )
+                target = {
+                    "scope": "external",
+                    "generation": generation,
+                    "start_time_ms": ledger_start_ms,
+                    "complete_through_ms": complete_through_ms,
+                    "event_count": int(event_count),
+                    "total_amount": float(total_amount),
+                    "ledger_sha256": ledger_hash,
+                }
+                _write_json_atomic(
+                    self.cash_flow_anchor_path,
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "phase": "PREPARED",
+                        "target": target,
+                        "sha256": _sha256(target),
+                    },
+                )
+                connection.execute(
+                    "INSERT INTO cash_flow_history("
+                    "scope, generation, start_time_ms, complete_through_ms, "
+                    "event_count, total_amount, prev_ledger_sha256, "
+                    "ledger_sha256, committed_at"
+                    ") VALUES ('external', ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        generation,
+                        ledger_start_ms,
+                        complete_through_ms,
+                        int(event_count),
+                        float(total_amount),
+                        previous_hash,
+                        ledger_hash,
+                        time.time(),
+                    ),
+                )
+                connection.execute(
+                    "UPDATE cash_flow_cursor SET complete_through_ms = ?, "
+                    "generation = ?, ledger_sha256 = ? "
+                    "WHERE scope = 'external' AND generation = ?",
+                    (
+                        complete_through_ms,
+                        generation,
+                        ledger_hash,
+                        int(cursor["generation"]),
+                    ),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            _write_json_atomic(
+                self.cash_flow_anchor_path,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "phase": "COMMITTED",
+                    "target": target,
+                    "sha256": _sha256(target),
+                },
+            )
+            return generation
+
     def close(self) -> None:
-        connection = self.connection
-        self.connection = None
-        if connection is not None:
-            connection.close()
-        self.fence.release()
+        with self._lock:
+            connection = self.connection
+            self.connection = None
+            if connection is not None:
+                connection.close()
+            self.fence.release()
 
     def __enter__(self) -> SidecarStateStore:
         self.open_recover()

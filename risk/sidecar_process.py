@@ -27,7 +27,7 @@ class SidecarProcessBootstrap:
             else ""
         )
         try:
-            SidecarProtocol.validate_launch_contract(settings)
+            SidecarProtocol.validate_runtime_state_contract(settings)
             handshake_complete = True
             isolate_console_interrupts()
             api_key = str(settings.get("api_key", "") or "")

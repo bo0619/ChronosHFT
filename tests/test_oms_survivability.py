@@ -39,6 +39,7 @@ from infrastructure.single_writer_fence import (
 from infrastructure.truth_monitor import TruthMonitor
 from oms.engine import OMS
 from oms.journal import (
+    decode_legacy_journal,
     JournalCorruptionError,
     JournalWriteError,
     OMSJournal,
@@ -249,7 +250,7 @@ class OMSSurvivabilityTests(unittest.TestCase):
             order.mark_submitting()
             order.mark_pending_ack("ex-close")
             order.mark_new("ex-close", update_time=1.0, seq=1)
-            oms.orders[order.client_oid] = order
+            oms.order_store.add(order)
             oms.exchange_id_map[order.exchange_oid] = order
 
             update = ExchangeOrderUpdate(
@@ -292,7 +293,7 @@ class OMSSurvivabilityTests(unittest.TestCase):
             order.mark_submitting()
             order.mark_pending_ack("ex-nan-fill")
             order.mark_new("ex-nan-fill", update_time=1.0, seq=1)
-            oms.orders[order.client_oid] = order
+            oms.order_store.add(order)
             oms.exchange_id_map[order.exchange_oid] = order
             oms.exposure.update_open_orders(oms.orders)
             queued = []
@@ -350,7 +351,7 @@ class OMSSurvivabilityTests(unittest.TestCase):
             order.mark_submitting()
             order.mark_pending_ack("ex-unknown-status")
             order.mark_new("ex-unknown-status", update_time=1.0, seq=1)
-            oms.orders[order.client_oid] = order
+            oms.order_store.add(order)
             oms.exchange_id_map[order.exchange_oid] = order
             queued = []
             oms._queue_reconcile_request_locked = (
@@ -583,6 +584,12 @@ class OMSSurvivabilityTests(unittest.TestCase):
                 journal_file.write('{"kind":"invalid","fill_price":NaN}\n')
 
             with self.assertRaises(JournalCorruptionError):
+                decode_legacy_journal(journal_path)
+
+            with self.assertRaisesRegex(
+                JournalCorruptionError,
+                "mixed v3 and legacy layouts",
+            ):
                 OMSJournal(config)
 
     def test_journal_replay_rejects_string_encoded_nonfinite_amount(self):
@@ -799,10 +806,15 @@ class OMSSurvivabilityTests(unittest.TestCase):
             order.mark_submitting()
             order.mark_pending_ack("exchange-rearm-order")
             order.mark_new("exchange-rearm-order")
-            oms.orders[order.client_oid] = order
+            oms.order_store.add(order)
             oms.exchange_id_map[order.exchange_oid] = order
 
-            strategy = StrategyTemplate(engine, oms, name="test")
+            strategy = StrategyTemplate(
+                engine,
+                oms,
+                name="test",
+                reference_data=object(),
+            )
             strategy.active_orders[order.client_oid] = intent
             oms.halt_system("operator_test")
 
@@ -1073,7 +1085,7 @@ class OMSSurvivabilityTests(unittest.TestCase):
             active_order.mark_submitting()
             active_order.mark_pending_ack("ex-active")
             active_order.mark_new("ex-active", update_time=1.0, seq=1)
-            oms.orders[active_order.client_oid] = active_order
+            oms.order_store.add(active_order)
             oms.exchange_id_map[active_order.exchange_oid] = active_order
 
             oms.halt_system("kill:test")
@@ -1106,7 +1118,7 @@ class OMSSurvivabilityTests(unittest.TestCase):
             active_order.mark_submitting()
             active_order.mark_pending_ack("ex-active")
             active_order.mark_new("ex-active", update_time=1.0, seq=1)
-            oms.orders[active_order.client_oid] = active_order
+            oms.order_store.add(active_order)
             oms.exchange_id_map[active_order.exchange_oid] = active_order
 
             oms.state = LifecycleState.RECONCILING
@@ -1131,7 +1143,7 @@ class OMSSurvivabilityTests(unittest.TestCase):
             order.mark_submitting()
             order.mark_pending_ack("ex-active")
             order.mark_new("ex-active", update_time=1.0, seq=1)
-            oms.orders[order.client_oid] = order
+            oms.order_store.add(order)
             oms.exchange_id_map[order.exchange_oid] = order
 
             oms.halt_system("operator:test")
@@ -1165,7 +1177,7 @@ class OMSSurvivabilityTests(unittest.TestCase):
                 OrderIntent("alpha", "BTCUSDT", Side.BUY, 100.0, 1.0),
             )
             order.mark_submitting()
-            oms.orders[order.client_oid] = order
+            oms.order_store.add(order)
 
             oms.on_exchange_update(
                 Event(
@@ -1207,7 +1219,7 @@ class OMSSurvivabilityTests(unittest.TestCase):
             order.mark_submitting()
             order.mark_pending_ack("ex-cancel-unknown")
             order.mark_new("ex-cancel-unknown", update_time=1.0, seq=1)
-            oms.orders[order.client_oid] = order
+            oms.order_store.add(order)
             oms.exchange_id_map[order.exchange_oid] = order
             oms.exposure.update_open_orders(oms.orders)
 

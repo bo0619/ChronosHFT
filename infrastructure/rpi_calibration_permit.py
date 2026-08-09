@@ -14,6 +14,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 
+from governance.state_paths import validate_live_state_path_bindings
 from strategy.model_readiness import (
     deployment_config_sha256,
     implementation_sha256_for_model,
@@ -397,6 +398,7 @@ def load_and_validate_rpi_calibration_permit(
     config: Mapping[str, Any],
     *,
     config_path: str | Path,
+    target_config_normalizer: Callable[[dict[str, Any]], Mapping[str, Any]],
     now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     """Load the target config and permit named by the calibration config."""
@@ -436,12 +438,12 @@ def load_and_validate_rpi_calibration_permit(
         "target deployment config",
         max_bytes=4_194_304,
     )
-    try:
-        from infrastructure.config_scaling import (
-            normalize_root_config_preapproval,
+    if not callable(target_config_normalizer):
+        raise RpiCalibrationPermitError(
+            "target deployment config normalizer must be injected"
         )
-
-        target_config = normalize_root_config_preapproval(raw_target_config)
+    try:
+        target_config = target_config_normalizer(raw_target_config)
     except Exception as exc:
         raise RpiCalibrationPermitError(
             "cannot normalize target deployment config before permit "
@@ -747,10 +749,6 @@ def _validate_cross_config_state_isolation(
     target_base_dir: str | Path | None,
 ) -> None:
     try:
-        from infrastructure.live_config_guard import (
-            validate_live_state_path_bindings,
-        )
-
         calibration_paths = validate_live_state_path_bindings(
             calibration_config,
             base_dir=calibration_base_dir,

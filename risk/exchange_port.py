@@ -150,6 +150,8 @@ class FlatProof:
     writer_epoch: int
     owner_epoch: int
     safety_epoch: int
+    generation: int
+    state_sha256: str
     first_truth_sequence: int
     last_truth_sequence: int
     sample_count: int
@@ -169,11 +171,15 @@ class FlatProof:
             and self.writer_epoch == version.writer_epoch
             and self.owner_epoch == version.owner_epoch
             and self.safety_epoch == version.safety_epoch
+            and self.generation == version.generation
+            and self.state_sha256 == version.state_sha256
         )
 
 
 class RuntimeClock(Protocol):
     def monotonic(self) -> float: ...
+
+    def wall_time(self) -> float: ...
 
     def utc_now_ms(self) -> int: ...
 

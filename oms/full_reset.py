@@ -50,6 +50,7 @@ class OMSFullResetCoordinator(OMSComponent):
             "halt_system",
             "lock",
             "order_monitor",
+            "order_store",
             "orders",
             "query_open_orders",
             "trade_cursors",
@@ -211,7 +212,9 @@ class OMSFullResetCoordinator(OMSComponent):
                 )
 
             with self.lock:
-                previously_tracked_symbols = set(self.exposure.net_positions.keys())
+                previously_tracked_symbols = set(
+                    self.exposure.tracked_symbols()
+                )
                 reset_terminal_orders = []
                 reset_time = time.time()
                 for order in self.orders.values():
@@ -227,15 +230,11 @@ class OMSFullResetCoordinator(OMSComponent):
                     )
                     self._write_tombstone(order)
                     reset_terminal_orders.append(order)
-                self.orders.clear()
+                self.order_store.clear()
                 self._submit_settlement_inflight_oids.clear()
                 self._submit_cancel_requested_oids.clear()
                 self.exchange_id_map.clear()
-                self.exposure.net_positions.clear()
-                self.exposure.avg_prices.clear()
-                self.exposure.open_buy_qty.clear()
-                self.exposure.open_sell_qty.clear()
-                self.exposure.update_open_orders(self.orders)
+                self.exposure.reset_account_ledgers(self.orders)
 
                 for pos in positions:
                     amount = float(pos["positionAmt"])

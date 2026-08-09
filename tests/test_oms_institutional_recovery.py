@@ -2,6 +2,7 @@ import threading
 import time
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from event.type import (
     CommandOutcome,
@@ -21,6 +22,12 @@ from event.type import (
 from oms.engine import OMS
 from oms.order import Order
 from oms.order_manager import OrderManager
+from oms.order_submission import OMSOrderSubmission
+from oms.submission_transaction import (
+    SubmissionState,
+    SubmissionTerminalOutcome,
+    SubmissionTransaction,
+)
 
 
 class DummyEngine:
@@ -126,13 +133,21 @@ class InstitutionalRecoveryTests(unittest.TestCase):
         order.mark_submitting()
         order.mark_pending_ack(exchange_oid)
         order.mark_new(exchange_oid, update_time=1.0)
-        oms.orders[client_oid] = order
+        oms.order_store.add(order)
         oms.exchange_id_map[exchange_oid] = order
         oms.exposure.update_open_orders(oms.orders)
         return order
 
     def test_submit_transport_timeout_remains_tracked_as_unknown(self):
         oms, gateway = self.make_live_oms()
+        transactions = []
+        original_factory = OMSOrderSubmission._new_submission_transaction
+
+        def capture_transaction(component, **kwargs):
+            transaction = original_factory(component, **kwargs)
+            transactions.append(transaction)
+            return transaction
+
         try:
             gateway.send_result = GatewayCommandResult(
                 CommandOutcome.UNKNOWN,
@@ -142,15 +157,88 @@ class InstitutionalRecoveryTests(unittest.TestCase):
             oms.validator.validate_params = lambda _intent: (True, "")
             oms.exposure.check_risk = lambda *_args, **_kwargs: (True, "")
 
-            result = oms.submit_order(
-                OrderIntent("test", "BTCUSDT", Side.BUY, 100.0, 1.0)
-            )
+            with patch.object(
+                OMSOrderSubmission,
+                "_new_submission_transaction",
+                capture_transaction,
+            ):
+                result = oms.submit_order(
+                    OrderIntent("test", "BTCUSDT", Side.BUY, 100.0, 1.0)
+                )
 
             self.assertTrue(result.accepted)
             self.assertEqual(result.reason, "submit_outcome_unknown")
             self.assertEqual(oms.orders[result.client_oid].status, OrderStatus.SUBMIT_UNKNOWN)
             self.assertIn(result.client_oid, oms.orders)
             self.assertTrue(oms.get_symbol_freeze_reason("BTCUSDT").startswith("order_truth:"))
+            self.assertEqual(len(transactions), 1)
+            snapshot = transactions[0].snapshot()
+            self.assertEqual(snapshot.history, tuple(SubmissionState))
+            self.assertEqual(
+                snapshot.terminal_outcome,
+                SubmissionTerminalOutcome.UNKNOWN,
+            )
+            gate = oms.get_outbound_gate_snapshot()
+            self.assertEqual(gate["order_sends_inflight"], 0)
+            self.assertEqual(gate["risk_sends_inflight"], 0)
+        finally:
+            oms.stop()
+
+    def test_settled_phase_fault_still_releases_the_outbound_permit(self):
+        oms, _gateway = self.make_live_oms()
+        transactions = []
+
+        def fail_settled(next_state):
+            if next_state is SubmissionState.SETTLED_DURABLE:
+                raise OSError("fault:SETTLED_DURABLE")
+
+        def transaction_factory(
+            _component,
+            *,
+            client_oid,
+            admission_policy,
+        ):
+            transaction = SubmissionTransaction(
+                transaction_id=f"SUBMIT:{client_oid}",
+                client_oid=client_oid,
+                admission_policy=admission_policy,
+                fault_injector=fail_settled,
+            )
+            transactions.append(transaction)
+            return transaction
+
+        try:
+            oms.validator.validate_params = lambda _intent: (True, "")
+            oms.exposure.check_risk = lambda *_args, **_kwargs: (True, "")
+            with (
+                patch.object(
+                    OMSOrderSubmission,
+                    "_new_submission_transaction",
+                    transaction_factory,
+                ),
+                self.assertRaisesRegex(OSError, "SETTLED_DURABLE"),
+            ):
+                oms.submit_order(
+                    OrderIntent(
+                        "test",
+                        "BTCUSDT",
+                        Side.BUY,
+                        100.0,
+                        1.0,
+                    )
+                )
+
+            self.assertEqual(len(transactions), 1)
+            snapshot = transactions[0].snapshot()
+            self.assertTrue(snapshot.finalized)
+            self.assertEqual(snapshot.state, SubmissionState.TERMINAL)
+            self.assertEqual(
+                snapshot.terminal_outcome,
+                SubmissionTerminalOutcome.ACKNOWLEDGED,
+            )
+            gate = oms.get_outbound_gate_snapshot()
+            self.assertEqual(gate["order_sends_inflight"], 0)
+            self.assertEqual(gate["risk_sends_inflight"], 0)
         finally:
             oms.stop()
 
@@ -519,7 +607,7 @@ class InstitutionalRecoveryTests(unittest.TestCase):
             )
             order.mark_submitting()
             order.mark_submit_unknown()
-            oms.orders[order.client_oid] = order
+            oms.order_store.add(order)
             oms.freeze_symbol(
                 "BTCUSDT",
                 "order_truth:submit_unknown:oid-unknown",
@@ -559,7 +647,7 @@ class InstitutionalRecoveryTests(unittest.TestCase):
             order.mark_submit_unknown()
             order.updated_at = time.time() - 2.0
             order.updated_monotonic = time.perf_counter() - 2.0
-            oms.orders[order.client_oid] = order
+            oms.order_store.add(order)
             oms.freeze_symbol(
                 "BTCUSDT",
                 "order_truth:submit_unknown:oid-absent",

@@ -1,0 +1,14 @@
+{
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "risk.independent_supervisor",
+  "version": 1,
+  "risk": {
+    "independent_supervisor": {
+      "enabled": false,
+      "state_store_root": "storage/risk/accounts/paper-disabled",
+      "account_scope_id": "paper-local-simulator",
+      "state_genesis_id": "paper-local-disabled-v1",
+      "cash_flow_deployment_start_ms": 1
+    }
+  }
+}

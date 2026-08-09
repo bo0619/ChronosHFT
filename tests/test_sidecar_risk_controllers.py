@@ -7,6 +7,7 @@ from risk.independent_supervisor import RiskSidecarCore
 from risk.sidecar_account_risk import SidecarAccountRiskController
 from risk.sidecar_funding_risk import SidecarFundingRiskController
 from risk.sidecar_policy import RiskSidecarPolicy
+from risk.sidecar_state_store import SidecarStateStore
 
 
 def _finite_float(value, label):
@@ -166,7 +167,7 @@ def test_funding_controller_recovers_only_from_owned_observation_state():
     assert controller.observations == {}
 
 
-def test_core_compatibility_fields_target_controller_owned_state():
+def test_core_controllers_own_their_mutable_state():
     core = RiskSidecarCore(
         object(),
         {
@@ -176,49 +177,61 @@ def test_core_compatibility_fields_target_controller_owned_state():
         now=10.0,
     )
 
-    core.day_start_equity = 975.0
-    core.deployment_loss = 12.5
-    core.deployment_id = "restored-deployment"
-    core.funding_action = "REDUCE_ONLY"
+    account_risk = core.observation.account_risk
+    funding_risk = core.observation.funding_risk
+    account_risk.state.day_start_equity = 975.0
+    account_risk.state.deployment_loss = 12.5
+    account_risk.state.deployment_id = "restored-deployment"
+    funding_risk.action = "REDUCE_ONLY"
 
-    assert core.account_risk.state.day_start_equity == 975.0
-    assert core.account_risk.state.deployment_loss == 12.5
-    assert core.account_risk.state.deployment_id == "restored-deployment"
-    assert core.funding_risk.action == "REDUCE_ONLY"
-    assert "day_start_equity" not in core.__dict__
-    assert "funding_action" not in core.__dict__
+    assert account_risk.state.day_start_equity == 975.0
+    assert account_risk.state.deployment_loss == 12.5
+    assert account_risk.state.deployment_id == "restored-deployment"
+    assert funding_risk.action == "REDUCE_ONLY"
+    assert not hasattr(core, "day_start_equity")
+    assert not hasattr(core, "funding_action")
 
 
 def test_durable_deployment_identity_restores_into_controller_state():
     with tempfile.TemporaryDirectory() as tmpdir:
-        state_path = str(Path(tmpdir) / "sidecar-state.json")
-        RiskSidecarCore(
-            object(),
-            {
-                "symbols": ["BTCUSDT"],
-                "deployment_id": "deployment-a",
-                "state_path": state_path,
-                "state_required": True,
-                "state_fsync": False,
+        state_root = Path(tmpdir) / "sidecar-v2"
+        SidecarStateStore.provision(
+            state_root,
+            account_scope_id="account-a",
+            deployment_id="deployment-a",
+            genesis_id="genesis-a",
+            initial_payload={
+                "schema_version": 2,
+                "kill_latched": True,
+                "stage": "KILL",
             },
+        )
+        settings = {
+            "symbols": ["BTCUSDT"],
+            "deployment_id": "deployment-a",
+            "state_store_root": str(state_root),
+            "account_scope_id": "account-a",
+            "state_genesis_id": "genesis-a",
+        }
+        first = RiskSidecarCore(
+            object(),
+            settings,
             now=10.0,
         )
+        first.close()
 
         recovered = RiskSidecarCore(
             object(),
-            {
-                "symbols": ["BTCUSDT"],
-                "state_path": state_path,
-                "state_required": True,
-                "state_fsync": False,
-            },
+            settings,
             now=11.0,
         )
-
-    assert recovered.state_recovered is True
-    assert recovered.deployment_id == "deployment-a"
-    assert recovered.account_risk.state.deployment_id == "deployment-a"
-    metrics = recovered.account_risk.fallback_metrics(
-        {"positions": [], "open_orders": []}
-    )
-    assert metrics["deployment_id"] == "deployment-a"
+        try:
+            assert recovered.state_recovered is True
+            account_risk = recovered.observation.account_risk
+            assert account_risk.state.deployment_id == "deployment-a"
+            metrics = account_risk.fallback_metrics(
+                {"positions": [], "open_orders": []}
+            )
+            assert metrics["deployment_id"] == "deployment-a"
+        finally:
+            recovered.close()

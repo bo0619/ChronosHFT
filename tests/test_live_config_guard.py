@@ -178,12 +178,13 @@ def safe_live_config():
                 "api_key": "risk-key",
                 "api_secret": "risk-secret",
                 "flatten_enabled": True,
-                "state_required": True,
-                "state_fsync": True,
-                "state_path": (
+                "state_store_root": (
                     "storage/live/canary-2026-07-23-001/"
-                    "risk_supervisor_state.json"
+                    "risk-sidecar-v2"
                 ),
+                "account_scope_id": "account-scope-test-001",
+                "state_genesis_id": "genesis-test-001",
+                "cash_flow_deployment_start_ms": 1_753_248_000_000,
                 "daily_loss_enabled": True,
                 "clock_sync_enabled": True,
                 "liquidation_proximity_enabled": True,
@@ -385,6 +386,7 @@ def validate_rpi_calibration_guard(config):
         return validate_live_runtime_config(
             config,
             config_path="config.json",
+            target_config_normalizer=lambda raw: raw,
         )
 
 
@@ -659,6 +661,7 @@ class LiveConfigGuardTests(unittest.TestCase):
                 validate_live_runtime_config(
                     config,
                     config_path="config.json",
+                    target_config_normalizer=lambda raw: raw,
                 )
 
     def test_rpi_calibration_hard_caps_fail_closed(self):
@@ -892,7 +895,7 @@ class LiveConfigGuardTests(unittest.TestCase):
             validate_live_state_path_bindings(traversal)
 
         aliased = safe_live_config()
-        aliased["risk"]["independent_supervisor"]["state_path"] = (
+        aliased["risk"]["independent_supervisor"]["state_store_root"] = (
             aliased["oms"]["journal_path"]
         )
         with self.assertRaisesRegex(ValueError, "different files"):

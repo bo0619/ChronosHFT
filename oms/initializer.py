@@ -6,7 +6,7 @@ import math
 import threading
 from collections import deque
 
-from event.type import LifecycleState, OMSCapabilityMode
+from event.type import OMSCapabilityMode
 from infrastructure.single_writer_fence import SingleWriterFence
 
 from .account_manager import AccountManager
@@ -17,14 +17,17 @@ from .cancellation_manager import OMSCancellationManager
 from .capability_manager import OMSCapabilityManager
 from .component import OMSComponent
 from .exchange_event_processor import OMSExchangeEventProcessor
-from .exposure import ExposureManager
+from .exposure import ExposureStore
 from .full_reset import OMSFullResetCoordinator
 from .guard_manager import OMSGuardManager
+from .guard_store import GuardStore
 from .journal import OMSJournal
 from .journal_rebuilder import OMSJournalRebuilder
 from .lifecycle_controller import OMSLifecycleController
+from .lifecycle_store import LifecycleStore
 from .order_manager import OrderManager
 from .order_policy import OMSOrderPolicy
+from .order_store import OrderStore
 from .order_submission import OMSOrderSubmission
 from .outbound_budget import OutboundMessageBudget
 from .outbound_gate import OMSOutboundGate
@@ -51,7 +54,6 @@ class OMSInitializer(OMSComponent):
             "_exchange_account_event_time",
             "_exchange_position_event_time",
             "_known_account_order_symbols",
-            "_lifecycle_generation",
             "_max_pending_reconcile_requests",
             "_order_truth_resolution_inflight",
             "_outbound_all_order_seal_reason",
@@ -139,12 +141,11 @@ class OMSInitializer(OMSComponent):
             "full_reset_coordinator",
             "gateway",
             "guard_manager",
+            "guard_store",
             "journal",
             "journal_rebuilder",
             "last_emergency_flatten_ts",
             "last_external_cash_flow_poll_at",
-            "last_freeze_reason",
-            "last_halt_reason",
             "last_reconcile_failure_ts",
             "last_reconcile_request_ts",
             "last_risk_control_heartbeat_monotonic",
@@ -153,9 +154,9 @@ class OMSInitializer(OMSComponent):
             "last_venue_dead_man_success_monotonic",
             "last_venue_dead_man_success_time",
             "lifecycle_controller",
+            "lifecycle_store",
             "local_self_cross_check_enabled",
             "lock",
-            "manual_rearm_required",
             "margin_health_enabled",
             "margin_health_require_snapshot",
             "margin_reduce_only_ratio",
@@ -178,8 +179,8 @@ class OMSInitializer(OMSComponent):
             "mode_override_reason",
             "order_monitor",
             "order_policy",
+            "order_store",
             "order_submission",
-            "orders",
             "outbound_gate",
             "outbound_gate_drain_timeout_sec",
             "outbound_message_budget_enabled",
@@ -217,11 +218,8 @@ class OMSInitializer(OMSComponent):
             "snapshot_max_attempts",
             "snapshot_settle_interval_sec",
             "snapshot_stability_required",
-            "state",
-            "strategy_guards",
             "strategy_risk_budgets",
             "strategy_risk_budgets_enabled",
-            "strategy_symbol_guards",
             "submit_settlement",
             "symbol_guard_epoch_counters",
             "symbol_guard_epochs",
@@ -273,7 +271,14 @@ class OMSInitializer(OMSComponent):
         }
     )
 
-    def initialize(self, event_engine, gateway, config) -> None:
+    def initialize(
+        self,
+        event_engine,
+        gateway,
+        config,
+        *,
+        market_cache=None,
+    ) -> None:
         self.event_engine = event_engine
         self.gateway = gateway
         self.config = config
@@ -282,7 +287,12 @@ class OMSInitializer(OMSComponent):
         target_position_mode = self._configure_order_controls(config, oms_cfg)
         self._initialize_shared_state(config)
         self._configure_account_and_risk(config, oms_cfg, target_position_mode)
-        self._initialize_components(event_engine, gateway, config)
+        self._initialize_components(
+            event_engine,
+            gateway,
+            config,
+            market_cache=market_cache,
+        )
         self._configure_recovery_and_outbound(config, oms_cfg)
         self._initialize_paper_trade_database(config)
         try:
@@ -424,11 +434,18 @@ class OMSInitializer(OMSComponent):
         return target_position_mode
 
     def _initialize_shared_state(self, config) -> None:
-        self.state = LifecycleState.BOOTSTRAP
-        self._lifecycle_generation = 0
-
         oms_cfg = config.get("oms", {})
         oms_cfg = oms_cfg if isinstance(oms_cfg, dict) else {}
+        terminal_order_limit = oms_cfg.get("tombstone_max", 2000)
+        if (
+            isinstance(terminal_order_limit, bool)
+            or not isinstance(terminal_order_limit, int)
+            or terminal_order_limit <= 0
+        ):
+            raise ValueError("oms.tombstone_max must be a positive integer")
+        self.lifecycle_store = LifecycleStore()
+        self.order_store = OrderStore(terminal_limit=terminal_order_limit)
+
         event_log_max = oms_cfg.get("event_log_max", 2048)
         if (
             isinstance(event_log_max, bool)
@@ -439,7 +456,6 @@ class OMSInitializer(OMSComponent):
         self.event_log_max = event_log_max
         self.event_log = deque(maxlen=event_log_max)
         self.event_log_evictions = 0
-        self.orders = {}
         # Cancels received during submit settlement either fence the POST or
         # run once settlement establishes whether the order can be live.
         self._submit_settlement_inflight_oids = set()
@@ -454,8 +470,7 @@ class OMSInitializer(OMSComponent):
         self.venue_guard_records = {}
         self.venue_guard_epochs = {}
         self.venue_guard_epoch_counters = {}
-        self.strategy_guards = {}
-        self.strategy_symbol_guards = {}
+        self.guard_store = GuardStore()
         self.lock = threading.RLock()
         self._outbound_gate_condition = threading.Condition()
         self._outbound_gate_open = False
@@ -728,9 +743,11 @@ class OMSInitializer(OMSComponent):
         event_engine,
         gateway,
         config,
+        *,
+        market_cache=None,
     ) -> None:
         self.validator = OrderValidator(config)
-        self.exposure = ExposureManager()
+        self.exposure = ExposureStore(market_cache=market_cache)
         self.account = AccountManager(event_engine, self.exposure, config)
         self.account_truth = self._spawn_component(OMSAccountTruth)
         self.order_monitor = OrderManager(
@@ -752,10 +769,7 @@ class OMSInitializer(OMSComponent):
                 "RPI calibration requires an enabled, fsync-backed, "
                 "integrity-checked OMS journal with startup replay"
             )
-        self.TOMBSTONE_MAX = config.get("oms", {}).get(
-            "tombstone_max",
-            2000,
-        )
+        self.TOMBSTONE_MAX = self.order_store.terminal_limit
         self.terminated_oids = set()
         self.terminated_oid_queue = deque()
         self.reconcile_retry_scheduled = False
@@ -767,9 +781,6 @@ class OMSInitializer(OMSComponent):
         self.rest_confirmed_execution_ids = set()
         self.trade_tail_verification_inflight = set()
         self.trade_tail_expected_ids = {}
-        self.manual_rearm_required = False
-        self.last_freeze_reason = ""
-        self.last_halt_reason = ""
         self.recovered_guard_cleanup_pending = False
         self._recovered_guard_cleanup_snapshot = None
         self.rpi_calibration_replay = self._spawn_component(

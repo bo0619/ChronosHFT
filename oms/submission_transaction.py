@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from threading import Lock
+from threading import Condition, Lock
 from typing import Generic, Protocol, TypeVar
 
 
@@ -96,8 +96,12 @@ class SubmissionTransaction:
         self._terminal_outcome: SubmissionTerminalOutcome | None = None
         self._leases: list[tuple[str, Cleanup]] = []
         self._gate_cleanup: GateCleanup | None = None
+        self._gate_failure: tuple[str, BaseException] | None = None
         self._finalized = False
+        self._finalizing = False
+        self._cleanup_complete = False
         self._lock = Lock()
+        self._condition = Condition(self._lock)
 
     @property
     def state(self) -> SubmissionState:
@@ -110,9 +114,13 @@ class SubmissionTransaction:
             return self._permit_epoch
 
     @property
+    def admission_policy(self) -> SubmissionAdmissionPolicy:
+        return self._admission_policy
+
+    @property
     def finalized(self) -> bool:
         with self._lock:
-            return self._finalized
+            return self._cleanup_complete
 
     def snapshot(self) -> SubmissionStateSnapshot:
         with self._lock:
@@ -124,7 +132,7 @@ class SubmissionTransaction:
                 history=tuple(self._history),
                 permit_epoch=self._permit_epoch,
                 terminal_outcome=self._terminal_outcome,
-                finalized=self._finalized,
+                finalized=self._cleanup_complete,
             )
 
     def bind_gate_cleanup(self, cleanup: GateCleanup) -> None:
@@ -137,6 +145,22 @@ class SubmissionTransaction:
                 raise SubmissionTransitionError("gate cleanup already bound")
             self._gate_cleanup = cleanup
 
+    def record_gate_failure(
+        self,
+        context: str,
+        error: BaseException,
+    ) -> None:
+        normalized_context = str(context).strip()
+        if not normalized_context:
+            raise ValueError("gate failure context is required")
+        with self._lock:
+            if self._finalized:
+                raise SubmissionTransitionError(
+                    "cannot record gate failure after finalization"
+                )
+            if self._gate_failure is None:
+                self._gate_failure = (normalized_context, error)
+
     def prepared_durable(self) -> None:
         self._advance(SubmissionState.PREPARED_DURABLE)
 
@@ -147,7 +171,6 @@ class SubmissionTransaction:
     ) -> None:
         if permit_epoch is None:
             raise SubmissionTransitionError("permit epoch is required")
-        self._inject(SubmissionState.PERMIT_ACQUIRED)
         with self._lock:
             if self._state is not SubmissionState.PREPARED_DURABLE:
                 self._raise_bad_transition(SubmissionState.PERMIT_ACQUIRED)
@@ -155,6 +178,14 @@ class SubmissionTransaction:
                 raise SubmissionTransitionError("permit already acquired")
             self._permit_epoch = int(permit_epoch)
             self._leases.append(("outbound-permit", release))
+        # Register the externally acquired permit before the phase barrier.
+        # A fault at the barrier can then be finalized without leaking it.
+        self._inject(SubmissionState.PERMIT_ACQUIRED)
+        with self._lock:
+            if self._finalized:
+                self._raise_bad_transition(SubmissionState.PERMIT_ACQUIRED)
+            if self._state is not SubmissionState.PREPARED_DURABLE:
+                self._raise_bad_transition(SubmissionState.PERMIT_ACQUIRED)
             self._state = SubmissionState.PERMIT_ACQUIRED
             self._history.append(self._state)
 
@@ -192,18 +223,28 @@ class SubmissionTransaction:
         may both call it. The first call owns the terminal outcome.
         """
 
-        with self._lock:
-            if self._finalized:
+        if bool(gate_failure_context) != (gate_failure is not None):
+            raise ValueError(
+                "gate failure context and exception must be supplied together"
+            )
+
+        with self._condition:
+            if self._finalized or self._finalizing:
+                while not self._cleanup_complete:
+                    self._condition.wait()
                 return
-        self._inject(SubmissionState.TERMINAL)
-        with self._lock:
-            if self._finalized:
-                return
-            if bool(gate_failure_context) != (gate_failure is not None):
-                raise ValueError(
-                    "gate failure context and exception must be supplied together"
-                )
+            self._finalizing = True
+
+        injection_error: BaseException | None = None
+        try:
+            self._inject(SubmissionState.TERMINAL)
+        except BaseException as exc:
+            # Terminal fault injection must never bypass resource release.
+            injection_error = exc
+
+        with self._condition:
             gate_cleanup = self._gate_cleanup
+            recorded_gate_failure = self._gate_failure
             leases = tuple(reversed(self._leases))
             self._leases.clear()
             self._terminal_outcome = outcome
@@ -212,18 +253,41 @@ class SubmissionTransaction:
             self._finalized = True
 
         errors: list[BaseException] = []
-        if gate_failure is not None and gate_cleanup is not None:
-            try:
-                gate_cleanup(gate_failure_context, gate_failure)
-            except BaseException as exc:
-                errors.append(exc)
-        for _name, release in leases:
-            try:
-                release()
-            except BaseException as exc:
-                errors.append(exc)
+        gate_cleanup_attempted = False
+        try:
+            effective_gate_failure = (
+                (gate_failure_context, gate_failure)
+                if gate_failure is not None
+                else recorded_gate_failure
+            )
+            if effective_gate_failure is not None and gate_cleanup is not None:
+                gate_cleanup_attempted = True
+                try:
+                    gate_cleanup(*effective_gate_failure)
+                except BaseException as exc:
+                    errors.append(exc)
+            for _name, release in leases:
+                try:
+                    release()
+                except BaseException as exc:
+                    errors.append(exc)
+            if errors and gate_cleanup is not None and not gate_cleanup_attempted:
+                try:
+                    gate_cleanup("submission_resource_cleanup", errors[0])
+                except BaseException as exc:
+                    errors.append(exc)
+        finally:
+            with self._condition:
+                self._cleanup_complete = True
+                self._finalizing = False
+                self._condition.notify_all()
         if errors:
-            raise SubmissionFinalizationError(tuple(errors))
+            cleanup_error = SubmissionFinalizationError(tuple(errors))
+            if injection_error is not None:
+                raise cleanup_error from injection_error
+            raise cleanup_error
+        if injection_error is not None:
+            raise injection_error
 
     def _advance(self, target: SubmissionState) -> None:
         self._inject(target)

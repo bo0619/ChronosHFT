@@ -39,6 +39,10 @@ tests/*
 !tests/test_oms_durable_ledger.py
 !tests/test_oms_components.py
 !tests/test_oms_component_boundaries.py
+!tests/test_guard_store.py
+!tests/test_exposure_store.py
+!tests/test_quote_decision.py
+!tests/test_adaptive_pipeline.py
 !tests/test_exchange_snapshot.py
 !tests/test_oms_risk_port.py
 !tests/test_paper_gateway.py
@@ -109,6 +113,16 @@ tests/*
 !tests/test_sidecar_status.py
 !tests/test_sidecar_transport.py
 !tests/test_sidecar_risk_controllers.py
+!tests/test_sidecar_state_store.py
+!tests/test_sidecar_cash_flow_ledger.py
+!tests/test_sidecar_flat_proof.py
+!tests/test_sidecar_parent_fence.py
+!tests/test_runtime_migration.py
+!tests/test_submission_transaction.py
+!tests/test_lifecycle_store.py
+!tests/test_order_store.py
+!tests/test_governance_dependencies.py
+!tests/test_governance_release.py
 !tests/test_venue_dms.py
 !tests/test_risk_state_repository.py
 !tests/test_risk_controllers.py

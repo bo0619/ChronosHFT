@@ -20,6 +20,7 @@
     {"path": "config/system/time_sync.json", "fragment": "system.time_sync", "version": 1},
     {"path": "config/account.json", "fragment": "account", "version": 1},
     {"path": "config/risk/core.json", "fragment": "risk.core", "version": 1},
+    {"path": "config/risk/independent_supervisor.json", "fragment": "risk.independent_supervisor", "version": 1},
     {"path": "config/risk/limits.json", "fragment": "risk.limits", "version": 1},
     {"path": "config/risk/price_sanity.json", "fragment": "risk.price_sanity", "version": 1},
     {"path": "config/risk/technical_health.json", "fragment": "risk.technical_health", "version": 1},

@@ -44,6 +44,7 @@ class OMSJournalRebuilder(OMSComponent):
             "journal",
             "lock",
             "order_monitor",
+            "order_store",
             "orders",
             "terminated_oid_queue",
             "terminated_oids",
@@ -898,20 +899,19 @@ class OMSJournalRebuilder(OMSComponent):
         )
 
         with self.lock:
-            self.orders.clear()
             self.exchange_id_map.clear()
             self.execution_ids.clear()
             self.terminated_oids.clear()
             self.terminated_oid_queue.clear()
-            self.exposure.strategy_net_positions.clear()
-            self.exposure.strategy_avg_prices.clear()
-            self.exposure.strategy_open_buy_qty.clear()
-            self.exposure.strategy_open_sell_qty.clear()
-            self.exposure.strategy_net_positions.update(strategy_positions)
-            self.exposure.strategy_avg_prices.update(strategy_average_prices)
+            self.exposure.restore_strategy_ledgers(
+                strategy_positions,
+                strategy_average_prices,
+            )
             self.execution_ids.update(retained_execution_ids)
             recovered_terminal_ids = 0
             recovered_active_orders = 0
+            recovered_active_order_values = []
+            recovered_active_order_ids = set()
             for client_oid, payload in latest_order_records.items():
                 try:
                     order = Order.from_record(payload)
@@ -945,7 +945,8 @@ class OMSJournalRebuilder(OMSComponent):
                     order.mark_cancel_unknown("recovered_inflight_cancel")
 
                 if order.is_active():
-                    self.orders[order.client_oid] = order
+                    recovered_active_order_values.append(order)
+                    recovered_active_order_ids.add(order.client_oid)
                     if order.exchange_oid:
                         self.exchange_id_map[order.exchange_oid] = order
                     self.order_monitor.recover_order(order)
@@ -962,7 +963,7 @@ class OMSJournalRebuilder(OMSComponent):
 
             for terminal_oid in terminal_order_oids:
                 if (
-                    terminal_oid in self.orders
+                    terminal_oid in recovered_active_order_ids
                     or terminal_oid in self.exchange_id_map
                     or terminal_oid in self.terminated_oids
                 ):
@@ -971,6 +972,7 @@ class OMSJournalRebuilder(OMSComponent):
                 recovered_terminal_ids += 1
 
             self.execution_ids.intersection_update(retained_execution_ids)
+            self.order_store.replace_active(recovered_active_order_values)
             self.exposure.update_open_orders(self.orders)
             self.account.calculate()
 

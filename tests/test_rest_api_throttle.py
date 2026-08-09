@@ -31,6 +31,7 @@ from gateway.binance.constants import (
 from gateway.binance.rest_api import BinanceRestApi
 from oms.engine import OMS
 from oms.order import Order
+from oms.order_store import OrderStore
 from oms.validator import OrderValidator
 from scripts.list_binance_rpi_contracts import (
     render_csv,
@@ -490,7 +491,7 @@ class RPICoreIntegrationTests(unittest.TestCase):
 
     def test_recovery_and_snapshot_preserve_rpi_semantics(self):
         oms = object.__new__(OMS)
-        oms.orders = {}
+        oms.order_store = OrderStore()
         oms.exchange_id_map = {}
         oms._rpi_calibration = {"enabled": False}
         oms._audit = lambda *args, **kwargs: None
@@ -530,7 +531,8 @@ class RPICoreIntegrationTests(unittest.TestCase):
         )
         resting.mark_submitting()
         resting.mark_new(exchange_oid="exchange-rpi-resting")
-        oms.orders = {resting.client_oid: resting}
+        oms.order_store = OrderStore()
+        oms.order_store.add(resting)
         incoming = OrderIntent(
             "alpha", "LTCUSDT", Side.BUY, 101.0, 0.1, time_in_force="IOC"
         )

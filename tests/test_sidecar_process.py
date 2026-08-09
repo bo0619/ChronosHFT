@@ -3,7 +3,17 @@ from risk.sidecar_process import SidecarProcessBootstrap
 
 
 def _launch_settings(settings):
-    return SidecarProtocol.with_launch_contract(settings)
+    return SidecarProtocol.with_launch_contract(
+        {
+            "session_id": "session-1",
+            "state_store_root": "state-v2",
+            "account_scope_id": "account-1",
+            "deployment_id": "deployment-1",
+            "state_genesis_id": "genesis-1",
+            "cash_flow_deployment_start_ms": 1_700_000_000_000,
+            **settings,
+        }
+    )
 
 
 class _Exchange:
