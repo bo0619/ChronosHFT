@@ -170,6 +170,58 @@ def test_rearm_uses_coordinated_rearm_flow():
     assert owner.publish_calls == [True]
 
 
+def test_rearm_refusal_includes_flat_verification_diagnostic():
+    class FakeOms:
+        def rearm_system(self, reason):
+            raise AssertionError("rearm_system must not run before flat verification")
+
+    class FakeRiskManager:
+        def can_operator_rearm(self):
+            return False
+
+    owner = DummyOwner(oms=FakeOms(), risk_manager=FakeRiskManager())
+    owner.snapshot = {
+        "system": {
+            "oms": {
+                "state": "HALTED",
+                "manual_rearm_required": True,
+                "capability_mode": "CANCEL_ONLY",
+                "capability": {
+                    "venue_dead_man_switch": {
+                        "valid": False,
+                        "reason": "renewal_stale:1042.984s>45.000s",
+                    },
+                    "risk_control_heartbeat": {
+                        "valid": False,
+                        "reason": "risk_live_loop",
+                    },
+                },
+            },
+        },
+        "risk": {
+            "status": {
+                "kill_switch_triggered": True,
+                "kill_state": "FAILED",
+                "kill_reason": "SystemHealth: PAPER_DMS_TRIGGERED:CLUSDT",
+            },
+        },
+    }
+
+    response, status = handle_dashboard_admin_action(
+        owner,
+        {"action": "rearm", "reason": "dashboard_rearm"},
+    )
+
+    assert status == 409
+    assert response["accepted"] is False
+    assert response["diagnostic"]["code"] == "paper_dms_triggered"
+    assert "Paper DMS" in response["diagnostic"]["summary"]
+    assert response["diagnostic"]["details"]["kill_state"] == "FAILED"
+    assert "PAPER_DMS_TRIGGERED:CLUSDT" in response["diagnostic"]["details"]["kill_reason"]
+    assert "DMS" in response["diagnostic"]["details"]["blocking_hint"]
+    assert owner.publish_calls == [True]
+
+
 def test_admin_post_requires_dashboard_action_header():
     owner = DummyOwner()
     handler = DummyHandler({"Host": "127.0.0.1:8765", "Content-Type": "application/json"})

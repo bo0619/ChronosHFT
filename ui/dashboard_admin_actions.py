@@ -209,6 +209,103 @@ def _snapshot_response(
     return response, code
 
 
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _clean_detail(value: Any, limit: int = 512) -> str:
+    if value is None:
+        return ""
+    return _redact_text(value, limit=limit).strip()
+
+
+def _build_rearm_refusal_diagnostic(
+    snapshot: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> dict[str, Any]:
+    system = _mapping(snapshot.get("system"))
+    oms = _mapping(system.get("oms"))
+    capability = _mapping(oms.get("capability"))
+    dms = _mapping(capability.get("venue_dead_man_switch"))
+    heartbeat = _mapping(capability.get("risk_control_heartbeat"))
+    risk = _mapping(snapshot.get("risk"))
+    risk_status = _mapping(risk.get("status"))
+
+    result_reason = _clean_detail(result.get("reason"), limit=160)
+    kill_state = _clean_detail(risk_status.get("kill_state"), limit=80)
+    kill_reason = _clean_detail(risk_status.get("kill_reason"), limit=512)
+    oms_state = _clean_detail(oms.get("state"), limit=80)
+    capability_mode = _clean_detail(
+        oms.get("capability_mode") or capability.get("mode"),
+        limit=80,
+    )
+    dms_reason = _clean_detail(dms.get("reason"), limit=512)
+    dms_valid = dms.get("valid") if "valid" in dms else None
+    heartbeat_valid = heartbeat.get("valid") if "valid" in heartbeat else None
+    heartbeat_reason = _clean_detail(heartbeat.get("reason"), limit=256)
+
+    details: dict[str, Any] = {
+        "result_reason": result_reason,
+    }
+    for key, value in (
+        ("oms_state", oms_state),
+        ("capability_mode", capability_mode),
+        ("manual_rearm_required", oms.get("manual_rearm_required")),
+        ("kill_switch_triggered", risk_status.get("kill_switch_triggered")),
+        ("kill_state", kill_state),
+        ("kill_reason", kill_reason),
+        ("dms_valid", dms_valid),
+        ("dms_reason", dms_reason),
+        ("risk_heartbeat_valid", heartbeat_valid),
+        ("risk_heartbeat_reason", heartbeat_reason),
+    ):
+        if value not in ("", None):
+            details[key] = value
+
+    code = "rearm_refused"
+    summary = "Rearm 被拒：后端没有接受本次恢复请求。"
+    next_steps = [
+        "确认无挂单、无持仓。",
+        "等待 risk.kill_state 变为 FLAT_VERIFIED。",
+        "再点击 Rearm。",
+    ]
+
+    if result_reason == "risk_manager_flat_state_not_verified":
+        code = "flat_state_not_verified"
+        summary = "Rearm 被拒：Kill Switch 尚未完成全平验证。"
+        if kill_state:
+            summary += f" 当前 kill_state={kill_state}。"
+        if "PAPER_DMS_TRIGGERED" in kill_reason:
+            code = "paper_dms_triggered"
+            summary = (
+                "Rearm 被拒：Paper DMS 到期触发 Kill Switch，"
+                "需要先恢复续租/控制循环并完成全平验证。"
+            )
+            next_steps = [
+                "确认所有标的无挂单、无持仓。",
+                "让主程序继续运行，等待 kill_state 进入 FLAT_VERIFIED。",
+                "如果 DMS 仍 stale，干净重启主程序以恢复 DMS 续租。",
+                "确认 DMS valid=true 后再点击 Rearm。",
+            ]
+        elif kill_state and kill_state != "FLAT_VERIFIED":
+            next_steps = [
+                "确认无挂单、无持仓。",
+                "等待 kill switch 验证线程把 kill_state 推进到 FLAT_VERIFIED。",
+                "若长时间停在 FAILED/CANCEL_PENDING/FLATTENING，检查日志中的 KillSwitch/truth/DMS 错误。",
+                "再点击 Rearm。",
+            ]
+
+    if dms_valid is False and dms_reason:
+        details["blocking_hint"] = f"DMS unhealthy: {dms_reason}"
+
+    return {
+        "code": code,
+        "summary": summary,
+        "details": details,
+        "next_steps": next_steps,
+    }
+
+
 def _base_error(
     *,
     action: str,
@@ -344,7 +441,7 @@ def _handle_rearm(
         if accepted
         else f"Rearm refused: {result.get('reason', 'unknown')}"
     )
-    return _snapshot_response(
+    response, code = _snapshot_response(
         owner,
         accepted=accepted,
         status="ok" if accepted else "rejected",
@@ -355,6 +452,12 @@ def _handle_rearm(
         extra={"result": deepcopy(dict(result))},
         code=200 if accepted else 409,
     )
+    if not accepted:
+        response["diagnostic"] = _build_rearm_refusal_diagnostic(
+            _mapping(response.get("snapshot")),
+            _mapping(result),
+        )
+    return response, code
 
 
 def _handle_flatten_all(

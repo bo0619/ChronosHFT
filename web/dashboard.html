@@ -93,6 +93,7 @@
       display: inline-flex; align-items: center; min-width: 172px; height: 34px;
       padding: 0 10px; border: 1px solid var(--line); border-radius: 4px;
       background: #0c1219; color: var(--muted); white-space: nowrap;
+      max-width: min(48vw, 620px); overflow: hidden; text-overflow: ellipsis;
     }
     .action-status.good { color: var(--green); border-color: rgba(66, 211, 146, .35); }
     .action-status.warn { color: var(--amber); border-color: rgba(244, 190, 85, .35); }
@@ -528,6 +529,31 @@
     const metric = (label, value, note = "", tone = "") => `<div class="metric ${tone}"><div class="metric-label">${esc(label)}</div><div class="metric-value">${value}</div><div class="metric-note">${note}</div></div>`;
     const kv = (label, value) => `<div class="kv"><span title="${esc(label)}">${esc(label)}</span><span>${value}</span></div>`;
     const emptyRow = (cols, text = "暂无数据") => `<tr><td colspan="${cols}" class="empty">${esc(text)}</td></tr>`;
+    function currentRearmDiagnostic(data = state.data) {
+      const snapshot = obj(data);
+      const oms = obj(path(snapshot, "system.oms", {}));
+      const capability = obj(first(oms.capability, {}));
+      const risk = obj(path(snapshot, "risk.status", {}));
+      const dms = obj(first(capability.venue_dead_man_switch, {}));
+      const parts = [];
+      const killState = String(first(risk.kill_state, "") || "");
+      const killReason = String(first(risk.kill_reason, "") || "");
+      const dmsReason = String(first(dms.reason, "") || "");
+      if (killState && killState !== "ARMED") parts.push(`kill_state=${killState}`);
+      if (killReason) parts.push(`kill_reason=${killReason}`);
+      if (dms.valid === false) parts.push(`DMS=${dmsReason || "invalid"}`);
+      if (oms.manual_rearm_required === true) parts.push("manual_rearm_required=true");
+      return parts.join(" · ");
+    }
+    function adminActionMessage(data) {
+      const diagnostic = obj(data?.diagnostic);
+      const summary = String(first(diagnostic.summary, "") || "");
+      const details = obj(diagnostic.details);
+      const kill = String(first(details.kill_reason, "") || "");
+      const dms = String(first(details.blocking_hint, details.dms_reason, "") || "");
+      const suffix = [kill, dms].filter(Boolean).join(" · ");
+      return [summary || first(data?.message, ""), suffix].filter(Boolean).join(" | ");
+    }
     function confirmDashboardAction(action, symbol = "") {
       if (action === "flatten_all") {
         return window.confirm("确认一键平仓全部标的？\n\n后端会关闭新风险出站、提交 reduce-only 平仓单，然后 HALT OMS。");
@@ -536,7 +562,9 @@
         return window.confirm(`确认平仓 ${symbol || "该标的"}？\n\n后端会提交该标的 reduce-only 平仓单，并冻结该标的。`);
       }
       if (action === "rearm") {
-        return window.confirm("确认 Rearm？\n\n只有风控已验证全平时后端才会接受，成功后 OMS 会恢复可交易状态。");
+        const diagnostic = currentRearmDiagnostic();
+        const detail = diagnostic ? `\n\n当前阻塞/风险状态：\n${diagnostic}` : "";
+        return window.confirm(`确认 Rearm？\n\n只有风控已验证全平时后端才会接受，成功后 OMS 会恢复可交易状态。${detail}`);
       }
       return true;
     }
@@ -546,6 +574,7 @@
       const el = $("actionStatus");
       if (!el) return;
       el.textContent = state.actionMessage;
+      el.title = state.actionMessage;
       el.className = state.actionTone ? `action-status ${state.actionTone}` : "action-status";
     }
     function syncActionButtons() {
@@ -585,7 +614,13 @@
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok || data.accepted === false) {
-          throw new Error(first(data.message, `HTTP ${response.status}`));
+          renderActionStatus(first(adminActionMessage(data), data.message, `HTTP ${response.status}`), "bad");
+          if (data.snapshot) {
+            render(data.snapshot);
+          } else if (state.data) {
+            render(state.data);
+          }
+          return data;
         }
         renderActionStatus(first(data.message, "已完成"), "good");
         if (data.snapshot) {
