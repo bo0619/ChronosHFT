@@ -50,12 +50,12 @@ does not retry the non-recoverable startup exit code `2`. A normal
 cancel orders, persist state, and stop the independent supervisor before the
 service timeout. The unit also pins OpenBLAS, OpenMP, MKL, and NumExpr to one
 thread each; the strategy's small covariance matrices do not benefit from
-oversubscribing both `t3.small` vCPUs. glibc is limited to two malloc arenas to
+oversubscribing both `t3.medium` vCPUs. glibc is limited to two malloc arenas to
 reduce long-lived per-thread heap fragmentation, and Python's fatal-signal
 handler emits all thread stacks to journald before a watchdog `SIGABRT`. The
 complete service cgroup is capped at
-128 tasks, enters memory pressure at 1,400 MiB, and cannot exceed 1,600 MiB;
-service swap and core dumps are disabled. The in-process 1.25 GiB
+128 tasks, enters memory pressure at 2,800 MiB, and cannot exceed 3,200 MiB;
+service swap and core dumps are disabled. The in-process 2.5 GiB
 sustained-RSS guard should
 freeze quoting first, while the cgroup remains the final defense if Python or a
 native library can no longer run that guard. A 60-second systemd watchdog is
@@ -77,7 +77,8 @@ The runtime uses production Binance public market data but all balances,
 orders, and fills remain local simulations. The SSH session and EC2 web console
 may be closed after the service is active.
 
-The tracked AWS Paper profile is intentionally sized for a `t3.small` and a
+The tracked AWS Paper profile is intentionally sized for a `t3.medium` (2 vCPU /
+4 GiB) and a
 10,000 USDT simulated account. It subscribes only `SNDKUSDT`, matching the one
 concurrent-symbol slot derived from capital scaling. A broader symbol universe
 requires correlation-aware capital allocation and coordinated risk changes;
@@ -480,7 +481,7 @@ processes. An incomplete or over-limit traversal is itself a sustained
 fail-closed condition, so a newly added helper cannot silently escape the
 application-level RSS, thread, or file-descriptor guard. Main-process counts
 remain separate for diagnosis. A warning starts at 768 MiB RSS; three consecutive
-samples at 1.25 GiB RSS, 96 main threads, 4,096 main file descriptors, 112
+samples at 2.5 GiB RSS, 96 main threads, 4,096 main file descriptors, 112
 aggregate threads, or 8,192 aggregate file descriptors freeze new risk and
 cancel active orders. The aggregate thread guard fires before systemd's
 `TasksMax=128`. Six healthy samples clear the monitor latch, but the OMS still

@@ -91,10 +91,10 @@ verify_effective_unit() {
     esac
     [[ "${tasks_max}" == "128" ]] \
         || die "effective TasksMax is ${tasks_max:-missing}, expected 128"
-    [[ "${memory_high}" == "1468006400" ]] \
-        || die "effective MemoryHigh is ${memory_high:-missing}, expected 1400M"
-    [[ "${memory_max}" == "1677721600" ]] \
-        || die "effective MemoryMax is ${memory_max:-missing}, expected 1600M"
+    [[ "${memory_high}" == "2936012800" ]] \
+        || die "effective MemoryHigh is ${memory_high:-missing}, expected 2800M"
+    [[ "${memory_max}" == "3355443200" ]] \
+        || die "effective MemoryMax is ${memory_max:-missing}, expected 3200M"
     [[ "${memory_swap_max}" == "0" ]] \
         || die "effective MemorySwapMax is ${memory_swap_max:-missing}, expected 0"
 }

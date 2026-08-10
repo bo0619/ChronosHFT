@@ -18,8 +18,8 @@ def test_systemd_unit_preserves_runtime_shutdown_and_restart_contract():
     assert "WatchdogSignal=SIGABRT" in unit
     assert "LimitCORE=0" in unit
     assert "TasksMax=128" in unit
-    assert "MemoryHigh=1400M" in unit
-    assert "MemoryMax=1600M" in unit
+    assert "MemoryHigh=2800M" in unit
+    assert "MemoryMax=3200M" in unit
     assert "MemorySwapMax=0" in unit
     assert "OOMPolicy=stop" in unit
     assert "StartLimitIntervalSec=3600" in unit
@@ -61,6 +61,8 @@ def test_installer_validates_paper_config_and_avoids_blind_double_start():
     assert "effective_property MemoryHigh" in installer
     assert "effective_property MemoryMax" in installer
     assert "effective_property MemorySwapMax" in installer
+    assert '[[ "${memory_high}" == "2936012800" ]]' in installer
+    assert '[[ "${memory_max}" == "3355443200" ]]' in installer
     assert "--check-config" in installer
     assert '"CONFIG_OK mode=paper "' in installer
     assert "find_project_python_pids" in installer
