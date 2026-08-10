@@ -5,16 +5,15 @@ from __future__ import annotations
 import time
 import uuid
 
-from infrastructure.logger import logger
-
 from event.type import (
+    TIF_IOC,
     CommandOutcome,
     OrderIntent,
     OrderRequest,
     OrderStatus,
     OrderSubmitResult,
-    TIF_IOC,
 )
+from infrastructure.logger import logger
 
 from .component import OMSComponent
 from .journal import JournalError
@@ -27,6 +26,7 @@ from .submission_transaction import (
     SubmissionTerminalOutcome,
     SubmissionTransaction,
 )
+
 
 class OMSOrderSubmission(OMSComponent):
     """Own prepare, fence, dispatch and durable submit settlement."""

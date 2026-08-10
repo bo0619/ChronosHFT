@@ -1,5 +1,5 @@
-from risk.sidecar_protocol import SidecarProtocol
 from risk.sidecar_process import SidecarProcessBootstrap
+from risk.sidecar_protocol import SidecarProtocol
 
 
 def _launch_settings(settings):

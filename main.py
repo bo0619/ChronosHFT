@@ -12,7 +12,6 @@ from data.ref_data import ref_data_manager
 from event.engine import EventEngine
 from event.type import OMSCapabilityMode
 from gateway.binance.gateway import BinanceGateway
-from infrastructure.binance_rate_limit_budget import BinanceRateLimitBudget
 from gateway.binance.truth_provider import BinanceTruthSnapshotProvider
 from governance import calibration_artifact as calibration_artifact_port
 from governance.contracts import is_testnet_environment
@@ -22,8 +21,9 @@ from infrastructure.admin_control import (
     load_admin_control_config,
     submit_admin_command,
 )
-from infrastructure.config_scaling import load_root_config
+from infrastructure.binance_rate_limit_budget import BinanceRateLimitBudget
 from infrastructure.commission_truth import parse_commission_rate_payload
+from infrastructure.config_scaling import load_root_config
 from infrastructure.external_alerts import ExternalAlertService
 from infrastructure.live_config_guard import (
     validate_live_account_equity_truth,
@@ -32,7 +32,6 @@ from infrastructure.live_config_guard import (
 from infrastructure.logger import logger
 from infrastructure.paper_trade import apply_paper_trade_mode, is_paper_trade
 from infrastructure.process_resources import ProcessResourceMonitor
-from infrastructure.systemd_watchdog import SystemdWatchdog
 from infrastructure.rpi_policy import (
     requires_zero_rpi_commission,
     validate_live_rpi_policy,
@@ -55,15 +54,16 @@ from infrastructure.runtime_control_loop import (
     RuntimeControlServices,
 )
 from infrastructure.runtime_failure_policy import RuntimeFailurePolicy
-from infrastructure.runtime_resources import RuntimeResources
 from infrastructure.runtime_ports import (
     compose_runtime_domain,
     read_clock_health,
 )
+from infrastructure.runtime_resources import RuntimeResources
 from infrastructure.runtime_shutdown import (
     RuntimeShutdownCoordinator,
     RuntimeShutdownServices,
 )
+from infrastructure.systemd_watchdog import SystemdWatchdog
 from infrastructure.time_service import time_service
 from infrastructure.truth_monitor import TruthMonitor
 from infrastructure.venue_supervisor import VenueSupervisor

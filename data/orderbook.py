@@ -3,7 +3,7 @@
 import heapq
 import math
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from event.type import OrderBook, OrderBookGapError
 from infrastructure.logger import logger
@@ -209,7 +209,7 @@ class LocalOrderBook:
         return OrderBook(
             symbol=self.symbol,
             exchange="BINANCE",
-            datetime=datetime.fromtimestamp(received_ts),
+            datetime=datetime.fromtimestamp(received_ts, tz=timezone.utc),
             bids=bids,
             asks=asks,
             top_bids=tuple(self.top_bids),

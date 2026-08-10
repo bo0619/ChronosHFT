@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional
 
 EVENT_ORDERBOOK = "eOrderBook"
 EVENT_AGG_TRADE = "eAggTrade"
@@ -204,10 +204,10 @@ class OrderBook:
     symbol: str
     exchange: str
     datetime: datetime
-    asks: Dict[float, float] = field(default_factory=dict)
-    bids: Dict[float, float] = field(default_factory=dict)
-    top_bids: Tuple[Tuple[float, float], ...] = field(default_factory=tuple)
-    top_asks: Tuple[Tuple[float, float], ...] = field(default_factory=tuple)
+    asks: dict[float, float] = field(default_factory=dict)
+    bids: dict[float, float] = field(default_factory=dict)
+    top_bids: tuple[tuple[float, float], ...] = field(default_factory=tuple)
+    top_asks: tuple[tuple[float, float], ...] = field(default_factory=tuple)
     exchange_timestamp: float = 0.0
     received_timestamp: float = 0.0
     best_bid_price: float = 0.0
@@ -367,8 +367,8 @@ class ExchangeAccountUpdate:
     asset: str
     wallet_balance: float
     available_balance: Optional[float] = None
-    balances: Dict[str, Dict[str, Optional[float]]] = field(default_factory=dict)
-    positions: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    balances: dict[str, dict[str, Optional[float]]] = field(default_factory=dict)
+    positions: dict[str, dict[str, float]] = field(default_factory=dict)
     reason: str = ""
     event_time: float = 0.0
     received_timestamp: float = 0.0
@@ -394,11 +394,11 @@ class AccountData:
     available: float
     used_margin: float
     datetime: datetime
-    balances: Dict[str, float] = field(default_factory=dict)
-    available_balances: Dict[str, float] = field(default_factory=dict)
+    balances: dict[str, float] = field(default_factory=dict)
+    available_balances: dict[str, float] = field(default_factory=dict)
     budget_balance: float = 0.0
     budget_available: float = 0.0
-    trading_budget_by_asset: Dict[str, float] = field(default_factory=dict)
+    trading_budget_by_asset: dict[str, float] = field(default_factory=dict)
     maintenance_margin: float = 0.0
     margin_balance: float = 0.0
     maintenance_margin_ratio: float = 0.0
@@ -416,5 +416,7 @@ class StrategyData:
     symbol: str
     fair_value: float
     alpha_bps: float
-    params: Dict[str, Any] = field(default_factory=dict)
-    timestamp: float = field(default_factory=lambda: datetime.now().timestamp())
+    params: dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(
+        default_factory=lambda: datetime.now(timezone.utc).timestamp()
+    )

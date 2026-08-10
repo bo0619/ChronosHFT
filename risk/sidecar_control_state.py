@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass
 import secrets
 import time
-
+from collections.abc import Callable
+from dataclasses import dataclass
 
 PersistTransition = Callable[[str, bool], tuple[bool, str]]
 

@@ -9,7 +9,6 @@ from typing import Any, Protocol
 
 from infrastructure.durability import DurabilityError
 
-
 RESUMABLE_KILL_STATES = frozenset(
     {
         "TRIGGERED",

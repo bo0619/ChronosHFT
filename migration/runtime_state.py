@@ -8,9 +8,9 @@ import os
 import shutil
 import sqlite3
 import uuid
+from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
-from typing import Mapping
 
 from governance.contracts import (
     CONFIG_DOCUMENT_VERSION,
@@ -29,7 +29,6 @@ from infrastructure.config_schema import (
 from oms.journal import OMSJournal, decode_legacy_journal
 from oms.paper_trade_database import PaperTradeDatabase
 from risk.sidecar_state_store import SidecarStateStore
-
 
 PLAN_SCHEMA = "chronoshft.runtime-migration-plan.v1"
 RECEIPT_SCHEMA = "chronoshft.runtime-migration-receipt.v1"

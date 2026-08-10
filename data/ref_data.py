@@ -2,9 +2,10 @@
 
 import math
 from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP
+from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 
 import requests
+
 from infrastructure.logger import logger
 
 

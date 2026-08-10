@@ -9,7 +9,6 @@ from typing import Any
 
 from governance.canonical import canonical_json_bytes
 
-
 DEPLOYMENT_CONFIG_PROJECTION_SCHEMA = (
     "chronoshft.live_deployment_config_projection.v2"
 )

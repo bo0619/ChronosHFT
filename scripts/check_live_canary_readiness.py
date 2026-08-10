@@ -11,21 +11,21 @@ import json
 import math
 import re
 import sys
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Mapping, Sequence
-
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from governance import calibration_artifact as calibration_artifact_port  # noqa: E402
 from infrastructure.config_scaling import (  # noqa: E402
     normalize_root_config_preapproval,
 )
-from governance import calibration_artifact as calibration_artifact_port  # noqa: E402
 from infrastructure.live_config_guard import (  # noqa: E402
     CANARY_STAGE,
     LIVE_CANARY_ACCOUNT_SOURCE,
@@ -48,7 +48,6 @@ from infrastructure.rpi_policy import validate_live_rpi_policy  # noqa: E402
 from strategy.model_readiness import (  # noqa: E402
     validate_live_calibration_approval,
 )
-
 
 REPORT_SCHEMA = "chronoshft.live_canary_readiness.v1"
 EVIDENCE_SCHEMA = LIVE_CANARY_EVIDENCE_SCHEMA

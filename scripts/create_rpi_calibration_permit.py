@@ -24,15 +24,14 @@ from typing import Any
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from governance.contracts import market_data_environment  # noqa: E402
 from infrastructure.config_scaling import (  # noqa: E402
     normalize_root_config_preapproval,
 )
-from governance.contracts import market_data_environment  # noqa: E402
 from infrastructure.rpi_calibration_permit import (  # noqa: E402
     RPI_CALIBRATION_PERMIT_SCHEMA,
     RPI_CALIBRATION_SIGNATURE_ALGORITHM,
@@ -49,7 +48,6 @@ from strategy.model_readiness import (  # noqa: E402
     strategy_policy_sha256,
 )
 from strategy.registry import canonical_model_key  # noqa: E402
-
 
 DEFAULT_PASSPHRASE_ENV = "CHRONOSHFT_PERMIT_KEY_PASSPHRASE"
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{1,127}$")

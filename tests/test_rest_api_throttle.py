@@ -63,8 +63,10 @@ class DummyResponse:
 class SequenceSession:
     def __init__(self, responses):
         self.responses = list(responses)
+        self.prepared = []
 
     def prepare_request(self, req):
+        self.prepared.append(req)
         return req
 
     def send(self, _prepped, timeout=None):
@@ -125,7 +127,14 @@ class RestApiThrottleTests(unittest.TestCase):
             self_trade_prevention_mode="EXPIRE_MAKER",
         )
 
-        with patch.object(api, "request", return_value=DummyResponse(200, {})) as request:
+        with (
+            patch.object(ref_data_manager, "get_info", return_value=None),
+            patch.object(
+                api,
+                "request",
+                return_value=DummyResponse(200, {}),
+            ) as request,
+        ):
             response = api.new_order(order, "client-1")
 
         self.assertEqual(response.status_code, 200)
@@ -136,9 +145,9 @@ class RestApiThrottleTests(unittest.TestCase):
                 "symbol": "BTCUSDT",
                 "side": "BUY",
                 "type": "LIMIT",
-                "quantity": 0.1,
+                "quantity": "0.1",
                 "newClientOrderId": "client-1",
-                "price": 100.0,
+                "price": "100.0",
                 "timeInForce": "GTC",
                 "selfTradePreventionMode": "EXPIRE_MAKER",
             },
@@ -158,7 +167,14 @@ class RestApiThrottleTests(unittest.TestCase):
             self_trade_prevention_mode="EXPIRE_MAKER",
         )
 
-        with patch.object(api, "request", return_value=DummyResponse(200, {})) as request:
+        with (
+            patch.object(ref_data_manager, "get_info", return_value=None),
+            patch.object(
+                api,
+                "request",
+                return_value=DummyResponse(200, {}),
+            ) as request,
+        ):
             response = api.new_order(order, "rpi-client-1")
 
         self.assertEqual(response.status_code, 200)
@@ -171,15 +187,47 @@ class RestApiThrottleTests(unittest.TestCase):
                 "symbol": "LTCUSDT",
                 "side": "BUY",
                 "type": "LIMIT",
-                "quantity": 0.1,
+                "quantity": "0.1",
                 "newClientOrderId": "rpi-client-1",
-                "price": 100.0,
+                "price": "100.0",
                 "timeInForce": "RPI",
             },
             signed=True,
             pre_send_guard=(),
             max_attempts=1,
         )
+
+    @patch("gateway.binance.rest_api.requests.Request", DummyRequest)
+    def test_new_order_formats_quantity_and_price_from_symbol_precision(self):
+        session = SequenceSession([DummyResponse(200, {"orderId": 7})])
+        api = BinanceRestApi("key", "secret", session, testnet=True)
+        api.min_signed_interval_sec = 0.0
+        api.endpoint_intervals[EP_ORDER] = 0.0
+        info = ContractInfo(
+            symbol="BTCUSDT",
+            tick_size=0.01,
+            step_size=0.00001,
+            min_qty=0.00001,
+            min_notional=5.0,
+            price_precision=2,
+            qty_precision=5,
+        )
+        order = OrderRequest(
+            symbol="BTCUSDT",
+            price=0.30000000000000004,
+            volume=1e-05,
+            side="BUY",
+        )
+
+        with patch.object(ref_data_manager, "get_info", return_value=info):
+            response = api.new_order(order, "precision-client")
+
+        self.assertEqual(response.status_code, 200)
+        sent_params = session.prepared[0].params
+        self.assertEqual(sent_params["quantity"], "0.00001")
+        self.assertEqual(sent_params["price"], "0.30")
+        self.assertNotIn("e-", sent_params["quantity"])
+        self.assertNotIn("e-", sent_params["price"])
 
     def test_legacy_post_only_order_is_normalized_to_gtx_before_send(self):
         api = BinanceRestApi("key", "secret", DummySession(), testnet=True)

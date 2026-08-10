@@ -4,17 +4,17 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Callable, Mapping
 
 from event.type import (
-    AggTradeData,
-    OrderBook,
-    OrderRequest,
     TIF_FOK,
     TIF_IOC,
     TIF_RPI,
+    AggTradeData,
+    OrderBook,
+    OrderRequest,
 )
 from infrastructure.commission_truth import resolve_passive_fee_rate
 

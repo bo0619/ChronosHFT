@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from bisect import bisect_right
-from dataclasses import asdict, dataclass
 import math
 import sqlite3
-from typing import Iterable, Sequence
+from bisect import bisect_right
+from collections.abc import Iterable, Sequence
+from dataclasses import asdict, dataclass
 
 import numpy as np
-
 
 TERMINAL_ORDER_STATUSES = frozenset(
     {

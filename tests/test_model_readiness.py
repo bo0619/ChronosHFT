@@ -21,6 +21,8 @@ from governance.canonical import canonical_config_digest
 from governance.release_manifest import write_release_manifest
 from infrastructure.config_scaling import (
     load_root_config as _load_root_config,
+)
+from infrastructure.config_scaling import (
     normalize_root_config_preapproval,
 )
 from infrastructure.rpi_calibration_permit import (
@@ -61,11 +63,12 @@ from strategy.model_readiness import (
     readiness_requirements,
     sha256_file,
     strategy_policy_sha256,
-    validate_live_calibration_approval as _validate_live_calibration_approval,
     verify_ed25519_signature,
 )
+from strategy.model_readiness import (
+    validate_live_calibration_approval as _validate_live_calibration_approval,
+)
 from tests.test_live_config_guard import safe_live_config
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TEST_CASH_FLOW_DEPLOYMENT_START_MS = 1_753_248_000_000

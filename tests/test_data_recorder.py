@@ -12,7 +12,7 @@ import pandas as pd
 
 import data.recorder as recorder_module
 from data.recorder import DataRecorder
-from event.type import Event, OrderBook, EVENT_ORDERBOOK
+from event.type import EVENT_ORDERBOOK, Event, OrderBook
 
 
 class DummyEngine:

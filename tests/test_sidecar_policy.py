@@ -1,5 +1,5 @@
-from dataclasses import FrozenInstanceError
 import math
+from dataclasses import FrozenInstanceError
 
 import pytest
 

@@ -2,7 +2,6 @@ import hashlib
 import json
 import math
 
-
 MAX_CANARY_DEPLOYED_EQUITY_FRACTION = 0.02
 
 

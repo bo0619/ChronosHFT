@@ -4,26 +4,29 @@ import math
 import secrets
 
 from risk.exchange_port import StateVersion
+from risk.runtime_clock import system_runtime_clock
 from risk.sidecar_account_risk import SidecarAccountRiskController
 from risk.sidecar_command_runtime import (
     commit_rearm as run_commit_rearm,
+)
+from risk.sidecar_command_runtime import (
     complete_stop_request,
+)
+from risk.sidecar_command_runtime import (
     prepare_rearm as run_prepare_rearm,
 )
 from risk.sidecar_control_state import ControlEffects, SidecarControlController
 from risk.sidecar_core_status import RiskSidecarStatusProjection
-from risk.sidecar_funding_risk import SidecarFundingRiskController
 from risk.sidecar_flat_proof import FlatProofEngine, FlatProofError
+from risk.sidecar_funding_risk import SidecarFundingRiskController
 from risk.sidecar_observation import SidecarObservationController
 from risk.sidecar_policy import RiskSidecarPolicy
-from risk.runtime_clock import system_runtime_clock
 from risk.sidecar_state_projection import (
     close_state_store,
     open_state_store,
     persist_state,
 )
 from risk.sidecar_values import finite_float as _finite_float
-
 
 _HARD_CLOCK_FAILURE_PREFIXES = (
     "clock_phase_error_kill:",

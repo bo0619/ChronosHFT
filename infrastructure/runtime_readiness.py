@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Callable
-
 
 _READY = "ready"
 _UNREADY = "unready"

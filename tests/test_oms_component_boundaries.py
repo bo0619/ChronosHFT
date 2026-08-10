@@ -6,7 +6,6 @@ from oms.component import OMSComponent, OMSComponentContext
 from oms.component_state import MULTI_WRITER_STATE_OWNERS, build_state_owners
 from oms.engine import OMS
 
-
 OMS_DIR = Path(__file__).resolve().parents[1] / "oms"
 MUTATING_CONTAINER_METHODS = frozenset(
     {

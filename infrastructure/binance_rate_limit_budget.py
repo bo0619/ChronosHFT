@@ -10,7 +10,6 @@ from datetime import timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
-
 DEFAULT_REQUEST_WEIGHT_LIMIT = 2400
 DEFAULT_EMERGENCY_RESERVE = 300
 DEFAULT_TRADING_RESERVE = 300

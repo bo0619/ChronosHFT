@@ -1,6 +1,6 @@
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-import tempfile
 
 from risk.funding_guard import FundingGuardPolicy
 from risk.independent_supervisor import RiskSidecarCore

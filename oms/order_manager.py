@@ -1,8 +1,8 @@
 import threading
 import time
 
-from infrastructure.logger import logger
 from event.type import OrderStatus
+from infrastructure.logger import logger
 
 
 class OrderManager:

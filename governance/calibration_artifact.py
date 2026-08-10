@@ -19,10 +19,9 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -33,13 +32,13 @@ from alpha.rpi_intensity import (  # noqa: E402
     RPIIntensityRequirements,
     estimate_rpi_intensity,
 )
-from governance.deployment_identity import (  # noqa: E402
-    deployment_config_sha256,
-)
 from governance.contracts import (  # noqa: E402
     RPI_CALIBRATION_ARTIFACT_SCHEMA,
     RPI_EXPOSURE_SAMPLE_SCHEMA,
     market_data_environment,
+)
+from governance.deployment_identity import (  # noqa: E402
+    deployment_config_sha256,
 )
 from governance.strategy_identity import (  # noqa: E402
     canonical_model_key,
@@ -50,7 +49,6 @@ from strategy.quote_math import (  # noqa: E402
     GLFT_FORMULA_VERSION,
     UNITS_VERSION,
 )
-
 
 JOURNAL_RECORD_VERSION = 2
 SAMPLE_KIND = "rpi_exposure_sample"

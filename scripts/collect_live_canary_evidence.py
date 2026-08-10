@@ -18,12 +18,12 @@ import re
 import sys
 import tempfile
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Protocol
 from urllib.parse import urlencode
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -41,13 +41,12 @@ from infrastructure.live_config_guard import (  # noqa: E402
     resolve_live_canary_evidence_path,
     sign_live_canary_evidence,
     validate_live_api_restrictions_evidence,
-    validate_live_canary_evidence_payload,
     validate_live_canary_evidence_destination,
+    validate_live_canary_evidence_payload,
     validate_live_dual_key_account_evidence,
     validate_live_flat_start_evidence,
     validate_live_symbol_configuration_evidence,
 )
-
 
 FUTURES_HOST = "fapi.binance.com"
 ACCOUNT_HOST = "api.binance.com"

@@ -4,13 +4,17 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from gateway.binance.constants import EP_ACCOUNT
-from gateway.binance.constants import EP_ALL_ORDERS
-from gateway.binance.constants import EP_ORDER
-from gateway.binance.constants import EP_USER_TRADES
-from infrastructure.binance_rate_limit_budget import BinanceRateLimitBudget
-from infrastructure.binance_rate_limit_budget import RateLimitDecision
+from gateway.binance.constants import (
+    EP_ACCOUNT,
+    EP_ALL_ORDERS,
+    EP_ORDER,
+    EP_USER_TRADES,
+)
 from gateway.binance.rest_api import BinanceRestApi
+from infrastructure.binance_rate_limit_budget import (
+    BinanceRateLimitBudget,
+    RateLimitDecision,
+)
 
 
 class DummyRequest:

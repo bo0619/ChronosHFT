@@ -6,10 +6,9 @@ It performs no I/O and does not depend on the OMS, gateway, or strategy layer.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-import math
-
 
 ALLOW = "ALLOW"
 REDUCE_ONLY = "REDUCE_ONLY"

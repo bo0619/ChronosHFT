@@ -1,14 +1,14 @@
-from types import SimpleNamespace
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
 
-from infrastructure.runtime_readiness import RuntimeReadinessEvaluator
 from infrastructure.runtime_ports import (
     ClockPort,
     MarketCachePort,
     ReferenceDataPort,
 )
+from infrastructure.runtime_readiness import RuntimeReadinessEvaluator
 from infrastructure.runtime_resources import RuntimeResources
 from infrastructure.runtime_telemetry import TelemetryPublisher
 from infrastructure.time_service import TimeService

@@ -29,7 +29,6 @@ from scripts.collect_live_canary_evidence import (
     resolve_evidence_output_path,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "collect_live_canary_evidence.py"
 

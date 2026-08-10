@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import math
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import math
-import time
 
 from risk.deployment_loss import (
     MAX_CANARY_DEPLOYED_EQUITY_FRACTION,

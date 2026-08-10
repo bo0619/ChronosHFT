@@ -9,7 +9,6 @@ from oms.engine import OMS, _loaded_oms_component_types
 from oms.lifecycle_controller import OMSLifecycleController
 from oms.lifecycle_store import LifecycleStore
 
-
 LIFECYCLE_FIELDS = frozenset(
     {
         "last_freeze_reason",

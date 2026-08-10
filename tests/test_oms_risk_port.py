@@ -4,7 +4,6 @@ from pathlib import Path
 from infrastructure.oms_risk_port import RISK_OMS_PORT_MEMBERS, RiskOMSPort
 from oms.engine import OMS
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 

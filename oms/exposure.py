@@ -4,9 +4,10 @@
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, localcontext
 from types import MappingProxyType
 
-from event.type import Side, PositionData
+from event.type import PositionData, Side
 
 
 class _ZeroDefaultLedger(dict):
@@ -268,6 +269,18 @@ class ExposureStore:
         )
 
     @staticmethod
+    def _decimal_value(value: object, field_name: str) -> Decimal:
+        """Parse a ledger value without reintroducing binary float noise."""
+
+        try:
+            # ``str`` preserves the decimal representation callers supplied
+            # (and the shortest round-trip representation of existing floats).
+            parsed = value if isinstance(value, Decimal) else Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} must be numeric") from exc
+        return parsed
+
+    @staticmethod
     def _apply_fill_to_ledger(
         positions,
         average_prices,
@@ -277,57 +290,126 @@ class ExposureStore:
         price: float,
     ) -> float:
         try:
-            qty = float(qty)
-            price = float(price)
-        except (TypeError, ValueError) as exc:
+            qty_decimal = ExposureStore._decimal_value(qty, "Fill quantity")
+            price_decimal = ExposureStore._decimal_value(price, "Fill price")
+        except ValueError as exc:
             raise ValueError("Fill quantity and price must be numeric") from exc
+        try:
+            qty_float = float(qty_decimal)
+            price_float = float(price_decimal)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError(
+                "Fill quantity and price must be finite and positive"
+            ) from exc
         if (
-            not math.isfinite(qty)
-            or qty <= 0.0
-            or not math.isfinite(price)
-            or price <= 0.0
+            not qty_decimal.is_finite()
+            or qty_decimal <= 0
+            or not price_decimal.is_finite()
+            or price_decimal <= 0
+            or not math.isfinite(qty_float)
+            or qty_float <= 0.0
+            or not math.isfinite(price_float)
+            or price_float <= 0.0
         ):
             raise ValueError(
                 "Fill quantity and price must be finite and positive"
             )
-        current_pos = positions[key]
-        avg_price = average_prices[key]
+
+        try:
+            current_position_decimal = ExposureStore._decimal_value(
+                positions[key],
+                f"Exposure position for {key}",
+            )
+            average_price_decimal = ExposureStore._decimal_value(
+                average_prices[key],
+                f"Exposure average price for {key}",
+            )
+        except ValueError:
+            raise ValueError(f"Exposure ledger is invalid for {key}")
         if (
-            not math.isfinite(float(current_pos))
-            or not math.isfinite(float(avg_price))
+            not current_position_decimal.is_finite()
+            or not average_price_decimal.is_finite()
         ):
             raise ValueError(f"Exposure ledger is invalid for {key}")
-        signed_qty = qty if side == Side.BUY else -qty
-        next_pos = current_pos + signed_qty
-        realized_pnl = 0.0
-
-        # ?????????????????????
-        is_increasing = (
-            current_pos == 0
-            or (current_pos > 0 and signed_qty > 0)
-            or (current_pos < 0 and signed_qty < 0)
+        signed_qty_decimal = (
+            qty_decimal if side == Side.BUY else -qty_decimal
         )
 
-        if is_increasing:
-            total_val = abs(current_pos) * avg_price + qty * price
-            new_total = abs(current_pos) + qty
-            if new_total > 0:
-                average_prices[key] = total_val / new_total
-        else:
-            closing_qty = min(abs(current_pos), qty)
-            if current_pos > 0:
-                realized_pnl = (price - avg_price) * closing_qty
+        # Keep the public ledgers as floats for compatibility, but perform the
+        # cumulative fill arithmetic in Decimal so repeated lots do not inherit
+        # binary representation noise from the previous float value.
+        with localcontext() as context:
+            context.prec = 50
+            next_position_decimal = (
+                current_position_decimal + signed_qty_decimal
+            )
+            realized_pnl_decimal = Decimal(0)
+
+            is_increasing = (
+                current_position_decimal == 0
+                or (
+                    current_position_decimal > 0
+                    and signed_qty_decimal > 0
+                )
+                or (
+                    current_position_decimal < 0
+                    and signed_qty_decimal < 0
+                )
+            )
+
+            if is_increasing:
+                total_value_decimal = (
+                    abs(current_position_decimal) * average_price_decimal
+                    + qty_decimal * price_decimal
+                )
+                new_total_decimal = (
+                    abs(current_position_decimal) + qty_decimal
+                )
+                next_average_price_decimal = (
+                    total_value_decimal / new_total_decimal
+                    if new_total_decimal > 0
+                    else Decimal(0)
+                )
             else:
-                realized_pnl = (avg_price - price) * closing_qty
+                closing_qty_decimal = min(
+                    abs(current_position_decimal),
+                    qty_decimal,
+                )
+                if current_position_decimal > 0:
+                    realized_pnl_decimal = (
+                        price_decimal - average_price_decimal
+                    ) * closing_qty_decimal
+                else:
+                    realized_pnl_decimal = (
+                        average_price_decimal - price_decimal
+                    ) * closing_qty_decimal
+                next_average_price_decimal = average_price_decimal
 
-        positions[key] = next_pos
+            zero_tolerance = Decimal("1e-9")
+            if abs(next_position_decimal) < zero_tolerance:
+                next_position_decimal = Decimal(0)
+                next_average_price_decimal = Decimal(0)
+            elif (
+                current_position_decimal > 0 > next_position_decimal
+                or current_position_decimal < 0 < next_position_decimal
+            ):
+                next_average_price_decimal = price_decimal
 
-        # ?? / ????
-        if abs(positions[key]) < 1e-9:
-            positions[key] = 0.0
-            average_prices[key] = 0.0
-        elif current_pos > 0 > positions[key] or current_pos < 0 < positions[key]:
-            average_prices[key] = price
+            try:
+                next_position = float(next_position_decimal)
+                next_average_price = float(next_average_price_decimal)
+                realized_pnl = float(realized_pnl_decimal)
+            except (OverflowError, ValueError) as exc:
+                raise ValueError(f"Exposure ledger overflow for {key}") from exc
+
+        if not all(
+            math.isfinite(value)
+            for value in (next_position, next_average_price, realized_pnl)
+        ):
+            raise ValueError(f"Exposure ledger overflow for {key}")
+
+        positions[key] = next_position
+        average_prices[key] = next_average_price
 
         return realized_pnl
 
@@ -357,7 +439,7 @@ class ExposureStore:
     ) -> float:
         symbol = str(symbol or "").upper()
         recovery_key = ("exchange_recovery", symbol)
-        attributed = sum(
+        attributed = math.fsum(
             position
             for (strategy_id, tracked_symbol), position in self._strategy_net_positions.items()
             if tracked_symbol == symbol and strategy_id != "exchange_recovery"

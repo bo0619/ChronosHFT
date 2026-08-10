@@ -1,7 +1,6 @@
 from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 
-
 COMMISSION_RATE_FIELDS = (
     "makerCommissionRate",
     "takerCommissionRate",

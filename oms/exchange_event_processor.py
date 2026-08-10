@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime
-
-from infrastructure.logger import logger
+from datetime import datetime, timezone
+from typing import ClassVar
 
 from event.type import (
-    CommandOutcome,
     EVENT_TRADE_UPDATE,
+    CommandOutcome,
     Event,
     ExchangeAccountUpdate,
     ExchangeOrderUpdate,
@@ -17,6 +16,7 @@ from event.type import (
     OrderStatus,
     TradeData,
 )
+from infrastructure.logger import logger
 
 from .component import OMSComponent
 from .journal import JournalCorruptionError, JournalError
@@ -78,7 +78,7 @@ class OMSExchangeEventProcessor(OMSComponent):
         }
     )
 
-    _SUPPORTED_ORDER_UPDATE_STATUSES = {
+    _SUPPORTED_ORDER_UPDATE_STATUSES: ClassVar[set[str]] = {
         "NEW",
         "PARTIALLY_FILLED",
         "FILLED",
@@ -908,7 +908,7 @@ class OMSExchangeEventProcessor(OMSComponent):
                             side=order.intent.side.value,
                             price=update.filled_price,
                             volume=delta,
-                            datetime=datetime.now(),
+                            datetime=datetime.now(timezone.utc),
                         )
                         self.event_engine.put(Event(EVENT_TRADE_UPDATE, trade_data))
                     else:

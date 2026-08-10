@@ -8,6 +8,16 @@ from unittest.mock import patch
 
 from event.engine import EventEngine
 from event.type import (
+    EVENT_AGG_TRADE,
+    EVENT_EXCHANGE_ACCOUNT_UPDATE,
+    EVENT_EXCHANGE_ORDER_UPDATE,
+    EVENT_MARK_PRICE,
+    EVENT_ORDERBOOK,
+    EVENT_SYSTEM_HEALTH,
+    TIF_GTC,
+    TIF_GTX,
+    TIF_IOC,
+    TIF_RPI,
     AggTradeData,
     CancelRequest,
     CommandOutcome,
@@ -20,16 +30,6 @@ from event.type import (
     OrderRequest,
     OrderStatus,
     Side,
-    TIF_GTC,
-    TIF_GTX,
-    TIF_IOC,
-    TIF_RPI,
-    EVENT_AGG_TRADE,
-    EVENT_EXCHANGE_ACCOUNT_UPDATE,
-    EVENT_EXCHANGE_ORDER_UPDATE,
-    EVENT_MARK_PRICE,
-    EVENT_ORDERBOOK,
-    EVENT_SYSTEM_HEALTH,
 )
 from gateway.binance.paper_gateway import (
     BinancePaperGateway,
@@ -43,7 +43,6 @@ from infrastructure.venue_supervisor import VenueSupervisor
 from main import build_gateway_bundle
 from oms.engine import OMS
 from oms.guard_manager import OMSGuardManager
-
 
 SYMBOL = "SOXLUSDT"
 

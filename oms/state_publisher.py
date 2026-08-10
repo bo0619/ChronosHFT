@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 
 from event.type import (
-    Event,
-    OrderIntent,
     EVENT_ORDER_UPDATE,
     EVENT_POSITION_UPDATE,
+    Event,
+    OrderIntent,
 )
 
 from .component import OMSComponent

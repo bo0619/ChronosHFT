@@ -21,7 +21,6 @@ from data.live_evidence import (
     validate_live_evidence_journal,
 )
 
-
 OOS_RECONSTRUCTION_SCHEMA = "chronoshft.glft_rpi_oos_reconstruction.v1"
 RAW_OOS_EVIDENCE_SCHEMA = "chronoshft.glft_rpi_raw_oos_evidence.v1"
 OMS_JOURNAL_RECORD_VERSION = 2

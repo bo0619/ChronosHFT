@@ -1,6 +1,5 @@
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 UNIT_TEMPLATE = ROOT / "deploy" / "systemd" / "chronoshft.service.in"
 INSTALLER = ROOT / "scripts" / "install_systemd_service.sh"

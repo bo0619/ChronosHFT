@@ -1,10 +1,9 @@
+import time
 from collections import deque
 from threading import Condition, Thread
-import time
 
 from infrastructure.logger import logger
 from strategy.contracts import StrategyRuntimeContract
-
 
 _HANDLER_METHOD_BY_KIND = {
     "orderbook": "on_orderbook",

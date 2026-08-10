@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from typing import Callable
+from collections.abc import Callable
+from typing import ClassVar
 
 from governance.contracts import SIDECAR_IPC_VERSION
 
@@ -29,7 +30,7 @@ class SidecarProtocol:
     REQUIRED_PARENT_CAPABILITIES = PARENT_CAPABILITIES
     REQUIRED_CHILD_CAPABILITIES = CHILD_CAPABILITIES
 
-    _CONTROL_STRING_FIELDS = {
+    _CONTROL_STRING_FIELDS: ClassVar[dict[str, tuple[str, ...]]] = {
         "QUIESCE": ("request_id", "reason"),
         "RESUME_SHUTDOWN": ("request_id", "reason"),
         "STOP": ("request_id",),

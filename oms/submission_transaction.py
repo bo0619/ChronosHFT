@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from threading import Condition, Lock
+from typing import ClassVar
 
 
 class SubmissionState(str, Enum):
@@ -68,7 +69,7 @@ class SubmissionTransaction:
     once.
     """
 
-    _NEXT_STATE = {
+    _NEXT_STATE: ClassVar[dict[SubmissionState, SubmissionState]] = {
         SubmissionState.CREATED: SubmissionState.PREPARED_DURABLE,
         SubmissionState.PREPARED_DURABLE: SubmissionState.PERMIT_ACQUIRED,
         SubmissionState.PERMIT_ACQUIRED: SubmissionState.DISPATCHED,

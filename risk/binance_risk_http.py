@@ -6,10 +6,10 @@ import hashlib
 import hmac
 import threading
 import time
+from typing import ClassVar
 from urllib.parse import urlencode
 
 import requests
-
 
 REST_URL_MAIN = "https://fapi.binance.com"
 REST_URL_TEST = "https://testnet.binancefuture.com"
@@ -28,7 +28,7 @@ class LocalRiskResponse:
 class BinanceRiskHttpClient:
     """Small authenticated client with an explicitly injected timestamp."""
 
-    ENDPOINT_WEIGHTS = {
+    ENDPOINT_WEIGHTS: ClassVar[dict[str, int]] = {
         "/fapi/v1/time": 1,
         "/fapi/v2/account": 5,
         "/fapi/v2/positionRisk": 5,

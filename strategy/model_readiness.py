@@ -7,12 +7,12 @@ import hmac
 import json
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from alpha.rpi_intensity import (
     RPIExposureBin,
@@ -31,7 +31,11 @@ from governance.contracts import (
 )
 from governance.deployment_identity import (
     DEPLOYMENT_CONFIG_PROJECTION_SCHEMA as GOVERNANCE_DEPLOYMENT_SCHEMA,
+)
+from governance.deployment_identity import (
     deployment_config_projection as governance_deployment_projection,
+)
+from governance.deployment_identity import (
     deployment_config_sha256 as governance_deployment_sha256,
 )
 from governance.release_manifest import build_release_manifest

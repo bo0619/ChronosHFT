@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 from governance.contracts import is_testnet_environment
 from risk.limit_contract import (

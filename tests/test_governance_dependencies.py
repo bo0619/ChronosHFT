@@ -6,7 +6,6 @@ from governance.dependency_graph import (
     strongly_connected_components,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 

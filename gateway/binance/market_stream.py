@@ -5,14 +5,14 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 from event.type import (
-    AggTradeData,
-    MarkPriceData,
     EVENT_AGG_TRADE,
     EVENT_MARK_PRICE,
     EVENT_ORDERBOOK,
+    AggTradeData,
+    MarkPriceData,
 )
 
 
@@ -128,7 +128,7 @@ class BinanceMarketStreamParser:
             price,
             quantity,
             data["m"],
-            datetime.fromtimestamp(exchange_timestamp),
+            datetime.fromtimestamp(exchange_timestamp, tz=timezone.utc),
             exchange_timestamp=exchange_timestamp,
             received_timestamp=envelope.received_timestamp,
             received_monotonic=envelope.received_monotonic,
@@ -167,8 +167,8 @@ class BinanceMarketStreamParser:
             mark_price,
             index_price,
             funding_rate,
-            datetime.fromtimestamp(next_funding_timestamp),
-            datetime.fromtimestamp(exchange_timestamp),
+            datetime.fromtimestamp(next_funding_timestamp, tz=timezone.utc),
+            datetime.fromtimestamp(exchange_timestamp, tz=timezone.utc),
             exchange_timestamp=exchange_timestamp,
             received_timestamp=envelope.received_timestamp,
             received_monotonic=envelope.received_monotonic,

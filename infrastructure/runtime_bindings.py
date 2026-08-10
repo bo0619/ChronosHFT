@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 from data.cache import data_cache
 from event.type import (
@@ -16,8 +16,8 @@ from event.type import (
     EVENT_EXCHANGE_ORDER_UPDATE,
     EVENT_LOG,
     EVENT_MARK_PRICE,
-    EVENT_ORDERBOOK,
     EVENT_ORDER_UPDATE,
+    EVENT_ORDERBOOK,
     EVENT_POSITION_UPDATE,
     EVENT_STRATEGY_UPDATE,
     EVENT_SYSTEM_HEALTH,

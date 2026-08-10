@@ -9,7 +9,6 @@ from oms.submission_transaction import (
     SubmissionTransaction,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / "oms" / "engine.py"
 OMS_IMPLEMENTATION = (

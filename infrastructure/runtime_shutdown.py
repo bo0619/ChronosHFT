@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable
+from typing import Any
 
 from infrastructure.runtime_resources import RuntimeResources
 

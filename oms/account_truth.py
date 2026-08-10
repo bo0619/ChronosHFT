@@ -8,15 +8,15 @@ from datetime import datetime, timezone
 
 from event.type import (
     EVENT_EXCHANGE_ORDER_UPDATE,
+    TIF_GTC,
+    TIF_GTX,
+    TIF_RPI,
     Event,
     ExchangeOrderUpdate,
     ExecutionPolicy,
     OrderIntent,
     OrderStatus,
     Side,
-    TIF_GTC,
-    TIF_GTX,
-    TIF_RPI,
 )
 from infrastructure.logger import logger
 

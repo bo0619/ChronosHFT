@@ -13,8 +13,8 @@ class AsyncLogger:
     """Bounded asynchronous file, console, dashboard, and alert logger."""
 
     _instance = None
-    _LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
-    _HIGH_PRIORITY = {"WARNING", "ERROR", "CRITICAL"}
+    _LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+    _HIGH_PRIORITY = frozenset({"WARNING", "ERROR", "CRITICAL"})
 
     def __new__(cls, *args, **kwargs):
         if not cls._instance:
@@ -132,14 +132,22 @@ class AsyncLogger:
                 if self.ui_callback:
                     try:
                         self.ui_callback(f"[{level}] {message}")
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # Use the standard logger directly: enqueueing here
+                        # would recurse through the callback that just failed.
+                        self.logger.debug(
+                            "Async logger UI callback failed: "
+                            f"{type(exc).__name__}"
+                        )
 
                 if self.alert_callback and level in self._HIGH_PRIORITY:
                     try:
                         self.alert_callback(level, message)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        self.logger.debug(
+                            "Async logger alert callback failed: "
+                            f"{type(exc).__name__}"
+                        )
             except queue.Empty:
                 pass
             except Exception as exc:

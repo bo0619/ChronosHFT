@@ -26,8 +26,8 @@ from oms.journal import (
     decode_legacy_journal,
 )
 from oms.order import Order
-from oms.shutdown_coordinator import OMSShutdownCoordinator
 from oms.order_submission import OMSOrderSubmission
+from oms.shutdown_coordinator import OMSShutdownCoordinator
 from oms.submission_transaction import (
     SubmissionAdmissionPolicy,
     SubmissionState,

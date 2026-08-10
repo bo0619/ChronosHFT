@@ -19,7 +19,6 @@ from infrastructure.config_schema import (
     validate_versioned_manifest,
 )
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 

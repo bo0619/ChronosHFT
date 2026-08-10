@@ -1,3 +1,5 @@
+from datetime import timezone
+
 import pytest
 
 from event.type import EVENT_AGG_TRADE, EVENT_MARK_PRICE, EVENT_ORDERBOOK
@@ -37,6 +39,7 @@ def test_agg_trade_normalization_is_transport_independent():
     assert update.payload.price == 101.5
     assert update.payload.exchange_timestamp == 1.9
     assert update.payload.received_monotonic == 7.0
+    assert update.payload.datetime.tzinfo is timezone.utc
 
 
 @pytest.mark.parametrize(
@@ -81,6 +84,8 @@ def test_mark_price_uses_event_time_not_next_funding_time():
     assert update.event_type == EVENT_MARK_PRICE
     assert update.payload.exchange_timestamp == 2.0
     assert update.payload.next_funding_timestamp == 3.0
+    assert update.payload.datetime.tzinfo is timezone.utc
+    assert update.payload.next_funding_time.tzinfo is timezone.utc
 
 
 def test_depth_metadata_is_copied_without_mutating_wire_payload():

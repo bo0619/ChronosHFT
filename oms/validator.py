@@ -1,8 +1,8 @@
-﻿import threading
-import math
+﻿import math
+import threading
 from collections import deque
 
-from event.type import OrderIntent, TIF_GTX, TIF_RPI
+from event.type import TIF_GTX, TIF_RPI, OrderIntent
 
 
 class OrderValidator:

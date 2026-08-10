@@ -5,18 +5,17 @@ from __future__ import annotations
 import math
 import threading
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
-
-from infrastructure.logger import logger
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from event.type import (
+    TIF_RPI,
     ExecutionPolicy,
     OrderIntent,
     OrderRequest,
     OrderStatus,
     Side,
-    TIF_RPI,
 )
+from infrastructure.logger import logger
 
 from .component import OMSComponent
 from .journal import JournalCorruptionError, JournalError

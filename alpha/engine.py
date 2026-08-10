@@ -1,8 +1,11 @@
 # file: alpha/engine.py
 
-import numpy as np
 from collections import defaultdict
-from event.type import OrderBook, AggTradeData
+
+import numpy as np
+
+from event.type import AggTradeData, OrderBook
+
 
 class FeatureEngine:
     """

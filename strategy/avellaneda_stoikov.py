@@ -44,10 +44,10 @@ from strategy.quote_decision import (
 )
 from strategy.quote_math import (
     ADAPTIVE_AS_FORMULA_VERSION,
-    ASQuoteScenario,
     AS_FORMULA_VERSION,
     PORTFOLIO_AS_FORMULA_VERSION,
     UNITS_VERSION,
+    ASQuoteScenario,
     adaptive_portfolio_as_quote_offsets,
     as_quote_offsets,
     robust_adaptive_portfolio_as_quote_offsets,

@@ -1,6 +1,5 @@
 import math
 import time
-from typing import Dict, Set
 
 from event.type import (
     ExecutionPolicy,
@@ -18,7 +17,7 @@ TERMINAL_STATUSES = {
     OrderStatus.EXPIRED,
 }
 
-_ALLOWED_TRANSITIONS: Dict[OrderStatus, Set[OrderStatus]] = {
+_ALLOWED_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
     OrderStatus.CREATED: {OrderStatus.SUBMITTING, OrderStatus.REJECTED_LOCALLY},
     OrderStatus.SUBMITTING: {
         OrderStatus.SUBMIT_UNKNOWN,

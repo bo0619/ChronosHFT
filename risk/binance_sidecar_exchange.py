@@ -3,9 +3,9 @@
 import time
 
 from infrastructure.binance_rate_limit_budget import BinanceRateLimitBudget
+from risk.binance_risk_http import BinanceRiskHttpClient
 from risk.binance_sidecar_clock import BinanceSidecarClock
 from risk.binance_sidecar_emergency import BinanceSidecarEmergencyActions
-from risk.binance_risk_http import BinanceRiskHttpClient
 from risk.binance_sidecar_settings import BinanceSidecarExchangeConfiguration
 from risk.binance_sidecar_truth import BinanceSidecarTruthReader
 from risk.exchange_port import ActionResult, SnapshotPurpose, TruthResult

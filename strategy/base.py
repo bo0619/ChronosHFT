@@ -2,6 +2,9 @@ import math
 from copy import deepcopy
 
 from event.type import (
+    EVENT_LOG,
+    TIF_GTX,
+    TIF_RPI,
     AccountData,
     AggTradeData,
     Event,
@@ -11,10 +14,7 @@ from event.type import (
     OrderStatus,
     PositionData,
     Side,
-    TIF_GTX,
-    TIF_RPI,
     TradeData,
-    EVENT_LOG,
 )
 from infrastructure.commission_truth import resolve_passive_fee_rate
 from infrastructure.paper_trade import is_paper_trade

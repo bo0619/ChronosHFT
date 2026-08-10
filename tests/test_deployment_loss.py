@@ -4,8 +4,8 @@ import unittest
 from risk.deployment_loss import (
     deployed_capital_equity_ratio,
     deployed_capital_within_equity_limit,
-    deployment_policy_fingerprint,
     deployment_loss_action,
+    deployment_policy_fingerprint,
     update_deployment_loss,
 )
 

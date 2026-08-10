@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -36,7 +35,6 @@ from strategy.model_readiness import (  # noqa: E402
     implementation_sha256_for_model,
     oos_evidence_sha256,
 )
-
 
 OUTPUT_SCHEMA = "chronoshft.glft_rpi_oos_reconstruction_output.v1"
 

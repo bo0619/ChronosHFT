@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import math
+from collections.abc import Mapping
 
 from risk.exchange_port import FlatProof
-
 
 SCHEMA_VERSION = 2
 

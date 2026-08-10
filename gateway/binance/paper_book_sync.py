@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Callable
+from datetime import datetime, timezone
+from typing import Any
 
 from data.orderbook import LocalOrderBook
-from event.type import OrderBook, OrderBookGapError, EVENT_ORDERBOOK
+from event.type import EVENT_ORDERBOOK, OrderBook, OrderBookGapError
 from infrastructure.logger import logger
-
 
 RecoveryClaim = tuple[str, int, int, str]
 
@@ -366,7 +366,7 @@ class PaperBookSynchronizer:
         return OrderBook(
             symbol=book.symbol,
             exchange="BINANCE",
-            datetime=datetime.fromtimestamp(received_at),
+            datetime=datetime.fromtimestamp(received_at, tz=timezone.utc),
             bids=dict(book.bids),
             asks=dict(book.asks),
             top_bids=tuple(book.top_bids),

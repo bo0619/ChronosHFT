@@ -2,22 +2,21 @@
 
 import math
 import multiprocessing
-from pathlib import Path
 import queue
 import secrets
 import time
+from pathlib import Path
 
 from risk.sidecar_health import SidecarOmsHealth
 from risk.sidecar_protocol import SidecarProtocol
 from risk.sidecar_settings import SidecarSupervisorConfiguration
-from risk.sidecar_status import SidecarStatusProjection
 from risk.sidecar_state_store import (
     AccountWriterFence,
     SidecarWriterFenceError,
 )
+from risk.sidecar_status import SidecarStatusProjection
 from risk.sidecar_transport import SidecarTransport
 from risk.sidecar_values import finite_float as _finite_float
-
 
 SUPERVISOR_SOURCE = "independent_supervisor"
 

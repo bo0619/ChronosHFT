@@ -8,19 +8,20 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from alpha.paper_calibration import MARKOUT_FEATURE_NAMES
-from alpha.paper_calibration import MarkoutObservation
-from alpha.paper_calibration import QuoteExposure
-from alpha.paper_calibration import bootstrap_intensity_intervals
-from alpha.paper_calibration import fit_conditional_markout
-from alpha.paper_calibration import fit_exponential_intensity
-from alpha.paper_calibration import load_markout_observations
-from alpha.paper_calibration import load_quote_exposures
-from alpha.paper_calibration import walk_forward_intensity
+from alpha.paper_calibration import (
+    MARKOUT_FEATURE_NAMES,
+    MarkoutObservation,
+    QuoteExposure,
+    bootstrap_intensity_intervals,
+    fit_conditional_markout,
+    fit_exponential_intensity,
+    load_markout_observations,
+    load_quote_exposures,
+    walk_forward_intensity,
+)
 from oms.journal import OMSJournal
 from oms.paper_trade_database import PaperTradeDatabase
 from scripts.calibrate_paper_models import main as calibrate_main
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 

@@ -29,7 +29,6 @@ from strategy.model_readiness import (
     strategy_policy_sha256,
 )
 
-
 NOW = datetime(2026, 7, 24, 12, 2, tzinfo=timezone.utc)
 PUBLIC_KEY = b"K" * 32
 KEY_ID = "rpi-permit-test-key"

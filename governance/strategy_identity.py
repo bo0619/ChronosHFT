@@ -16,7 +16,6 @@ from strategy.quote_math import (
     UNITS_VERSION,
 )
 
-
 _ALIASES = {
     "glft": "glft",
     "glftmultiscale": "glft",

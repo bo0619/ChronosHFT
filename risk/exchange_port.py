@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-import math
-from typing import Mapping, Protocol
+from typing import Protocol
 
 
 class SnapshotPurpose(str, Enum):

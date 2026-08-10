@@ -4,17 +4,18 @@ import time
 import requests
 
 from event.type import (
-    CancelRequest,
-    Event,
-    GatewayState,
-    GatewayCommandResult,
-    OrderRequest,
     EVENT_ORDERBOOK,
     EVENT_SYSTEM_HEALTH,
+    CancelRequest,
+    Event,
+    GatewayCommandResult,
+    GatewayState,
+    OrderRequest,
 )
 from gateway.base_gateway import BaseGateway
 from infrastructure.logger import logger
 from infrastructure.time_service import time_service
+
 from .account_configuration import (
     BinanceAccountConfigurationController,
     BinanceAccountConfigurationDependencies,
@@ -35,7 +36,6 @@ from .rest_gateway import (
     BinanceRestGateway,
     BinanceRestGatewayDependencies,
 )
-from .ws_api import BinanceWsApi
 from .user_stream import (
     BinanceUserStreamController,
     BinanceUserStreamDependencies,
@@ -44,6 +44,7 @@ from .websocket_dispatcher import (
     BinanceWebSocketDependencies,
     BinanceWebSocketDispatcher,
 )
+from .ws_api import BinanceWsApi
 
 
 class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):

@@ -19,7 +19,6 @@ from pathlib import Path
 from infrastructure.logger import logger
 from infrastructure.paper_trade import validate_paper_trade_database_config
 
-
 SCHEMA_VERSION = 5
 LEGACY_RUN_ID = "legacy-journal-import"
 SOFTWARE_VERSION = "0.1.0"

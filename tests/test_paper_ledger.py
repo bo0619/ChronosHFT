@@ -1,7 +1,7 @@
 import time
 from collections import deque
 
-from event.type import OrderRequest, TIF_GTX
+from event.type import TIF_GTX, OrderRequest
 from gateway.binance.paper_ledger import (
     PaperLedger,
     PaperLedgerConfig,
@@ -9,7 +9,6 @@ from gateway.binance.paper_ledger import (
 )
 from gateway.binance.paper_matching import PaperVenueState
 from gateway.binance.paper_state import PaperOrder
-
 
 SYMBOL = "SNDKUSDT"
 

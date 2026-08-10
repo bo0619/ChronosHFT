@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import asdict, replace
 import json
 import sqlite3
+from dataclasses import asdict, replace
 
 import pytest
 
@@ -11,11 +11,10 @@ from risk.exchange_port import (
     StateVersion,
     TruthResult,
 )
+from risk.sidecar_command_runtime import rearm_proof_binding
 from risk.sidecar_core import RiskSidecarCore
 from risk.sidecar_flat_proof import FlatProofEngine, FlatProofError
-from risk.sidecar_command_runtime import rearm_proof_binding
 from risk.sidecar_state_store import SidecarStateStore, SidecarStateStoreError
-
 
 STATE_DIGEST = "a" * 64
 

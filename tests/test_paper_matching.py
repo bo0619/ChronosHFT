@@ -1,11 +1,11 @@
 from datetime import datetime
 
 from event.type import (
+    TIF_GTX,
+    TIF_RPI,
     AggTradeData,
     OrderBook,
     OrderRequest,
-    TIF_GTX,
-    TIF_RPI,
 )
 from gateway.binance.paper_matching import (
     PaperMatchingEngine,
@@ -14,7 +14,6 @@ from gateway.binance.paper_matching import (
     PaperVenueState,
 )
 from gateway.binance.paper_state import PaperOrder
-
 
 SYMBOL = "SNDKUSDT"
 

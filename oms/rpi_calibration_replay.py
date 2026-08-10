@@ -5,15 +5,14 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
-from decimal import Decimal, ROUND_CEILING
+from decimal import ROUND_CEILING, Decimal
 
+from event.type import TIF_RPI, Side
 from infrastructure.rpi_calibration_permit import (
     rpi_calibration_permit_sha256,
     rpi_calibration_permit_signature_payload,
 )
 from strategy.model_readiness import verify_ed25519_signature
-
-from event.type import Side, TIF_RPI
 
 from .component import OMSComponent
 from .journal import JournalCorruptionError

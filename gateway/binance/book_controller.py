@@ -11,7 +11,6 @@ from typing import Any
 from data.orderbook import LocalOrderBook
 from event.type import OrderBookGapError
 
-
 BookRecovery = tuple[str, int, int, str]
 
 

@@ -27,7 +27,6 @@ from governance.deployment_identity import deployment_config_sha256
 from infrastructure.logger import logger
 from infrastructure.single_writer_fence import SingleWriterFence
 
-
 LIVE_EVIDENCE_SCHEMA = "chronoshft.live_market_evidence.v1"
 LIVE_EVIDENCE_RECORD_VERSION = 1
 LIVE_EVIDENCE_KINDS = frozenset(

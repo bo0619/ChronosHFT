@@ -8,7 +8,6 @@ from typing import Any
 
 from event.type import OrderRequest
 
-
 ACTIVE_ORDER_STATUSES = frozenset({"NEW", "PARTIALLY_FILLED"})
 TERMINAL_ORDER_STATUSES = frozenset(
     {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}

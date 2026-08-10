@@ -6,14 +6,13 @@ import math
 from collections import OrderedDict, defaultdict
 from itertools import chain
 
-from infrastructure.logger import logger
-
 from event.type import (
     LifecycleState,
     OMSCapabilityMode,
     OrderStatus,
     Side,
 )
+from infrastructure.logger import logger
 
 from .component import OMSComponent
 from .execution_identity import retain_cursor_uncovered_execution_ids

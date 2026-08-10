@@ -17,7 +17,6 @@ from risk.exchange_port import (
 )
 from risk.funding_guard import parse_binance_premium_index_payload
 
-
 BINANCE_PREMIUM_INDEX_ENDPOINT = "/fapi/v1/premiumIndex"
 
 

@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from event.type import (
+    EVENT_SYSTEM_HEALTH,
     CommandOutcome,
     Event,
     LifecycleState,
     OMSCapabilityMode,
-    EVENT_SYSTEM_HEALTH,
 )
 from infrastructure.logger import logger
 

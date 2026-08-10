@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 from governance.contracts import (
     CONFIG_DOCUMENT_VERSION,

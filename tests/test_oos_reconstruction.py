@@ -17,7 +17,6 @@ from data.oos_reconstruction import (
 )
 from strategy.model_readiness import _validate_raw_oos_evidence
 
-
 SYMBOL = "XAUUSDT"
 DEPLOYMENT_ID = "unit-oos-001"
 CONFIG_SHA256 = "a" * 64

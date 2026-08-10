@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Iterator, MutableMapping
 from typing import Generic, TypeVar
 
-
 T = TypeVar("T")
 
 

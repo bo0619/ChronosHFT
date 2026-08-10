@@ -1,7 +1,7 @@
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 
-from event.type import AccountData, Event, EVENT_ACCOUNT_UPDATE
+from event.type import EVENT_ACCOUNT_UPDATE, AccountData, Event
 
 
 class AccountManager:
@@ -272,7 +272,10 @@ class AccountManager:
             equity=self.equity,
             available=self.available,
             used_margin=self.used_margin,
-            datetime=datetime.fromtimestamp(self.clock.wall_time()),
+            datetime=datetime.fromtimestamp(
+                self.clock.wall_time(),
+                tz=timezone.utc,
+            ),
             balances=dict(self.balances),
             available_balances=dict(self.available_balances),
             budget_balance=self.budget_equity,

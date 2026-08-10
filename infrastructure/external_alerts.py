@@ -1,21 +1,21 @@
 from __future__ import annotations
 
-from collections import deque
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
+import logging
 import math
 import os
-from pathlib import Path
 import re
 import shutil
 import threading
 import time
+from collections import deque
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 from uuid import uuid4
-
 
 ALERT_SCHEMA = "chronoshft.external_alert.v1"
 ALERT_FAILURE_SCHEMA = "chronoshft.external_alert_failure.v1"
@@ -1003,8 +1003,11 @@ class ExternalAlertService:
                         os.fsync(handle.fileno())
         except _FailureSpoolSpaceError as exc:
             failure_reason = str(exc)
-        except (OSError, TypeError, ValueError):
-            pass
+        except (OSError, TypeError, ValueError) as exc:
+            logging.getLogger(__name__).debug(
+                "External alert failure spool write failed: "
+                f"{type(exc).__name__}"
+            )
         else:
             with self._condition:
                 self._failure_records += 1
@@ -1025,5 +1028,8 @@ class ExternalAlertService:
         if callable(close):
             try:
                 close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.getLogger(__name__).debug(
+                    "External alert transport close failed: "
+                    f"{type(exc).__name__}"
+                )

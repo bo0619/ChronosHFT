@@ -2,7 +2,6 @@ import math
 from copy import deepcopy
 from pathlib import Path
 
-
 PAPER_EXECUTION_MODE = "paper"
 LIVE_EXECUTION_MODE = "live"
 RISK_MANAGER_HEARTBEAT_SOURCE = "risk_manager"

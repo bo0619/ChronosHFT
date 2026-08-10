@@ -1,6 +1,6 @@
 import time
 
-from event.type import Event, EVENT_SYSTEM_HEALTH, OMSCapabilityMode
+from event.type import EVENT_SYSTEM_HEALTH, Event, OMSCapabilityMode
 from infrastructure.logger import logger
 
 

@@ -14,7 +14,6 @@ from numbers import Real
 
 import numpy as np
 
-
 UNITS_VERSION = "chronoshft.log_bps_seconds_fixed_notional_lot.v1"
 AS_FORMULA_VERSION = "avellaneda_stoikov.log_bps_finite_horizon.v1"
 PORTFOLIO_AS_FORMULA_VERSION = (

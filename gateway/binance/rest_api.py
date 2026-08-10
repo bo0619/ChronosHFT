@@ -2,11 +2,14 @@ import hashlib
 import hmac
 import threading
 import time
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 from urllib.parse import urlencode
 
 import requests
 
+from data.ref_data import ref_data_manager
 from event.type import CancelRequest, OrderRequest
+from infrastructure.binance_rate_limit_budget import BinanceRateLimitBudget
 from infrastructure.logger import logger
 from infrastructure.time_service import time_service
 
@@ -31,7 +34,6 @@ from .constants import (
     REST_URL_MAIN,
     REST_URL_TEST,
 )
-from infrastructure.binance_rate_limit_budget import BinanceRateLimitBudget
 from .rest_metrics import BinanceRestMetrics
 
 
@@ -42,6 +44,82 @@ class _LocalGuardResponse:
 
     def json(self):
         return dict(self._payload)
+
+
+def _decimal_places(value) -> int | None:
+    """Return the fixed-point scale represented by an exchange filter value."""
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not parsed.is_finite() or parsed <= 0:
+        return None
+    # Strip insignificant trailing zeroes first.  Reference data is stored as
+    # floats, so a whole-number step can arrive as ``1.0`` even though its
+    # wire scale is zero.
+    exponent = parsed.normalize().as_tuple().exponent
+    return max(0, -int(exponent))
+
+
+def _format_decimal_text(value, *, precision: int | None, rounding) -> str:
+    """Serialize an order value as fixed-point text, never scientific text."""
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("order price/quantity must be numeric") from exc
+    if not parsed.is_finite():
+        raise ValueError("order price/quantity must be finite")
+
+    if precision is None:
+        return format(parsed, "f")
+
+    original = parsed
+    places = max(0, int(precision))
+    # Decimal.quantize uses the active context precision.  Increase it for
+    # large prices so formatting itself cannot fail at the send boundary.
+    with localcontext() as context:
+        context.prec = max(28, len(parsed.as_tuple().digits) + places + 8)
+        quantum = Decimal(1).scaleb(-places)
+        parsed = parsed.quantize(quantum, rounding=rounding)
+    if original > 0 and parsed <= 0:
+        raise ValueError("order price/quantity rounds to zero")
+    return format(parsed, f".{places}f")
+
+
+def _reference_field(info, name: str):
+    if isinstance(info, dict):
+        return info.get(name)
+    return getattr(info, name, None)
+
+
+def _format_symbol_order_value(
+    symbol: str,
+    value,
+    *,
+    precision_field: str,
+    filter_field: str,
+    rounding,
+) -> str:
+    """Format a value using the symbol's reference precision/filter scale."""
+    info = ref_data_manager.get_info(symbol)
+
+    scales = []
+    if info is not None:
+        raw_precision = _reference_field(info, precision_field)
+        if raw_precision is not None:
+            try:
+                scales.append(max(0, int(raw_precision)))
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+        raw_filter = _reference_field(info, filter_field)
+        if raw_filter is not None:
+            filter_scale = _decimal_places(raw_filter)
+            if filter_scale is not None:
+                scales.append(filter_scale)
+
+    precision = max(scales) if scales else None
+    return _format_decimal_text(value, precision=precision, rounding=rounding)
 
 
 class BinanceRestApi:
@@ -600,6 +678,26 @@ class BinanceRestApi:
         if req.order_type == "LIMIT":
             params["price"] = req.price
             params["timeInForce"] = req.time_in_force
+
+        # Keep exchange-facing numeric fields as fixed-point text.  Binance
+        # rejects scientific notation and values with binary-float residue;
+        # quantity is rounded toward zero so serialization cannot increase
+        # the requested exposure.
+        params["quantity"] = _format_symbol_order_value(
+            req.symbol,
+            params["quantity"],
+            precision_field="qty_precision",
+            filter_field="step_size",
+            rounding=ROUND_DOWN,
+        )
+        if "price" in params:
+            params["price"] = _format_symbol_order_value(
+                req.symbol,
+                params["price"],
+                precision_field="price_precision",
+                filter_field="tick_size",
+                rounding=ROUND_HALF_UP,
+            )
 
         guards = []
         if not req.reduce_only and self.order_clock_guard is not None:

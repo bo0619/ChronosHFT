@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 from risk.deployment_loss import deployment_policy_fingerprint
 from risk.funding_guard import FundingGuardPolicy

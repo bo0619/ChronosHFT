@@ -8,11 +8,11 @@ import hmac
 import json
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from governance.state_paths import validate_live_state_path_bindings
 from strategy.model_readiness import (
@@ -22,7 +22,6 @@ from strategy.model_readiness import (
     verify_ed25519_signature,
 )
 from strategy.registry import canonical_model_key
-
 
 RPI_CALIBRATION_PERMIT_SCHEMA = "chronoshft.rpi_calibration_permit.v1"
 RPI_CALIBRATION_SIGNATURE_ALGORITHM = "ED25519"

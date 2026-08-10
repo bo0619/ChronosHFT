@@ -1,7 +1,7 @@
-from datetime import datetime
 import io
-from types import SimpleNamespace
 import threading
+from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest

@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict, deque
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from numbers import Real
-from typing import Iterable, Sequence
 
 import numpy as np
 

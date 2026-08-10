@@ -3,14 +3,13 @@ import time
 from types import SimpleNamespace
 
 from data.orderbook import LocalOrderBook
-from event.type import Event, OrderBookGapError, EVENT_ORDERBOOK, EVENT_SYSTEM_HEALTH
+from event.type import EVENT_ORDERBOOK, EVENT_SYSTEM_HEALTH, Event, OrderBookGapError
 from gateway.binance.paper_book_sync import (
     PaperBookFeedConfig,
     PaperBookFeedPort,
     PaperBookFeedState,
     PaperBookSynchronizer,
 )
-
 
 SYMBOL = "BTCUSDT"
 

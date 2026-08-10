@@ -1,7 +1,7 @@
+import time
 from collections import defaultdict, deque
 from queue import Empty, Full, Queue
 from threading import Condition, Lock, RLock, Thread, local
-import time
 
 from infrastructure.logger import logger
 

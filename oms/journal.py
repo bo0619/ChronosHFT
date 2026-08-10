@@ -18,10 +18,10 @@ import time
 import uuid
 import zlib
 from collections import deque
+from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Iterable, Iterator
 
 from infrastructure.durability import DurabilityError
 

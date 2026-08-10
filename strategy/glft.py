@@ -6,7 +6,7 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 
 from alpha.engine import FeatureEngine
 from alpha.factors import GLFTCalibrator
@@ -29,6 +29,7 @@ from alpha.rpi_intensity import (
 from alpha.signal import MultiHorizonPredictor
 from event.type import (
     EVENT_STRATEGY_UPDATE,
+    TIF_RPI,
     AggTradeData,
     Event,
     OrderBook,
@@ -37,9 +38,9 @@ from event.type import (
     OrderStatus,
     Side,
     StrategyData,
-    TIF_RPI,
     TradeData,
 )
+from infrastructure.logger import logger
 from infrastructure.paper_trade import is_paper_trade
 from infrastructure.runtime_ports import ClockPort, ReferenceDataPort
 from strategy.adaptive_pipeline import (
@@ -59,8 +60,8 @@ from strategy.quote_math import (
     ADAPTIVE_GLFT_FORMULA_VERSION,
     GLFT_FORMULA_VERSION,
     PORTFOLIO_GLFT_FORMULA_VERSION,
-    GLFTQuoteScenario,
     UNITS_VERSION,
+    GLFTQuoteScenario,
     glft_quote_offsets,
     portfolio_glft_quote_offsets,
     robust_adaptive_portfolio_glft_quote_offsets,
@@ -713,7 +714,7 @@ class GLFTStrategy(StrategyTemplate):
         self.latest_stale_guard = defaultdict(dict)
         self.latest_market_timing = defaultdict(dict)
 
-        print(
+        logger.info(
             f"[{self.name}] GLFT initialized: gamma={self.gamma_base}, "
             f"alpha_enabled={self.alpha_enabled}, live={self.live_mode}"
         )

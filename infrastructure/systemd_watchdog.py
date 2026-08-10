@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
 import math
 import os
 import socket
 import time
+from collections.abc import Callable, Mapping
 from typing import Any
 
 

@@ -1,11 +1,12 @@
-from collections.abc import Mapping
 import json
 import math
+from collections.abc import Mapping
+from typing import ClassVar
 
 from .account_truth import OMSAccountTruth
 from .background_tasks import OMSBackgroundTaskManager
-from .capability_manager import OMSCapabilityManager
 from .cancellation_manager import OMSCancellationManager
+from .capability_manager import OMSCapabilityManager
 from .component import OMSComponent, OMSComponentContext, component_method
 from .component_state import (
     OMSAttributeBinding,
@@ -26,8 +27,8 @@ from .recovery_state import OMSRecoveryStateRestorer
 from .rpi_calibration_manager import RpiCalibrationManager
 from .rpi_calibration_replay import RpiCalibrationReplay
 from .rpi_calibration_runtime import RpiCalibrationRuntime
-from .submit_settlement import OMSSubmitSettlement
 from .state_publisher import OMSStatePublisher
+from .submit_settlement import OMSSubmitSettlement
 
 
 class OMS:
@@ -163,7 +164,7 @@ class OMS:
     OUTBOUND_REDUCE_ORDER = "REDUCE_ORDER"
     OUTBOUND_CANCEL = "CANCEL"
 
-    _component_factories = {
+    _component_factories: ClassVar[dict[str, object]] = {
         "account_truth": OMSAccountTruth,
         "background_task_manager": OMSBackgroundTaskManager,
         "capability_manager": OMSCapabilityManager,

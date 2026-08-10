@@ -6,13 +6,13 @@ import os
 from dataclasses import asdict
 
 from risk.exchange_port import FlatProof
-from risk.sidecar_state_store import (
-    SidecarStateStore,
-    SidecarStateStoreError,
-)
 from risk.sidecar_state_payload import (
     SidecarStatePayloadError,
     parse_sidecar_state_payload,
+)
+from risk.sidecar_state_store import (
+    SidecarStateStore,
+    SidecarStateStoreError,
 )
 
 

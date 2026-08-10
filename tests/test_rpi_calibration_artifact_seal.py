@@ -3,8 +3,8 @@ import json
 from pathlib import Path
 
 import pytest
-from governance import calibration_artifact as calibration_artifact_port
 
+from governance import calibration_artifact as calibration_artifact_port
 from infrastructure.single_writer_fence import (
     SingleWriterFence,
     SingleWriterFenceError,
@@ -12,12 +12,11 @@ from infrastructure.single_writer_fence import (
 from scripts import build_rpi_calibration_artifact as artifact_builder
 from scripts.build_rpi_calibration_artifact import (
     CalibrationArtifactError,
-    authorized_journal_fence,
     _CalibrationJournalReplay,
+    authorized_journal_fence,
 )
 from strategy import model_readiness
 from tests.test_live_config_guard import safe_rpi_calibration_config
-
 
 ROOT = Path(__file__).resolve().parents[1]
 

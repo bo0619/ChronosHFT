@@ -8,17 +8,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.check_live_canary_readiness import (
-    ACCOUNT_TRUTH_SOURCE,
-    BLOCKED,
-    EVIDENCE_SCHEMA,
-    PASS,
-    RPI_COMMISSION_SOURCE,
-    RPI_EXCHANGE_INFO_SOURCE,
-    _REQUIRED_ATTESTATIONS,
-    assess_live_canary_readiness,
-    main,
-)
 from infrastructure.live_config_guard import (
     LIVE_CANARY_EVIDENCE_CANONICALIZATION,
     LIVE_CANARY_EVIDENCE_INTEGRITY_ALGORITHM,
@@ -26,11 +15,21 @@ from infrastructure.live_config_guard import (
     sign_live_canary_evidence,
     validate_live_canary_local_evidence,
 )
+from scripts.check_live_canary_readiness import (
+    _REQUIRED_ATTESTATIONS,
+    ACCOUNT_TRUTH_SOURCE,
+    BLOCKED,
+    EVIDENCE_SCHEMA,
+    PASS,
+    RPI_COMMISSION_SOURCE,
+    RPI_EXCHANGE_INFO_SOURCE,
+    assess_live_canary_readiness,
+    main,
+)
 from tests.test_live_config_guard import (
     safe_live_config,
     safe_rpi_calibration_config,
 )
-
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXED_NOW = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)

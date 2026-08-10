@@ -6,13 +6,13 @@ import math
 import uuid
 
 from event.type import (
+    TIF_GTX,
+    TIF_IOC,
     ExecutionPolicy,
     OMSCapabilityMode,
     OrderIntent,
     OrderRequest,
     Side,
-    TIF_GTX,
-    TIF_IOC,
 )
 
 from .component import OMSComponent

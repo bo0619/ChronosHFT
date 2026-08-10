@@ -6,7 +6,6 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-
 DEFAULT_ADMIN_DIR = os.path.join("storage", "admin")
 DEFAULT_COMMAND_TTL_SEC = 10.0
 DEFAULT_SESSION_MAX_AGE_SEC = 2.0

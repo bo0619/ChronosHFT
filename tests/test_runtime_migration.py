@@ -17,7 +17,6 @@ from migration.runtime_state import (
 )
 from oms.journal import OMSJournal
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 

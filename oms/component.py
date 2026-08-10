@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 from .component_state import OMSAttributeBinding
-
 
 _ComponentT = TypeVar("_ComponentT", bound="OMSComponent")
 

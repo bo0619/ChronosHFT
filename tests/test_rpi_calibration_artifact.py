@@ -18,10 +18,11 @@ from scripts.build_rpi_calibration_artifact import (
     SAMPLE_KIND,
     SAMPLE_SCHEMA,
     CalibrationArtifactError,
-    build_rpi_calibration_artifact as _build_rpi_calibration_artifact,
     validate_rpi_calibration_journal,
 )
-
+from scripts.build_rpi_calibration_artifact import (
+    build_rpi_calibration_artifact as _build_rpi_calibration_artifact,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SYMBOL = "XAUUSDT"

@@ -1,12 +1,14 @@
 from abc import ABC, abstractmethod
 
-from event.type import Event, GatewayState
 from event.type import (
     EVENT_EXCHANGE_ACCOUNT_UPDATE,
     EVENT_EXCHANGE_ORDER_UPDATE,
     EVENT_LOG,
+    Event,
+    ExchangeAccountUpdate,
+    ExchangeOrderUpdate,
+    GatewayState,
 )
-from event.type import ExchangeAccountUpdate, ExchangeOrderUpdate
 
 
 class BaseGateway(ABC):

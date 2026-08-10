@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import multiprocessing
-from pathlib import Path
 import threading
 import time
+from pathlib import Path
 
 import pytest
 

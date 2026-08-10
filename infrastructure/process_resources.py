@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from collections import deque
-from collections.abc import Callable, Iterable, Mapping
 import math
 import os
-from pathlib import Path
 import sys
 import time
+from collections import deque
+from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
 from typing import Any
 
 

@@ -1,7 +1,6 @@
 import re
 import threading
 
-
 _RATE_LIMIT_HEADER = re.compile(
     r"^x-mbx-(used-weight|order-count)-([1-9][0-9]*[smhd])$",
     re.IGNORECASE,

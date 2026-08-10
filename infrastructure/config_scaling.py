@@ -24,7 +24,6 @@ from strategy.model_readiness import (
     validate_live_calibration_approval,
 )
 
-
 QUOTE_ASSET_SUFFIXES = ("USDT", "USDC", "BUSD", "FDUSD")
 TIME_SYNC_DEFAULTS = {
     "startup_required": True,

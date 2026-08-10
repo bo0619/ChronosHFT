@@ -9,18 +9,17 @@ import signal
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from event.type import (
+    EVENT_AGG_TRADE,
+    EVENT_ORDERBOOK,
     AggTradeData,
     Event,
     OrderBook,
-    EVENT_AGG_TRADE,
-    EVENT_ORDERBOOK,
 )
 from infrastructure.logger import logger
-
 
 _ROW = "ROW"
 _FLUSH = "FLUSH"
@@ -94,7 +93,7 @@ def _flush_hdf_buffer(
                 f"free={free_bytes}:required={reserved_bytes}:"
                 f"reserve={min_free_bytes}"
             )
-    today = datetime.now().strftime("%Y%m%d")
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
     filename = Path(save_path) / f"{symbol}_{data_type}_{today}.h5"
     frame = pd.DataFrame(batch)
     write_options = {}

@@ -3,10 +3,6 @@ from pathlib import Path
 
 import pytest
 
-from infrastructure.binance_account_configuration import (
-    AccountConfigurationVerificationError,
-    verify_account_configuration,
-)
 from gateway.binance.account_configuration import (
     BinanceAccountConfigurationController,
     BinanceAccountConfigurationDependencies,
@@ -14,7 +10,10 @@ from gateway.binance.account_configuration import (
 from gateway.binance.constants import (
     ACCOUNT_CONFIGURATION_MODE_VERIFY_ONLY,
 )
-
+from infrastructure.binance_account_configuration import (
+    AccountConfigurationVerificationError,
+    verify_account_configuration,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 

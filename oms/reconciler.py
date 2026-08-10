@@ -5,9 +5,8 @@ from __future__ import annotations
 import threading
 import time
 
-from infrastructure.logger import logger
-
 from event.type import LifecycleState
+from infrastructure.logger import logger
 
 from .component import OMSComponent
 from .exchange_snapshot import (

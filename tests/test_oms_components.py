@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 import pytest
 
 from event.type import LifecycleState
@@ -36,7 +38,9 @@ class _ExampleFacade:
 
 
 class _LazyFacade:
-    _component_factories = {"component": _ExampleComponent}
+    _component_factories: ClassVar[dict[str, object]] = {
+        "component": _ExampleComponent
+    }
     read_value = component_method("component")
 
     def __init__(self):

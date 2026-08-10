@@ -11,7 +11,6 @@ from pathlib import Path
 from infrastructure.config_scaling import load_root_config
 from infrastructure.paper_trade import is_paper_trade
 
-
 WORKSPACE_DIR = Path(__file__).resolve().parent
 TARGET_SCRIPT = WORKSPACE_DIR / "main.py"
 CONFIG_PATH = WORKSPACE_DIR / "config.json"

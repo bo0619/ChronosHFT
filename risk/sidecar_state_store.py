@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
 import hashlib
 import json
 import os
-from pathlib import Path
 import secrets
 import socket
 import sqlite3
 import threading
 import time
-from typing import Mapping
+from collections.abc import Mapping
+from contextlib import suppress
+from pathlib import Path
 
 from risk.exchange_port import StateVersion
 from risk.sidecar_state_payload import (
@@ -20,7 +20,6 @@ from risk.sidecar_state_payload import (
     SidecarStatePayloadError,
     parse_sidecar_state_payload,
 )
-
 
 _SAFETY_INCREASING = "SAFETY_INCREASING"
 _NEUTRAL = "NEUTRAL"

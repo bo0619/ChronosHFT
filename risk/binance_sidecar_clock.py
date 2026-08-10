@@ -5,7 +5,8 @@ from __future__ import annotations
 import math
 import statistics
 import time
-from typing import Callable, Protocol
+from collections.abc import Callable
+from typing import Protocol
 
 
 class BinanceSidecarClockOwner(Protocol):

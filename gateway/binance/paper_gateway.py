@@ -20,13 +20,21 @@ import queue
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
 
 from data.ref_data import ref_data_manager
 from event.type import (
+    EVENT_AGG_TRADE,
+    EVENT_MARK_PRICE,
+    EVENT_SYSTEM_HEALTH,
+    TIF_FOK,
+    TIF_GTC,
+    TIF_GTX,
+    TIF_IOC,
+    TIF_RPI,
     AggTradeData,
     CancelRequest,
     CommandOutcome,
@@ -36,14 +44,6 @@ from event.type import (
     MarkPriceData,
     OrderBook,
     OrderRequest,
-    EVENT_AGG_TRADE,
-    EVENT_MARK_PRICE,
-    EVENT_SYSTEM_HEALTH,
-    TIF_FOK,
-    TIF_GTC,
-    TIF_GTX,
-    TIF_IOC,
-    TIF_RPI,
 )
 from gateway.base_gateway import BaseGateway
 from infrastructure.logger import logger
@@ -69,10 +69,16 @@ from .paper_matching import (
     PaperVenueState,
 )
 from .paper_state import (
-    EngineCommand as _EngineCommand,
-    PaperOrder as _PaperOrder,
-    PaperPosition as _PaperPosition,
     TERMINAL_ORDER_STATUSES as _TERMINAL_STATUSES,
+)
+from .paper_state import (
+    EngineCommand as _EngineCommand,
+)
+from .paper_state import (
+    PaperOrder as _PaperOrder,
+)
+from .paper_state import (
+    PaperPosition as _PaperPosition,
 )
 from .ws_api import BinanceWsApi
 
@@ -854,7 +860,8 @@ class BinancePaperGateway(BaseGateway):
                 maker_is_buyer=bool(data.get("m", False)),
                 datetime=datetime.fromtimestamp(
                     float(data.get("T", event_ms) or int(received_timestamp * 1000))
-                    / 1000.0
+                    / 1000.0,
+                    tz=timezone.utc,
                 ),
                 exchange_timestamp=(
                     float(data.get("T", event_ms) or 0.0) / 1000.0
@@ -884,10 +891,12 @@ class BinancePaperGateway(BaseGateway):
                 index_price=float(data.get("i", 0.0) or 0.0),
                 funding_rate=float(data.get("r", 0.0) or 0.0),
                 next_funding_time=datetime.fromtimestamp(
-                    next_funding_timestamp or time.time()
+                    next_funding_timestamp or time.time(),
+                    tz=timezone.utc,
                 ),
                 datetime=datetime.fromtimestamp(
-                    event_time_ms / 1000.0 if event_time_ms else received_timestamp
+                    event_time_ms / 1000.0 if event_time_ms else received_timestamp,
+                    tz=timezone.utc,
                 ),
                 exchange_timestamp=(event_time_ms / 1000.0 if event_time_ms else 0.0),
                 received_timestamp=received_timestamp,
@@ -1033,9 +1042,13 @@ class BinancePaperGateway(BaseGateway):
             index_price=index_price,
             funding_rate=funding_rate,
             next_funding_time=datetime.fromtimestamp(
-                next_funding_timestamp or received_timestamp
+                next_funding_timestamp or received_timestamp,
+                tz=timezone.utc,
             ),
-            datetime=datetime.fromtimestamp(exchange_timestamp),
+            datetime=datetime.fromtimestamp(
+                exchange_timestamp,
+                tz=timezone.utc,
+            ),
             exchange_timestamp=exchange_timestamp,
             received_timestamp=received_timestamp,
             received_monotonic=received_monotonic,

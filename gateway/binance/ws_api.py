@@ -6,6 +6,7 @@ import time
 import websocket
 
 from infrastructure.logger import logger
+
 from .constants import (
     WS_MARKET_URL_MAIN,
     WS_PRIVATE_URL_MAIN,
@@ -195,8 +196,11 @@ class BinanceWsApi:
         for ws_app in stream_apps:
             try:
                 ws_app.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(
+                    "[BinanceWsApi] stream close raised "
+                    f"{type(exc).__name__}"
+                )
         deadline = time.perf_counter() + 2.0
         for thread in stream_threads:
             if thread.is_alive():

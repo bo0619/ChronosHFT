@@ -1,23 +1,23 @@
+import tempfile
 import threading
 import time
-import tempfile
 import unittest
 from unittest.mock import patch
 
 from event.type import (
+    EVENT_EXCHANGE_ORDER_UPDATE,
+    EVENT_ORDER_SUBMITTED,
+    TIF_IOC,
     CommandOutcome,
     Event,
-    ExecutionPolicy,
     ExchangeOrderUpdate,
+    ExecutionPolicy,
     GatewayCommandResult,
     LifecycleState,
     OrderIntent,
     OrderRequest,
     OrderStatus,
     Side,
-    TIF_IOC,
-    EVENT_EXCHANGE_ORDER_UPDATE,
-    EVENT_ORDER_SUBMITTED,
 )
 from oms.engine import OMS
 from oms.order import Order
@@ -100,6 +100,30 @@ class RecoveryGateway:
         return list(self.open_orders)
 
 
+class BlockingSubmitGateway(RecoveryGateway):
+    """Hold the first transport call to probe the OMS risk-lock boundary."""
+
+    def __init__(self):
+        super().__init__()
+        self.first_send_entered = threading.Event()
+        self.release_first_send = threading.Event()
+        self.send_count = 0
+        self._send_count_lock = threading.Lock()
+
+    def send_order(self, _request, _client_oid):
+        with self._send_count_lock:
+            self.send_count += 1
+            send_number = self.send_count
+        if send_number == 1:
+            self.first_send_entered.set()
+            if not self.release_first_send.wait(5.0):
+                raise TimeoutError("test did not release the first send")
+        return GatewayCommandResult(
+            CommandOutcome.ACKNOWLEDGED,
+            exchange_oid=f"ex-blocking-{send_number}",
+        )
+
+
 class InstitutionalRecoveryTests(unittest.TestCase):
     def make_config(self):
         return {
@@ -137,6 +161,65 @@ class InstitutionalRecoveryTests(unittest.TestCase):
         oms.exchange_id_map[exchange_oid] = order
         oms.exposure.update_open_orders(oms.orders)
         return order
+
+    def test_submit_risk_lock_is_released_before_gateway_send(self):
+        gateway = BlockingSubmitGateway()
+        oms, _ = self.make_live_oms(gateway)
+        oms.validator.validate_params = lambda _intent: (True, "")
+
+        risk_calls = 0
+        risk_calls_lock = threading.Lock()
+        second_risk_check_entered = threading.Event()
+
+        def check_risk(*_args, **_kwargs):
+            nonlocal risk_calls
+            with risk_calls_lock:
+                risk_calls += 1
+                if risk_calls >= 2:
+                    second_risk_check_entered.set()
+            return True, ""
+
+        oms.exposure.check_risk = check_risk
+        first_result = []
+        second_result = []
+        failures = []
+
+        def submit(target, result):
+            try:
+                result.append(
+                    oms.submit_order(
+                        OrderIntent(target, "BTCUSDT", Side.BUY, 100.0, 1.0)
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - assertion aid
+                failures.append(exc)
+
+        first = threading.Thread(target=submit, args=("first", first_result))
+        second = threading.Thread(target=submit, args=("second", second_result))
+        try:
+            first.start()
+            self.assertTrue(gateway.first_send_entered.wait(2.0))
+
+            # The first call is blocked in the gateway. The second risk check
+            # must still run while that transport call remains blocked.
+            second.start()
+            self.assertTrue(
+                second_risk_check_entered.wait(2.0),
+                "risk lock appears to cover the blocking gateway send",
+            )
+        finally:
+            gateway.release_first_send.set()
+            first.join(5.0)
+            second.join(5.0)
+            oms.stop()
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(len(first_result), 1)
+        self.assertEqual(len(second_result), 1)
+        self.assertTrue(first_result[0].accepted)
+        self.assertTrue(second_result[0].accepted)
 
     def test_submit_transport_timeout_remains_tracked_as_unknown(self):
         oms, gateway = self.make_live_oms()

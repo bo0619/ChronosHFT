@@ -177,3 +177,50 @@ def test_exposure_ledger_views_reject_external_writes():
 
     with pytest.raises(AttributeError):
         store.net_positions = {"BTCUSDT": 1.0}
+
+
+def test_repeated_lot_fills_do_not_accumulate_binary_float_noise():
+    store = _store()
+
+    for _ in range(10_000):
+        store.on_fill("BTCUSDT", Side.BUY, 0.000001, 100.0)
+
+    # The public contract remains float, while the cumulative result is the
+    # exact decimal quantity represented by the repeated exchange lots.
+    assert store.net_positions["BTCUSDT"] == 0.01
+    assert store.avg_prices["BTCUSDT"] == 100.0
+
+
+def test_strategy_reconciliation_does_not_create_float_residual():
+    store = _store()
+
+    for _ in range(10_000):
+        store.on_strategy_fill(
+            "alpha",
+            "BTCUSDT",
+            Side.BUY,
+            0.000001,
+            100.0,
+        )
+
+    assert store.strategy_net_positions[("alpha", "BTCUSDT")] == 0.01
+    assert store.reconcile_strategy_position("BTCUSDT", 0.01, 100.0) == 0.0
+    assert store.strategy_net_positions[("exchange_recovery", "BTCUSDT")] == 0.0
+
+
+def test_strategy_reconciliation_uses_stable_attribution_sum():
+    store = _store()
+    store.restore_strategy_ledgers(
+        {
+            ("large-long", "BTCUSDT"): 1e16,
+            ("small-long", "BTCUSDT"): 1.0,
+            ("large-short", "BTCUSDT"): -1e16,
+        },
+        {
+            ("large-long", "BTCUSDT"): 100.0,
+            ("small-long", "BTCUSDT"): 100.0,
+            ("large-short", "BTCUSDT"): 100.0,
+        },
+    )
+
+    assert store.reconcile_strategy_position("BTCUSDT", 1.0, 100.0) == 0.0

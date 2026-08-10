@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 from infrastructure.runtime_telemetry import TelemetryPublisher
 from infrastructure.watchdog import (

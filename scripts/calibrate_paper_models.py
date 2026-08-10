@@ -5,13 +5,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from pathlib import Path
 import sqlite3
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -25,7 +24,6 @@ from alpha.paper_calibration import (  # noqa: E402
     load_quote_exposures,
     walk_forward_intensity,
 )
-
 
 DEFAULT_DATABASE = PROJECT_ROOT / "storage" / "paper" / "trades.sqlite3"
 

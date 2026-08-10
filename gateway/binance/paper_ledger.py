@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 from event.type import ExchangeAccountUpdate, ExchangeOrderUpdate
 from infrastructure.logger import logger
 
 from .paper_matching import PaperVenueState
 from .paper_state import (
+    TERMINAL_ORDER_STATUSES,
     PaperOrder,
     PaperPosition,
-    TERMINAL_ORDER_STATUSES,
 )
 
 

@@ -6,7 +6,6 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-
 # Recovery and reset workflows may hydrate another component's state, but the
 # storage owner remains singular and explicit. Any newly shared writer must be
 # assigned here or OMS module import fails closed.

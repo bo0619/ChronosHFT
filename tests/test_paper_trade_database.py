@@ -9,11 +9,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from event.type import (
+    TIF_RPI,
     ExchangeOrderUpdate,
     LifecycleState,
     OrderIntent,
     Side,
-    TIF_RPI,
 )
 from oms.engine import OMS
 from oms.initializer import OMSInitializer
@@ -25,8 +25,7 @@ from oms.paper_trade_database import (
     PaperTradeDatabaseError,
 )
 from scripts.query_paper_trades import main as query_main
-from scripts.query_paper_trades import query_observations
-from scripts.query_paper_trades import query_rows
+from scripts.query_paper_trades import query_observations, query_rows
 
 
 def make_config(tmp_path: Path, *, paper=True):

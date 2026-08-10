@@ -7,7 +7,7 @@ import binascii
 import hashlib
 import json
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 
 from infrastructure.rpi_calibration_permit import (
     rpi_calibration_permit_signature_payload,
