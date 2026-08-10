@@ -7,40 +7,6 @@ from collections import defaultdict
 from infrastructure.logger import logger
 
 
-class ScopeGuardField:
-    """Expose one declared guard state field through the compatibility facade."""
-
-    def __init__(self, attribute: str):
-        self.attribute = attribute
-
-    def __get__(self, instance, owner):
-        if instance is None:
-            return self
-        return getattr(instance.scope_guards, self.attribute)
-
-    def __set__(self, instance, value) -> None:
-        setattr(instance.scope_guards, self.attribute, value)
-
-
-class ScopeGuardMethod:
-    """Bind a RiskManager method to its scope-guard controller."""
-
-    def __init__(self, method_name: str | None = None):
-        self.method_name = method_name
-
-    def __set_name__(self, owner, name: str) -> None:
-        if self.method_name is None:
-            self.method_name = name
-
-    def __get__(self, instance, owner):
-        if instance is None:
-            return self
-        return getattr(instance.scope_guards, self.method_name)
-
-    def __set__(self, instance, value) -> None:
-        setattr(instance.scope_guards, self.method_name, value)
-
-
 class RiskScopeGuardController:
     """Own symbol/venue guard state and compare-and-clear recovery."""
 

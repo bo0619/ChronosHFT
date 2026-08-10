@@ -5,27 +5,9 @@ from __future__ import annotations
 import threading
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
 from types import MappingProxyType
 
 from .order import Order
-
-
-@dataclass(frozen=True, slots=True)
-class OrderStoreSnapshot:
-    """Detached order-state projection for telemetry and checkpoints."""
-
-    generation: int
-    active: tuple
-    terminal: tuple
-
-    @property
-    def active_count(self) -> int:
-        return len(self.active)
-
-    @property
-    def terminal_count(self) -> int:
-        return len(self.terminal)
 
 
 class OrderStore:
@@ -33,7 +15,6 @@ class OrderStore:
 
     __slots__ = (
         "__active",
-        "__generation",
         "__lock",
         "__orders",
         "__terminal",
@@ -53,22 +34,18 @@ class OrderStore:
         self.__active: dict[str, Order] = {}
         self.__terminal: OrderedDict[str, Order] = OrderedDict()
         self.__terminal_limit = terminal_limit
-        self.__generation = 0
         self.__view: Mapping[str, Order] = MappingProxyType(self.__orders)
 
     @staticmethod
     def _validate_order(order: object) -> Order:
         if not isinstance(order, Order):
             raise TypeError("order store values must be Order instances")
-        client_oid = str(order.client_oid or "")
-        if not client_oid or client_oid != order.client_oid.strip():
+        if not isinstance(order.client_oid, str):
+            raise ValueError("order client_oid must be a string")
+        client_oid = order.client_oid
+        if not client_oid or client_oid != client_oid.strip():
             raise ValueError("order client_oid must be non-empty and canonical")
         return order
-
-    @property
-    def generation(self) -> int:
-        with self.__lock:
-            return self.__generation
 
     @property
     def terminal_limit(self) -> int:
@@ -89,15 +66,15 @@ class OrderStore:
         with self.__lock:
             return self.__orders.get(str(client_oid or ""))
 
-    def add(self, order: Order) -> None:
+    def add(self, order: Order) -> tuple[Order, ...]:
         order = self._validate_order(order)
         client_oid = order.client_oid
         with self.__lock:
             if client_oid in self.__orders:
                 raise ValueError(f"duplicate OMS client_oid: {client_oid}")
             self.__orders[client_oid] = order
-            self.__index_locked(order)
-            self.__generation += 1
+            evicted = self.__index_locked(order)
+            return evicted
 
     def remove(self, client_oid: str) -> Order | None:
         client_oid = str(client_oid or "")
@@ -107,10 +84,9 @@ class OrderStore:
                 return None
             self.__active.pop(client_oid, None)
             self.__terminal.pop(client_oid, None)
-            self.__generation += 1
             return order
 
-    def reindex(self, order: Order) -> None:
+    def reindex(self, order: Order) -> tuple[Order, ...]:
         """Refresh active/terminal projections after an order transition."""
 
         order = self._validate_order(order)
@@ -120,8 +96,8 @@ class OrderStore:
                 raise ValueError(
                     f"cannot reindex unowned OMS order: {client_oid}"
                 )
-            self.__index_locked(order)
-            self.__generation += 1
+            evicted = self.__index_locked(order)
+            return evicted
 
     def replace_active(self, orders: Iterable[Order]) -> None:
         """Atomically replace all retained state with validated active orders."""
@@ -143,7 +119,6 @@ class OrderStore:
             self.__orders.update(replacement)
             self.__active = dict(replacement)
             self.__terminal.clear()
-            self.__generation += 1
 
     def clear(self) -> tuple[Order, ...]:
         with self.__lock:
@@ -151,38 +126,26 @@ class OrderStore:
             self.__orders.clear()
             self.__active.clear()
             self.__terminal.clear()
-            self.__generation += 1
             return removed
 
-    def snapshot(self) -> OrderStoreSnapshot:
-        with self.__lock:
-            return OrderStoreSnapshot(
-                generation=self.__generation,
-                active=tuple(
-                    order.to_snapshot()
-                    for order in self.__active.values()
-                ),
-                terminal=tuple(
-                    order.to_snapshot()
-                    for order in self.__terminal.values()
-                ),
-            )
-
-    def __index_locked(self, order: Order) -> None:
+    def __index_locked(self, order: Order) -> tuple[Order, ...]:
         client_oid = order.client_oid
         if order.is_active():
             self.__terminal.pop(client_oid, None)
             self.__active[client_oid] = order
-            return
+            return ()
         self.__active.pop(client_oid, None)
         if not order.is_terminal():
             self.__terminal.pop(client_oid, None)
-            return
+            return ()
         self.__terminal[client_oid] = order
         self.__terminal.move_to_end(client_oid)
+        evicted = []
         while len(self.__terminal) > self.__terminal_limit:
-            expired_oid, _ = self.__terminal.popitem(last=False)
+            expired_oid, expired_order = self.__terminal.popitem(last=False)
             self.__orders.pop(expired_oid, None)
+            evicted.append(expired_order)
+        return tuple(evicted)
 
 
-__all__ = ["OrderStore", "OrderStoreSnapshot"]
+__all__ = ["OrderStore"]

@@ -53,9 +53,8 @@ _REGISTRY_CONTROL_KEYS = {
     "name",
     "primary_model",
     "registered_models",
-    "shared",
-    "models",
 }
+_RETIRED_CONFIG_KEYS = frozenset({"shared", "models"})
 
 _ROOT_TRUST_KEYS = frozenset(
     {
@@ -103,9 +102,14 @@ def _strategy_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
     if not isinstance(config, Mapping):
         raise TypeError("strategy configuration must be a mapping")
     nested = config.get("strategy")
-    if isinstance(nested, Mapping):
-        return nested
-    return config
+    strategy_config = nested if isinstance(nested, Mapping) else config
+    retired = sorted(_RETIRED_CONFIG_KEYS.intersection(strategy_config))
+    if retired:
+        raise ValueError(
+            "Unsupported strategy configuration fields: "
+            + ", ".join(f"strategy.{key}" for key in retired)
+        )
+    return strategy_config
 
 
 def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
@@ -126,51 +130,20 @@ def _merged_model_config(
     strategy_config: Mapping[str, Any],
     model_key: str,
 ) -> dict[str, Any]:
-    # Preserve the legacy flat strategy fields as shared defaults, while
-    # excluding registration controls and every model-specific block.
+    # Flat fields are the shared defaults; canonical model blocks override them.
     shared = {
         key: deepcopy(value)
         for key, value in strategy_config.items()
         if key not in _REGISTRY_CONTROL_KEYS
-        and key != "as_parameters"
         and _model_key_if_known(key) is None
     }
-    explicit_shared = strategy_config.get("shared", {})
-    if explicit_shared is not None and not isinstance(explicit_shared, Mapping):
-        raise TypeError("strategy.shared must be a mapping")
-    _reject_protected_overrides(explicit_shared or {}, "strategy.shared")
-    shared = _deep_merge(shared, explicit_shared or {})
-
     model_config: dict[str, Any] = {}
-    # ``as_parameters`` is the existing A-S configuration spelling. Canonical
-    # blocks take precedence when both legacy and canonical forms are present.
-    if model_key == "avellaneda_stoikov":
-        legacy_as_config = strategy_config.get("as_parameters", {})
-        if legacy_as_config is not None and not isinstance(legacy_as_config, Mapping):
-            raise TypeError("strategy.as_parameters must be a mapping")
-        _reject_protected_overrides(
-            legacy_as_config or {},
-            "strategy.as_parameters",
-        )
-        model_config = _deep_merge(model_config, legacy_as_config or {})
-
     for key, value in strategy_config.items():
         if _model_key_if_known(key) != model_key:
             continue
         if not isinstance(value, Mapping):
             raise TypeError(f"strategy.{key} must be a mapping")
         _reject_protected_overrides(value, f"strategy.{key}")
-        model_config = _deep_merge(model_config, value)
-
-    models = strategy_config.get("models", {})
-    if models is not None and not isinstance(models, Mapping):
-        raise TypeError("strategy.models must be a mapping")
-    for key, value in (models or {}).items():
-        if _model_key_if_known(key) != model_key:
-            continue
-        if not isinstance(value, Mapping):
-            raise TypeError(f"strategy.models.{key} must be a mapping")
-        _reject_protected_overrides(value, f"strategy.models.{key}")
         model_config = _deep_merge(model_config, value)
 
     merged = _deep_merge(shared, model_config)
@@ -180,7 +153,7 @@ def _merged_model_config(
     if model_key == "glft":
         merged["glft"] = deepcopy(model_config)
     elif model_key == "avellaneda_stoikov":
-        merged["as_parameters"] = deepcopy(model_config)
+        merged["avellaneda_stoikov"] = deepcopy(model_config)
     return merged
 
 
@@ -254,13 +227,6 @@ def create_primary_strategy(
     merged_config = effective_primary_strategy_config(config)
     execution = coerce_strategy_execution_port(oms)
     resolved_config = deepcopy(dict(config))
-    if "execution" not in resolved_config and "paper_trade" not in resolved_config:
-        compatibility_config = getattr(oms, "config", {})
-        if isinstance(compatibility_config, Mapping):
-            resolved_config = _deep_merge(
-                compatibility_config,
-                resolved_config,
-            )
 
     if primary_model == "glft":
         from strategy.model_readiness import (
@@ -317,7 +283,6 @@ def create_primary_strategy(
     strategy.strategy_id = registration.strategy_id
     strategy.model_key = primary_model
     strategy.registered_models = registered_models
-    strategy.execution_role = "primary"
     return strategy
 
 

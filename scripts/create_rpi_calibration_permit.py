@@ -32,6 +32,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from infrastructure.config_scaling import (  # noqa: E402
     normalize_root_config_preapproval,
 )
+from governance.contracts import market_data_environment  # noqa: E402
 from infrastructure.rpi_calibration_permit import (  # noqa: E402
     RPI_CALIBRATION_PERMIT_SCHEMA,
     RPI_CALIBRATION_SIGNATURE_ALGORITHM,
@@ -51,7 +52,6 @@ from strategy.registry import canonical_model_key  # noqa: E402
 
 
 DEFAULT_PASSPHRASE_ENV = "CHRONOSHFT_PERMIT_KEY_PASSPHRASE"
-PRIVATE_KEY_LABEL = "ChronosHFT RPI calibration signing key"
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{1,127}$")
 _KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$")
 _WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^([A-Za-z]:)")
@@ -112,13 +112,10 @@ def _load_live_config(path: Path, label: str) -> dict[str, Any]:
             f"cannot normalize {label}: {exc}"
         ) from exc
     execution = config.get("execution")
-    paper = config.get("paper_trade")
     if (
         not isinstance(execution, Mapping)
         or str(execution.get("mode", "") or "").strip().lower() != "live"
-        or not isinstance(paper, Mapping)
-        or paper.get("enabled") is not False
-        or config.get("testnet") is not False
+        or market_data_environment(config) != "production"
     ):
         raise PermitAuthoringError(
             f"{label} must be an explicit production Live configuration"

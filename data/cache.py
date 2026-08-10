@@ -105,10 +105,6 @@ class LiveDataCache:
             self.trade_update_wall_times[symbol] = received_wall
         return True
 
-    def get_book(self, symbol):
-        with self._lock:
-            return self.books.get(symbol)
-
     def get_mark_price(self, symbol):
         with self._lock:
             data = self.mark_prices.get(symbol)

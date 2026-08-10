@@ -49,9 +49,9 @@ def test_configuration_assembles_parent_and_child_settings():
         deployment_loss=15.0,
     )
     config = {
-        "testnet": True,
         "symbols": ["SNDKUSDT", "SOXLUSDT"],
         "system": {
+            "market_data": {"environment": "testnet"},
             "binance_rest_rate_limit": {
                 "full_open_orders_audit_interval_sec": 12.0,
             }

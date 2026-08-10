@@ -44,12 +44,6 @@ class ExchangeTruthSnapshot:
     def trade_watermark_ms(self) -> float:
         return self.end_time_ms
 
-    def __getitem__(self, name: str) -> Any:
-        # Keep the extracted full-reset component source-compatible while the
-        # snapshot contract replaces its former anonymous dictionaries.
-        return getattr(self, name)
-
-
 class ExchangeSnapshotNormalizer:
     """Pure validation and canonicalization of remote account truth."""
 

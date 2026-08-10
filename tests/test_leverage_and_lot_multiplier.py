@@ -565,8 +565,6 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
                     "target_daily_loss": 5.0,
                     "max_order_qty": 10000.0,
                     "position_buffer_orders": 2.0,
-                    "reference_min_notional": 5.0,
-                    "notional_buffer": 1.1,
                 },
             },
         }
@@ -583,7 +581,6 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
         self.assertEqual(scaled["risk"]["limits"]["max_daily_loss"], 10.0)
         self.assertEqual(scaled["risk"]["limits"]["max_order_qty"], 20000.0)
         self.assertEqual(scaled["risk"]["limits"]["max_concurrent_symbols"], 3)
-        self.assertAlmostEqual(scaled["strategy"]["lot_multiplier"], 16.0 / 5.5, places=8)
         self.assertEqual(scaled["strategy"]["target_order_notional"], 16.0)
         self.assertEqual(scaled["strategy"]["max_pos_usdt"], 32.0)
 
@@ -630,8 +627,6 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
                     "target_order_notional": 8.0,
                     "target_total_risk_notional": 45.0,
                     "target_concurrent_symbols": 2,
-                    "reference_min_notional": 5.0,
-                    "notional_buffer": 1.1,
                 },
             },
         }
@@ -657,8 +652,6 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
                     "target_order_notional": 8.0,
                     "target_total_risk_notional": 45.0,
                     "target_concurrent_symbols": 2,
-                    "reference_min_notional": 5.0,
-                    "notional_buffer": 1.1,
                     "budget_asset_weights": {"USDC": 3.0, "USDT": 1.0},
                 },
             },
@@ -686,8 +679,6 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
                     "order_notional_limit_factor": 1.5,
                     "target_total_risk_notional": 36.0,
                     "target_concurrent_symbols": 2,
-                    "reference_min_notional": 5.0,
-                    "notional_buffer": 1.1,
                 },
             },
         }
@@ -695,7 +686,6 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
         scaled = apply_capital_scaling(payload)
 
         self.assertEqual(scaled["risk"]["limits"]["max_order_notional"], 12.0)
-        self.assertAlmostEqual(scaled["strategy"]["lot_multiplier"], 8.0 / 5.5, places=8)
         self.assertEqual(scaled["strategy"]["target_order_notional"], 8.0)
 
     def test_oms_sets_gateway_target_leverage_from_account_config(self):
@@ -775,7 +765,6 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             ws.start_market_stream = MagicMock()
 
             gateway = BinanceGateway(DummyEngine(), "key", "secret", testnet=True)
-            gateway._init_books = lambda: None
             gateway.target_leverage = 9
             gateway.target_margin_type = "ISOLATED"
             gateway.target_position_mode = "ONE_WAY"
@@ -821,12 +810,11 @@ class PaperTradeConfigTests(unittest.TestCase):
     def test_paper_mode_is_type_selected_and_scrubs_every_private_credential(self):
         raw = {
             "execution": {"mode": "paper"},
-            "testnet": True,
             "api_key": "live-key-must-disappear",
             "api_secret": "live-secret-must-disappear",
             "api_key_env": "BINANCE_API_KEY",
             "api_secret_env": "BINANCE_API_SECRET",
-            "system": {"market_data": {}},
+            "system": {"market_data": {"environment": "testnet"}},
             "oms": {
                 "journal_path": "storage/oms/live.jsonl",
                 "single_writer_fence": {"path": "storage/oms/live.lock"},
@@ -844,7 +832,7 @@ class PaperTradeConfigTests(unittest.TestCase):
         configured = apply_paper_trade_mode(raw)
 
         self.assertTrue(is_paper_trade(configured))
-        self.assertFalse(configured["testnet"])
+        self.assertNotIn("testnet", configured)
         self.assertEqual(configured["api_key"], "")
         self.assertEqual(configured["api_secret"], "")
         self.assertEqual(configured["api_key_env"], "")
@@ -865,6 +853,7 @@ class PaperTradeConfigTests(unittest.TestCase):
         self.assertTrue(configured["paper_trade"]["reset_on_start"])
         self.assertFalse(configured["risk"]["independent_supervisor"]["enabled"])
         self.assertFalse(configured["risk"]["cash_flow_truth"]["enabled"])
+        self.assertNotIn("dry_run", configured["system"])
         self.assertEqual(
             configured["risk"]["risk_control_heartbeat"]["required_source"],
             "risk_manager",
@@ -872,14 +861,13 @@ class PaperTradeConfigTests(unittest.TestCase):
         rendered = json.dumps(configured)
         self.assertNotIn("must-disappear", rendered)
 
-    def test_live_mode_cannot_be_combined_with_legacy_dry_run(self):
-        with self.assertRaisesRegex(ValueError, "Conflicting execution"):
-            is_paper_trade(
-                {
-                    "execution": {"mode": "live"},
-                    "system": {"dry_run": True},
-                }
-            )
+    def test_legacy_execution_mode_aliases_are_rejected(self):
+        for mode in ("paper_trade", "simulation", "sim", "production", "real"):
+            with self.subTest(mode=mode), self.assertRaisesRegex(
+                ValueError,
+                "Unsupported execution.mode",
+            ):
+                is_paper_trade({"execution": {"mode": mode}})
 
     def test_paper_mode_rejects_unsupported_persistent_venue_state(self):
         with self.assertRaisesRegex(ValueError, "reset_on_start must be true"):
@@ -894,7 +882,6 @@ class PaperTradeConfigTests(unittest.TestCase):
         configured = apply_paper_trade_mode(
             {
                 "execution": {"mode": "paper"},
-                "paper_trade": {"enabled": True},
                 "strategy": {
                     "order_sizing": {
                         "mode": "FIXED_QUANTITY",
@@ -914,7 +901,6 @@ class PaperTradeConfigTests(unittest.TestCase):
             apply_paper_trade_mode(
                 {
                     "execution": {"mode": "paper"},
-                    "paper_trade": {"enabled": True},
                     "strategy": {
                         "order_sizing": {
                             "mode": "fixed_quantity",

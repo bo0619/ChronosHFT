@@ -17,9 +17,7 @@
       "budget_asset_weights": {
         "USDT": 1.0
       },
-      "position_buffer_orders": 5.0,
-      "reference_min_notional": 5.0,
-      "notional_buffer": 1.1
+      "position_buffer_orders": 5.0
     }
   }
 }

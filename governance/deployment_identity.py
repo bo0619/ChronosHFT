@@ -114,7 +114,6 @@ def deployment_config_projection(
         "symbols": list(symbols),
         "execution": _section(config, "execution"),
         "paper_trade": _section(config, "paper_trade"),
-        "testnet": config.get("testnet"),
         "record_data": config.get("record_data"),
         "live_launch": _section(config, "live_launch"),
         "system": system,

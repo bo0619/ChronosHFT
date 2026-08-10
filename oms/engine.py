@@ -1,10 +1,8 @@
 from collections.abc import Mapping
 import json
 import math
-import time
 
 from .account_truth import OMSAccountTruth
-from .audit_logger import OMSAuditLogger
 from .background_tasks import OMSBackgroundTaskManager
 from .capability_manager import OMSCapabilityManager
 from .cancellation_manager import OMSCancellationManager
@@ -213,14 +211,6 @@ class OMS:
         self.lifecycle_store.state = value
 
     @property
-    def _lifecycle_generation(self) -> int:
-        return self.lifecycle_store.generation
-
-    @_lifecycle_generation.setter
-    def _lifecycle_generation(self, value: int) -> None:
-        self.lifecycle_store.generation = value
-
-    @property
     def manual_rearm_required(self) -> bool:
         return self.lifecycle_store.manual_rearm_required
 
@@ -250,7 +240,16 @@ class OMS:
 
         return self.order_store.view()
 
-    def __init__(self, event_engine, gateway, config, *, market_cache=None):
+    def __init__(
+        self,
+        event_engine,
+        gateway,
+        config,
+        *,
+        clock=None,
+        market_cache=None,
+        reference_data=None,
+    ):
         self.__dict__["_component_state"] = OMSStateRegistry(
             self._component_state_field_owners
         )
@@ -258,7 +257,9 @@ class OMS:
             event_engine,
             gateway,
             config,
+            clock=clock,
             market_cache=market_cache,
+            reference_data=reference_data,
         )
 
     def _component_context_for(
@@ -276,11 +277,7 @@ class OMS:
                     read=lambda name=name: state.read(name),
                     write=(
                         (
-                            lambda value, name=name: state.write(
-                                component_name,
-                                name,
-                                value,
-                            )
+                            lambda value, name=name: state.write(name, value)
                         )
                         if name in writable
                         else None
@@ -360,6 +357,18 @@ class OMS:
             }
         )
 
+    def _reindex_order_locked(self, order: Order) -> None:
+        """Refresh projections and retire secondary indexes after eviction."""
+
+        for evicted in self.order_store.reindex(order):
+            exchange_oid = str(evicted.exchange_oid or "")
+            if (
+                exchange_oid
+                and self.exchange_id_map.get(exchange_oid) is evicted
+            ):
+                self.exchange_id_map.pop(exchange_oid, None)
+            self._write_tombstone(evicted)
+
     def record_paper_strategy_sample(self, strategy_data) -> bool:
         database = getattr(self, "paper_trade_database", None)
         if database is None:
@@ -387,7 +396,9 @@ class OMS:
         sample_datetime = getattr(account_data, "datetime", None)
         timestamp_method = getattr(sample_datetime, "timestamp", None)
         sample_time = (
-            timestamp_method() if callable(timestamp_method) else time.time()
+            timestamp_method()
+            if callable(timestamp_method)
+            else self.clock.wall_time()
         )
         balance = getattr(account_data, "balance", 0.0)
         equity = getattr(account_data, "equity", 0.0)
@@ -500,7 +511,7 @@ class OMS:
                 "event_time": (
                     read_value("event_time", None)
                     or read_value("timestamp", None)
-                    or time.time()
+                    or self.clock.wall_time()
                 ),
                 "event_kind": event_kind,
                 "severity": severity,
@@ -581,7 +592,9 @@ class OMS:
         return database.record_market_sample(
             {
                 "sample_time": (
-                    corrected_received_time or received_time or time.time()
+                    corrected_received_time
+                    or received_time
+                    or self.clock.wall_time()
                 ),
                 "symbol": str(getattr(market_data, "symbol", "") or ""),
                 "mark_price": mark_price,
@@ -626,16 +639,12 @@ class OMS:
     )
 
     bootstrap = component_method("lifecycle_controller")
-    _refresh_read_only_account_snapshot = component_method("lifecycle_controller")
     _apply_rebuild_summary = component_method("recovery_state_restorer")
     _has_active_guards = component_method("lifecycle_controller")
-    _outbound_gate_should_open_locked = component_method("outbound_gate")
     _close_outbound_gate_locked = component_method("outbound_gate")
     _refresh_outbound_gate_locked = component_method("outbound_gate")
     _acquire_outbound_order_send_permit_locked = component_method("outbound_gate")
-    _acquire_outbound_risk_send_permit_locked = component_method("outbound_gate")
     _release_outbound_order_send_permit = component_method("outbound_gate")
-    _release_outbound_risk_send_permit = component_method("outbound_gate")
     _submit_settlement_count_locked = component_method("outbound_gate")
     _wait_for_outbound_risk_sends = component_method("outbound_gate")
     _wait_for_outbound_order_sends = component_method("outbound_gate")
@@ -648,46 +657,13 @@ class OMS:
     rearm_system = component_method("lifecycle_controller")
     stop = component_method("lifecycle_controller")
 
-    _rpi_calibration_active_orders_locked = component_method("rpi_calibration_runtime")
-
-    @staticmethod
-    def _exchange_ns_to_iso(value: int) -> str:
-        return RpiCalibrationRuntime._exchange_ns_to_iso(value)
-
     _rpi_calibration_snapshot_locked = component_method("rpi_calibration_runtime")
-
-    @classmethod
-    def _signed_usdt_to_microu(
-        cls,
-        value,
-        *,
-        rounding,
-        context: str,
-    ) -> int:
-        return RpiCalibrationRuntime._signed_usdt_to_microu(
-            value,
-            rounding=rounding,
-            context=context,
-        )
-
-    _rpi_calibration_equity_truth_locked = component_method("rpi_calibration_runtime")
     _observe_rpi_calibration_loss_locked = component_method("rpi_calibration_runtime")
-    _rpi_calibration_activation_payload_locked = component_method(
-        "rpi_calibration_runtime"
-    )
-    _activate_rpi_calibration_permit_locked = component_method(
-        "rpi_calibration_runtime"
-    )
-    _expire_rpi_calibration_permit_locked = component_method("rpi_calibration_runtime")
     expire_rpi_calibration_permit = component_method("rpi_calibration_runtime")
-    _validate_rpi_calibration_sample_locked = component_method(
-        "rpi_calibration_runtime"
-    )
     _reserve_rpi_calibration_sample_locked = component_method("rpi_calibration_runtime")
     _audit_rpi_calibration_emergency_bypass_locked = component_method(
         "rpi_calibration_runtime"
     )
-    _mark_rpi_calibration_terminal_pending = component_method("rpi_calibration_runtime")
     _enforce_rpi_calibration_terminal_once = component_method("rpi_calibration_runtime")
     enforce_rpi_calibration_runtime_limits = component_method("rpi_calibration_runtime")
     _schedule_rpi_calibration_runtime_enforcement = component_method(
@@ -724,7 +700,6 @@ class OMS:
     _mode_rank = component_method("capability_manager")
     _mode_constraint_key = component_method("capability_manager")
     _refresh_selected_mode_constraint = component_method("capability_manager")
-    _capability_mode_for_state = component_method("capability_manager")
     _ensure_capability_mode_consistent = component_method("capability_manager")
     set_trading_mode = component_method("capability_manager")
     clear_trading_mode = component_method("capability_manager")
@@ -736,12 +711,7 @@ class OMS:
     get_risk_control_heartbeat_snapshot = component_method("capability_manager")
     _venue_dead_man_switch_health_locked = component_method("capability_manager")
     get_venue_dead_man_switch_snapshot = component_method("capability_manager")
-    _venue_dead_man_switch_renewal_allowed_locked = component_method(
-        "capability_manager"
-    )
     can_renew_venue_dead_man_switch = component_method("capability_manager")
-    _venue_dead_man_constraint_reason = component_method("capability_manager")
-    _start_venue_dead_man_safety_cancel = component_method("capability_manager")
     handle_venue_dead_man_switch_unhealthy = component_method("capability_manager")
     request_venue_dead_man_switch_renewal = component_method("capability_manager")
     renew_venue_dead_man_switch = component_method("capability_manager")
@@ -756,7 +726,6 @@ class OMS:
     query_user_trades = component_method("capability_manager")
     query_income_history = component_method("capability_manager")
 
-    _normalize_submit_command = component_method("submit_settlement")
     _get_final_outbound_send_rejection_locked = component_method("submit_settlement")
     _dispatch_gateway_order_with_final_fence = component_method("submit_settlement")
     _bind_submit_exchange_oid_locked = component_method("submit_settlement")
@@ -766,7 +735,6 @@ class OMS:
     _finish_submit_settlement = component_method("submit_settlement")
     _publish_order_submitted_safely = component_method("submit_settlement")
     _audit_post_submit_safely = component_method("submit_settlement")
-    _latch_submit_ambiguity_locked = component_method("submit_settlement")
     _close_gate_after_submit_settlement_failure = component_method("submit_settlement")
     _cleanup_pre_dispatch_submit_exception = component_method("submit_settlement")
     _settle_post_dispatch_submit_exception = component_method("submit_settlement")
@@ -775,7 +743,6 @@ class OMS:
         "audit_logger",
         "record_command_prepared",
     )
-    _command_prepared_payload = staticmethod(OMSAuditLogger.command_prepared_payload)
     _build_submit_prepared_records = component_method(
         "audit_logger",
         "build_submit_prepared_records",
@@ -800,9 +767,6 @@ class OMS:
     _backfill_trade_history = component_method("account_truth")
     _schedule_trade_tail_verification = component_method("account_truth")
     _prime_trade_history_baseline = component_method("account_truth")
-    _utc_day_start_ms = component_method("account_truth")
-    _external_cash_flow_income_id = component_method("account_truth")
-    _apply_external_cash_flow_rows = component_method("account_truth")
     mark_external_cash_flow_truth_unavailable = component_method("account_truth")
     backfill_external_cash_flow_history = component_method("account_truth")
     poll_external_cash_flow_truth = component_method("account_truth")
@@ -813,7 +777,6 @@ class OMS:
     _fail_closed_on_journal_error = component_method("durability_manager")
 
     adapt_intent_for_trading_mode = component_method("order_policy")
-    _estimate_emergency_price = component_method("order_policy")
     emergency_reduce_only_flatten = component_method("order_policy")
     _get_order_block_reason = component_method("order_policy")
     _get_submission_safety_reason_locked = component_method("order_policy")
@@ -853,28 +816,11 @@ class OMS:
     clear_strategy_freeze = component_method("guard_manager")
     get_strategy_freeze_reason = component_method("guard_manager")
     _capture_guard_cleanup_snapshot_locked = component_method("guard_manager")
-    _clear_guard_cleanup_snapshot = component_method("guard_manager")
     clear_transient_guards = component_method("guard_manager")
     _clear_recovered_guards_if_pending = component_method("guard_manager")
     is_symbol_tradeable = component_method("guard_manager")
     can_submit_for_strategy = component_method("guard_manager")
-    get_order_block_reason = component_method("guard_manager")
     _cancel_orders_matching = component_method("guard_manager")
-
-    def _prune_outbound_message_history_locked(self, now: float = None) -> float:
-        observed_at = time.perf_counter() if now is None else float(now)
-        self._outbound_budget.snapshot(observed_at)
-        return observed_at
-
-    def _outbound_message_counts_locked(self) -> dict:
-        return dict(self._outbound_budget.snapshot()["counts"])
-
-    def _reserve_outbound_message_locked(
-        self,
-        message_kind: str,
-        now: float = None,
-    ) -> str:
-        return self._outbound_budget.reserve(message_kind, now)
 
     def get_outbound_message_budget_snapshot(self) -> dict:
         return self._outbound_budget.snapshot()
@@ -884,29 +830,23 @@ class OMS:
     _submit_background_task = component_method("background_task_manager")
     get_background_task_snapshot = component_method("background_task_manager")
 
-    _schedule_pending_reconcile_requests = component_method("reconciler")
     _queue_reconcile_request_locked = component_method("reconciler")
-    _drain_pending_reconcile_requests = component_method("reconciler")
     trigger_reconcile = component_method("reconciler")
     _schedule_reconcile_retry = component_method("reconciler")
     _execute_reconcile = component_method("reconciler")
     _complete_venue_recovery_verification = component_method("reconciler")
-    _exchange_snapshot_signature = component_method("reconciler")
     _capture_stable_exchange_snapshot = component_method("reconciler")
     _perform_full_reset = component_method("full_reset_coordinator")
     _normalize_remote_account = component_method("reconciler")
     _normalize_remote_account_balances = component_method("reconciler")
-    _normalize_remote_positions = component_method("reconciler")
     _normalize_remote_open_orders = component_method("reconciler")
     _collect_local_active_orders_locked = component_method("reconciler")
     _collect_exchange_position_drift_locked = component_method("reconciler")
     _has_active_orders_locked = component_method("reconciler")
 
     submit_order = component_method("order_submission")
-    _reject_intent_locally = component_method("order_submission")
 
     cancel_order = component_method("cancellation_manager")
-    _schedule_cancel_order_retry = component_method("cancellation_manager")
     _schedule_cancel_all_retry = component_method("cancellation_manager")
     _cancel_all_orders_unchecked = component_method("cancellation_manager")
     _account_cancel_symbols = component_method("cancellation_manager")
@@ -923,17 +863,10 @@ class OMS:
 
     _journal_int = staticmethod(RpiCalibrationReplay._journal_int)
 
-    _journal_decimal = component_method("rpi_calibration_replay")
-
     _new_rpi_calibration_replay_state = staticmethod(
         RpiCalibrationReplay._new_rpi_calibration_replay_state
     )
 
-    _verify_replayed_rpi_calibration_permit = component_method("rpi_calibration_replay")
-    _replay_rpi_calibration_activation = component_method("rpi_calibration_replay")
-    _replay_rpi_calibration_reservation = component_method("rpi_calibration_replay")
-    _replay_rpi_calibration_expiry = component_method("rpi_calibration_replay")
-    _replay_rpi_calibration_bypass = component_method("rpi_calibration_replay")
     _replay_rpi_calibration_record = component_method("rpi_calibration_replay")
     _finalize_rpi_calibration_replay = component_method("rpi_calibration_replay")
     rebuild_from_log = component_method("journal_rebuilder")

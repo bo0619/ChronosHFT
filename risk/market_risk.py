@@ -11,21 +11,6 @@ from event.type import Event, OMSCapabilityMode
 from infrastructure.time_service import time_service
 
 
-class MarketRiskField:
-    """Expose one declared market-risk field through RiskManager."""
-
-    def __init__(self, attribute: str):
-        self.attribute = attribute
-
-    def __get__(self, instance, owner):
-        if instance is None:
-            return self
-        return getattr(instance.market_risk, self.attribute)
-
-    def __set__(self, instance, value) -> None:
-        setattr(instance.market_risk, self.attribute, value)
-
-
 class MarketRiskMethod:
     """Bind one RiskManager method to its market-risk controller."""
 

@@ -70,7 +70,7 @@ def effective_rpi_route_enabled(config: Mapping) -> bool:
             strategy.get("use_rpi_for_glft", True),
         )
     else:
-        model_config = strategy.get("as_parameters", {})
+        model_config = strategy.get("avellaneda_stoikov", {})
         model_config = (
             model_config if isinstance(model_config, Mapping) else {}
         )
@@ -111,7 +111,7 @@ def validate_live_rpi_policy(
     if _enabled(strategy.get("rpi_fallback_to_gtx", True)):
         violations.append("strategy.rpi_fallback_to_gtx must be false")
 
-    for section_name in ("glft", "avellaneda_stoikov", "as_parameters"):
+    for section_name in ("glft", "avellaneda_stoikov"):
         section = strategy.get(section_name, {})
         if (
             isinstance(section, Mapping)

@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 from collections import deque
 
+from data.cache import data_cache
+from data.ref_data import ref_data_manager
 from event.type import OMSCapabilityMode
+from infrastructure.runtime_ports import MainProcessClock
 from infrastructure.single_writer_fence import SingleWriterFence
+from infrastructure.time_service import time_service
 
 from .account_manager import AccountManager
 from .account_truth import OMSAccountTruth
@@ -112,6 +117,7 @@ class OMSInitializer(OMSComponent):
             "capability_manager",
             "capability_mode",
             "capability_reason",
+            "clock",
             "command_fence_timeout_sec",
             "config",
             "consecutive_reconcile_api_failures",
@@ -134,7 +140,6 @@ class OMSInitializer(OMSComponent):
             "external_cash_flow_poll_interval_sec",
             "external_cash_flow_recovery_lookback_ms",
             "external_cash_flow_recovery_overlap_ms",
-            "external_cash_flow_require_snapshot",
             "external_cash_flow_scan_end_ms",
             "external_cash_flow_truth_enabled",
             "external_income_types",
@@ -161,17 +166,14 @@ class OMSInitializer(OMSComponent):
             "margin_health_require_snapshot",
             "margin_reduce_only_ratio",
             "margin_snapshot_max_age_sec",
+            "market_cache",
             "max_account_gross_notional",
-            "max_cancel_messages_per_window",
             "max_concurrent_symbols",
-            "max_new_orders_per_window",
             "max_pos_notional",
-            "max_reduce_orders_per_window",
             "max_strategy_active_orders",
             "max_strategy_symbol_active_orders",
             "max_symbol_active_orders",
             "max_total_active_orders",
-            "max_total_messages_per_window",
             "mode_constraint_generation",
             "mode_constraint_generations",
             "mode_constraints",
@@ -183,11 +185,10 @@ class OMSInitializer(OMSComponent):
             "order_submission",
             "outbound_gate",
             "outbound_gate_drain_timeout_sec",
-            "outbound_message_budget_enabled",
-            "outbound_message_history",
             "outbound_message_window_sec",
             "paper_trade_database",
             "rebuild_summary",
+            "reference_data",
             "recovery_state_restorer",
             "reconcile_api_cooldown_sec",
             "reconcile_api_failure_threshold",
@@ -198,7 +199,6 @@ class OMSInitializer(OMSComponent):
             "rejected_risk_control_heartbeat_sources",
             "require_explicit_strategy_budget",
             "require_healthy_clock",
-            "reserved_risk_messages_per_window",
             "rest_confirmed_execution_ids",
             "risk_control_heartbeat_enabled",
             "risk_control_heartbeat_max_age_sec",
@@ -277,22 +277,28 @@ class OMSInitializer(OMSComponent):
         gateway,
         config,
         *,
+        clock=None,
         market_cache=None,
+        reference_data=None,
     ) -> None:
         self.event_engine = event_engine
         self.gateway = gateway
         self.config = config
+        self.clock = clock or MainProcessClock(
+            exchange_clock=time_service,
+            monotonic_fn=time.perf_counter,
+            monotonic_ns_fn=time.perf_counter_ns,
+            wall_time_fn=time.time,
+            sleep_fn=time.sleep,
+        )
+        self.market_cache = market_cache or data_cache
+        self.reference_data = reference_data or ref_data_manager
         oms_cfg = config.get("oms", {})
 
         target_position_mode = self._configure_order_controls(config, oms_cfg)
         self._initialize_shared_state(config)
         self._configure_account_and_risk(config, oms_cfg, target_position_mode)
-        self._initialize_components(
-            event_engine,
-            gateway,
-            config,
-            market_cache=market_cache,
-        )
+        self._initialize_components(event_engine, config)
         self._configure_recovery_and_outbound(config, oms_cfg)
         self._initialize_paper_trade_database(config)
         try:
@@ -645,9 +651,6 @@ class OMSInitializer(OMSComponent):
         self.external_cash_flow_truth_enabled = bool(
             cash_flow_truth.get("enabled", False)
         )
-        self.external_cash_flow_require_snapshot = bool(
-            cash_flow_truth.get("require_snapshot", True)
-        )
         self.external_cash_flow_max_age_sec = max(
             0.0,
             float(
@@ -741,20 +744,26 @@ class OMSInitializer(OMSComponent):
     def _initialize_components(
         self,
         event_engine,
-        gateway,
         config,
-        *,
-        market_cache=None,
     ) -> None:
-        self.validator = OrderValidator(config)
-        self.exposure = ExposureStore(market_cache=market_cache)
-        self.account = AccountManager(event_engine, self.exposure, config)
+        self.validator = OrderValidator(
+            config,
+            clock=self.clock,
+            market_cache=self.market_cache,
+            reference_data=self.reference_data,
+        )
+        self.exposure = ExposureStore(market_cache=self.market_cache)
+        self.account = AccountManager(
+            event_engine,
+            self.exposure,
+            config,
+            clock=self.clock,
+            market_cache=self.market_cache,
+        )
         self.account_truth = self._spawn_component(OMSAccountTruth)
         self.order_monitor = OrderManager(
-            event_engine,
-            gateway,
-            self._on_order_truth_check,
-            config.get("oms", {}),
+            dirty_callback=self._on_order_truth_check,
+            monitor_config=config.get("oms", {}),
         )
 
         self.journal = OMSJournal(config)
@@ -935,18 +944,7 @@ class OMSInitializer(OMSComponent):
         )
         outbound_budget = oms_cfg.get("outbound_message_budget", {})
         self._outbound_budget = OutboundMessageBudget(outbound_budget)
-        self.outbound_message_budget_enabled = self._outbound_budget.enabled
         self.outbound_message_window_sec = self._outbound_budget.window_sec
-        self.max_total_messages_per_window = self._outbound_budget.max_total
-        self.max_new_orders_per_window = self._outbound_budget.max_new_orders
-        self.max_reduce_orders_per_window = (
-            self._outbound_budget.max_reduce_orders
-        )
-        self.max_cancel_messages_per_window = self._outbound_budget.max_cancels
-        self.reserved_risk_messages_per_window = (
-            self._outbound_budget.reserved_risk_messages
-        )
-        self.outbound_message_history = self._outbound_budget.history
         self._deferred_cancel_oids = set()
         self._deferred_cancel_all_symbols = set()
         self._stopped = False

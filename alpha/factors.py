@@ -5,16 +5,7 @@ import math
 import time
 import numpy as np
 from collections import deque
-from event.type import OrderBook, TradeData, AggTradeData
-
-
-class FactorBase:
-    def __init__(self, name):
-        self.name  = name
-        self.value = 0.0
-
-    def on_orderbook(self, ob: OrderBook): pass
-    def on_trade(self, trade: TradeData):  pass
+from event.type import OrderBook
 
 
 class GLFTCalibrator:
@@ -48,7 +39,6 @@ class GLFTCalibrator:
         self.A:         float = cfg.get("initial_A",          10.0)
         self.k:         float = cfg.get("initial_k",           0.8)
 
-        self.learning_rate: float = cfg.get("learning_rate",    0.005)
         self.sigma_max:     float = cfg.get("sigma_max_bps",  100.0)
         self.ema_alpha:     float = cfg.get("sigma_ema_alpha",   0.1)
 
@@ -70,11 +60,6 @@ class GLFTCalibrator:
         self.last_tick_source: str = ""
         self.last_tick_monotonic: float = 0.0
         self._has_tick_reference: bool = False
-        self.is_warmed_up:   bool  = False
-        # Public aggTrade events are not evidence of RPI-accessible retail
-        # flow and must never update the live A/k estimator.
-        self.public_trade_sample_count: int = 0
-        self.intensity_sample_count: int = 0
 
     @property
     def volatility_sample_count(self) -> int:
@@ -183,24 +168,9 @@ class GLFTCalibrator:
                 self.sigma_bps = min(self.sigma_bps, self.sigma_max)
                 self.sigma_bps = max(self.sigma_bps, 0.1)  # 下限保护
 
-                self.is_warmed_up = True
-
         self._set_tick_reference(
             mid=mid,
             clock_source=clock_source,
             tick_time=tick_time,
             now_monotonic=now_monotonic,
         )
-
-    # ----------------------------------------------------------
-
-    def on_market_trade(self, trade: AggTradeData, current_mid: float):
-        """Observe public flow without treating it as RPI fill evidence."""
-        if not self.is_warmed_up or current_mid <= 0:
-            return
-
-        delta_mkt = abs(trade.price / current_mid - 1.0) * 10000.0
-
-        if delta_mkt > 100.0:
-            return
-        self.public_trade_sample_count += 1

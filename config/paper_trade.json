@@ -3,8 +3,6 @@
   "fragment": "paper_trade",
   "version": 1,
   "paper_trade": {
-    "enabled": true,
-    "market_data_environment": "production",
     "maker_fee": 0.0002,
     "taker_fee": 0.0005,
     "rpi_commission_rate": 0.0,

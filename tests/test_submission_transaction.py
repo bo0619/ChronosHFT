@@ -6,7 +6,6 @@ import pytest
 
 from oms.submission_transaction import (
     SubmissionAdmissionPolicy,
-    SubmissionFinalizationError,
     SubmissionState,
     SubmissionTerminalOutcome,
     SubmissionTransaction,
@@ -198,43 +197,6 @@ def test_concurrent_finalizers_wait_for_one_cleanup_owner():
     assert transaction.snapshot().terminal_outcome is (
         SubmissionTerminalOutcome.UNKNOWN
     )
-
-
-def test_finalizer_closes_gate_then_releases_leases_in_reverse_order():
-    actions: list[str] = []
-    transaction = _transaction()
-    transaction.bind_gate_cleanup(
-        lambda context, error: actions.append(
-            f"gate:{context}:{type(error).__name__}"
-        )
-    )
-    transaction.acquire_lease("calibration", lambda: actions.append("calibration"))
-    transaction.prepared_durable()
-    transaction.permit_acquired(4, lambda: actions.append("permit"))
-
-    transaction.finalize(
-        SubmissionTerminalOutcome.FAILED_CLOSED,
-        gate_failure_context="dispatch",
-        gate_failure=TimeoutError("lost response"),
-    )
-
-    assert actions == ["gate:dispatch:TimeoutError", "permit", "calibration"]
-
-
-def test_finalizer_attempts_all_cleanup_before_reporting_errors():
-    actions: list[str] = []
-    transaction = _transaction()
-    transaction.acquire_lease(
-        "first",
-        lambda: (_ for _ in ()).throw(OSError("first")),
-    )
-    transaction.acquire_lease("second", lambda: actions.append("second"))
-
-    with pytest.raises(SubmissionFinalizationError, match="first"):
-        transaction.finalize(SubmissionTerminalOutcome.FAILED_CLOSED)
-
-    assert actions == ["second"]
-    assert transaction.finalized
 
 
 def test_recorded_gate_failure_is_applied_once_by_the_finalizer():

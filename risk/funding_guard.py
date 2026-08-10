@@ -239,10 +239,6 @@ class FundingGuardDecision:
     def blocks_open_risk(self) -> bool:
         return self.action == REDUCE_ONLY
 
-    @property
-    def allows_reduce_only(self) -> bool:
-        return True
-
 
 def _decision(
     *,

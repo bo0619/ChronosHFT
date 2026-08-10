@@ -5,9 +5,11 @@ from __future__ import annotations
 import math
 from typing import Callable
 
+from governance.contracts import SIDECAR_IPC_VERSION
+
 
 class SidecarProtocol:
-    VERSION = 2
+    VERSION = SIDECAR_IPC_VERSION
     PARENT_CAPABILITIES = frozenset(
         {
             "control.request.v1",

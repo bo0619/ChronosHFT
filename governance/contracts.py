@@ -5,6 +5,8 @@ code and offline tools may depend on these names without creating a dependency
 on either implementation layer.
 """
 
+from collections.abc import Mapping
+
 CONFIG_MANIFEST_SCHEMA = "chronoshft.config_manifest.v3"
 CONFIG_DOCUMENT_VERSION = 3
 CONFIG_FRAGMENT_SCHEMA = "chronoshft.config_fragment.v3"
@@ -27,6 +29,23 @@ RPI_CALIBRATION_ARTIFACT_SCHEMA = "chronoshft.glft_rpi_calibration.v3"
 RPI_EXPOSURE_SAMPLE_SCHEMA = "chronoshft.rpi_exposure_sample.v2"
 
 
+def market_data_environment(config: Mapping[str, object]) -> str:
+    """Return the canonical deployment environment from strict config v3."""
+    if not isinstance(config, Mapping):
+        return ""
+    system = config.get("system", {})
+    if not isinstance(system, Mapping):
+        return ""
+    market_data = system.get("market_data", {})
+    if not isinstance(market_data, Mapping):
+        return ""
+    return str(market_data.get("environment", "") or "").strip().lower()
+
+
+def is_testnet_environment(config: Mapping[str, object]) -> bool:
+    return market_data_environment(config) == "testnet"
+
+
 __all__ = [
     "CANONICAL_CONFIG_DIGEST_DOMAIN",
     "CANONICAL_CONFIG_SCHEMA",
@@ -36,6 +55,8 @@ __all__ = [
     "CONFIG_UNKNOWN_KEY_POLICY",
     "LIVE_APPROVAL_SCHEMA",
     "LIVE_APPROVAL_SIGNATURE_DOMAIN",
+    "is_testnet_environment",
+    "market_data_environment",
     "OMS_JOURNAL_RECORD_VERSION",
     "RELEASE_DIGEST_ALGORITHM",
     "RELEASE_DIGEST_DOMAIN",

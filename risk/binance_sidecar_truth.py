@@ -59,25 +59,7 @@ class BinanceSidecarTruthOwner(Protocol):
 
     def _ensure_exchange_clock(self, force: bool = False): ...
 
-    def _response_payload(self, response, expected_type, label: str): ...
-
-    def _position_risk_fingerprint(self, positions): ...
-
     def _corrected_epoch_at(self, observed_monotonic: float): ...
-
-    def _get_open_orders_snapshot(self): ...
-
-    def _get_cached_daily_external_cash_flow(self): ...
-
-    def _get_cached_external_cash_flow_truth(self): ...
-
-    def _get_funding_observations(self): ...
-
-    def _income_identity(self, row: dict): ...
-
-    def _get_daily_external_cash_flow(self): ...
-
-    def _remember_open_order_symbols(self, rows): ...
 
 
 class BinanceSidecarTruthReader:
@@ -210,7 +192,7 @@ class BinanceSidecarTruthReader:
 
         observations = {}
         for symbol in owner.symbols:
-            ok, payload, reason = owner._response_payload(
+            ok, payload, reason = self.response_payload(
                 owner.rest.request(
                     "GET",
                     BINANCE_PREMIUM_INDEX_ENDPOINT,
@@ -265,14 +247,14 @@ class BinanceSidecarTruthReader:
             clock_ok, reason = owner._ensure_exchange_clock()
             if not clock_ok:
                 return False, {}, reason
-            account_ok, account, reason = owner._response_payload(
+            account_ok, account, reason = self.response_payload(
                 owner.rest.get_account(),
                 dict,
                 "account",
             )
             if not account_ok:
                 return False, {}, reason
-            positions_ok, positions, reason = owner._response_payload(
+            positions_ok, positions, reason = self.response_payload(
                 owner.rest.get_positions(),
                 list,
                 "positions",
@@ -280,12 +262,12 @@ class BinanceSidecarTruthReader:
             if not positions_ok:
                 return False, {}, reason
             orders_ok, open_orders, reason = (
-                owner._get_open_orders_snapshot()
+                self.get_open_orders_snapshot()
             )
             if not orders_ok:
                 return False, {}, reason
             positions_after_ok, positions_after, reason = (
-                owner._response_payload(
+                self.response_payload(
                     owner.rest.get_positions(),
                     list,
                     "positions_after_open_orders",
@@ -293,9 +275,9 @@ class BinanceSidecarTruthReader:
             )
             if not positions_after_ok:
                 return False, {}, reason
-            if owner._position_risk_fingerprint(
+            if self.position_risk_fingerprint(
                 positions
-            ) != owner._position_risk_fingerprint(positions_after):
+            ) != self.position_risk_fingerprint(positions_after):
                 return (
                     False,
                     {},
@@ -310,12 +292,12 @@ class BinanceSidecarTruthReader:
                 getattr(owner, "daily_loss_enabled", False),
             ):
                 cash_flow_ok, cash_flow_truth, reason = (
-                    owner._get_cached_external_cash_flow_truth()
+                    self.get_cached_external_cash_flow_truth()
                 )
                 if not cash_flow_ok:
                     return False, {}, reason
             funding_ok, funding_observations, reason = (
-                owner._get_funding_observations()
+                self.get_funding_observations()
             )
             if not funding_ok:
                 return False, {}, reason
@@ -394,7 +376,7 @@ class BinanceSidecarTruthReader:
             clock_ok, reason = owner._ensure_exchange_clock(force=True)
             if not clock_ok:
                 return TruthResult(False, reason=reason)
-            account_ok, account, reason = owner._response_payload(
+            account_ok, account, reason = self.response_payload(
                 owner.rest.get_account(),
                 dict,
                 "flat_proof_account",
@@ -403,14 +385,14 @@ class BinanceSidecarTruthReader:
                 return TruthResult(False, reason=reason)
             snapshots = []
             for sample in (1, 2):
-                positions_ok, positions, reason = owner._response_payload(
+                positions_ok, positions, reason = self.response_payload(
                     owner.rest.get_positions(emergency=True),
                     list,
                     f"flat_proof_positions_{sample}",
                 )
                 if not positions_ok:
                     return TruthResult(False, reason=reason)
-                orders_ok, orders, reason = owner._response_payload(
+                orders_ok, orders, reason = self.response_payload(
                     owner.rest.get_open_orders(emergency=True),
                     list,
                     f"flat_proof_open_orders_{sample}",
@@ -589,7 +571,7 @@ class BinanceSidecarTruthReader:
         seen: dict[str, str] = {}
         limit = 1000
         for page in range(1, owner.cash_flow_max_pages + 1):
-            ok, rows, reason = owner._response_payload(
+            ok, rows, reason = self.response_payload(
                 owner.rest.get_income_history(
                     start_time=int(start_time_ms),
                     end_time=end_time_ms,
@@ -620,7 +602,7 @@ class BinanceSidecarTruthReader:
                         [],
                         f"cash_flow_asset_unsupported:{asset or 'empty'}",
                     )
-                identity = owner._income_identity(row)
+                identity = self.income_identity(row)
                 try:
                     amount = float(row.get("income", 0.0) or 0.0)
                     event_time_ms = int(row["time"])
@@ -855,7 +837,7 @@ class BinanceSidecarTruthReader:
                 "",
             )
 
-        ok, daily_total, reason = owner._get_daily_external_cash_flow()
+        ok, daily_total, reason = self.get_daily_external_cash_flow()
         if not ok:
             return False, None, reason
         previous_daily = float(
@@ -915,12 +897,6 @@ class BinanceSidecarTruthReader:
             "",
         )
 
-    def get_cached_daily_external_cash_flow(self):
-        ok, truth, reason = self.get_cached_external_cash_flow_truth()
-        if not ok:
-            return False, 0.0, reason
-        return True, float(truth.daily_external_cash_flow_total), ""
-
     def get_open_orders_snapshot(self):
         owner = self._owner
         symbols = tuple(getattr(owner, "symbols", ()) or ())
@@ -949,7 +925,7 @@ class BinanceSidecarTruthReader:
             or last_full_audit <= 0.0
             or now - last_full_audit >= interval
         ):
-            ok, rows, reason = owner._response_payload(
+            ok, rows, reason = self.response_payload(
                 owner.rest.get_open_orders(),
                 list,
                 "open_orders",
@@ -957,7 +933,7 @@ class BinanceSidecarTruthReader:
             if not ok:
                 return False, [], reason
             owner._last_full_open_orders_audit_monotonic = now
-            owner._remember_open_order_symbols(rows)
+            self.remember_open_order_symbols(rows)
             return True, rows, ""
 
         rows = []
@@ -965,7 +941,7 @@ class BinanceSidecarTruthReader:
             getattr(owner, "_known_open_order_symbols", set()) or set()
         )
         for symbol in sorted(set(symbols) | known_symbols):
-            ok, symbol_rows, reason = owner._response_payload(
+            ok, symbol_rows, reason = self.response_payload(
                 owner.rest.get_open_orders(symbol),
                 list,
                 f"open_orders:{symbol}",
@@ -973,7 +949,7 @@ class BinanceSidecarTruthReader:
             if not ok:
                 return False, [], reason
             rows.extend(symbol_rows)
-        owner._remember_open_order_symbols(rows)
+        self.remember_open_order_symbols(rows)
         return True, rows, ""
 
     def remember_open_order_symbols(self, rows):

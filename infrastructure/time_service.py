@@ -32,11 +32,9 @@ class TimeService:
         self.url = "https://fapi.binance.com/fapi/v1/time"
         self.listeners = []
 
-        self.max_offset_ms = 25.0
-        self.halt_offset_ms = 100.0
         self.max_initial_offset_ms = 5000.0
-        self.max_phase_error_ms = self.max_offset_ms
-        self.halt_phase_error_ms = self.halt_offset_ms
+        self.max_phase_error_ms = 25.0
+        self.halt_phase_error_ms = 100.0
         self.max_rtt_ms = 250.0
         self.max_uncertainty_ms = 50.0
         self.max_consecutive_failures = 3
@@ -69,7 +67,6 @@ class TimeService:
         self._anchor_epoch_ns = 0
         self._anchor_mono_ns = 0
         self._anchor_wall_ns = 0
-        self._anchor_offset_ms = 0.0
         self._last_sync_mono_ns = 0
         self._last_now_ns = 0
         self._last_wall_step_ms = 0.0
@@ -98,33 +95,10 @@ class TimeService:
             self._anchor_mono_ns = mono_ns
             self._anchor_wall_ns = wall_ns
             self._anchor_epoch_ns = wall_ns + int(value * 1_000_000.0)
-            self._anchor_offset_ms = value
             self._last_phase_error_ms = 0.0
 
     def configure(self, config=None):
         config = config or {}
-        self.max_offset_ms = self._float_config(
-            config,
-            "max_offset_ms",
-            self.max_offset_ms,
-            minimum=0.0,
-        )
-        self.halt_offset_ms = self._float_config(
-            config,
-            "halt_offset_ms",
-            self.halt_offset_ms,
-            minimum=0.0,
-        )
-        phase_freeze_default = (
-            self.max_offset_ms
-            if "max_offset_ms" in config
-            else self.max_phase_error_ms
-        )
-        phase_halt_default = (
-            self.halt_offset_ms
-            if "halt_offset_ms" in config
-            else self.halt_phase_error_ms
-        )
         self.max_initial_offset_ms = max(
             0.0,
             self._float_config(
@@ -139,7 +113,7 @@ class TimeService:
             self._float_config(
                 config,
                 "max_phase_error_ms",
-                phase_freeze_default,
+                self.max_phase_error_ms,
                 minimum=0.0,
             ),
         )
@@ -148,14 +122,10 @@ class TimeService:
             self._float_config(
                 config,
                 "halt_phase_error_ms",
-                phase_halt_default,
+                self.halt_phase_error_ms,
                 minimum=0.0,
             ),
         )
-        # Keep the legacy public attributes as aliases of the effective phase
-        # thresholds, not as a second source of truth.
-        self.max_offset_ms = self.max_phase_error_ms
-        self.halt_offset_ms = self.halt_phase_error_ms
         self.max_rtt_ms = self._float_config(
             config,
             "max_rtt_ms",
@@ -317,10 +287,6 @@ class TimeService:
                 return False
 
         return unsubscribe
-
-    def clear_listeners(self):
-        with self._state_lock:
-            self.listeners.clear()
 
     def start(self, testnet=False):
         self.stop()
@@ -848,7 +814,6 @@ class TimeService:
                 # was captured together after sampling, so this is an atomic
                 # replacement of the exchange epoch anchor.
                 self._offset_ms = offset_ms
-                self._anchor_offset_ms = offset_ms
                 self._anchor_epoch_ns = anchor_epoch_ns
                 self._anchor_mono_ns = anchor_mono_ns
                 self._anchor_wall_ns = anchor_wall_ns

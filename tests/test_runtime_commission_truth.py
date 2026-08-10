@@ -6,7 +6,6 @@ from infrastructure.truth_monitor import TruthMonitor
 def live_rpi_config():
     return {
         "execution": {"mode": "live"},
-        "paper_trade": {"enabled": False},
         "symbols": ["XAUUSDT"],
         "oms": {
             "truth_monitor": {

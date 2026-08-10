@@ -81,6 +81,7 @@ from risk.independent_supervisor import (
     run_sidecar_loop,
 )
 from risk.manager import RiskManager
+from risk.binance_sidecar_truth import BinanceSidecarTruthReader
 from risk.sidecar_protocol import SidecarProtocol
 from risk.sidecar_state_store import SidecarStateStore, SidecarStateStoreError
 from strategy.base import StrategyTemplate
@@ -427,8 +428,15 @@ class DummyRiskSidecarRest:
             status_code=self.server_time_status,
         )
 
-    def new_order(self, request, client_oid):
-        self.new_orders.append((request, client_oid))
+    def new_reduce_only_market_order(
+        self,
+        *,
+        symbol,
+        side,
+        quantity,
+        client_oid,
+    ):
+        self.new_orders.append((symbol, side, quantity, client_oid))
         return DummyResponse({"orderId": len(self.new_orders)})
 
 
@@ -714,7 +722,7 @@ class ExchangeTruthTests(unittest.TestCase):
         gateway.seq_lock = threading.Lock()
         gateway.symbols = ["BTCUSDT"]
 
-        gateway._handle_user_update(
+        gateway._websocket_events().handle_user_update(
             {
                 "e": "ORDER_TRADE_UPDATE",
                 "o": {
@@ -734,7 +742,7 @@ class ExchangeTruthTests(unittest.TestCase):
                 },
             }
         )
-        gateway._handle_account_update(
+        gateway._websocket_events().handle_account_update(
             {
                 "e": "ACCOUNT_UPDATE",
                 "E": 2000,
@@ -770,9 +778,9 @@ class ExchangeTruthTests(unittest.TestCase):
         gateway.gateway_name = "BINANCE"
         gateway.state = GatewayState.READY
         gateway._book_lock = threading.RLock()
-        gateway._book_generation = 0
+        gateway._order_books().generation = 0
         gateway.active = True
-        gateway.ws = None
+        gateway._connections().ws = None
 
         gateway.on_ws_message("{bad-json")
 
@@ -786,9 +794,9 @@ class ExchangeTruthTests(unittest.TestCase):
         gateway.gateway_name = "BINANCE"
         gateway.state = GatewayState.READY
         gateway._book_lock = threading.RLock()
-        gateway._book_generation = 0
+        gateway._order_books().generation = 0
         gateway.active = True
-        gateway.ws = None
+        gateway._connections().ws = None
         gateway.latency_stats = {}
 
         gateway.on_ws_message(
@@ -846,8 +854,8 @@ class ExchangeTruthTests(unittest.TestCase):
         gateway._book_lock = threading.RLock()
         gateway.active = True
         gateway.state = GatewayState.READY
-        gateway.book_resyncing = set()
-        gateway.ws_buffer = {"BTCUSDT": None}
+        gateway._order_books().resyncing = set()
+        gateway._order_books().buffers = {"BTCUSDT": None}
         gateway.rest = types.SimpleNamespace(
             new_order=lambda _req, _client_oid, **_kwargs: None
         )
@@ -870,8 +878,8 @@ class ExchangeTruthTests(unittest.TestCase):
         gateway._book_lock = threading.RLock()
         gateway.active = True
         gateway.state = GatewayState.READY
-        gateway.book_resyncing = set()
-        gateway.ws_buffer = {"BTCUSDT": None}
+        gateway._order_books().resyncing = set()
+        gateway._order_books().buffers = {"BTCUSDT": None}
         gateway.rest = types.SimpleNamespace(
             new_order=lambda _req, _client_oid, **_kwargs: DummyResponse(
                 {"code": -1006, "msg": "Unexpected response from message bus"},
@@ -909,8 +917,8 @@ class ExchangeTruthTests(unittest.TestCase):
         gateway._book_lock = threading.RLock()
         gateway.active = True
         gateway.state = GatewayState.READY
-        gateway.book_resyncing = set()
-        gateway.ws_buffer = {"BTCUSDT": None}
+        gateway._order_books().resyncing = set()
+        gateway._order_books().buffers = {"BTCUSDT": None}
         gateway.rest = types.SimpleNamespace(
             new_order=lambda req, client_oid, **_kwargs: calls.append(
                 (req, client_oid)
@@ -945,7 +953,7 @@ class ExchangeTruthTests(unittest.TestCase):
         gateway.gateway_name = "BINANCE"
         gateway.symbols = ["BTCUSDT"]
 
-        gateway._handle_account_update(
+        gateway._websocket_events().handle_account_update(
             {
                 "e": "ACCOUNT_UPDATE",
                 "T": 3000,
@@ -1295,9 +1303,9 @@ class RiskExecutionTests(unittest.TestCase):
             exchange="BINANCE",
             datetime=datetime.now() - timedelta(milliseconds=250),
         )
-        risk.on_orderbook(Event("eOrderBook", stale_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", stale_book))
         self.assertFalse(risk.kill_switch_triggered)
-        risk.on_orderbook(Event("eOrderBook", stale_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", stale_book))
 
         self.assertFalse(risk.kill_switch_triggered)
         self.assertEqual(len(oms.frozen_symbols), 1)
@@ -1309,8 +1317,8 @@ class RiskExecutionTests(unittest.TestCase):
         oms = DummyOMS()
         risk = RiskManager(engine, self.make_risk_config(), oms=oms, gateway=gateway)
 
-        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, AccountData(1000.0, 1000.0, 1000.0, 0.0, datetime.now())))
-        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, AccountData(970.0, 970.0, 970.0, 0.0, datetime.now())))
+        risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, AccountData(1000.0, 1000.0, 1000.0, 0.0, datetime.now())))
+        risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, AccountData(970.0, 970.0, 970.0, 0.0, datetime.now())))
 
         self.assertTrue(risk.kill_switch_triggered)
         self.assertIn("Drawdown", risk.kill_reason)
@@ -1341,11 +1349,11 @@ class RiskExecutionTests(unittest.TestCase):
                 cash_flow_snapshot_synced=True,
             )
 
-        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account(1000.0, 0.0)))
-        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account(1100.0, 100.0)))
+        risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account(1000.0, 0.0)))
+        risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account(1100.0, 100.0)))
         self.assertFalse(risk.kill_switch_triggered)
 
-        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account(1040.0, 100.0)))
+        risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account(1040.0, 100.0)))
         self.assertTrue(risk.kill_switch_triggered)
         self.assertIn("Daily loss", risk.kill_reason)
 
@@ -1363,7 +1371,7 @@ class RiskExecutionTests(unittest.TestCase):
         risk = RiskManager(engine, config, oms=oms, gateway=gateway)
 
         missing = AccountData(1000.0, 1000.0, 1000.0, 0.0, datetime.now())
-        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, missing))
+        risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, missing))
         self.assertEqual(oms.trading_modes[-1][0], OMSCapabilityMode.REDUCE_ONLY)
         self.assertTrue(oms.trading_modes[-1][1].startswith("daily_pnl_truth:"))
 
@@ -1376,9 +1384,9 @@ class RiskExecutionTests(unittest.TestCase):
             cash_flow_snapshot_time=time.time(),
             cash_flow_snapshot_synced=True,
         )
-        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, healthy))
+        risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, healthy))
         self.assertFalse(oms.cleared_trading_modes)
-        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, healthy))
+        risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, healthy))
         self.assertTrue(oms.cleared_trading_modes)
 
     def test_live_risk_cycle_renews_oms_heartbeat_lease(self):
@@ -1423,7 +1431,7 @@ class RiskExecutionTests(unittest.TestCase):
         ]
 
         with patch(
-            "risk.manager.data_cache.get_risk_snapshot",
+            "risk.market_risk.data_cache.get_risk_snapshot",
             side_effect=snapshots,
         ) as get_snapshot:
             mark_failures = risk.market_data_readiness_failures(now=100.0)
@@ -1445,7 +1453,7 @@ class RiskExecutionTests(unittest.TestCase):
             ],
         )
         self.assertEqual(oms.frozen_symbols, [])
-        self.assertEqual(risk.frozen_symbols, {})
+        self.assertEqual(risk.scope_guards.frozen_symbols, {})
         self.assertFalse(risk.kill_switch_triggered)
 
     def test_freshness_guard_recovers_while_dms_renewal_is_withheld(self):
@@ -1478,22 +1486,24 @@ class RiskExecutionTests(unittest.TestCase):
         fresh = {**stale, "book_age_ms": 10.0}
 
         with patch(
-            "risk.manager.data_cache.get_risk_snapshot",
+            "risk.market_risk.data_cache.get_risk_snapshot",
             side_effect=[stale, fresh],
         ):
             self.assertTrue(risk.check_market_data_freshness(now=100.0))
-            self.assertIn("BTCUSDT", risk.frozen_symbols)
+            self.assertIn("BTCUSDT", risk.scope_guards.frozen_symbols)
             oms.symbol_guards["BTCUSDT"] = {
-                "stale_market_data": risk.frozen_symbols["BTCUSDT"],
+                "stale_market_data": (
+                    risk.scope_guards.frozen_symbols["BTCUSDT"]
+                ),
             }
 
             self.assertTrue(risk.check_market_data_freshness(now=101.0))
 
-        self.assertEqual(risk.frozen_symbols, {})
+        self.assertEqual(risk.scope_guards.frozen_symbols, {})
         self.assertEqual(len(oms.unfrozen_symbols), 1)
         self.assertEqual(oms.dead_man_renewals, 1)
         self.assertEqual(len(oms.risk_heartbeats), 2)
-        self.assertTrue(risk._venue_dms_renewal_authorized)
+        self.assertTrue(risk.venue_dms.renewal_authorized)
 
     def test_risk_status_snapshot_exposes_cash_flow_adjusted_pnl_and_margin(self):
         engine = DummyEngine()
@@ -1558,15 +1568,15 @@ class RiskExecutionTests(unittest.TestCase):
                 margin_snapshot_synced=True,
             )
 
-        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account_at(0.55)))
+        risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account_at(0.55)))
         self.assertEqual(oms.trading_modes[-1][0], OMSCapabilityMode.DEGRADED)
 
-        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account_at(0.75)))
+        risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account_at(0.75)))
         self.assertEqual(oms.trading_modes[-1][0], OMSCapabilityMode.REDUCE_ONLY)
 
-        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account_at(0.30)))
+        risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account_at(0.30)))
         self.assertEqual(oms.cleared_trading_modes, [])
-        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account_at(0.30)))
+        risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account_at(0.30)))
         self.assertTrue(oms.cleared_trading_modes)
 
     def test_stale_margin_snapshot_enters_reduce_only(self):
@@ -1590,7 +1600,7 @@ class RiskExecutionTests(unittest.TestCase):
             margin_snapshot_synced=True,
         )
 
-        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account))
+        risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account))
 
         self.assertEqual(oms.trading_modes[-1][0], OMSCapabilityMode.REDUCE_ONLY)
         self.assertTrue(oms.trading_modes[-1][1].startswith("margin_health:stale_snapshot:"))
@@ -1632,8 +1642,8 @@ class RiskExecutionTests(unittest.TestCase):
                 margin_snapshot_synced=True,
             )
 
-            risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, healthy))
-            risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, healthy))
+            risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, healthy))
+            risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, healthy))
 
             self.assertFalse(oms.has_trading_mode_constraint(("margin_health:",)))
             self.assertTrue(oms.has_trading_mode_constraint(("processing_lag:",)))
@@ -1662,7 +1672,7 @@ class RiskExecutionTests(unittest.TestCase):
             margin_snapshot_synced=True,
         )
 
-        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account))
+        risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account))
 
         self.assertTrue(risk.kill_switch_triggered)
         self.assertIn("Maintenance margin ratio", risk.kill_reason)
@@ -1673,7 +1683,7 @@ class RiskExecutionTests(unittest.TestCase):
         oms = DummyOMS()
         risk = RiskManager(engine, self.make_risk_config(), oms=oms, gateway=gateway)
 
-        risk.on_mark_price(
+        risk.market_risk.on_mark_price(
             Event(
                 "eMarkPrice",
                 MarkPriceData(
@@ -1686,7 +1696,7 @@ class RiskExecutionTests(unittest.TestCase):
                 ),
             )
         )
-        risk.on_mark_price(
+        risk.market_risk.on_mark_price(
             Event(
                 "eMarkPrice",
                 MarkPriceData(
@@ -1713,7 +1723,7 @@ class RiskExecutionTests(unittest.TestCase):
             gateway=DummyGateway(),
         )
 
-        risk.on_mark_price(
+        risk.market_risk.on_mark_price(
             Event(
                 "eMarkPrice",
                 MarkPriceData(
@@ -1749,7 +1759,7 @@ class RiskExecutionTests(unittest.TestCase):
             datetime=datetime.now(),
         )
 
-        risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account))
+        risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, account))
 
         self.assertTrue(risk.kill_switch_triggered)
         self.assertIn("non-finite", risk.kill_reason)
@@ -1805,7 +1815,9 @@ class RiskExecutionTests(unittest.TestCase):
         time.sleep(0.16)
 
         self.assertTrue(risk.kill_switch_triggered)
-        self.assertTrue(risk._kill_supervisor_thread.is_alive())
+        self.assertTrue(
+            risk.kill_switch._kill_supervisor_thread.is_alive()
+        )
 
         gateway.open_orders = []
         gateway.positions = []
@@ -1817,8 +1829,10 @@ class RiskExecutionTests(unittest.TestCase):
             time.sleep(0.02)
 
         self.assertEqual(risk.kill_state, "FLAT_VERIFIED")
-        risk._kill_supervisor_thread.join(timeout=0.5)
-        self.assertFalse(risk._kill_supervisor_thread.is_alive())
+        risk.kill_switch._kill_supervisor_thread.join(timeout=0.5)
+        self.assertFalse(
+            risk.kill_switch._kill_supervisor_thread.is_alive()
+        )
 
 
     def test_latency_limit_uses_exchange_timestamp_over_local_datetime(self):
@@ -1835,8 +1849,8 @@ class RiskExecutionTests(unittest.TestCase):
             datetime=fresh_local_time,
             exchange_timestamp=exchange_ts,
         )
-        risk.on_orderbook(Event("eOrderBook", stale_book))
-        risk.on_orderbook(Event("eOrderBook", stale_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", stale_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", stale_book))
 
         self.assertFalse(risk.kill_switch_triggered)
         self.assertTrue(oms.frozen_symbols)
@@ -1864,11 +1878,19 @@ class RiskExecutionTests(unittest.TestCase):
                 received_monotonic=time.perf_counter(),
             )
 
-            corrected_risk.on_orderbook(Event("eOrderBook", corrected_book))
-            corrected_risk.on_orderbook(Event("eOrderBook", corrected_book))
+            corrected_risk.market_risk.on_orderbook(
+                Event("eOrderBook", corrected_book)
+            )
+            corrected_risk.market_risk.on_orderbook(
+                Event("eOrderBook", corrected_book)
+            )
 
             self.assertFalse(corrected_oms.frozen_symbols)
-            self.assertAlmostEqual(corrected_risk.last_market_latency_ms, 0.0, places=3)
+            self.assertAlmostEqual(
+                corrected_risk.market_risk.last_market_latency_ms,
+                0.0,
+                places=3,
+            )
 
             time_service.offset = 0.0
             skewed_oms = DummyOMS()
@@ -1878,10 +1900,17 @@ class RiskExecutionTests(unittest.TestCase):
                 oms=skewed_oms,
                 gateway=DummyGateway(),
             )
-            skewed_risk.on_orderbook(Event("eOrderBook", corrected_book))
-            skewed_risk.on_orderbook(Event("eOrderBook", corrected_book))
+            skewed_risk.market_risk.on_orderbook(
+                Event("eOrderBook", corrected_book)
+            )
+            skewed_risk.market_risk.on_orderbook(
+                Event("eOrderBook", corrected_book)
+            )
 
-            self.assertLess(skewed_risk.last_market_latency_ms, -200.0)
+            self.assertLess(
+                skewed_risk.market_risk.last_market_latency_ms,
+                -200.0,
+            )
             self.assertTrue(skewed_oms.frozen_symbols)
             self.assertIn("latency:-", skewed_oms.frozen_symbols[-1][1])
         finally:
@@ -1910,11 +1939,14 @@ class RiskExecutionTests(unittest.TestCase):
                 received_monotonic=time.perf_counter(),
             )
 
-            risk.on_orderbook(Event("eOrderBook", book))
-            risk.on_orderbook(Event("eOrderBook", book))
+            risk.market_risk.on_orderbook(Event("eOrderBook", book))
+            risk.market_risk.on_orderbook(Event("eOrderBook", book))
 
             self.assertFalse(oms.frozen_venues)
-            self.assertLess(risk.last_processing_lag_ms, 100.0)
+            self.assertLess(
+                risk.market_risk.last_processing_lag_ms,
+                100.0,
+            )
         finally:
             time_service.offset = original_offset
 
@@ -1936,12 +1968,12 @@ class RiskExecutionTests(unittest.TestCase):
             datetime=datetime.now() - timedelta(milliseconds=250),
         )
 
-        risk.on_orderbook(Event("eOrderBook", stale_btc))
-        risk.on_orderbook(Event("eOrderBook", stale_btc))
+        risk.market_risk.on_orderbook(Event("eOrderBook", stale_btc))
+        risk.market_risk.on_orderbook(Event("eOrderBook", stale_btc))
         self.assertFalse(risk.kill_switch_triggered)
 
-        risk.on_orderbook(Event("eOrderBook", stale_eth))
-        risk.on_orderbook(Event("eOrderBook", stale_eth))
+        risk.market_risk.on_orderbook(Event("eOrderBook", stale_eth))
+        risk.market_risk.on_orderbook(Event("eOrderBook", stale_eth))
 
         self.assertTrue(risk.kill_switch_triggered)
         self.assertTrue(oms.halt_reasons)
@@ -1964,12 +1996,12 @@ class RiskExecutionTests(unittest.TestCase):
             exchange_timestamp=datetime.now().timestamp(),
         )
 
-        risk.on_orderbook(Event("eOrderBook", stale_book))
-        risk.on_orderbook(Event("eOrderBook", stale_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", stale_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", stale_book))
         self.assertTrue(oms.frozen_symbols)
 
-        risk.on_orderbook(Event("eOrderBook", fresh_book))
-        risk.on_orderbook(Event("eOrderBook", fresh_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", fresh_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", fresh_book))
 
         self.assertTrue(oms.unfrozen_symbols)
 
@@ -1990,22 +2022,22 @@ class RiskExecutionTests(unittest.TestCase):
             exchange_timestamp=datetime.now().timestamp(),
         )
 
-        risk.on_orderbook(Event("eOrderBook", stale_book))
-        risk.on_orderbook(Event("eOrderBook", stale_book))
-        owned_reason = risk.frozen_symbols["BTCUSDT"]
-        owned_epoch = risk.symbol_freeze_epochs["BTCUSDT"]
+        risk.market_risk.on_orderbook(Event("eOrderBook", stale_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", stale_book))
+        owned_reason = risk.scope_guards.frozen_symbols["BTCUSDT"]
+        owned_epoch = risk.scope_guards.symbol_freeze_epochs["BTCUSDT"]
         newer_epoch = oms.freeze_symbol(
             "BTCUSDT",
             "truth_plane:newer",
             cancel_active_orders=False,
         )
 
-        risk.on_orderbook(Event("eOrderBook", fresh_book))
-        risk.on_orderbook(Event("eOrderBook", fresh_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", fresh_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", fresh_book))
 
         self.assertGreater(newer_epoch, owned_epoch)
         self.assertEqual(oms.get_symbol_freeze_reason("BTCUSDT"), "truth_plane:newer")
-        self.assertNotIn("BTCUSDT", risk.frozen_symbols)
+        self.assertNotIn("BTCUSDT", risk.scope_guards.frozen_symbols)
         self.assertIn(
             ("BTCUSDT", "latency recovered after 2 healthy updates", owned_epoch, owned_reason),
             oms.symbol_clear_attempts,
@@ -2025,8 +2057,8 @@ class RiskExecutionTests(unittest.TestCase):
             received_timestamp=(datetime.now() - timedelta(milliseconds=250)).timestamp(),
         )
 
-        risk.on_orderbook(Event("eOrderBook", delayed_book))
-        risk.on_orderbook(Event("eOrderBook", delayed_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", delayed_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", delayed_book))
 
         self.assertFalse(oms.frozen_symbols)
         self.assertTrue(oms.frozen_venues)
@@ -2053,12 +2085,12 @@ class RiskExecutionTests(unittest.TestCase):
             received_timestamp=datetime.now().timestamp(),
         )
 
-        risk.on_orderbook(Event("eOrderBook", delayed_book))
-        risk.on_orderbook(Event("eOrderBook", delayed_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", delayed_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", delayed_book))
         self.assertTrue(oms.frozen_venues)
 
-        risk.on_orderbook(Event("eOrderBook", fresh_book))
-        risk.on_orderbook(Event("eOrderBook", fresh_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", fresh_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", fresh_book))
 
         self.assertTrue(oms.unfrozen_venues)
 
@@ -2068,8 +2100,11 @@ class RiskExecutionTests(unittest.TestCase):
         oms = DummyOMS()
         risk = RiskManager(engine, self.make_risk_config(), oms=oms, gateway=gateway)
 
-        risk._freeze_venue("BINANCE", "processing_lag:first")
-        stale_epoch = risk.venue_freeze_epochs["BINANCE"]
+        risk.scope_guards._freeze_venue(
+            "BINANCE",
+            "processing_lag:first",
+        )
+        stale_epoch = risk.scope_guards.venue_freeze_epochs["BINANCE"]
         oms.freeze_venue(
             "BINANCE",
             "system_health:new_fault",
@@ -2077,7 +2112,10 @@ class RiskExecutionTests(unittest.TestCase):
         )
 
         for _ in range(risk.venue_freeze_recovery_updates):
-            risk._recover_venue_if_stable("BINANCE", prefix="processing_lag:")
+            risk.scope_guards._recover_venue_if_stable(
+                "BINANCE",
+                prefix="processing_lag:",
+            )
 
         self.assertEqual(
             oms.get_venue_freeze_reason("BINANCE"),
@@ -2100,12 +2138,18 @@ class RiskExecutionTests(unittest.TestCase):
             gateway=DummyGateway(),
         )
 
-        risk._freeze_symbol("BTCUSDT", "latency:1500.0ms>1200ms")
-        risk._freeze_symbol("BTCUSDT", "latency:4500.0ms>1200ms")
+        risk.scope_guards._freeze_symbol(
+            "BTCUSDT",
+            "latency:1500.0ms>1200ms",
+        )
+        risk.scope_guards._freeze_symbol(
+            "BTCUSDT",
+            "latency:4500.0ms>1200ms",
+        )
 
         self.assertEqual(len(oms.frozen_symbols), 1)
         self.assertEqual(
-            risk.frozen_symbols["BTCUSDT"],
+            risk.scope_guards.frozen_symbols["BTCUSDT"],
             "latency:1500.0ms>1200ms",
         )
 
@@ -2119,18 +2163,18 @@ class RiskExecutionTests(unittest.TestCase):
             gateway=DummyGateway(),
         )
 
-        risk._freeze_venue(
+        risk.scope_guards._freeze_venue(
             "BINANCE",
             "processing_lag:1500.0ms>1200ms",
         )
-        risk._freeze_venue(
+        risk.scope_guards._freeze_venue(
             "BINANCE",
             "processing_lag:4500.0ms>1200ms",
         )
 
         self.assertEqual(len(oms.frozen_venues), 1)
         self.assertEqual(
-            risk.frozen_venues["BINANCE"],
+            risk.scope_guards.frozen_venues["BINANCE"],
             "processing_lag:1500.0ms>1200ms",
         )
 
@@ -2200,14 +2244,14 @@ class RiskExecutionTests(unittest.TestCase):
             received_timestamp=(datetime.now() - timedelta(milliseconds=250)).timestamp(),
         )
 
-        risk.on_orderbook(Event("eOrderBook", delayed_book))
-        risk.on_orderbook(Event("eOrderBook", delayed_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", delayed_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", delayed_book))
 
         self.assertTrue(any(mode == OMSCapabilityMode.DEGRADED for mode, _reason in oms.trading_modes))
         self.assertTrue(any(mode == OMSCapabilityMode.PASSIVE_ONLY for mode, _reason in oms.trading_modes))
         self.assertFalse(oms.frozen_venues)
 
-        risk.on_orderbook(Event("eOrderBook", delayed_book))
+        risk.market_risk.on_orderbook(Event("eOrderBook", delayed_book))
         self.assertTrue(oms.frozen_venues)
 
     def test_kill_switch_requests_emergency_flatten(self):
@@ -2247,8 +2291,8 @@ class RiskExecutionTests(unittest.TestCase):
             gateway=gateway,
         )
 
-        self.assertEqual(risk._query_kill_open_orders(), [])
-        self.assertEqual(risk._query_kill_positions(), set())
+        self.assertEqual(risk.kill_switch._query_kill_open_orders(), [])
+        self.assertEqual(risk.kill_switch._query_kill_positions(), set())
         self.assertEqual(gateway.open_order_priorities, [True])
         self.assertEqual(gateway.position_priorities, [True])
 
@@ -2323,13 +2367,13 @@ class RiskExecutionTests(unittest.TestCase):
         risk.kill_reason = "test_kill"
         risk.kill_state = "FLATTENING"
 
-        risk._refresh_rearm_state()
+        risk.kill_switch._refresh_rearm_state()
 
         self.assertTrue(risk.kill_switch_triggered)
         self.assertEqual(risk.kill_state, "FLATTENING")
 
         risk.kill_state = "FLAT_VERIFIED"
-        risk._refresh_rearm_state()
+        risk.kill_switch._refresh_rearm_state()
 
         self.assertFalse(risk.kill_switch_triggered)
         self.assertEqual(risk.kill_state, "ARMED")
@@ -2991,9 +3035,8 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         }
         settings = self.make_settings(
             clock_sync_enabled=True,
-            # Legacy offset keys remain accepted, but now define phase limits.
-            clock_reduce_only_offset_ms=25.0,
-            clock_kill_offset_ms=100.0,
+            clock_reduce_only_phase_error_ms=25.0,
+            clock_kill_phase_error_ms=100.0,
             clock_max_rtt_ms=200.0,
             clock_max_uncertainty_ms=50.0,
             clock_max_offset_dispersion_ms=10.0,
@@ -3492,15 +3535,19 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         self.assertTrue(ok, reason)
         self.assertEqual(submitted, 2)
         self.assertEqual(len(rest.new_orders), 2)
-        long_close, long_oid = rest.new_orders[0]
-        short_close, short_oid = rest.new_orders[1]
-        self.assertEqual(long_close.side, "SELL")
-        self.assertEqual(long_close.volume, 2.0)
-        self.assertEqual(short_close.side, "BUY")
-        self.assertEqual(short_close.volume, 3.0)
-        for request, client_oid in rest.new_orders:
-            self.assertEqual(request.order_type, "MARKET")
-            self.assertTrue(request.reduce_only)
+        long_symbol, long_side, long_quantity, long_oid = rest.new_orders[0]
+        short_symbol, short_side, short_quantity, short_oid = rest.new_orders[1]
+        self.assertEqual((long_symbol, long_side, long_quantity), (
+            "BTCUSDT",
+            "SELL",
+            2.0,
+        ))
+        self.assertEqual((short_symbol, short_side, short_quantity), (
+            "ETHUSDT",
+            "BUY",
+            3.0,
+        ))
+        for _symbol, _side, _quantity, client_oid in rest.new_orders:
             self.assertLessEqual(len(client_oid), 36)
         self.assertNotEqual(long_oid, short_oid)
 
@@ -3621,14 +3668,15 @@ class IndependentRiskSupervisorTests(unittest.TestCase):
         exchange._last_full_open_orders_audit_monotonic = 0.0
         exchange._known_open_order_symbols = set()
 
-        ok, first_rows, reason = exchange._get_open_orders_snapshot()
+        truth_reader = BinanceSidecarTruthReader(exchange)
+        ok, first_rows, reason = truth_reader.get_open_orders_snapshot()
         self.assertTrue(ok, reason)
         self.assertEqual(len(first_rows), 2)
 
         rest.open_orders = [
             {"symbol": "BTCUSDT", "orderId": 3},
         ]
-        ok, scoped_rows, reason = exchange._get_open_orders_snapshot()
+        ok, scoped_rows, reason = truth_reader.get_open_orders_snapshot()
 
         self.assertTrue(ok, reason)
         self.assertEqual(scoped_rows, rest.open_orders)

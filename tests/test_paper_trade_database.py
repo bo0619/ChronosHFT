@@ -33,7 +33,6 @@ def make_config(tmp_path: Path, *, paper=True):
     return {
         "execution": {"mode": "paper" if paper else "live"},
         "paper_trade": {
-            "enabled": paper,
             "initial_balance_usdt": 500_000.0,
         },
         "paper_trade_database": {

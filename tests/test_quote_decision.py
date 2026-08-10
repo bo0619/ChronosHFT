@@ -38,7 +38,6 @@ def test_quote_decision_applies_fee_floor_and_directional_tick_rounding():
     assert decision.effective_half_spread_bps == 5.0
     assert decision.target_bid == 99.95
     assert decision.target_ask == 100.06
-    assert decision.spread_bps(100.0) == pytest.approx(11.0)
 
 
 def test_quote_decision_enforces_passive_top_of_book_after_skew():

@@ -3,7 +3,9 @@ import types
 import unittest
 from unittest.mock import Mock, patch
 
-if "requests" not in sys.modules:
+try:
+    __import__("requests")
+except ModuleNotFoundError:
     requests_module = types.ModuleType("requests")
 
     class Request:
@@ -18,6 +20,7 @@ if "requests" not in sys.modules:
     requests_module.get = lambda *args, **kwargs: None
     sys.modules["requests"] = requests_module
 
+from data.cache import data_cache
 from data.ref_data import ContractInfo, ref_data_manager
 from event.type import OrderIntent, OrderRequest, Side, TIF_GTX, TIF_RPI
 from gateway.binance.constants import (
@@ -340,6 +343,17 @@ class RPICoreIntegrationTests(unittest.TestCase):
         ref_data_manager.contracts = self.original_contracts
 
     @staticmethod
+    def _validator() -> OrderValidator:
+        clock = Mock()
+        clock.monotonic.return_value = 1.0
+        return OrderValidator(
+            {},
+            clock=clock,
+            market_cache=data_cache,
+            reference_data=ref_data_manager,
+        )
+
+    @staticmethod
     def _contract(symbol: str, *, supports_rpi: bool) -> ContractInfo:
         permissions = frozenset({"RPI"}) if supports_rpi else frozenset()
         return ContractInfo(
@@ -435,7 +449,7 @@ class RPICoreIntegrationTests(unittest.TestCase):
         self.assertIn('"symbol": "LTCUSDT"', rendered_json)
 
     def test_rpi_model_and_validator_are_fail_closed(self):
-        validator = OrderValidator({})
+        validator = self._validator()
         supported = OrderIntent(
             "alpha", "LTCUSDT", Side.BUY, 100.0, 0.1, time_in_force="rpi"
         )
@@ -485,7 +499,7 @@ class RPICoreIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(conflicting.time_in_force, "IOC")
         self.assertEqual(
-            OrderValidator({}).validate_params(conflicting),
+            self._validator().validate_params(conflicting),
             (False, "post_only_incompatible_time_in_force:IOC"),
         )
 

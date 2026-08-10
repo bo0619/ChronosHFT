@@ -50,7 +50,6 @@ MULTI_WRITER_STATE_OWNERS = {
 # These compatibility attributes remain available on the OMS facade, but
 # their values live inside the named store rather than OMSStateRegistry.
 EXTRACTED_STATE_STORE_OWNERS = {
-    "_lifecycle_generation": "LifecycleStore",
     "last_freeze_reason": "LifecycleStore",
     "last_halt_reason": "LifecycleStore",
     "manual_rearm_required": "LifecycleStore",
@@ -67,14 +66,13 @@ class OMSAttributeBinding:
 class OMSStateRegistry:
     """Partition shared values into cells owned by one named component."""
 
-    __slots__ = ("_field_owners", "_last_writers", "_values")
+    __slots__ = ("_field_owners", "_values")
 
     def __init__(self, field_owners: Mapping[str, str]) -> None:
         self._field_owners = dict(field_owners)
         self._values: dict[str, dict[str, Any]] = {
             owner: {} for owner in set(field_owners.values())
         }
-        self._last_writers: dict[str, str] = {}
 
     @property
     def field_owners(self) -> Mapping[str, str]:
@@ -96,13 +94,9 @@ class OMSStateRegistry:
         except KeyError as exc:
             raise AttributeError(name) from exc
 
-    def write(self, writer: str, name: str, value: Any) -> None:
+    def write(self, name: str, value: Any) -> None:
         owner = self.owner_of(name)
         self._values[owner][name] = value
-        self._last_writers[name] = str(writer)
-
-    def last_writer(self, name: str) -> str | None:
-        return self._last_writers.get(name)
 
 
 class OMSSharedField:
@@ -128,7 +122,7 @@ class OMSSharedField:
         return self._registry(instance).read(self.name)
 
     def __set__(self, instance, value) -> None:
-        self._registry(instance).write("OMSFacade", self.name, value)
+        self._registry(instance).write(self.name, value)
 
 
 def build_state_owners(component_types: Iterable[type]) -> dict[str, str]:

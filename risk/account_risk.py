@@ -14,40 +14,6 @@ from risk.deployment_loss import (
 )
 
 
-class AccountRiskField:
-    """Expose one declared account-risk field through RiskManager."""
-
-    def __init__(self, attribute: str):
-        self.attribute = attribute
-
-    def __get__(self, instance, owner):
-        if instance is None:
-            return self
-        return getattr(instance.account_risk, self.attribute)
-
-    def __set__(self, instance, value) -> None:
-        setattr(instance.account_risk, self.attribute, value)
-
-
-class AccountRiskMethod:
-    """Bind one RiskManager method to its account-risk controller."""
-
-    def __init__(self, method_name: str | None = None):
-        self.method_name = method_name
-
-    def __set_name__(self, owner, name: str) -> None:
-        if self.method_name is None:
-            self.method_name = name
-
-    def __get__(self, instance, owner):
-        if instance is None:
-            return self
-        return getattr(instance.account_risk, self.method_name)
-
-    def __set__(self, instance, value) -> None:
-        setattr(instance.account_risk, self.method_name, value)
-
-
 class AccountRiskController:
     """Own account-level loss and truth-recovery state machines."""
 

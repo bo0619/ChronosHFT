@@ -88,11 +88,7 @@ class FakeLogger:
 class FailedClock:
     def __init__(self):
         self.stop_calls = 0
-        self.listeners_cleared = 0
         self.config = None
-
-    def clear_listeners(self):
-        self.listeners_cleared += 1
 
     def configure(self, config):
         self.config = config
@@ -171,10 +167,10 @@ class MainDashboardStartupTests(unittest.TestCase):
         return {
             "api_key": "test-key",
             "api_secret": "test-secret",
-            "testnet": False,
             "symbols": ["BTCUSDT"],
             "execution": {"mode": "live"},
             "system": {
+                "market_data": {"environment": "production"},
                 "log_console": False,
                 "time_sync": {"startup_required": True},
                 "web_dashboard": {
@@ -241,7 +237,7 @@ class MainDashboardStartupTests(unittest.TestCase):
             with redirect_stdout(output):
                 result = main_module._run_main(
                     ["--config", "config.json", "--check-config"],
-                    runtime={},
+                    runtime=RuntimeResources(),
                 )
 
         self.assertEqual(result, 0)
@@ -270,7 +266,7 @@ class MainDashboardStartupTests(unittest.TestCase):
         ):
             result = main_module._run_main(
                 ["--config", "config.json"],
-                runtime={},
+                runtime=RuntimeResources(),
             )
 
         self.assertEqual(result, 2)
@@ -338,25 +334,29 @@ class MainDashboardStartupTests(unittest.TestCase):
         engine = FakeEngine("engine")
         clock = Component("clock")
         oms = FakeOms()
-        legacy_runtime = {
-            "oms": oms,
-            "engine": engine,
-            "gateway": gateway,
-            "truth_provider": truth_provider,
-            "strategy_runtime": strategy,
-            "risk_supervisor": risk,
-            "risk_controller": FakeRiskController(),
-            "truth_monitor": truth_monitor,
-            "venue_supervisor": venue,
-            "recorder": recorder,
-            "admin_control": admin_control,
-            "time_service": clock,
-            "event_engine_config": {"shutdown_drain_timeout_sec": 1.5},
-        }
-        runtime = RuntimeResources.coerce(legacy_runtime)
+        runtime = RuntimeResources()
+        runtime.update(
+            {
+                "oms": oms,
+                "engine": engine,
+                "gateway": gateway,
+                "truth_provider": truth_provider,
+                "strategy_runtime": strategy,
+                "risk_supervisor": risk,
+                "risk_controller": FakeRiskController(),
+                "truth_monitor": truth_monitor,
+                "venue_supervisor": venue,
+                "recorder": recorder,
+                "admin_control": admin_control,
+                "time_service": clock,
+                "event_engine_config": {
+                    "shutdown_drain_timeout_sec": 1.5
+                },
+            }
+        )
 
         self.assertTrue(main_module.shutdown_runtime(runtime, "test_exit"))
-        self.assertIs(legacy_runtime["_shutdown_complete"], True)
+        self.assertIs(runtime["_shutdown_complete"], True)
         first_call_count = len(calls)
         self.assertTrue(main_module.shutdown_runtime(runtime, "duplicate"))
         self.assertEqual(len(calls), first_call_count)
@@ -868,6 +868,57 @@ class MainShutdownLatchOrderStaticTests(unittest.TestCase):
 
 
 class AdminControlStartupTests(unittest.TestCase):
+    @staticmethod
+    def _write_admin_config_manifest(
+        root_dir,
+        *,
+        admin_path="storage/admin",
+        fragment_payload=None,
+    ):
+        """Write the smallest strict v3 manifest used by admin-loader tests."""
+        root_dir = os.fspath(root_dir)
+        fragment_path = os.path.join(root_dir, "admin_control.json")
+        if fragment_payload is None:
+            fragment_payload = {
+                "$schema": "chronoshft.config_fragment.v3",
+                "fragment": "system.admin_control",
+                "version": 1,
+                "system": {
+                    "admin_control": {
+                        "path": admin_path,
+                        "command_ttl_sec": 10.0,
+                        "session_max_age_sec": 2.0,
+                        "max_retained_results": 256,
+                        "max_retained_archives": 256,
+                        "retention_max_age_sec": 604800.0,
+                    }
+                },
+            }
+        with open(fragment_path, "w", encoding="utf-8") as handle:
+            if isinstance(fragment_payload, str):
+                handle.write(fragment_payload)
+            else:
+                json.dump(fragment_payload, handle)
+
+        manifest_path = os.path.join(root_dir, "live.json")
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "schema": "chronoshft.config_manifest.v3",
+                    "config_version": 3,
+                    "unknown_keys": "reject",
+                    "includes": [
+                        {
+                            "path": "admin_control.json",
+                            "fragment": "system.admin_control",
+                            "version": 1,
+                        }
+                    ],
+                },
+                handle,
+            )
+        return manifest_path
+
     def test_atomic_json_write_retries_transient_replace_conflict(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             target = os.path.join(tmpdir, "state.json")
@@ -1049,19 +1100,10 @@ class AdminControlStartupTests(unittest.TestCase):
     def test_minimal_loader_ignores_live_secrets_and_approvals(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             admin_dir = os.path.join(tmpdir, "admin")
-            config_path = os.path.join(tmpdir, "live.json")
-            payload = {
-                "execution": {"mode": "live"},
-                "api_key_env": "",
-                "api_secret_env": "",
-                "live_launch": {"permit_path": "missing.json"},
-                "system": {
-                    "admin_control": {"path": admin_dir},
-                    "external_alerts": {"webhook_env": "MISSING_WEBHOOK"},
-                },
-            }
-            with open(config_path, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle)
+            config_path = self._write_admin_config_manifest(
+                tmpdir,
+                admin_path=admin_dir,
+            )
 
             loaded = main_module.load_admin_control_config(config_path)
 
@@ -1085,16 +1127,10 @@ class AdminControlStartupTests(unittest.TestCase):
             caller_dir = os.path.join(tmpdir, "caller")
             os.makedirs(deploy_dir)
             os.makedirs(caller_dir)
-            config_path = os.path.join(deploy_dir, "live.json")
-            with open(config_path, "w", encoding="utf-8") as handle:
-                json.dump(
-                    {
-                        "system": {
-                            "admin_control": {"path": "state/admin"}
-                        }
-                    },
-                    handle,
-                )
+            config_path = self._write_admin_config_manifest(
+                deploy_dir,
+                admin_path="state/admin",
+            )
             previous = os.getcwd()
             try:
                 os.chdir(caller_dir)
@@ -1112,30 +1148,50 @@ class AdminControlStartupTests(unittest.TestCase):
             for name, payload, expected in (
                 ("malformed", "{", "malformed"),
                 ("array", "[]", "JSON object"),
-                ("bad-system", '{"system": 1}', "system must be a JSON object"),
+                (
+                    "bad-system",
+                    json.dumps(
+                        {
+                            "$schema": "chronoshft.config_fragment.v3",
+                            "fragment": "system.admin_control",
+                            "version": 1,
+                            "system": 1,
+                        }
+                    ),
+                    "config.system must be an object",
+                ),
                 (
                     "bad-admin",
-                    '{"system":{"admin_control":1}}',
-                    "admin_control must be a JSON object",
+                    json.dumps(
+                        {
+                            "$schema": "chronoshft.config_fragment.v3",
+                            "fragment": "system.admin_control",
+                            "version": 1,
+                            "system": {"admin_control": 1},
+                        }
+                    ),
+                    "config.system.admin_control must be an object",
                 ),
                 (
                     "duplicate",
-                    '{"system":{},"system":{}}',
+                    '{"$schema":"chronoshft.config_fragment.v3",'
+                    '"fragment":"system.admin_control","version":1,'
+                    '"system":{},"system":{}}',
                     "duplicate JSON object key",
                 ),
             ):
                 with self.subTest(name=name):
-                    config_path = os.path.join(tmpdir, f"{name}.json")
-                    with open(config_path, "w", encoding="utf-8") as handle:
-                        handle.write(payload)
+                    config_path = self._write_admin_config_manifest(
+                        tmpdir,
+                        fragment_payload=payload,
+                    )
                     with self.assertRaisesRegex((ValueError, OSError), expected):
                         main_module.load_admin_control_config(config_path)
 
     def test_minimal_loader_rejects_dangerous_or_ambiguous_paths(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = os.path.join(tmpdir, "live.json")
             cases = {
-                "": "non-empty",
+                "": "at least 1 characters",
                 ".": "working directory",
                 "..\\admin": "parent traversal",
                 "C:admin": "drive-relative",
@@ -1144,15 +1200,10 @@ class AdminControlStartupTests(unittest.TestCase):
             }
             for admin_path, expected in cases.items():
                 with self.subTest(admin_path=admin_path):
-                    with open(config_path, "w", encoding="utf-8") as handle:
-                        json.dump(
-                            {
-                                "system": {
-                                    "admin_control": {"path": admin_path}
-                                }
-                            },
-                            handle,
-                        )
+                    config_path = self._write_admin_config_manifest(
+                        tmpdir,
+                        admin_path=admin_path,
+                    )
                     with self.assertRaisesRegex(ValueError, expected):
                         main_module.load_admin_control_config(config_path)
 

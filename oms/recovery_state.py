@@ -25,6 +25,7 @@ class OMSRecoveryStateRestorer(OMSComponent):
             "_venue_guard_owner",
             "account",
             "guard_store",
+            "lifecycle_store",
             "rebuild_summary",
         }
     )
@@ -49,14 +50,10 @@ class OMSRecoveryStateRestorer(OMSComponent):
             "_rpi_calibration_start_external_cash_flow_microu",
             "external_cash_flow_ids",
             "external_cash_flow_scan_end_ms",
-            "last_freeze_reason",
-            "last_halt_reason",
-            "manual_rearm_required",
             "mode_constraint_generation",
             "mode_constraint_generations",
             "mode_constraints",
             "recovered_guard_cleanup_pending",
-            "state",
             "symbol_guard_epoch_counters",
             "symbol_guard_epochs",
             "symbol_guard_records",
@@ -370,9 +367,15 @@ class OMSRecoveryStateRestorer(OMSComponent):
                 )
         self._refresh_selected_mode_constraint()
 
-        self.last_freeze_reason = str(summary.get("last_freeze_reason", "") or "")
-        self.last_halt_reason = str(summary.get("last_halt_reason", "") or "")
-        self.manual_rearm_required = bool(summary.get("manual_rearm_required", False))
+        last_freeze_reason = str(
+            summary.get("last_freeze_reason", "") or ""
+        )
+        last_halt_reason = str(
+            summary.get("last_halt_reason", "") or ""
+        )
+        manual_rearm_required = bool(
+            summary.get("manual_rearm_required", False)
+        )
         unsafe_trade_symbols = sorted(
             {
                 str(symbol or "").upper()
@@ -387,8 +390,8 @@ class OMSRecoveryStateRestorer(OMSComponent):
             for symbol in unsafe_trade_symbols:
                 self.trade_cursors.pop(symbol, None)
                 self.trade_scan_end_ms.pop(symbol, None)
-            self.manual_rearm_required = True
-            self.last_halt_reason = (
+            manual_rearm_required = True
+            last_halt_reason = (
                 "Legacy execution truth requires operator rearm: "
                 + ",".join(unsafe_trade_symbols)
             )
@@ -397,29 +400,43 @@ class OMSRecoveryStateRestorer(OMSComponent):
         dirty_shutdown = bool(summary.get("dirty_shutdown", False))
         recovered_active_orders = int(summary.get("recovered_active_orders", 0) or 0)
         pending_commands = int(summary.get("pending_commands", 0) or 0)
-        if self.manual_rearm_required or last_lifecycle == LifecycleState.HALTED.value:
-            self.state = LifecycleState.HALTED
-            self.manual_rearm_required = True
-            if not self.last_halt_reason:
-                self.last_halt_reason = "Recovered halted state"
+        if manual_rearm_required or last_lifecycle == LifecycleState.HALTED.value:
+            if not last_halt_reason:
+                last_halt_reason = "Recovered halted state"
+            self.lifecycle_store.transition(
+                LifecycleState.HALTED,
+                manual_rearm_required=True,
+                last_freeze_reason=last_freeze_reason,
+                last_halt_reason=last_halt_reason,
+            )
             self._sync_capability_mode("recovered_halted_state")
             return
 
         if recovered_active_orders or pending_commands:
-            self.state = LifecycleState.FROZEN
             self.recovered_guard_cleanup_pending = True
-            self.last_freeze_reason = (
+            last_freeze_reason = (
                 "Recovered orders require exchange truth: "
                 f"active={recovered_active_orders}, pending_commands={pending_commands}"
+            )
+            self.lifecycle_store.transition(
+                LifecycleState.FROZEN,
+                manual_rearm_required=manual_rearm_required,
+                last_freeze_reason=last_freeze_reason,
+                last_halt_reason=last_halt_reason,
             )
             self._sync_capability_mode("recovered_inflight_commands")
             return
 
         if dirty_shutdown:
-            self.state = LifecycleState.FROZEN
             self.recovered_guard_cleanup_pending = self._has_active_guards()
-            if not self.last_freeze_reason:
-                self.last_freeze_reason = "Recovered unclean shutdown"
+            if not last_freeze_reason:
+                last_freeze_reason = "Recovered unclean shutdown"
+            self.lifecycle_store.transition(
+                LifecycleState.FROZEN,
+                manual_rearm_required=manual_rearm_required,
+                last_freeze_reason=last_freeze_reason,
+                last_halt_reason=last_halt_reason,
+            )
             self._sync_capability_mode("recovered_unclean_shutdown")
             return
 
@@ -427,12 +444,22 @@ class OMSRecoveryStateRestorer(OMSComponent):
             LifecycleState.FROZEN.value,
             LifecycleState.RECONCILING.value,
         }:
-            self.state = LifecycleState.FROZEN
             self.recovered_guard_cleanup_pending = True
-            if not self.last_freeze_reason:
-                self.last_freeze_reason = "Recovered guarded state"
+            if not last_freeze_reason:
+                last_freeze_reason = "Recovered guarded state"
+            self.lifecycle_store.transition(
+                LifecycleState.FROZEN,
+                manual_rearm_required=manual_rearm_required,
+                last_freeze_reason=last_freeze_reason,
+                last_halt_reason=last_halt_reason,
+            )
             self._sync_capability_mode("recovered_guarded_state")
             return
 
-        self.state = LifecycleState.BOOTSTRAP
+        self.lifecycle_store.transition(
+            LifecycleState.BOOTSTRAP,
+            manual_rearm_required=manual_rearm_required,
+            last_freeze_reason=last_freeze_reason,
+            last_halt_reason=last_halt_reason,
+        )
         self._sync_capability_mode("bootstrap")

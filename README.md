@@ -440,7 +440,6 @@ split into independently testable components:
 | `risk/limit_contract.py` | Canonical defaults shared by in-process and sidecar risk caps |
 | `risk/sidecar_policy.py` | Immutable normalized sidecar thresholds, timing limits, funding policy, and deployment identity |
 | `risk/sidecar_process.py` | Child console isolation, dedicated dual-client initialization, failure status publication, and runtime handoff |
-| `risk/sidecar_durable_state.py` | Isolated legacy v1 JSON decoder used only by offline migration tests and tooling |
 | `risk/sidecar_state_payload.py` | Strict v2 durable payload schema, identity checks, and semantic validation |
 | `risk/sidecar_state_projection.py` | Explicit control/equity projection to and from the v2 state payload |
 | `risk/sidecar_state_store.py` | Account-scoped SQLite CAS, writer fences, hash history, rollback anchors, and cash-flow ledger |
@@ -493,7 +492,7 @@ Paper startup; the production target for this guard is the AWS Linux service.
 For capital changes, edit only `strategy.capital_multiplier` in
 `config/strategy/capital_scaling.json`. The loader derives the Paper, account,
 and backtest starting capital; order, position, exposure, and daily-loss
-limits; `lot_multiplier`; `target_order_notional`; and `max_pos_usdt` from that
+limits; `target_order_notional`; and `max_pos_usdt` from that
 single source. Do not declare these derived fields in fragments; the loader
 always computes their effective values.
 

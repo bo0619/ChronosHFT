@@ -1,6 +1,8 @@
 import hashlib
 import json
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,23 @@ from oms.journal import OMSJournal
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_migration_cli_supports_direct_script_invocation(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPOSITORY_ROOT / "scripts" / "migrate_runtime_state.py"),
+            "--help",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "{inspect,plan,apply,verify}" in result.stdout
 
 
 def _canonical(value) -> bytes:

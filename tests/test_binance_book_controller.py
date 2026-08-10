@@ -197,7 +197,7 @@ def test_gateway_book_methods_are_thin_component_facades():
         == "processed"
     )
     assert (
-        gateway._schedule_book_recovery(
+        gateway._order_books().schedule_recovery(
             "BTCUSDT",
             "FATAL_GAP",
             expected_generation=7,
@@ -219,14 +219,13 @@ def test_gateway_book_methods_are_thin_component_facades():
     ]
 
 
-def test_legacy_state_attributes_are_views_of_component_owned_state():
+def test_partial_gateway_lazily_owns_stable_book_component():
     gateway = BinanceGateway.__new__(BinanceGateway)
     books = {"BTCUSDT": LocalOrderBook("BTCUSDT")}
-    gateway.orderbooks = books
-    gateway.book_resyncing = {"BTCUSDT"}
-
     component = gateway._order_books()
+    component.orderbooks = books
+    component.resyncing = {"BTCUSDT"}
+
+    assert gateway._order_books() is component
     assert component.orderbooks is books
     assert component.resyncing == {"BTCUSDT"}
-    assert "orderbooks" not in gateway.__dict__
-    assert "book_resyncing" not in gateway.__dict__

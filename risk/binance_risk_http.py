@@ -280,8 +280,5 @@ class BinanceRiskHttpClient:
             max_attempts=1,
         )
 
-    def request_public(self, endpoint: str, params=None):
-        return self.request("GET", endpoint, params, signed=False)
-
     def close(self) -> None:
         self.session.close()

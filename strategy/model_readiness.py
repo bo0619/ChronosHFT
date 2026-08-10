@@ -34,7 +34,7 @@ from governance.deployment_identity import (
     deployment_config_projection as governance_deployment_projection,
     deployment_config_sha256 as governance_deployment_sha256,
 )
-from governance.release_manifest import build_release_manifest, release_files
+from governance.release_manifest import build_release_manifest
 from governance.strategy_identity import effective_strategy_config
 from strategy.formula_governance import (
     LIVE_APPROVED_FORMULA_VERSIONS,
@@ -738,20 +738,6 @@ def validate_live_calibration_approval(
         ) from exc
 
 
-def formula_source_path_for_model(model: Any) -> Path:
-    canonical_model_key(model)
-    return Path(__file__).resolve().with_name("quote_math.py")
-
-
-def implementation_source_paths_for_model(model: Any) -> tuple[Path, ...]:
-    canonical_model_key(model)
-    project_root = Path(__file__).resolve().parents[1]
-    return tuple(
-        project_root / relative_path
-        for relative_path, _kind in release_files(project_root)
-    )
-
-
 def implementation_sha256_for_model(model: Any) -> str:
     """Bind model approval to the complete deterministic release digest."""
     canonical_model_key(model)
@@ -835,7 +821,7 @@ def strategy_policy_sha256(
             ),
         }
     else:
-        model_config = effective.get("as_parameters", {})
+        model_config = effective.get("avellaneda_stoikov", {})
         if not isinstance(model_config, Mapping):
             model_config = {}
         policy = {
@@ -849,7 +835,7 @@ def strategy_policy_sha256(
                 "target_order_notional"
             ),
             "max_pos_usdt": effective.get("max_pos_usdt"),
-            "as_parameters": dict(model_config),
+            "avellaneda_stoikov": dict(model_config),
         }
 
     try:
@@ -1128,20 +1114,6 @@ def _canonical_json_bytes(value: Any, label: str) -> bytes:
         ).encode("ascii")
     except (TypeError, ValueError, UnicodeEncodeError) as exc:
         raise ValueError(f"{label} is not canonical JSON") from exc
-
-
-def _redacted_section(
-    config: Mapping[str, Any],
-    key: str,
-    *,
-    excluded_keys: set[str] | frozenset[str] = frozenset(),
-) -> dict[str, Any]:
-    value = config.get(key, {})
-    if value is None:
-        value = {}
-    if not isinstance(value, Mapping):
-        raise ValueError(f"{key} must be an object")
-    return _redacted_json_projection(value, excluded_keys=excluded_keys)
 
 
 def _redacted_json_projection(
@@ -3043,10 +3015,8 @@ __all__ = [
     "deployment_config_projection",
     "deployment_config_sha256",
     "evaluate_symbol_readiness",
-    "formula_source_path_for_model",
     "formula_version_for_model",
     "implementation_sha256_for_model",
-    "implementation_source_paths_for_model",
     "oos_evidence_sha256",
     "readiness_requirements",
     "sha256_file",

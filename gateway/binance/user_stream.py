@@ -33,7 +33,6 @@ class BinanceUserStreamController:
             0.01,
             float(keep_alive_interval_sec),
         )
-        self.listen_key = ""
         self.generation = 0
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
@@ -81,7 +80,6 @@ class BinanceUserStreamController:
                     self.stop_event = stop_event
                     self.generation += 1
                     generation = self.generation
-                    self.listen_key = listen_key
                     thread = threading.Thread(
                         target=self.keep_alive_loop,
                         args=(

@@ -33,6 +33,14 @@ class DummyStrategy:
 
 
 class StrategyRuntimeTests(unittest.TestCase):
+    def _wait_for(self, predicate, *, timeout_sec=1.0):
+        deadline = time.perf_counter() + timeout_sec
+        while time.perf_counter() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        self.fail("strategy runtime did not complete work before timeout")
+
     def test_complete_strategy_satisfies_explicit_runtime_contract(self):
         class CompleteStrategy(DummyStrategy):
             def on_trade(self, _trade):
@@ -50,12 +58,13 @@ class StrategyRuntimeTests(unittest.TestCase):
         runtime.on_orderbook(SimpleNamespace(symbol="BTCUSDT", sequence=1))
         runtime.on_orderbook(SimpleNamespace(symbol="BTCUSDT", sequence=2))
 
-        processed = runtime.process_pending()
-        metrics = runtime.get_metrics_snapshot()
-
-        self.assertEqual(processed, 1)
-        self.assertEqual(strategy.orderbooks, [2])
-        self.assertEqual(metrics["coalesced_market_events"], 1)
+        try:
+            runtime.start()
+            self._wait_for(lambda: strategy.orderbooks == [2])
+            metrics = runtime.get_metrics_snapshot()
+            self.assertEqual(metrics["coalesced_market_events"], 1)
+        finally:
+            runtime.stop()
 
     def test_control_events_are_not_coalesced(self):
         strategy = DummyStrategy()
@@ -64,12 +73,17 @@ class StrategyRuntimeTests(unittest.TestCase):
         runtime.on_order(SimpleNamespace(order_id="oid-1"))
         runtime.on_account_update(SimpleNamespace(balance=1000.0))
         runtime.on_system_health("FROZEN:test")
-        processed = runtime.process_pending()
-
-        self.assertEqual(processed, 3)
-        self.assertEqual(strategy.orders, ["oid-1"])
-        self.assertEqual(strategy.accounts, [1000.0])
-        self.assertEqual(strategy.health, ["FROZEN:test"])
+        try:
+            runtime.start()
+            self._wait_for(
+                lambda: (
+                    strategy.orders == ["oid-1"]
+                    and strategy.accounts == [1000.0]
+                    and strategy.health == ["FROZEN:test"]
+                )
+            )
+        finally:
+            runtime.stop()
 
     def test_control_queue_overflow_is_bounded_and_fails_closed(self):
         strategy = DummyStrategy()
@@ -97,8 +111,11 @@ class StrategyRuntimeTests(unittest.TestCase):
         self.assertEqual(failures[0]["phase"], "enqueue")
         self.assertEqual(failures[0]["kind"], "order")
 
-        self.assertEqual(runtime.process_pending(), 2)
-        self.assertEqual(strategy.orders, ["oid-1", "oid-2"])
+        try:
+            runtime.start()
+            self._wait_for(lambda: strategy.orders == ["oid-1", "oid-2"])
+        finally:
+            runtime.stop()
 
     def test_control_queue_capacity_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "control_queue_capacity"):
@@ -156,15 +173,18 @@ class StrategyRuntimeTests(unittest.TestCase):
         )
         runtime.on_order(SimpleNamespace(order_id="oid-failed"))
 
-        self.assertEqual(runtime.process_pending(), 1)
-        self.assertEqual(len(failures), 1)
-        self.assertEqual(failures[0]["phase"], "handler")
-        self.assertEqual(failures[0]["kind"], "order")
-        self.assertIn("ValueError:forced strategy failure", failures[0]["message"])
-        metrics = runtime.get_metrics_snapshot()
-        self.assertEqual(metrics["handler_error_count"], 1)
-        self.assertEqual(metrics["processed"], 0)
-        self.assertEqual(metrics["last_error_kind"], "order")
+        try:
+            runtime.start()
+            self._wait_for(lambda: len(failures) == 1)
+            self.assertEqual(failures[0]["phase"], "handler")
+            self.assertEqual(failures[0]["kind"], "order")
+            self.assertIn("ValueError:forced strategy failure", failures[0]["message"])
+            metrics = runtime.get_metrics_snapshot()
+            self.assertEqual(metrics["handler_error_count"], 1)
+            self.assertEqual(metrics["processed"], 0)
+            self.assertEqual(metrics["last_error_kind"], "order")
+        finally:
+            runtime.stop()
 
 
 if __name__ == "__main__":

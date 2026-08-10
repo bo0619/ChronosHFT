@@ -38,6 +38,7 @@ from infrastructure.single_writer_fence import (
 )
 from infrastructure.truth_monitor import TruthMonitor
 from oms.engine import OMS
+from oms.exchange_snapshot import ExchangeTruthSnapshot
 from oms.journal import (
     decode_legacy_journal,
     JournalCorruptionError,
@@ -694,26 +695,29 @@ class OMSSurvivabilityTests(unittest.TestCase):
     def test_full_reset_imports_but_halts_on_off_config_position(self):
         gateway = DummyGateway()
         oms = OMS(DummyEngine(), gateway, self.make_config())
-        snapshot = {
-            "open_orders": [],
-            "account": {
+        snapshot = ExchangeTruthSnapshot(
+            open_orders=[],
+            account={
                 "totalWalletBalance": "1000",
                 "totalInitialMargin": "10",
                 "availableBalance": "990",
                 "totalMaintMargin": "1",
                 "totalMarginBalance": "1000",
             },
-            "positions": [
+            positions=[
                 {
                     "symbol": "ETHUSDT",
                     "positionAmt": "0.5",
                     "entryPrice": "2000",
                 }
             ],
-            "account_floor": 1.0,
-            "positions_floor": 1.0,
-            "end_time_ms": 1000,
-        }
+            signature=(),
+            capture_started_ms=900.0,
+            account_floor=1.0,
+            positions_floor=1.0,
+            end_time_ms=1000.0,
+            attempt=1,
+        )
         try:
             oms._ensure_venue_dead_man_switch_armed = lambda *_args: True
             oms.query_open_orders = lambda: []
@@ -734,20 +738,23 @@ class OMSSurvivabilityTests(unittest.TestCase):
     def test_full_reset_completion_cannot_overwrite_newer_halt(self):
         gateway = DummyGateway()
         oms = OMS(DummyEngine(), gateway, self.make_config())
-        snapshot = {
-            "open_orders": [],
-            "account": {
+        snapshot = ExchangeTruthSnapshot(
+            open_orders=[],
+            account={
                 "totalWalletBalance": "1000",
                 "totalInitialMargin": "0",
                 "availableBalance": "1000",
                 "totalMaintMargin": "0",
                 "totalMarginBalance": "1000",
             },
-            "positions": [],
-            "account_floor": 1.0,
-            "positions_floor": 1.0,
-            "end_time_ms": 1000,
-        }
+            positions=[],
+            signature=(),
+            capture_started_ms=900.0,
+            account_floor=1.0,
+            positions_floor=1.0,
+            end_time_ms=1000.0,
+            attempt=1,
+        )
         try:
             oms._ensure_venue_dead_man_switch_armed = lambda *_args: True
             oms.query_open_orders = lambda: []
@@ -3336,8 +3343,8 @@ class DummyTruthProvider:
 class TruthMonitorTests(unittest.TestCase):
     def make_config(self):
         return {
-            "testnet": False,
             "symbols": ["BTCUSDT"],
+            "system": {"market_data": {"environment": "production"}},
             "account": {
                 "initial_balance_usdt": 1000.0,
                 "leverage": 10,
@@ -3556,7 +3563,7 @@ class TruthMonitorTests(unittest.TestCase):
 
     def test_truth_monitor_ignores_flat_balance_drift_on_testnet(self):
         config = self.make_config()
-        config["testnet"] = True
+        config["system"]["market_data"]["environment"] = "testnet"
         oms = OMS(DummyEngine(), DummyGateway(), config)
         provider = DummyTruthProvider()
         provider.account["totalWalletBalance"] = "1007"

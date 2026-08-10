@@ -74,6 +74,7 @@ class BinanceRiskSidecarExchange:
             rate_limit_settings=rate_limit_settings,
         )
         configuration.initialize_owner(self)
+        self._truth_reader = BinanceSidecarTruthReader(self)
         if hasattr(self.rest, "timestamp_provider"):
             self.rest.timestamp_provider = self._signed_timestamp_ms
 
@@ -104,7 +105,7 @@ class BinanceRiskSidecarExchange:
         )
 
     def check_account_channel(self):
-        return BinanceSidecarTruthReader(self).check_account_channel()
+        return self._truth().check_account_channel()
 
     @staticmethod
     def _response_payload(response, expected_type, label: str):
@@ -114,53 +115,24 @@ class BinanceRiskSidecarExchange:
             label,
         )
 
-    @staticmethod
-    def _position_risk_fingerprint(positions) -> tuple:
-        return BinanceSidecarTruthReader.position_risk_fingerprint(
-            positions
-        )
-
     def _corrected_epoch_at(self, observed_monotonic: float):
         return self._clock().corrected_epoch_at(observed_monotonic)
 
-    def _get_funding_observations(self):
-        return BinanceSidecarTruthReader(self).get_funding_observations()
+    def _truth(self) -> BinanceSidecarTruthReader:
+        reader = self.__dict__.get("_truth_reader")
+        if reader is None:
+            reader = BinanceSidecarTruthReader(self)
+            self._truth_reader = reader
+        return reader
 
     def get_risk_snapshot(self):
-        return BinanceSidecarTruthReader(self).get_risk_snapshot()
+        return self._truth().get_risk_snapshot()
 
     def read_account_truth(
         self,
         purpose: SnapshotPurpose,
     ) -> TruthResult:
-        return BinanceSidecarTruthReader(self).read_account_truth(purpose)
-
-    @staticmethod
-    def _income_identity(row: dict) -> str:
-        return BinanceSidecarTruthReader.income_identity(row)
-
-    def _get_daily_external_cash_flow(self):
-        return BinanceSidecarTruthReader(
-            self
-        ).get_daily_external_cash_flow()
-
-    def _get_cached_daily_external_cash_flow(self):
-        return BinanceSidecarTruthReader(
-            self
-        ).get_cached_daily_external_cash_flow()
-
-    def _get_cached_external_cash_flow_truth(self):
-        return BinanceSidecarTruthReader(
-            self
-        ).get_cached_external_cash_flow_truth()
-
-    def _get_open_orders_snapshot(self):
-        return BinanceSidecarTruthReader(self).get_open_orders_snapshot()
-
-    def _remember_open_order_symbols(self, rows):
-        return BinanceSidecarTruthReader(self).remember_open_order_symbols(
-            rows
-        )
+        return self._truth().read_account_truth(purpose)
 
     def emergency_cancel(self, symbols, countdown_time_ms: int):
         return BinanceSidecarEmergencyActions(self).cancel(

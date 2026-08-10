@@ -1,15 +1,22 @@
 ﻿import threading
-import time
 import math
 from collections import deque
 
-from data.cache import data_cache
-from data.ref_data import ref_data_manager
 from event.type import OrderIntent, TIF_GTX, TIF_RPI
 
 
 class OrderValidator:
-    def __init__(self, config: dict):
+    def __init__(
+        self,
+        config: dict,
+        *,
+        clock,
+        market_cache,
+        reference_data,
+    ):
+        self.clock = clock
+        self.market_cache = market_cache
+        self.reference_data = reference_data
         risk = config.get("risk", {})
         limits = risk.get("limits", {})
         sanity = risk.get("price_sanity", {})
@@ -52,7 +59,7 @@ class OrderValidator:
                 f"{intent.time_in_force}"
             )
 
-        info = ref_data_manager.get_info(intent.symbol)
+        info = self.reference_data.get_info(intent.symbol)
         if intent.time_in_force == TIF_RPI:
             if info is None:
                 return False, f"rpi_capability_unknown:{intent.symbol}"
@@ -84,7 +91,7 @@ class OrderValidator:
         if not intent.reduce_only and notional > self.max_order_notional:
             return False, f"notional_exceeded:{notional:.2f}>{self.max_order_notional:.2f}"
 
-        snapshot = data_cache.get_risk_snapshot(intent.symbol)
+        snapshot = self.market_cache.get_risk_snapshot(intent.symbol)
         if self.freshness_enabled and not intent.reduce_only:
             freshness_error = self._validate_market_data_freshness(snapshot)
             if freshness_error:
@@ -93,7 +100,7 @@ class OrderValidator:
         mark_price = self._finite_or_zero(snapshot["mark_price"])
         if mark_price <= 0 and not self.freshness_enabled:
             mark_price = self._finite_or_zero(
-                data_cache.get_mark_price(intent.symbol)
+                self.market_cache.get_mark_price(intent.symbol)
             )
         if mark_price > 0 and not intent.reduce_only:
             deviation = abs(intent.price - mark_price) / mark_price
@@ -107,7 +114,9 @@ class OrderValidator:
         bid_price = self._finite_or_zero(snapshot["bid_price"])
         ask_price = self._finite_or_zero(snapshot["ask_price"])
         if not self.freshness_enabled and (bid_price <= 0 or ask_price <= 0):
-            bid_price, ask_price = data_cache.get_best_quote(intent.symbol)
+            bid_price, ask_price = self.market_cache.get_best_quote(
+                intent.symbol
+            )
             bid_price = self._finite_or_zero(bid_price)
             ask_price = self._finite_or_zero(ask_price)
         if (
@@ -202,7 +211,7 @@ class OrderValidator:
         reduce_only: bool = False,
     ) -> tuple[bool, str]:
         with self._rate_lock:
-            now = time.perf_counter()
+            now = self.clock.monotonic()
             cutoff = now - 1.0
             timestamps = (
                 self._reduce_order_timestamps

@@ -1,17 +1,25 @@
 import math
-import time
 from datetime import datetime
 
-from data.cache import data_cache
 from event.type import AccountData, Event, EVENT_ACCOUNT_UPDATE
 
 
 class AccountManager:
     _USD_EQUIVALENT_ASSETS = frozenset({"USDT", "USDC", "BUSD", "FDUSD"})
 
-    def __init__(self, engine, exposure_manager, config):
+    def __init__(
+        self,
+        engine,
+        exposure_manager,
+        config,
+        *,
+        clock,
+        market_cache,
+    ):
         self.engine = engine
         self.exposure = exposure_manager
+        self.clock = clock
+        self.market_cache = market_cache
 
         acc_conf = config.get("account", {})
         self.configured_balance = float(acc_conf.get("initial_balance_usdt", 10000.0) or 10000.0)
@@ -203,9 +211,9 @@ class AccountManager:
                     f"Non-finite position volume for {symbol}"
                 )
 
-            mark_price = data_cache.get_mark_price(symbol)
+            mark_price = self.market_cache.get_mark_price(symbol)
             if not math.isfinite(mark_price) or mark_price <= 0:
-                mark_price, _ = data_cache.get_best_quote(symbol)
+                mark_price, _ = self.market_cache.get_best_quote(symbol)
             if not math.isfinite(mark_price) or mark_price <= 0:
                 mark_price = self.exposure.avg_prices[symbol]
 
@@ -264,7 +272,7 @@ class AccountManager:
             equity=self.equity,
             available=self.available,
             used_margin=self.used_margin,
-            datetime=datetime.now(),
+            datetime=datetime.fromtimestamp(self.clock.wall_time()),
             balances=dict(self.balances),
             available_balances=dict(self.available_balances),
             budget_balance=self.budget_equity,
@@ -315,14 +323,18 @@ class AccountManager:
         self.margin_snapshot_synced = True
         return True
 
-    @staticmethod
     def _snapshot_times(
+        self,
         snapshot_time: float | None,
         snapshot_monotonic: float | None,
     ) -> tuple[float, float]:
         if snapshot_time is None and snapshot_monotonic is None:
-            return time.time(), time.perf_counter()
-        wall_time = time.time() if snapshot_time is None else float(snapshot_time)
+            return self.clock.wall_time(), self.clock.monotonic()
+        wall_time = (
+            self.clock.wall_time()
+            if snapshot_time is None
+            else float(snapshot_time)
+        )
         monotonic_time = (
             0.0
             if snapshot_monotonic is None
@@ -427,9 +439,9 @@ class AccountManager:
         return self.equity
 
     def _get_price_safely(self, symbol):
-        price = data_cache.get_mark_price(symbol)
+        price = self.market_cache.get_mark_price(symbol)
         if not math.isfinite(price) or price <= 0:
-            price, _ = data_cache.get_best_quote(symbol)
+            price, _ = self.market_cache.get_best_quote(symbol)
         return price if math.isfinite(price) and price > 0.0 else 0.0
 
     def check_margin(self, notional_value):
@@ -439,11 +451,3 @@ class AccountManager:
             self.calculate()
             effective_available = self.budget_available if self.trading_budget_total > 0.0 else self.available
         return effective_available >= required
-
-    def get_margin_ratio(self):
-        if self.equity <= 0:
-            return 0.0
-        return self.used_margin / self.equity
-
-    def get_maintenance_margin_ratio(self):
-        return self.maintenance_margin_ratio if self.margin_snapshot_synced else None

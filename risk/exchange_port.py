@@ -186,14 +186,6 @@ class RuntimeClock(Protocol):
     def sleep(self, seconds: float) -> None: ...
 
 
-class ExchangeClockPort(Protocol):
-    def sync(self, *, force: bool = False) -> bool: ...
-
-    def timestamp_ms(self) -> int: ...
-
-    def health(self) -> Mapping: ...
-
-
 class RiskExchangePort(Protocol):
     """The complete venue-neutral surface consumed by the sidecar core."""
 

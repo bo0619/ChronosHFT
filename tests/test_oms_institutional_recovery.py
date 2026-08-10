@@ -1146,7 +1146,7 @@ class InstitutionalRecoveryTests(unittest.TestCase):
                 [{"symbol": "BTCUSDT", "positionAmt": "1", "entryPrice": "100"}],
             ]
             snapshot = oms._capture_stable_exchange_snapshot()
-            self.assertEqual(snapshot["attempt"], 3)
+            self.assertEqual(snapshot.attempt, 3)
             self.assertEqual(gateway.position_query_count, 3)
         finally:
             oms.stop()
@@ -1154,8 +1154,6 @@ class InstitutionalRecoveryTests(unittest.TestCase):
     def test_order_manager_rechecks_stuck_cancelling_state(self):
         calls = []
         manager = OrderManager(
-            DummyEngine(),
-            RecoveryGateway(),
             lambda reason, suspicious_oid=None: calls.append((reason, suspicious_oid)),
             {"cancel_timeout_sec": 1.0},
             start_thread=False,

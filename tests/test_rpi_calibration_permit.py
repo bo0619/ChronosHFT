@@ -65,8 +65,6 @@ def _configs():
     }
     calibration = {
         "execution": {"mode": "live"},
-        "paper_trade": {"enabled": False},
-        "testnet": False,
         "record_data": True,
         "symbols": ["XAUUSDT"],
         "live_launch": {
@@ -79,6 +77,7 @@ def _configs():
             "calibration_permit_trusted_signers": trusted_signers,
         },
         "system": {
+            "market_data": {"environment": "production"},
             "admin_control": {
                 "path": f"storage/live/{deployment_id}/calibration/admin",
             },

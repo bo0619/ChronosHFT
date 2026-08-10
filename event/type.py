@@ -3,7 +3,6 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, Optional, Tuple
 
-EVENT_TICK = "eTick"
 EVENT_ORDERBOOK = "eOrderBook"
 EVENT_AGG_TRADE = "eAggTrade"
 EVENT_MARK_PRICE = "eMarkPrice"
@@ -14,7 +13,6 @@ EVENT_API_LIMIT = "eApiLimit"
 EVENT_ALERT = "eAlert"
 EVENT_SYSTEM_HEALTH = "eSystemHealth"
 
-EVENT_ORDER_REQUEST = "eOrderRequest"
 EVENT_ORDER_SUBMITTED = "eOrderSubmitted"
 EVENT_ORDER_UPDATE = "eOrderUpdate"
 EVENT_TRADE_UPDATE = "eTradeUpdate"
@@ -22,9 +20,6 @@ EVENT_POSITION_UPDATE = "ePositionUpdate"
 EVENT_EXCHANGE_ORDER_UPDATE = "eExchangeOrderUpdate"
 EVENT_EXCHANGE_ACCOUNT_UPDATE = "eExchangeAccountUpdate"
 EVENT_STRATEGY_UPDATE = "eStrategyUpdate"
-
-EVENT_BACKTEST_END = "eBacktestEnd"
-
 
 class Side(Enum):
     BUY = "BUY"
@@ -54,15 +49,6 @@ class GatewayState(Enum):
     ERROR = "ERROR"
 
 
-class GatewayError(Enum):
-    NETWORK_ERROR = "NETWORK_ERROR"
-    API_ERROR = "API_ERROR"
-    RATE_LIMIT = "RATE_LIMIT"
-    AUTH_ERROR = "AUTH_ERROR"
-    SERVER_OVERLOAD = "SERVER_OVERLOAD"
-    UNKNOWN = "UNKNOWN"
-
-
 class CommandOutcome(Enum):
     ACKNOWLEDGED = "ACKNOWLEDGED"
     REJECTED = "REJECTED"
@@ -87,13 +73,6 @@ class OMSCapabilityMode(Enum):
     LOCKDOWN = "LOCKDOWN"
 
 
-class SystemState(Enum):
-    CLEAN = "CLEAN"
-    DIRTY = "DIRTY"
-    SYNCING = "SYNCING"
-    FROZEN = "FROZEN"
-
-
 TIF_GTC = "GTC"
 TIF_IOC = "IOC"
 TIF_FOK = "FOK"
@@ -106,13 +85,6 @@ POST_ONLY_TIME_IN_FORCE = frozenset({TIF_GTX, TIF_RPI})
 class ExecutionPolicy(Enum):
     AGGRESSIVE = "AGGRESSIVE"
     PASSIVE = "PASSIVE"
-
-
-Status_SUBMITTED = "SUBMITTED"
-Status_PARTTRADED = "PARTTRADED"
-Status_ALLTRADED = "ALLTRADED"
-Status_CANCELLED = "CANCELLED"
-Status_REJECTED = "REJECTED"
 
 
 class OrderBookGapError(Exception):
@@ -380,18 +352,6 @@ class OrderStateSnapshot:
 
 
 @dataclass
-class OrderData:
-    symbol: str
-    order_id: str
-    side: str
-    price: float
-    volume: float
-    traded: float
-    status: str
-    datetime: datetime
-
-
-@dataclass
 class TradeData:
     symbol: str
     order_id: str
@@ -449,34 +409,6 @@ class AccountData:
     cash_flow_snapshot_time: float = 0.0
     cash_flow_snapshot_monotonic: float = 0.0
     cash_flow_snapshot_synced: bool = False
-
-
-@dataclass
-class ApiLimitData:
-    weight_used_1m: int
-    timestamp: float
-
-
-@dataclass
-class AlertData:
-    level: str
-    msg: str
-    timestamp: float
-
-
-@dataclass
-class SystemHealthData:
-    state: SystemState
-    total_exposure: float
-    margin_ratio: float
-    pos_diffs: Dict[str, tuple]
-    order_count_local: int
-    order_count_remote: int
-    is_sync_error: bool
-    cancelling_count: int
-    fill_ratio: float
-    api_weight: int
-    timestamp: float
 
 
 @dataclass

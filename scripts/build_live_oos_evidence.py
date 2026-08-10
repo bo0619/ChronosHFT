@@ -24,6 +24,7 @@ from data.oos_reconstruction import (  # noqa: E402
     load_raw_oos_evidence,
     reconstruct_oos_evidence,
 )
+from governance.contracts import market_data_environment  # noqa: E402
 from infrastructure.config_scaling import (  # noqa: E402
     normalize_root_config_preapproval,
 )
@@ -85,13 +86,10 @@ def _read_config(path: Path) -> dict:
         ) from exc
 
     execution = config.get("execution", {})
-    paper = config.get("paper_trade", {})
     if (
         not isinstance(execution, Mapping)
         or str(execution.get("mode", "") or "").lower() != "live"
-        or not isinstance(paper, Mapping)
-        or paper.get("enabled") is not False
-        or config.get("testnet") is not False
+        or market_data_environment(config) != "production"
     ):
         raise OOSReconstructionError(
             "OOS reconstruction requires an explicit production Live config"

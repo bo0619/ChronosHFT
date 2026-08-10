@@ -222,18 +222,6 @@ class StrategyRuntime:
                 snapshot["async_worker"] = async_metrics
             return snapshot
 
-    def process_pending(self, max_items=None):
-        processed = 0
-        while True:
-            if max_items is not None and processed >= max_items:
-                break
-            work = self._pop_next_work(block=False)
-            if work is None:
-                break
-            self._execute(*work)
-            processed += 1
-        return processed
-
     def _submit_market(self, kind: str, symbol: str, payload):
         symbol = (symbol or "").upper()
         key = (kind, symbol)

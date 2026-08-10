@@ -927,7 +927,6 @@ def _rebuild_paper(
     target = staging_root / action["target_relative"]
     config = {
         "execution": {"mode": "paper"},
-        "paper_trade": {"enabled": True},
         "paper_trade_database": {
             "enabled": True,
             "path": str(target),

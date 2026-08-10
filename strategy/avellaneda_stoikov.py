@@ -107,7 +107,7 @@ class AvellanedaStoikovStrategy(StrategyTemplate):
         )
         self.adaptive_pipeline = adaptive_pipeline or AdaptiveQuotePipeline()
         self.config = dict(strategy_config)
-        raw_as_config = self.config.get("as_parameters", {})
+        raw_as_config = self.config.get("avellaneda_stoikov", {})
         self.as_conf = dict(raw_as_config) if isinstance(raw_as_config, dict) else {}
 
         self.use_rpi = bool(self.config.get("use_rpi", False)) and bool(

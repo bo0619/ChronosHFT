@@ -13,6 +13,7 @@ from risk.exchange_port import (
 )
 from risk.sidecar_core import RiskSidecarCore
 from risk.sidecar_flat_proof import FlatProofEngine, FlatProofError
+from risk.sidecar_command_runtime import rearm_proof_binding
 from risk.sidecar_state_store import SidecarStateStore, SidecarStateStoreError
 
 
@@ -184,11 +185,11 @@ def test_rearm_binding_rejects_version_change() -> None:
         barrier_monotonic=0.0,
     )
     core.last_flat_proof = proof
-    assert core._rearm_proof_binding(20.0) is not None
+    assert rearm_proof_binding(core, 20.0) is not None
 
     core.state_version = replace(core.state_version, generation=1)
 
-    assert core._rearm_proof_binding(20.0) is None
+    assert rearm_proof_binding(core, 20.0) is None
 
 
 class _CrashAfterDispatchExchange(_ActionExchange):

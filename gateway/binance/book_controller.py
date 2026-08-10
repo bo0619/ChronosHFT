@@ -168,10 +168,6 @@ class BinanceOrderBookController:
             if recovery is not None:
                 self.dependencies.launch_recovery(recovery)
 
-    def initialize_books(self, symbols: list[str]) -> None:
-        for symbol in symbols:
-            self.schedule_recovery(symbol)
-
     def begin_recovery_locked(
         self,
         symbol: str,

@@ -90,6 +90,40 @@ def make_contract(*, supports_rpi=True):
     )
 
 
+class PaperTestMarketCache:
+    @staticmethod
+    def get_best_quote(_symbol):
+        return 100.0, 101.0
+
+    @staticmethod
+    def get_mark_price(_symbol):
+        return 100.5
+
+    @staticmethod
+    def get_last_trade_price(_symbol):
+        return 100.5
+
+    @staticmethod
+    def get_risk_snapshot(_symbol, *, now=None):
+        return {
+            "mark_price": 100.5,
+            "bid_price": 100.0,
+            "ask_price": 101.0,
+            "mark_age_ms": 0.0,
+            "book_age_ms": 0.0,
+        }
+
+
+class PaperTestReferenceData:
+    @staticmethod
+    def get_info(_symbol):
+        return make_contract()
+
+    @staticmethod
+    def round_qty(_symbol, quantity):
+        return float(quantity)
+
+
 def make_book(*, bid_price=100.0, ask_price=101.0, bid_qty=1.0, ask_qty=1.0):
     now = time.time()
     return OrderBook(
@@ -125,10 +159,8 @@ def make_mark_payload(*, symbol=SYMBOL, mark_price="100.5"):
 def make_gateway_config(*, rpi_fill_model="disabled"):
     return {
         "execution": {"mode": "paper"},
-        "testnet": False,
         "symbols": [SYMBOL],
         "paper_trade": {
-            "enabled": True,
             "reset_on_start": True,
             "initial_balance_usdt": 100.0,
             "maker_fee": 0.0002,
@@ -194,7 +226,7 @@ class PaperGatewayTests(unittest.TestCase):
         self.gateway.state = GatewayState.READY
         self.gateway._call_worker(
             "book",
-            (self.gateway._book_generation, book or make_book()),
+            (self.gateway._book_feed_state.generation, book or make_book()),
         )
         return self.gateway
 
@@ -225,7 +257,7 @@ class PaperGatewayTests(unittest.TestCase):
         _capture,
     ):
         self.gateway = BinancePaperGateway(self.engine, make_gateway_config())
-        self.gateway.orderbooks = {SYMBOL: object()}
+        self.gateway._book_feed_state.orderbooks = {SYMBOL: object()}
         self.gateway._submit_worker = lambda *_args, **_kwargs: True
         payload = json.dumps(
             {
@@ -269,7 +301,7 @@ class PaperGatewayTests(unittest.TestCase):
             "max_market_event_ingress_age_ms"
         ] = 1200.0
         self.gateway = BinancePaperGateway(self.engine, config)
-        self.gateway.orderbooks = {SYMBOL: object()}
+        self.gateway._book_feed_state.orderbooks = {SYMBOL: object()}
         self.gateway.active = True
         self.gateway.state = GatewayState.READY
         self.gateway._submit_worker = lambda *_args, **_kwargs: True
@@ -360,7 +392,7 @@ class PaperGatewayTests(unittest.TestCase):
         self.assertEqual(mark_event.data.mark_price, 100.5)
         self.assertTrue(
             wait_until(
-                lambda: self.gateway._marks.get(SYMBOL) == 100.5
+                lambda: self.gateway._venue_state.marks.get(SYMBOL) == 100.5
             )
         )
 
@@ -440,7 +472,7 @@ class PaperGatewayTests(unittest.TestCase):
         gateway = self.start_offline()
         gateway.mark_rest_poll_interval_sec = 0.01
         gateway.mark_ws_stale_after_sec = 0.01
-        generation = gateway._book_generation
+        generation = gateway._book_feed_state.generation
 
         with patch.object(
             gateway.rest,
@@ -450,7 +482,7 @@ class PaperGatewayTests(unittest.TestCase):
             gateway._start_mark_fallback(generation)
             self.assertTrue(
                 wait_until(
-                    lambda: gateway._marks.get(SYMBOL) == 100.5
+                    lambda: gateway._venue_state.marks.get(SYMBOL) == 100.5
                 )
             )
             gateway._mark_fallback_stop.set()
@@ -471,7 +503,7 @@ class PaperGatewayTests(unittest.TestCase):
         gateway.symbols = [SYMBOL, second_symbol]
         gateway.mark_rest_poll_interval_sec = 0.1
         gateway.mark_ws_stale_after_sec = 0.01
-        generation = gateway._book_generation
+        generation = gateway._book_feed_state.generation
         payloads = [
             make_mark_payload(),
             make_mark_payload(symbol=second_symbol, mark_price="200.5"),
@@ -488,8 +520,8 @@ class PaperGatewayTests(unittest.TestCase):
             gateway._start_mark_fallback(generation)
             self.assertTrue(
                 wait_until(
-                    lambda: gateway._marks.get(SYMBOL) == 100.5
-                    and gateway._marks.get(second_symbol) == 200.5
+                    lambda: gateway._venue_state.marks.get(SYMBOL) == 100.5
+                    and gateway._venue_state.marks.get(second_symbol) == 200.5
                 )
             )
             gateway._mark_fallback_stop.set()
@@ -648,8 +680,8 @@ class PaperGatewayTests(unittest.TestCase):
         gateway = self.start_offline()
         symbol = SYMBOL
         book = object()
-        gateway.orderbooks[symbol] = book
-        generation = gateway._book_generation
+        gateway._book_feed_state.orderbooks[symbol] = book
+        generation = gateway._book_feed_state.generation
         events_before = len(self.engine.events)
 
         def fail_enqueue(*_args, **_kwargs):
@@ -778,9 +810,9 @@ class PaperGatewayTests(unittest.TestCase):
 
     def test_paper_risk_increasing_send_rejected_during_book_resync(self):
         gateway = self.start_offline()
-        with gateway._book_lock:
-            gateway.book_resyncing.add(SYMBOL)
-            gateway.ws_buffer[SYMBOL] = []
+        with gateway._book_feed_state.lock:
+            gateway._book_feed_state.resyncing.add(SYMBOL)
+            gateway._book_feed_state.ws_buffer[SYMBOL] = []
 
         result = gateway.send_order(
             OrderRequest(
@@ -842,11 +874,17 @@ class PaperGatewayTests(unittest.TestCase):
 
         gateway._resync_book = blocked_resync
         try:
-            gateway._schedule_book_recovery(SYMBOL, freeze_reason="FATAL_GAP")
+            gateway._book_sync.schedule_recovery(
+                SYMBOL,
+                freeze_reason="FATAL_GAP",
+            )
             self.assertTrue(first_started.wait(timeout=1.0))
 
             gateway._reset_public_books()
-            gateway._schedule_book_recovery(SYMBOL, freeze_reason="FATAL_GAP")
+            gateway._book_sync.schedule_recovery(
+                SYMBOL,
+                freeze_reason="FATAL_GAP",
+            )
             self.assertTrue(second_started.wait(timeout=1.0))
             self.assertEqual(
                 oms.get_symbol_freeze_reason(SYMBOL),
@@ -873,7 +911,11 @@ class PaperGatewayTests(unittest.TestCase):
             self.assertTrue(
                 wait_until(lambda: oms.get_symbol_freeze_reason(SYMBOL) == "")
             )
-            self.assertTrue(wait_until(lambda: SYMBOL not in gateway.book_resyncing))
+            self.assertTrue(
+                wait_until(
+                    lambda: SYMBOL not in gateway._book_feed_state.resyncing
+                )
+            )
         finally:
             release_first.set()
             release_second.set()
@@ -906,16 +948,22 @@ class PaperGatewayTests(unittest.TestCase):
 
         gateway.rest.get_depth_snapshot = blocked_snapshot
         gateway._resync_book = observed_resync
-        gateway._schedule_book_recovery(SYMBOL, freeze_reason="FATAL_GAP")
+        gateway._book_sync.schedule_recovery(
+            SYMBOL,
+            freeze_reason="FATAL_GAP",
+        )
         self.assertTrue(snapshot_started.wait(timeout=1.0))
 
         gateway._reset_public_books()
-        replacement_book = gateway.orderbooks[SYMBOL]
+        replacement_book = gateway._book_feed_state.orderbooks[SYMBOL]
         release_snapshot.set()
         self.assertTrue(recovery_finished.wait(timeout=1.0))
         time.sleep(0.02)
 
-        self.assertIs(gateway.orderbooks[SYMBOL], replacement_book)
+        self.assertIs(
+            gateway._book_feed_state.orderbooks[SYMBOL],
+            replacement_book,
+        )
         self.assertFalse(replacement_book.initialized)
         self.assertFalse(
             any(
@@ -930,17 +978,17 @@ class PaperGatewayTests(unittest.TestCase):
         gateway = self.gateway
         gateway.symbols = [SYMBOL]
         generation = gateway._reset_public_books()
-        gateway._book_recovery_token = 1
-        gateway.book_resyncing = {SYMBOL}
-        gateway.book_recovery_generation = {SYMBOL: generation}
-        gateway.book_recovery_tokens = {SYMBOL: 1}
-        gateway.ws_buffer[SYMBOL] = None
+        gateway._book_feed_state.recovery_token = 1
+        gateway._book_feed_state.resyncing = {SYMBOL}
+        gateway._book_feed_state.recovery_generation = {SYMBOL: generation}
+        gateway._book_feed_state.recovery_tokens = {SYMBOL: 1}
+        gateway._book_feed_state.ws_buffer[SYMBOL] = None
 
         class BrokenBook:
             def process_delta(self, _delta):
                 raise OrderBookGapError("forced paper gap")
 
-        gateway.orderbooks[SYMBOL] = BrokenBook()
+        gateway._book_feed_state.orderbooks[SYMBOL] = BrokenBook()
         launch_entered = threading.Event()
         allow_launch = threading.Event()
         launched = []
@@ -961,10 +1009,14 @@ class PaperGatewayTests(unittest.TestCase):
         worker.start()
         self.assertTrue(launch_entered.wait(timeout=1.0))
 
-        with gateway._book_lock:
-            self.assertEqual(gateway.book_recovery_tokens[SYMBOL], 2)
+        with gateway._book_feed_state.lock:
+            self.assertEqual(gateway._book_feed_state.recovery_tokens[SYMBOL], 2)
             self.assertFalse(
-                gateway._release_book_recovery_locked(SYMBOL, generation, 1)
+                gateway._book_sync.release_recovery_locked(
+                    SYMBOL,
+                    generation,
+                    1,
+                )
             )
 
         allow_launch.set()
@@ -977,10 +1029,10 @@ class PaperGatewayTests(unittest.TestCase):
         gateway = self.gateway
         gateway.symbols = [SYMBOL]
         generation = gateway._reset_public_books()
-        gateway._book_recovery_token = 1
-        gateway.book_resyncing = {SYMBOL}
-        gateway.book_recovery_generation = {SYMBOL: generation}
-        gateway.book_recovery_tokens = {SYMBOL: 1}
+        gateway._book_feed_state.recovery_token = 1
+        gateway._book_feed_state.resyncing = {SYMBOL}
+        gateway._book_feed_state.recovery_generation = {SYMBOL: generation}
+        gateway._book_feed_state.recovery_tokens = {SYMBOL: 1}
         gateway.rest.get_depth_snapshot = lambda _symbol: {
             "lastUpdateId": 10,
             "bids": [["100.0", "1.0"]],
@@ -1013,8 +1065,8 @@ class PaperGatewayTests(unittest.TestCase):
         worker.start()
         self.assertTrue(publish_entered.wait(timeout=1.0))
 
-        with gateway._book_lock:
-            replacement = gateway._begin_book_recovery_locked(
+        with gateway._book_feed_state.lock:
+            replacement = gateway._book_sync.begin_recovery_locked(
                 SYMBOL,
                 freeze_reason="FATAL_GAP",
                 expected_generation=generation,
@@ -1103,7 +1155,7 @@ class PaperGatewayTests(unittest.TestCase):
                 self.assertEqual(len(self.engine.events), before_events)
                 self.assertEqual(len(submitted), before_submissions)
 
-        stale_generation = gateway._book_generation - 1
+        stale_generation = gateway._book_feed_state.generation - 1
         stale_trade = AggTradeData(
             SYMBOL,
             202,
@@ -1135,7 +1187,7 @@ class PaperGatewayTests(unittest.TestCase):
                 (stale_generation, stale_mark),
             )
         )
-        self.assertNotIn(SYMBOL, gateway._marks)
+        self.assertNotIn(SYMBOL, gateway._venue_state.marks)
 
     def test_staged_order_emits_nothing_before_oms_commit_barrier(self):
         gateway = self.start_offline()
@@ -1194,7 +1246,7 @@ class PaperGatewayTests(unittest.TestCase):
             gateway._call_worker(
                 "book",
                 (
-                    gateway._book_generation,
+                    gateway._book_feed_state.generation,
                     make_book(bid_price=98.0, ask_price=99.0),
                 ),
             )
@@ -1423,7 +1475,7 @@ class PaperGatewayTests(unittest.TestCase):
             gateway._call_worker(
                 "market_trade",
                 (
-                    gateway._book_generation,
+                    gateway._book_feed_state.generation,
                     AggTradeData(
                         SYMBOL,
                         1,
@@ -1445,7 +1497,7 @@ class PaperGatewayTests(unittest.TestCase):
             gateway._call_worker(
                 "market_trade",
                 (
-                    gateway._book_generation,
+                    gateway._book_feed_state.generation,
                     AggTradeData(
                         SYMBOL,
                         2,
@@ -1478,7 +1530,7 @@ class PaperGatewayTests(unittest.TestCase):
             gateway._call_worker(
                 "market_trade",
                 (
-                    gateway._book_generation,
+                    gateway._book_feed_state.generation,
                     AggTradeData(
                         SYMBOL,
                         3,
@@ -1518,7 +1570,7 @@ class PaperGatewayTests(unittest.TestCase):
             gateway._call_worker(
                 "market_trade",
                 (
-                    gateway._book_generation,
+                    gateway._book_feed_state.generation,
                     AggTradeData(
                         SYMBOL,
                         11,
@@ -1619,7 +1671,7 @@ class PaperGatewayTests(unittest.TestCase):
             gateway._call_worker(
                 "market_trade",
                 (
-                    gateway._book_generation,
+                    gateway._book_feed_state.generation,
                     AggTradeData(
                         SYMBOL,
                         21,
@@ -1642,7 +1694,7 @@ class PaperGatewayTests(unittest.TestCase):
             gateway._call_worker(
                 "market_trade",
                 (
-                    gateway._book_generation,
+                    gateway._book_feed_state.generation,
                     AggTradeData(
                         SYMBOL,
                         22,
@@ -1785,12 +1837,11 @@ class PaperRuntimeIntegrationTests(unittest.TestCase):
     def test_live_gateway_factory_shares_one_host_rate_limit_budget(self):
         config = {
             "execution": {"mode": "live"},
-            "paper_trade": {"enabled": False},
             "api_key": "main-key",
             "api_secret": "main-secret",
-            "testnet": False,
             "symbols": ["BTCUSDT"],
             "system": {
+                "market_data": {"environment": "production"},
                 "binance_rest_rate_limit": {
                     "enabled": True,
                     "request_weight_limit": 2400,
@@ -1848,12 +1899,11 @@ class PaperRuntimeIntegrationTests(unittest.TestCase):
     def test_live_gateway_factory_rejects_disabled_host_budget(self):
         config = {
             "execution": {"mode": "live"},
-            "paper_trade": {"enabled": False},
             "api_key": "main-key",
             "api_secret": "main-secret",
-            "testnet": False,
             "symbols": ["BTCUSDT"],
             "system": {
+                "market_data": {"environment": "production"},
                 "binance_rest_rate_limit": {"enabled": False}
             },
         }
@@ -1888,7 +1938,7 @@ class PaperRuntimeIntegrationTests(unittest.TestCase):
         gateway.state = GatewayState.READY
         gateway._call_worker(
             "book",
-            (gateway._book_generation, make_book()),
+            (gateway._book_feed_state.generation, make_book()),
         )
         try:
             with patch(
@@ -1958,9 +2008,15 @@ class PaperRuntimeIntegrationTests(unittest.TestCase):
         gateway.state = GatewayState.READY
         gateway._call_worker(
             "book",
-            (gateway._book_generation, make_book()),
+            (gateway._book_feed_state.generation, make_book()),
         )
-        oms = OMS(engine, gateway, config)
+        oms = OMS(
+            engine,
+            gateway,
+            config,
+            market_cache=PaperTestMarketCache(),
+            reference_data=PaperTestReferenceData(),
+        )
         engine.register(EVENT_EXCHANGE_ORDER_UPDATE, oms.on_exchange_update)
         engine.register(EVENT_EXCHANGE_ACCOUNT_UPDATE, oms.on_exchange_account_update)
         oms.state = LifecycleState.LIVE
@@ -1994,12 +2050,6 @@ class PaperRuntimeIntegrationTests(unittest.TestCase):
             with patch(
                 "gateway.binance.paper_gateway.ref_data_manager.get_info",
                 return_value=make_contract(),
-            ), patch(
-                "oms.validator.data_cache.get_best_quote",
-                return_value=(100.0, 101.0),
-            ), patch(
-                "oms.validator.data_cache.get_mark_price",
-                return_value=100.5,
             ), patch.object(
                 gateway,
                 "commit_order_submission",
@@ -2071,9 +2121,15 @@ class PaperRuntimeIntegrationTests(unittest.TestCase):
         gateway.state = GatewayState.READY
         gateway._call_worker(
             "book",
-            (gateway._book_generation, make_book()),
+            (gateway._book_feed_state.generation, make_book()),
         )
-        oms = OMS(engine, gateway, config)
+        oms = OMS(
+            engine,
+            gateway,
+            config,
+            market_cache=PaperTestMarketCache(),
+            reference_data=PaperTestReferenceData(),
+        )
         engine.register(EVENT_EXCHANGE_ORDER_UPDATE, oms.on_exchange_update)
         engine.register(EVENT_EXCHANGE_ACCOUNT_UPDATE, oms.on_exchange_account_update)
         oms.state = LifecycleState.LIVE
@@ -2087,18 +2143,6 @@ class PaperRuntimeIntegrationTests(unittest.TestCase):
             with patch(
                 "gateway.binance.paper_gateway.ref_data_manager.get_info",
                 return_value=make_contract(),
-            ), patch(
-                "oms.validator.data_cache.get_best_quote",
-                return_value=(100.0, 101.0),
-            ), patch(
-                "oms.validator.data_cache.get_mark_price",
-                return_value=100.5,
-            ), patch(
-                "oms.exposure.data_cache.get_best_quote",
-                return_value=(100.0, 101.0),
-            ), patch(
-                "oms.exposure.data_cache.get_mark_price",
-                return_value=100.5,
             ):
                 result = oms.submit_order(
                     OrderIntent(
@@ -2143,13 +2187,13 @@ class PaperRuntimeIntegrationTests(unittest.TestCase):
         gateway.state = GatewayState.READY
         gateway._call_worker(
             "book",
-            (gateway._book_generation, make_book()),
+            (gateway._book_feed_state.generation, make_book()),
         )
         self.addCleanup(gateway.close)
         ownership = []
 
         def record(name, result=True):
-            ownership.append((name, gateway._book_lock._is_owned()))
+            ownership.append((name, gateway._book_feed_state.lock._is_owned()))
             return result
 
         gateway._submit_worker = lambda *_args, **_kwargs: record("submit")
@@ -2160,7 +2204,7 @@ class PaperRuntimeIntegrationTests(unittest.TestCase):
         )
         self.assertTrue(
             gateway._publish_public_market_update(
-                gateway._book_generation,
+                gateway._book_feed_state.generation,
                 EVENT_AGG_TRADE,
                 public_update,
                 worker_kind="market_trade",
@@ -2171,7 +2215,7 @@ class PaperRuntimeIntegrationTests(unittest.TestCase):
         self.assertTrue(
             gateway._dispatch_command(
                 "market_trade",
-                (gateway._book_generation, object()),
+                (gateway._book_feed_state.generation, object()),
             )
         )
 
@@ -2183,7 +2227,7 @@ class PaperRuntimeIntegrationTests(unittest.TestCase):
         gateway._submit_worker = fail_enqueue
         self.assertFalse(
             gateway._publish_public_market_update(
-                gateway._book_generation,
+                gateway._book_feed_state.generation,
                 EVENT_AGG_TRADE,
                 public_update,
                 worker_kind="market_trade",

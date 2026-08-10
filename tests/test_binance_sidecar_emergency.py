@@ -37,8 +37,15 @@ class _Rest:
         assert emergency
         return _Response(self.positions)
 
-    def new_order(self, request, client_oid):
-        self.orders.append((request, client_oid))
+    def new_reduce_only_market_order(
+        self,
+        *,
+        symbol,
+        side,
+        quantity,
+        client_oid,
+    ):
+        self.orders.append((symbol, side, quantity, client_oid))
         return _Response({})
 
 
@@ -97,15 +104,11 @@ def test_flatten_submits_only_reduce_only_market_ioc_orders():
 
     assert result == (True, 2, "")
     assert owner.clock_forces == [True]
-    requests = [request for request, _client_oid in owner.rest.orders]
-    assert [(request.symbol, request.side, request.volume) for request in requests] == [
+    assert [order[:3] for order in owner.rest.orders] == [
         ("BTCUSDT", "SELL", 2.0),
         ("ETHUSDT", "BUY", 3.0),
     ]
-    assert all(request.reduce_only for request in requests)
-    assert all(request.order_type == "MARKET" for request in requests)
-    assert all(request.time_in_force == "IOC" for request in requests)
     assert all(
         client_oid.startswith("crsk-42-")
-        for _request, client_oid in owner.rest.orders
+        for _symbol, _side, _quantity, client_oid in owner.rest.orders
     )

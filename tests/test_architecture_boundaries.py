@@ -44,10 +44,28 @@ OWNED_STATE_BUDGETS = {
     ("strategy/quote_decision.py", "QuoteDecisionEngine"): 0,
     ("ui/web_dashboard.py", "LocalWebDashboard"): 60,
 }
+OMS_PORT_OWNED_MODULES = (
+    "oms/account_manager.py",
+    "oms/account_truth.py",
+    "oms/engine.py",
+    "oms/exposure.py",
+    "oms/order_policy.py",
+    "oms/rpi_calibration_runtime.py",
+    "oms/validator.py",
+)
+PROCESS_SINGLETON_MODULES = frozenset(
+    {
+        "data.cache",
+        "data.ref_data",
+        "infrastructure.time_service",
+    }
+)
 
 
 def _tree(relative_path: str) -> ast.Module:
-    return ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
+    return ast.parse(
+        (ROOT / relative_path).read_text(encoding="utf-8-sig")
+    )
 
 
 def _function(tree: ast.AST, name: str) -> ast.FunctionDef:
@@ -120,6 +138,16 @@ def _directly_owned_state(class_node: ast.ClassDef) -> set[str]:
     return state
 
 
+def _imported_modules(tree: ast.Module) -> set[str]:
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+    return imported
+
+
 def test_composition_roots_remain_below_reviewable_size_budgets():
     for relative_path, maximum_lines in MODULE_LINE_BUDGETS.items():
         source = (ROOT / relative_path).read_text(encoding="utf-8")
@@ -186,3 +214,17 @@ def test_runtime_application_methods_do_not_hide_nested_closures():
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
         assert not nested, method.name
+
+
+def test_oms_domain_services_do_not_import_process_singletons():
+    offenders = {
+        relative_path: sorted(
+            _imported_modules(_tree(relative_path))
+            & PROCESS_SINGLETON_MODULES
+        )
+        for relative_path in OMS_PORT_OWNED_MODULES
+        if _imported_modules(_tree(relative_path))
+        & PROCESS_SINGLETON_MODULES
+    }
+
+    assert offenders == {}

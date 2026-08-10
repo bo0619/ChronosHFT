@@ -205,6 +205,7 @@ def _signed_test_calibration_permit(
     index,
     ack_time,
     terminal_time,
+    implementation_sha256,
     calibration_config,
     target_config,
 ):
@@ -240,7 +241,7 @@ def _signed_test_calibration_permit(
             calibration_config,
             "glft",
         ),
-        "implementation_sha256": implementation_sha256_for_model("glft"),
+        "implementation_sha256": implementation_sha256,
         "policy": {
             "fixed_depths_bps": [0.5, 1.0, 1.5],
             "order_ttl_sec": 30,
@@ -355,6 +356,7 @@ def _write_v2_calibration_journal(
                 index=index,
                 ack_time=ack_time,
                 terminal_time=terminal_time,
+                implementation_sha256=implementation_sha256,
                 calibration_config=calibration_config,
                 target_config=target_config,
             )
@@ -850,7 +852,6 @@ class ModelReadinessTests(unittest.TestCase):
         self.assertEqual(calibrator.k, 0.4)
         self.assertEqual(calibrator.max_tick_gap, 0.75)
         self.assertEqual(calibrator.volatility_sample_count, 0)
-        self.assertEqual(calibrator.intensity_sample_count, 0)
 
     def test_multi_horizon_model_exposes_minimum_trained_sample_count(self):
         predictor = MultiHorizonPredictor(num_features=9)
@@ -861,7 +862,6 @@ class ModelReadinessTests(unittest.TestCase):
                 float(index),
             )
 
-        self.assertEqual(predictor.observation_count, 95)
         self.assertEqual(predictor.sample_count, 35)
 
     def test_glft_volatility_uses_log_bps_and_rejects_crossed_books(self):
@@ -1329,14 +1329,13 @@ class ModelReadinessTests(unittest.TestCase):
                     config_path=root / "config.json",
                 )
 
-    def test_unversioned_paper_config_requires_explicit_offline_opt_in(self):
+    def test_unversioned_paper_config_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "paper.json"
             config_path.write_text(
                 json.dumps(
                     {
                         "execution": {"mode": "paper"},
-                        "paper_trade": {"enabled": True},
                         "symbols": ["XAUUSDT"],
                         "strategy": {
                             "primary_model": "glft",
@@ -1349,15 +1348,6 @@ class ModelReadinessTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "strict"):
                 load_root_config(str(config_path))
-            loaded = load_root_config(
-                str(config_path),
-                allow_unversioned_offline=True,
-            )
-
-        self.assertEqual(loaded["execution"]["mode"], "paper")
-        requirements = readiness_requirements(loaded["strategy"], "glft")
-        self.assertTrue(requirements.enabled)
-        self.assertEqual(requirements.min_volatility_samples, 50)
 
     def test_live_root_load_requires_manifest_before_runtime_startup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1384,8 +1374,7 @@ class ModelReadinessTests(unittest.TestCase):
     def _live_config(manifest_path):
         config = {
             "execution": {"mode": "live"},
-            "paper_trade": {"enabled": False},
-            "testnet": False,
+            "system": {"market_data": {"environment": "production"}},
             "symbols": ["XAUUSDT"],
             "live_launch": {
                 "stage": "canary",

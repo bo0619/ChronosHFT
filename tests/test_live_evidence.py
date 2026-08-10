@@ -105,7 +105,6 @@ def test_live_evidence_rejects_batch_before_advancing_hash_chain(tmp_path):
     recorder._next_seq = 1
     recorder._last_hash = ""
     recorder._committed_seq = 0
-    recorder._last_record_monotonic = 0.0
     recorder._last_fsync_monotonic = 0.0
     recorder._created_new_file = False
     recorder.min_free_bytes = 512 * 1024 * 1024

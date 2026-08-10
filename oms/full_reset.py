@@ -48,6 +48,7 @@ class OMSFullResetCoordinator(OMSComponent):
             "exposure",
             "external_cash_flow_truth_enabled",
             "halt_system",
+            "lifecycle_store",
             "lock",
             "order_monitor",
             "order_store",
@@ -60,23 +61,19 @@ class OMSFullResetCoordinator(OMSComponent):
         {
             "_account_state_event_time",
             "_exchange_account_event_time",
-            "_lifecycle_generation",
             "_rpi_calibration_terminal_empty_snapshots",
             "_rpi_calibration_terminal_generation",
             "_rpi_calibration_terminal_pending_reason",
             "_rpi_calibration_terminal_verified",
-            "last_freeze_reason",
-            "last_halt_reason",
-            "manual_rearm_required",
             "reconcile_retry_scheduled",
-            "state",
         }
     )
 
     def _perform_full_reset(self):
         with self.lock:
-            reset_entry_state = self.state
-            reset_entry_generation = self._lifecycle_generation
+            reset_entry = self.lifecycle_store.snapshot()
+            reset_entry_state = reset_entry.state
+            reset_entry_generation = reset_entry.generation
             if self._rpi_calibration_expired:
                 self._rpi_calibration_terminal_generation += 1
                 self._rpi_calibration_terminal_empty_snapshots = 0
@@ -114,28 +111,28 @@ class OMSFullResetCoordinator(OMSComponent):
             recovery_symbols = set(self._account_cancel_symbols())
             recovery_symbols.update(
                 str(position.get("symbol", "") or "").upper()
-                for position in initial_snapshot["positions"]
+                for position in initial_snapshot.positions
                 if str(position.get("symbol", "") or "").strip()
             )
             with self.lock:
                 establish_trade_baseline = bool(
-                    self.state == LifecycleState.BOOTSTRAP
+                    self.lifecycle_store.state == LifecycleState.BOOTSTRAP
                     and not self.orders
                     and not self.trade_cursors
                 )
             if establish_trade_baseline and not self._prime_trade_history_baseline(
-                initial_snapshot["end_time_ms"],
+                initial_snapshot.end_time_ms,
                 symbols=recovery_symbols,
             ):
                 raise RuntimeError("trade history baseline failed during bootstrap")
             if self.external_cash_flow_truth_enabled and not self.backfill_external_cash_flow_history(
-                end_time_ms=initial_snapshot["end_time_ms"],
+                end_time_ms=initial_snapshot.end_time_ms,
                 source="bootstrap_income_history",
             ):
                 raise RuntimeError("external cash-flow history failed during bootstrap")
             if not self._backfill_trade_history(
                 symbols=recovery_symbols,
-                end_time_ms=initial_snapshot["end_time_ms"],
+                end_time_ms=initial_snapshot.end_time_ms,
             ):
                 raise RuntimeError("trade history backfill failed during reset")
 
@@ -168,24 +165,24 @@ class OMSFullResetCoordinator(OMSComponent):
                 require_no_open_orders=True,
             )
             if self.external_cash_flow_truth_enabled and not self.backfill_external_cash_flow_history(
-                end_time_ms=snapshot["end_time_ms"],
+                end_time_ms=snapshot.end_time_ms,
                 source="reset_income_history",
             ):
                 raise RuntimeError("external cash-flow history failed during reset")
             recovery_symbols.update(
                 str(position.get("symbol", "") or "").upper()
-                for position in snapshot["positions"]
+                for position in snapshot.positions
                 if str(position.get("symbol", "") or "").strip()
             )
             if not self._backfill_trade_history(
                 symbols=recovery_symbols,
-                end_time_ms=snapshot["end_time_ms"],
+                end_time_ms=snapshot.end_time_ms,
             ):
                 raise RuntimeError("final trade history backfill failed during reset")
 
-            remote_orders = snapshot["open_orders"]
-            account = snapshot["account"]
-            positions = snapshot["positions"]
+            remote_orders = snapshot.open_orders
+            account = snapshot.account
+            positions = snapshot.positions
             configured_symbols = {
                 str(symbol or "").upper()
                 for symbol in self.config.get("symbols", [])
@@ -201,8 +198,8 @@ class OMSFullResetCoordinator(OMSComponent):
                 not in configured_symbols
                 and abs(float(pos.get("positionAmt", 0.0) or 0.0)) > 1e-9
             }
-            account_snapshot_floor = snapshot["account_floor"]
-            positions_snapshot_floor = snapshot["positions_floor"]
+            account_snapshot_floor = snapshot.account_floor
+            positions_snapshot_floor = snapshot.positions_floor
             account_balances = self._normalize_remote_account_balances(account)
 
             residual_orders = self._normalize_remote_open_orders(remote_orders)
@@ -307,36 +304,41 @@ class OMSFullResetCoordinator(OMSComponent):
 
             with self.lock:
                 if self._shutdown_requested or self._stopped:
-                    if self.state != LifecycleState.HALTED:
-                        self.state = LifecycleState.FROZEN
-                        self._lifecycle_generation += 1
+                    if self.lifecycle_store.state != LifecycleState.HALTED:
+                        self.lifecycle_store.transition(
+                            LifecycleState.FROZEN,
+                            increment_generation=True,
+                        )
                     self._sync_capability_mode("shutdown_requested")
                     self._audit(
                         "full_reset_resume_suppressed",
                         reason="shutdown_requested",
                     )
                     return
+                current_lifecycle = self.lifecycle_store.snapshot()
                 if (
                     reset_entry_state
                     not in {LifecycleState.BOOTSTRAP, LifecycleState.RECONCILING}
-                    or self.state != reset_entry_state
-                    or self._lifecycle_generation != reset_entry_generation
+                    or current_lifecycle.state != reset_entry_state
+                    or current_lifecycle.generation != reset_entry_generation
                 ):
                     self._audit(
                         "full_reset_resume_suppressed",
                         reason="lifecycle_superseded",
                         entry_state=reset_entry_state.value,
-                        current_state=self.state.value,
+                        current_state=current_lifecycle.state.value,
                         expected_generation=reset_entry_generation,
-                        current_generation=self._lifecycle_generation,
+                        current_generation=current_lifecycle.generation,
                     )
                     return
-                self.state = LifecycleState.LIVE
-                self._lifecycle_generation += 1
+                self.lifecycle_store.transition(
+                    LifecycleState.LIVE,
+                    increment_generation=True,
+                    manual_rearm_required=False,
+                    last_freeze_reason="",
+                    last_halt_reason="",
+                )
                 self._sync_capability_mode("full_reset_completed")
-                self.manual_rearm_required = False
-                self.last_freeze_reason = ""
-                self.last_halt_reason = ""
                 self.reconcile_retry_scheduled = False
                 self.clear_transient_guards(
                     prefixes=("truth_plane:",),
@@ -345,7 +347,7 @@ class OMSFullResetCoordinator(OMSComponent):
                 self._clear_recovered_guards_if_pending("full_reset_completed")
                 self._audit(
                     "full_reset_completed",
-                    state=self.state.value,
+                    state=self.lifecycle_store.state.value,
                     balance=self.account.balance,
                     equity=self.account.equity,
                     positions=dict(self.exposure.net_positions),

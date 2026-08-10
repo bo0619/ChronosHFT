@@ -6,7 +6,6 @@
     "market_data": {
       "_comment": "Reject stale Binance public events at ingress and reconnect before delayed batches can poison caches, paper matching, or symbol circuit breakers.",
       "environment": "production",
-      "testnet": false,
       "public_only": true,
       "publish_depth_levels": 5,
       "emit_full_orderbook_events": false,

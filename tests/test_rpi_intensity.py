@@ -70,36 +70,6 @@ def test_zero_fill_exposure_is_kept_in_poisson_likelihood():
     assert with_zero.k_per_bps > without_zero.k_per_bps
 
 
-def test_accumulator_measures_only_positive_ack_to_terminal_intervals():
-    accumulator = RPIIntensityAccumulator()
-
-    assert accumulator.add_acked_interval(
-        depth_bps=1.0,
-        acknowledged_at_seconds=10.0,
-        ended_at_seconds=12.5,
-        fill_count=0,
-    )
-    assert not accumulator.add_acked_interval(
-        depth_bps=1.0,
-        acknowledged_at_seconds=12.5,
-        ended_at_seconds=12.5,
-        fill_count=0,
-    )
-
-    assert accumulator.snapshot_bins() == (
-        RPIExposureBin(
-            depth_bps=1.0,
-            exposure_seconds=2.5,
-            fill_count=0,
-            sample_count=1,
-        ),
-    )
-    estimate = accumulator.estimate(_requirements())
-    assert not estimate.ready
-    assert estimate.state == "INVALID_DATA"
-    assert estimate.invalid_sample_count == 1
-
-
 def test_order_exposure_integrates_contemporaneous_depth_and_fill_bin():
     exposure = RPIOrderExposure(
         acknowledged_at_monotonic=10.0,
@@ -181,27 +151,15 @@ def test_accumulator_preserves_preaggregated_sample_count():
 def test_invalid_values_taint_result_instead_of_being_silently_dropped():
     accumulator = RPIIntensityAccumulator()
     for depth, fills in ((0.0, 10), (1.0, 5), (2.0, 2)):
-        assert accumulator.add_acked_exposure(
-            depth_bps=depth,
-            exposure_seconds=10.0,
-            fill_count=fills,
+        assert accumulator.add_acked_bin(
+            RPIExposureBin(depth, 10.0, fills)
         )
 
-    assert not accumulator.add_acked_exposure(
-        depth_bps=float("nan"),
-        exposure_seconds=10.0,
-        fill_count=0,
+    assert not accumulator.add_acked_bin(
+        RPIExposureBin(float("nan"), 10.0, 0)
     )
-    assert not accumulator.add_acked_exposure(
-        depth_bps=3.0,
-        exposure_seconds=-1.0,
-        fill_count=0,
-    )
-    assert not accumulator.add_acked_exposure(
-        depth_bps=3.0,
-        exposure_seconds=10.0,
-        fill_count=-1,
-    )
+    assert not accumulator.add_acked_bin(RPIExposureBin(3.0, -1.0, 0))
+    assert not accumulator.add_acked_bin(RPIExposureBin(3.0, 10.0, -1))
 
     estimate = accumulator.estimate(_requirements())
     assert not estimate.ready

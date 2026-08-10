@@ -20,14 +20,21 @@ def test_kill_and_scope_runtime_state_is_not_owned_by_manager():
     assert isinstance(manager.scope_guards, RiskScopeGuardController)
     assert isinstance(manager.market_risk, MarketRiskController)
     assert isinstance(manager.account_risk, AccountRiskController)
-    assert "_kill_supervisor_thread" not in vars(manager)
-    assert "_kill_empty_order_snapshots" not in vars(manager)
-    assert "frozen_symbols" not in vars(manager)
-    assert "symbol_freeze_owners" not in vars(manager)
-    assert "latency_breach_count" not in vars(manager)
+    for removed_facade in (
+        "_kill_supervisor_thread",
+        "_kill_empty_order_snapshots",
+        "frozen_symbols",
+        "symbol_freeze_owners",
+        "latency_breach_count",
+        "last_market_latency_ms",
+        "on_mark_price",
+        "on_orderbook",
+        "on_account_update",
+    ):
+        assert not hasattr(manager, removed_facade)
 
-    manager._kill_empty_order_snapshots = 2
-    manager.frozen_symbols["BTCUSDT"] = "latency:test"
+    manager.kill_switch._kill_empty_order_snapshots = 2
+    manager.scope_guards.frozen_symbols["BTCUSDT"] = "latency:test"
 
     assert manager.kill_switch.runtime.empty_order_snapshots == 2
     assert manager.scope_guards.frozen_symbols == {

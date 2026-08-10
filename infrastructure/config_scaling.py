@@ -3,9 +3,8 @@ import os
 from copy import deepcopy
 from pathlib import Path
 
+from governance.contracts import CONFIG_MANIFEST_SCHEMA
 from infrastructure.config_schema import (
-    CONFIG_FRAGMENT_SCHEMA,
-    VERSIONED_CONFIG_MANIFEST_SCHEMA,
     validate_composed_config,
     validate_fragment_document,
     validate_versioned_manifest,
@@ -27,11 +26,6 @@ from strategy.model_readiness import (
 
 
 QUOTE_ASSET_SUFFIXES = ("USDT", "USDC", "BUSD", "FDUSD")
-# Public startup contract. Legacy manifests are accepted only by offline
-# migration tooling, never by this runtime loader.
-CONFIG_MANIFEST_SCHEMA = VERSIONED_CONFIG_MANIFEST_SCHEMA
-CURRENT_CONFIG_MANIFEST_SCHEMA = VERSIONED_CONFIG_MANIFEST_SCHEMA
-_CONFIG_MANIFEST_KEYS = frozenset({"schema", "includes"})
 TIME_SYNC_DEFAULTS = {
     "startup_required": True,
     "require_healthy_for_trading": True,
@@ -314,51 +308,6 @@ def _merge_config_fragment(
         )
 
 
-def _compose_legacy_config_manifest(payload: dict, manifest_path: str) -> dict:
-    if set(payload) != _CONFIG_MANIFEST_KEYS:
-        unexpected = sorted(set(payload) - _CONFIG_MANIFEST_KEYS)
-        raise ValueError(
-            "config manifest must contain only schema and includes"
-            + (f"; unexpected keys: {unexpected}" if unexpected else "")
-        )
-    if payload.get("schema") != CONFIG_MANIFEST_SCHEMA:
-        raise ValueError(
-            f"config manifest schema must be {CONFIG_MANIFEST_SCHEMA!r}"
-        )
-    includes = payload.get("includes")
-    if not isinstance(includes, list) or not includes:
-        raise ValueError("config manifest includes must be a non-empty array")
-    if len(includes) > 128:
-        raise ValueError("config manifest includes must contain no more than 128 files")
-
-    merged = {}
-    owners: dict[tuple[str, ...], str] = {}
-    included_paths = set()
-    for include in includes:
-        fragment_path = _resolve_config_fragment_path(manifest_path, include)
-        normalized_path = os.path.normcase(fragment_path)
-        if normalized_path in included_paths:
-            raise ValueError(f"duplicate config manifest include: {include!r}")
-        included_paths.add(normalized_path)
-        fragment = _read_config_json_object(fragment_path, root=False)
-        if _is_config_manifest(fragment):
-            raise ValueError(
-                f"nested config manifests are not supported: {fragment_path}"
-            )
-        if fragment.get("$schema") == CONFIG_FRAGMENT_SCHEMA:
-            raise ValueError(
-                "versioned config fragments require a v2 manifest: "
-                f"{fragment_path}"
-            )
-        _merge_config_fragment(
-            merged,
-            fragment,
-            source=fragment_path,
-            owners=owners,
-        )
-    return merged
-
-
 def _compose_versioned_config_manifest(payload: dict, manifest_path: str) -> dict:
     includes = validate_versioned_manifest(payload)
     merged = {}
@@ -398,7 +347,7 @@ def _compose_versioned_config_manifest(payload: dict, manifest_path: str) -> dic
 
 def _compose_config_manifest(payload: dict, manifest_path: str) -> dict:
     schema = payload.get("schema")
-    if schema == VERSIONED_CONFIG_MANIFEST_SCHEMA:
+    if schema == CONFIG_MANIFEST_SCHEMA:
         return _compose_versioned_config_manifest(payload, manifest_path)
     if isinstance(schema, str) and schema.startswith(
         "chronoshft.config_manifest.v"
@@ -409,7 +358,7 @@ def _compose_config_manifest(payload: dict, manifest_path: str) -> dict:
         )
     raise ValueError(
         "config manifest schema must be "
-        f"{VERSIONED_CONFIG_MANIFEST_SCHEMA!r}"
+        f"{CONFIG_MANIFEST_SCHEMA!r}"
     )
 
 
@@ -423,8 +372,14 @@ def _load_config_document(path: str) -> tuple[dict, bool]:
 
 
 def load_config_document(path: str = "config.json") -> dict:
-    """Load strict JSON and compose a Paper config manifest without normalization."""
-    payload, _is_manifest = _load_config_document(path)
+    """Load and compose one strict v3 configuration manifest."""
+    payload, is_manifest = _load_config_document(path)
+    if not is_manifest:
+        raise ValueError(
+            "runtime configuration must use strict "
+            f"{CONFIG_MANIFEST_SCHEMA!r}; monolithic documents require "
+            "explicit offline migration"
+        )
     return payload
 
 
@@ -582,14 +537,6 @@ def apply_capital_scaling(config: dict) -> dict:
         1.0,
         _to_float(scaling.get("position_buffer_orders", 2.0), 2.0),
     )
-    reference_min_notional = max(
-        1.0,
-        _to_float(scaling.get("reference_min_notional", 5.0), 5.0),
-    )
-    notional_buffer = max(
-        1.0,
-        _to_float(scaling.get("notional_buffer", 1.1), 1.1),
-    )
     quote_assets = _tracked_quote_assets(symbols)
     budget_weights = scaling.get("budget_asset_weights")
     if not isinstance(budget_weights, dict):
@@ -604,9 +551,6 @@ def apply_capital_scaling(config: dict) -> dict:
     )
     derived_daily_loss = target_daily_loss * capital_multiplier
     derived_max_order_qty = max_order_qty * max(1.0, capital_multiplier)
-    derived_lot_multiplier = derived_order_notional / (
-        reference_min_notional * notional_buffer
-    )
     derived_budget_by_asset = _derive_budget_by_asset(
         derived_capital,
         quote_assets,
@@ -634,7 +578,6 @@ def apply_capital_scaling(config: dict) -> dict:
     limits["max_daily_loss"] = round(derived_daily_loss, 8)
     limits["max_order_qty"] = round(derived_max_order_qty, 8)
     limits["max_concurrent_symbols"] = active_symbol_slots
-    strategy["lot_multiplier"] = round(max(0.01, derived_lot_multiplier), 8)
     strategy["target_order_notional"] = round(derived_order_notional, 8)
     strategy["max_pos_usdt"] = round(derived_symbol_cap, 8)
 
@@ -660,10 +603,6 @@ def apply_production_safety_defaults(config: dict) -> dict:
     if not isinstance(time_sync, dict):
         time_sync = {}
         system["time_sync"] = time_sync
-    if "max_phase_error_ms" not in time_sync and "max_offset_ms" in time_sync:
-        time_sync["max_phase_error_ms"] = time_sync["max_offset_ms"]
-    if "halt_phase_error_ms" not in time_sync and "halt_offset_ms" in time_sync:
-        time_sync["halt_phase_error_ms"] = time_sync["halt_offset_ms"]
     for key, value in TIME_SYNC_DEFAULTS.items():
         time_sync.setdefault(key, value)
 
@@ -771,21 +710,6 @@ def apply_production_safety_defaults(config: dict) -> dict:
     if not isinstance(independent_supervisor, dict):
         independent_supervisor = {}
         risk["independent_supervisor"] = independent_supervisor
-
-    if (
-        "clock_reduce_only_phase_error_ms" not in independent_supervisor
-        and "clock_reduce_only_offset_ms" in independent_supervisor
-    ):
-        independent_supervisor["clock_reduce_only_phase_error_ms"] = (
-            independent_supervisor["clock_reduce_only_offset_ms"]
-        )
-    if (
-        "clock_kill_phase_error_ms" not in independent_supervisor
-        and "clock_kill_offset_ms" in independent_supervisor
-    ):
-        independent_supervisor["clock_kill_phase_error_ms"] = (
-            independent_supervisor["clock_kill_offset_ms"]
-        )
 
     for key, value in INDEPENDENT_RISK_SUPERVISOR_DEFAULTS.items():
         independent_supervisor.setdefault(key, value)
@@ -1005,17 +929,10 @@ def normalize_root_config_preapproval(raw: dict) -> dict:
 def load_root_config(
     path: str = "config.json",
     *,
-    allow_unversioned_offline: bool = False,
     calibration_artifact_port=None,
 ) -> dict:
     config_path = os.path.abspath(os.fspath(path))
-    raw, is_manifest = _load_config_document(config_path)
-    if not is_manifest and not allow_unversioned_offline:
-        raise ValueError(
-            "runtime configuration must use strict "
-            f"{VERSIONED_CONFIG_MANIFEST_SCHEMA!r}; monolithic documents "
-            "are accepted only by explicit offline migration tooling"
-        )
+    raw = load_config_document(config_path)
     _reject_live_inline_secrets(raw)
     configured = normalize_root_config_preapproval(raw)
     if not is_paper_trade(configured):

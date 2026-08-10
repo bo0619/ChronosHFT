@@ -10,12 +10,6 @@ PAPER_OMS_JOURNAL_PATH = "storage/paper/oms_journal.jsonl"
 PAPER_OMS_FENCE_PATH = "storage/paper/oms_journal.jsonl.lock"
 
 
-def _as_bool(value) -> bool:
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-    return bool(value)
-
-
 def _explicit_execution_mode(config: dict) -> str:
     execution = config.get("execution", {})
     if not isinstance(execution, dict):
@@ -23,43 +17,18 @@ def _explicit_execution_mode(config: dict) -> str:
     raw_mode = str(execution.get("mode", "") or "").strip().lower()
     if not raw_mode:
         return ""
-    if raw_mode in {"paper", "paper_trade", "simulation", "sim"}:
+    if raw_mode == PAPER_EXECUTION_MODE:
         return PAPER_EXECUTION_MODE
-    if raw_mode in {"live", "production", "real"}:
+    if raw_mode == LIVE_EXECUTION_MODE:
         return LIVE_EXECUTION_MODE
     raise ValueError(f"Unsupported execution.mode: {raw_mode}")
 
 
-def _legacy_paper_enabled(config: dict) -> bool:
-    paper_trade = config.get("paper_trade", {})
-    paper_enabled = (
-        _as_bool(paper_trade.get("enabled", False))
-        if isinstance(paper_trade, dict)
-        else _as_bool(paper_trade)
-    )
-    system = config.get("system", {})
-    dry_run = (
-        _as_bool(system.get("dry_run", False))
-        if isinstance(system, dict)
-        else False
-    )
-    return paper_enabled or dry_run
-
-
 def is_paper_trade(config: dict) -> bool:
-    """Return whether execution is paper-only, rejecting contradictory modes."""
+    """Return whether the strict execution mode selects Paper."""
     if not isinstance(config, dict):
         return False
-
-    explicit_mode = _explicit_execution_mode(config)
-    legacy_enabled = _legacy_paper_enabled(config)
-    if explicit_mode == LIVE_EXECUTION_MODE and legacy_enabled:
-        raise ValueError(
-            "Conflicting execution configuration: execution.mode=live with paper mode enabled"
-        )
-    if explicit_mode:
-        return explicit_mode == PAPER_EXECUTION_MODE
-    return legacy_enabled
+    return _explicit_execution_mode(config) == PAPER_EXECUTION_MODE
 
 
 def validate_paper_trade_database_config(config: dict) -> dict:
@@ -188,9 +157,7 @@ def apply_paper_trade_mode(config: dict) -> dict:
     if not isinstance(paper_trade, dict):
         paper_trade = {}
         configured["paper_trade"] = paper_trade
-    paper_trade["enabled"] = True
-    paper_trade["market_data_environment"] = "production"
-    if not _as_bool(paper_trade.get("reset_on_start", True)):
+    if paper_trade.get("reset_on_start", True) is not True:
         raise ValueError(
             "Paper Trade venue persistence is not implemented; "
             "paper_trade.reset_on_start must be true"
@@ -227,22 +194,17 @@ def apply_paper_trade_mode(config: dict) -> dict:
                 )
             order_sizing["fixed_quantity"] = quantity
 
-    # `testnet` historically controls every Binance connection. Paper execution
-    # intentionally uses production public market data and owns no private venue
-    # connection, so normalize this legacy switch to production.
-    configured["testnet"] = False
-
+    # Paper execution uses production public market data and owns no private
+    # venue connection.
     system = configured.get("system")
     if not isinstance(system, dict):
         system = {}
         configured["system"] = system
-    system["dry_run"] = True
     market_data = system.get("market_data")
     if not isinstance(market_data, dict):
         market_data = {}
         system["market_data"] = market_data
     market_data["environment"] = "production"
-    market_data["testnet"] = False
     market_data["public_only"] = True
 
     # Keep simulated execution state completely separate from live OMS state.

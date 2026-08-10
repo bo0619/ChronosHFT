@@ -728,7 +728,6 @@ class LiveEvidenceRecorder:
         self._last_hash = ""
         self._committed_seq = 0
         self._last_fsync_monotonic = 0.0
-        self._last_record_monotonic = 0.0
         self._dropped_records = 0
         self._disk_free_bytes: int | None = None
         self._last_space_check_monotonic = 0.0
@@ -886,7 +885,6 @@ class LiveEvidenceRecorder:
         self._last_hash = previous_hash
         self._committed_seq = next_seq - 1
         self._next_seq = next_seq
-        self._last_record_monotonic = time.perf_counter()
 
     def _require_disk_reserve(self, required_bytes: int) -> None:
         if self.min_free_bytes <= 0:

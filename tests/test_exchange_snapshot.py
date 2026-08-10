@@ -177,16 +177,16 @@ def test_collector_requires_consecutive_matching_structural_snapshots():
 
     snapshot = collector.capture()
 
-    assert snapshot["attempt"] == 3
-    assert snapshot["positions"][0]["positionAmt"] == 1.0
-    assert snapshot["account_floor"] < snapshot["positions_floor"]
+    assert snapshot.attempt == 3
+    assert snapshot.positions[0]["positionAmt"] == 1.0
+    assert snapshot.account_floor < snapshot.positions_floor
     assert audit == [
         (
             "stable_snapshot_acquired",
             {
                 "attempts": 3,
                 "stable_count": 2,
-                "end_time_ms": snapshot["end_time_ms"],
+                "end_time_ms": snapshot.end_time_ms,
             },
         )
     ]

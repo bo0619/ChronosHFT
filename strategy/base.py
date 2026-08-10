@@ -60,13 +60,7 @@ class StrategyTemplate:
         self.pos = 0.0
         self.active_orders = {}
         self.orders_cancelling = set()
-        self.latest_account = None
-        self.last_system_health = ""
-        self.last_submit_reject_reason = ""
-        self.last_submit_reject_oid = ""
-        self.last_submit_reject_by_symbol = {}
         self._rpi_fallback_warned_routes = set()
-        self.lot_multiplier = 1.0
         self.target_order_notional = 0.0
         self.max_pos_usdt = 0.0
         self.fixed_order_quantity = 0.0
@@ -92,7 +86,7 @@ class StrategyTemplate:
         return parsed
 
     def configure_quote_sizing(self, strategy_config: dict | None):
-        """Load quote sizing while keeping legacy lot_multiplier configs valid."""
+        """Load the resolved v3 quote-sizing policy."""
         config = strategy_config if isinstance(strategy_config, dict) else {}
         order_sizing = config.get("order_sizing", {})
         if not isinstance(order_sizing, dict):
@@ -116,10 +110,6 @@ class StrategyTemplate:
                 )
         else:
             self.fixed_order_quantity = 0.0
-        self.lot_multiplier = self._positive_finite(
-            config.get("lot_multiplier", 1.0),
-            1.0,
-        )
         scaling = config.get("capital_scaling", {})
         if not isinstance(scaling, dict):
             scaling = {}
@@ -128,13 +118,7 @@ class StrategyTemplate:
             * self._positive_finite(config.get("capital_multiplier", 1.0), 1.0)
         )
         self.target_order_notional = self._positive_finite(
-            config.get(
-                "target_order_notional",
-                config.get(
-                    "order_notional_usdt",
-                    config.get("order_notional", scaled_notional_fallback),
-                ),
-            )
+            config.get("target_order_notional", scaled_notional_fallback)
         )
         self.max_pos_usdt = self._positive_finite(
             config.get("max_pos_usdt", 0.0)
@@ -177,10 +161,11 @@ class StrategyTemplate:
         if fixed_quantity:
             target_qty = self.fixed_order_quantity
         else:
-            if explicit_notional:
-                target_notional = self.target_order_notional
-            else:
-                target_notional = min_notional * 1.1 * self.lot_multiplier
+            target_notional = (
+                self.target_order_notional
+                if explicit_notional
+                else min_notional * 1.1
+            )
             if self.max_pos_usdt > 0.0:
                 target_notional = min(target_notional, self.max_pos_usdt)
             target_qty = target_notional / price
@@ -232,11 +217,6 @@ class StrategyTemplate:
             OrderStatus.REJECTED_LOCALLY,
             OrderStatus.EXPIRED,
         }
-        if snapshot.status in {OrderStatus.REJECTED, OrderStatus.REJECTED_LOCALLY}:
-            reason = snapshot.error_msg or snapshot.status.value.lower()
-            self.last_submit_reject_reason = reason
-            self.last_submit_reject_oid = snapshot.client_oid
-            self.last_submit_reject_by_symbol[snapshot.symbol] = reason
         if snapshot.status in terminal_statuses:
             self.active_orders.pop(snapshot.client_oid, None)
             self.orders_cancelling.discard(snapshot.client_oid)
@@ -245,17 +225,13 @@ class StrategyTemplate:
         self.pos = pos.volume
 
     def on_account_update(self, account: AccountData):
-        self.latest_account = account
+        pass
 
     def on_system_health(self, message):
-        if not isinstance(message, str):
-            message = str(message)
-        self.last_system_health = message
+        pass
 
     def on_submit_rejected(self, intent: OrderIntent, reason: str, client_oid: str = ""):
-        self.last_submit_reject_reason = reason
-        self.last_submit_reject_oid = client_oid or ""
-        self.last_submit_reject_by_symbol[intent.symbol] = reason
+        pass
 
     def can_submit_orders(self, symbol: str = "") -> bool:
         return self.execution.can_submit(self.name, symbol)
@@ -265,13 +241,6 @@ class StrategyTemplate:
 
     def position_for(self, symbol: str, default: float = 0.0) -> float:
         return self.execution_state().position(symbol, default)
-
-    def strategy_position_for(
-        self,
-        symbol: str,
-        default: float | None = None,
-    ) -> float | None:
-        return self.execution_state().strategy_position(symbol, default)
 
     def log(self, msg):
         self.engine.put(Event(EVENT_LOG, f"[{self.name}] {msg}"))
@@ -302,14 +271,18 @@ class StrategyTemplate:
             )
         return TIF_GTX
 
-    def passive_fee_rate(self, symbol: str, time_in_force: str) -> float:
-        """Return the final passive fee rate for the selected venue route."""
+    def passive_round_trip_fee_bps(
+        self,
+        symbol: str,
+        time_in_force: str,
+    ) -> float:
+        """Return the round-trip fee drag for the selected passive route."""
         config = self.resolved_config
         fee_config = dict(config.get("backtest", {}) or {})
         paper_config = config.get("paper_trade", {}) or {}
         if is_paper_trade(config):
             fee_config.update(paper_config)
-        return resolve_passive_fee_rate(
+        fee_rate = resolve_passive_fee_rate(
             maker_rate=fee_config.get("maker_fee", 0.0),
             symbol=symbol,
             is_rpi=str(time_in_force or "").upper() == TIF_RPI,
@@ -319,13 +292,7 @@ class StrategyTemplate:
                 0.0,
             ),
         )
-
-    def passive_round_trip_fee_bps(
-        self,
-        symbol: str,
-        time_in_force: str,
-    ) -> float:
-        return max(0.0, self.passive_fee_rate(symbol, time_in_force) * 20000.0)
+        return max(0.0, fee_rate * 20000.0)
 
     def send_intent(self, intent: OrderIntent):
         intent.price = self.reference_data.round_price(intent.symbol, intent.price)
@@ -361,28 +328,6 @@ class StrategyTemplate:
         reject_reason = getattr(submit_result, "reason", "submit_rejected") if submit_result else "submit_rejected"
         self.on_submit_rejected(intent, reject_reason, client_oid)
         return None
-
-    def entry_long(self, symbol, price, volume):
-        intent = OrderIntent(self.name, symbol, Side.BUY, price, volume)
-        return self.send_intent(intent)
-
-    def exit_long(self, symbol, price, volume):
-        intent = OrderIntent(self.name, symbol, Side.SELL, price, volume, reduce_only=True)
-        return self.send_intent(intent)
-
-    def entry_short(self, symbol, price, volume):
-        intent = OrderIntent(self.name, symbol, Side.SELL, price, volume)
-        return self.send_intent(intent)
-
-    def exit_short(self, symbol, price, volume):
-        intent = OrderIntent(self.name, symbol, Side.BUY, price, volume, reduce_only=True)
-        return self.send_intent(intent)
-
-    def buy(self, symbol, price, volume):
-        return self.entry_long(symbol, price, volume)
-
-    def sell(self, symbol, price, volume):
-        return self.entry_short(symbol, price, volume)
 
     def cancel_order(self, client_oid: str):
         if client_oid not in self.active_orders:

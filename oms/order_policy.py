@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import math
-import time
 import uuid
 
-from data.cache import data_cache
-from data.ref_data import ref_data_manager
 from event.type import (
     ExecutionPolicy,
     OMSCapabilityMode,
@@ -17,7 +14,6 @@ from event.type import (
     TIF_GTX,
     TIF_IOC,
 )
-from infrastructure.time_service import time_service
 
 from .component import OMSComponent
 
@@ -35,6 +31,7 @@ class OMSOrderPolicy(OMSComponent):
             "account",
             "can_open_new_risk",
             "capability_mode",
+            "clock",
             "degraded_aggressive_to_passive",
             "duplicate_intent_window_sec",
             "emergency_flatten_cooldown_sec",
@@ -51,6 +48,7 @@ class OMSOrderPolicy(OMSComponent):
             "margin_health_require_snapshot",
             "margin_reduce_only_ratio",
             "margin_snapshot_max_age_sec",
+            "market_cache",
             "max_strategy_active_orders",
             "max_strategy_symbol_active_orders",
             "max_symbol_active_orders",
@@ -58,6 +56,7 @@ class OMSOrderPolicy(OMSComponent):
             "orders",
             "paper_trade_database",
             "query_positions",
+            "reference_data",
             "require_explicit_strategy_budget",
             "require_healthy_clock",
             "risk_control_heartbeat_enabled",
@@ -75,7 +74,7 @@ class OMSOrderPolicy(OMSComponent):
         if intent.reduce_only or not self.require_healthy_clock:
             return ""
         try:
-            snapshot = time_service.health_snapshot(notify_listeners=False)
+            snapshot = self.clock.health_snapshot()
         except Exception as exc:
             return f"clock_health_unavailable:{type(exc).__name__}"
         if bool(snapshot.get("ready", False)):
@@ -127,17 +126,17 @@ class OMSOrderPolicy(OMSComponent):
         return intent, ""
 
     def _estimate_emergency_price(self, symbol: str, side: Side) -> float:
-        bid, ask = data_cache.get_best_quote(symbol)
+        bid, ask = self.market_cache.get_best_quote(symbol)
         if side == Side.BUY and ask > 0:
             return ask
         if side == Side.SELL and bid > 0:
             return bid
 
-        mark_price = data_cache.get_mark_price(symbol)
+        mark_price = self.market_cache.get_mark_price(symbol)
         if mark_price > 0:
             return mark_price
 
-        last_trade = data_cache.get_last_trade_price(symbol)
+        last_trade = self.market_cache.get_last_trade_price(symbol)
         if last_trade > 0:
             return last_trade
 
@@ -174,7 +173,7 @@ class OMSOrderPolicy(OMSComponent):
                     positions[local_symbol] = volume
 
         submitted = 0
-        now_monotonic = time.perf_counter()
+        now_monotonic = self.clock.monotonic()
         self._audit("emergency_flatten_requested", reason=reason, symbols=sorted(positions.keys()))
         for target_symbol, volume in positions.items():
             if abs(volume) <= 1e-9:
@@ -193,7 +192,7 @@ class OMSOrderPolicy(OMSComponent):
                 )
                 continue
 
-            qty = ref_data_manager.round_qty(target_symbol, abs(volume))
+            qty = self.reference_data.round_qty(target_symbol, abs(volume))
             if qty <= 0:
                 continue
 
@@ -301,7 +300,7 @@ class OMSOrderPolicy(OMSComponent):
         symbol_active = 0
         strategy_active = 0
         strategy_symbol_active = 0
-        now_monotonic = time.perf_counter()
+        now_monotonic = self.clock.monotonic()
 
         for order in self.orders.values():
             if not order.is_active():
@@ -436,7 +435,8 @@ class OMSOrderPolicy(OMSComponent):
 
         age_sec = max(
             0.0,
-            time.perf_counter() - self.last_risk_control_heartbeat_monotonic,
+            self.clock.monotonic()
+            - self.last_risk_control_heartbeat_monotonic,
         )
         if age_sec > self.risk_control_heartbeat_max_age_sec:
             return (
@@ -469,11 +469,11 @@ class OMSOrderPolicy(OMSComponent):
         if snapshot_monotonic > 0.0:
             age_sec = max(
                 0.0,
-                time.perf_counter() - snapshot_monotonic,
+                self.clock.monotonic() - snapshot_monotonic,
             )
         else:
             age_sec = (
-                max(0.0, time.time() - snapshot_time)
+                max(0.0, self.clock.wall_time() - snapshot_time)
                 if snapshot_time
                 else float("inf")
             )

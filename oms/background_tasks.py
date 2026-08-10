@@ -16,10 +16,6 @@ from infrastructure.logger import logger
 from .component import OMSComponent
 
 
-class BackgroundTaskRejected(RuntimeError):
-    """Raised when bounded background work cannot be accepted."""
-
-
 class BackgroundTaskCancelled(RuntimeError):
     """Marks delayed work cancelled by an orderly executor shutdown."""
 
@@ -194,7 +190,6 @@ class OMSBackgroundTaskExecutor:
         default_workers = max_workers - safety_workers
         emergency_workers = 1
         general_safety_workers = safety_workers - emergency_workers
-        self.default_workers = default_workers
         self.general_safety_workers = general_safety_workers
         self.emergency_workers = emergency_workers
 
@@ -601,23 +596,6 @@ class OMSBackgroundTaskExecutor:
             self._condition.notify_all()
             return BackgroundTaskSubmission(True, True, handle)
 
-    def wait_for_idle(self, timeout: float | None = None) -> bool:
-        deadline = (
-            None
-            if timeout is None
-            else time.perf_counter() + max(0.0, float(timeout))
-        )
-        with self._condition:
-            while self._active_by_key or self._rerun_by_key:
-                if deadline is None:
-                    self._condition.wait(timeout=0.1)
-                    continue
-                remaining = deadline - time.perf_counter()
-                if remaining <= 0.0:
-                    return False
-                self._condition.wait(timeout=min(0.1, remaining))
-            return True
-
     def shutdown(self, timeout: float | None = None) -> bool:
         deadline = (
             None
@@ -713,24 +691,13 @@ class OMSBackgroundTaskManager(OMSComponent):
             "_audit",
             "_background_tasks",
             "_close_outbound_gate_locked",
-            "_lifecycle_generation",
             "_sync_capability_mode",
-            "last_freeze_reason",
-            "last_halt_reason",
+            "lifecycle_store",
             "lock",
-            "manual_rearm_required",
             "state",
         }
     )
-    OWNER_WRITES = frozenset(
-        {
-            "_lifecycle_generation",
-            "last_freeze_reason",
-            "last_halt_reason",
-            "manual_rearm_required",
-            "state",
-        }
-    )
+    OWNER_WRITES = frozenset()
     LOCAL_STATE = frozenset({"_background_task_rejection_count"})
 
     def __init__(self, owner):
@@ -752,12 +719,13 @@ class OMSBackgroundTaskManager(OMSComponent):
                 failure_reason,
                 hold="background_task_failure",
             )
-            if self.state != LifecycleState.HALTED:
-                self._lifecycle_generation += 1
-            self.state = LifecycleState.HALTED
-            self.manual_rearm_required = True
-            self.last_halt_reason = failure_reason
-            self.last_freeze_reason = ""
+            self.lifecycle_store.transition(
+                LifecycleState.HALTED,
+                increment_generation=self.state != LifecycleState.HALTED,
+                manual_rearm_required=True,
+                last_halt_reason=failure_reason,
+                last_freeze_reason="",
+            )
             self._sync_capability_mode(failure_reason)
         logger.critical(f"[OMS] {failure_reason}")
         try:

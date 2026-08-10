@@ -26,6 +26,7 @@ import time
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+from governance.contracts import is_testnet_environment
 
 _DEFAULT_STATIC_PATH = Path(__file__).resolve().parents[1] / "web" / "dashboard.html"
 _ACTIVE_ORDER_STATUSES = frozenset(
@@ -39,9 +40,6 @@ _ACTIVE_ORDER_STATUSES = frozenset(
         "CANCELLING",
         "CANCEL_UNKNOWN",
     }
-)
-_TERMINAL_ORDER_STATUSES = frozenset(
-    {"FILLED", "CANCELLED", "REJECTED", "REJECTED_LOCALLY", "EXPIRED"}
 )
 _SECRET_KEY_PARTS = (
     "api_key",
@@ -629,7 +627,6 @@ class LocalWebDashboard:
         self._server_thread: threading.Thread | None = None
         self._running = False
         self._service_state = "initialized"
-        self._started_wall = 0.0
         self._started_monotonic = 0.0
         self._actual_port = resolved_port
         self._static_bytes = self._fallback_html()
@@ -658,8 +655,6 @@ class LocalWebDashboard:
             "updated_at": time.time(),
         }
         self._rpi_external: dict[str, Any] = {}
-        self._rpi_capabilities: dict[str, bool | None] = {}
-
         self._order_status_seen: dict[str, set[str]] = defaultdict(set)
         self._order_filled_cumulative: dict[str, float] = {}
         self._execution_ids: set[str] = set()
@@ -682,19 +677,14 @@ class LocalWebDashboard:
         self._published_at = 0.0
         self._published_snapshot: dict[str, Any] = {}
         self._published_json = b"{}"
-        self._published_health_json = b'{"status":"starting"}'
         self.publish_snapshot(force=True)
 
     @staticmethod
     def _extract_web_config(config: Mapping[str, Any]) -> dict[str, Any]:
         system = config.get("system", {}) if isinstance(config, Mapping) else {}
         if not isinstance(system, Mapping):
-            system = {}
-        for key in ("web_dashboard", "local_web_dashboard", "dashboard"):
-            value = system.get(key)
-            if isinstance(value, Mapping):
-                return dict(value)
-        value = config.get("web_dashboard") if isinstance(config, Mapping) else None
+            return {}
+        value = system.get("web_dashboard")
         return dict(value) if isinstance(value, Mapping) else {}
 
     @staticmethod
@@ -741,26 +731,20 @@ class LocalWebDashboard:
             else {}
         )
         execution = config.get("execution", {}) if isinstance(config, Mapping) else {}
-        paper_trade = config.get("paper_trade", {}) if isinstance(config, Mapping) else {}
         raw_mode = (
             str(execution.get("mode", "") or "").strip().lower()
             if isinstance(execution, Mapping)
             else ""
         )
-        paper_enabled = (
-            bool(paper_trade.get("enabled", False))
-            if isinstance(paper_trade, Mapping)
-            else bool(paper_trade)
-        )
-        if raw_mode in {"paper", "paper_trade", "simulation", "sim"} or paper_enabled:
+        is_testnet = is_testnet_environment(config)
+        if raw_mode == "paper":
             execution_mode = "paper"
-        elif raw_mode in {"testnet", "sandbox"} or bool(config.get("testnet", False)):
+        elif is_testnet:
             execution_mode = "testnet"
         else:
             execution_mode = "live"
 
         is_paper = execution_mode == "paper"
-        is_testnet = execution_mode == "testnet"
         if is_paper:
             environment = "PAPER_LIVE_DATA"
             environment_label = "PAPER · LIVE DATA"
@@ -798,7 +782,7 @@ class LocalWebDashboard:
             execution_policy = "single_primary"
 
         return {
-            "testnet": bool(config.get("testnet", False)),
+            "testnet": is_testnet,
             "execution_mode": execution_mode,
             "environment": environment,
             "environment_label": environment_label,
@@ -914,11 +898,6 @@ class LocalWebDashboard:
         rendered_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
         return f"http://{rendered_host}:{self._actual_port}/"
 
-    @property
-    def is_running(self) -> bool:
-        with self._lock:
-            return self._running
-
     def set_startup_status(
         self,
         *,
@@ -960,7 +939,6 @@ class LocalWebDashboard:
             with self._lock:
                 self._running = True
                 self._service_state = "running"
-                self._started_wall = time.time()
                 self._started_monotonic = time.perf_counter()
             self.publish_snapshot(force=True)
             thread = threading.Thread(
@@ -1000,13 +978,6 @@ class LocalWebDashboard:
                 self._service_state = "stopped"
             self.publish_snapshot(force=True)
             return True
-
-    def __enter__(self) -> LocalWebDashboard:
-        self.start()
-        return self
-
-    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
-        self.stop()
 
     # ------------------------------------------------------------------
     # Event callbacks.  Each method copies only bounded primitive data.
@@ -1443,48 +1414,12 @@ class LocalWebDashboard:
             if level in {"WARNING", "ERROR", "CRITICAL"}:
                 self._alerts.append({**record, "source": "log"})
 
-    def update_risk_snapshot(self, snapshot: Mapping[str, Any] | None, source: str = "risk_manager") -> None:
-        safe = _safe_value(snapshot or {})
-        with self._lock:
-            self._risk_sources[str(source or "risk_manager")] = (
-                safe if isinstance(safe, dict) else {"value": safe}
-            )
-
-    def update_oms_snapshot(self, snapshot: Mapping[str, Any] | None) -> None:
-        self.update_risk_snapshot(snapshot, source="oms")
-
-    def update_rpi_metrics(self, metrics: Mapping[str, Any] | None) -> None:
-        safe = _safe_value(metrics or {})
-        with self._lock:
-            if isinstance(safe, dict):
-                self._rpi_external = self._deep_merge(self._rpi_external, safe)
-
-    def update_rpi_capabilities(self, capabilities: Mapping[str, Any] | list[str] | tuple[str, ...]) -> None:
-        if isinstance(capabilities, Mapping):
-            normalized = {
-                str(symbol).upper(): None if value is None else bool(value)
-                for symbol, value in capabilities.items()
-            }
-        else:
-            supported = {str(symbol).upper() for symbol in capabilities}
-            configured = set(self._config_view.get("symbols", []))
-            normalized = {symbol: symbol in supported for symbol in configured | supported}
-        with self._lock:
-            self._rpi_capabilities.update(normalized)
-
     # ------------------------------------------------------------------
     # Snapshot publication.  Only these methods inspect component objects.
     # ------------------------------------------------------------------
 
     def update_runtime_metrics(self, metrics: Mapping[str, Any] | None) -> bool:
         return self.publish_snapshot(runtime_metrics=metrics, force=False)
-
-    def publish_runtime_snapshot(
-        self,
-        runtime_metrics: Mapping[str, Any] | None = None,
-        **sections: Any,
-    ) -> bool:
-        return self.publish_snapshot(runtime_metrics=runtime_metrics, **sections)
 
     def publish_snapshot(
         self,
@@ -1547,21 +1482,6 @@ class LocalWebDashboard:
             allow_nan=False,
             separators=(",", ":"),
         ).encode("utf-8")
-        health = json.dumps(
-            {
-                "status": "ok" if self.is_running else self._service_state,
-                "engine_status": snapshot["startup"]["state"],
-                "startup_blocked": snapshot["startup"]["startup_blocked"],
-                "execution_enabled": snapshot["startup"]["execution_enabled"],
-                "restart_required": snapshot["startup"]["restart_required"],
-                "sequence": sequence,
-                "generated_at": snapshot["meta"]["generated_at"],
-                "snapshot_age_sec": 0.0,
-            },
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
         with self._lock:
             if sequence < self._published_sequence:
                 return False
@@ -1569,7 +1489,6 @@ class LocalWebDashboard:
             self._published_at = now
             self._published_snapshot = snapshot
             self._published_json = encoded
-            self._published_health_json = health
             self._last_publish_monotonic = now_monotonic
         return True
 
@@ -2732,9 +2651,8 @@ class LocalWebDashboard:
         return rows
 
     def _contract_snapshot(self, symbol: str) -> dict[str, Any]:
-        supports = self._rpi_capabilities.get(symbol)
         snapshot = {
-            "available": supports is not None,
+            "available": False,
             "status": None,
             "tick_size": None,
             "step_size": None,
@@ -2742,7 +2660,7 @@ class LocalWebDashboard:
             "min_notional": None,
             "price_precision": None,
             "qty_precision": None,
-            "supports_rpi": supports,
+            "supports_rpi": None,
         }
         try:
             from data.ref_data import ref_data_manager
@@ -2768,10 +2686,9 @@ class LocalWebDashboard:
         is_paper = self._config_view["simulated_execution"]
         configured_symbols = set(self._config_view["symbols"])
         eligibility = {}
-        for symbol in sorted(configured_symbols | set(self._rpi_capabilities)):
-            explicit = self._rpi_capabilities.get(symbol)
+        for symbol in sorted(configured_symbols):
             contract = self._contract_snapshot(symbol)
-            supported = explicit if explicit is not None else contract.get("supports_rpi")
+            supported = contract.get("supports_rpi")
             eligibility[symbol] = {
                 "available": supported is not None,
                 "supported": supported,

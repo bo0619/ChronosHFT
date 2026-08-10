@@ -30,21 +30,6 @@ class KillSwitchRuntimeState:
     supervisor_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-class KillSwitchField:
-    """Expose one declared controller field through the compatibility facade."""
-
-    def __init__(self, attribute: str):
-        self.attribute = attribute
-
-    def __get__(self, instance, owner):
-        if instance is None:
-            return self
-        return getattr(instance.kill_switch, self.attribute)
-
-    def __set__(self, instance, value) -> None:
-        setattr(instance.kill_switch, self.attribute, value)
-
-
 class KillSwitchMethod:
     """Bind a RiskManager method name to its kill-switch controller."""
 

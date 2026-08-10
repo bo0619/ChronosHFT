@@ -76,7 +76,6 @@ class RuntimeControlLoop:
         self.resource_monitor = resource_monitor
         self.event_bindings = event_bindings
         self.watchdog_state = watchdog_state
-        self.web_dashboard = web_dashboard
         self.admin_control = admin_control
         self.logger = logger
         self.services = services

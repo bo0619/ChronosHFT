@@ -1,19 +1,9 @@
-import socket
 import time
 
 import requests
-from requests.adapters import HTTPAdapter
 
+from .http_adapter import HFTAdapter
 from .rest_api import BinanceRestApi
-
-
-class TruthPlaneAdapter(HTTPAdapter):
-    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
-        pool_kwargs["socket_options"] = [
-            (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
-            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
-        ]
-        super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
 
 
 class BinanceTruthSnapshotProvider:
@@ -37,7 +27,7 @@ class BinanceTruthSnapshotProvider:
         self._owns_session = session is None
 
         if self._owns_session:
-            adapter = TruthPlaneAdapter(pool_connections=4, pool_maxsize=4)
+            adapter = HFTAdapter(pool_connections=4, pool_maxsize=4)
             self.session.mount("https://", adapter)
             self.session.headers.update({"Content-Type": "application/json"})
 

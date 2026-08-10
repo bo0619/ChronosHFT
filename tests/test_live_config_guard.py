@@ -6,8 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import mock_open, patch
 
+from governance.contracts import CONFIG_MANIFEST_SCHEMA
 from infrastructure.config_scaling import (
-    CONFIG_MANIFEST_SCHEMA,
     load_config_document,
     load_root_config,
     normalize_root_config_preapproval,
@@ -30,8 +30,6 @@ from strategy.model_readiness import strategy_policy_sha256
 def safe_live_config():
     return {
         "execution": {"mode": "live"},
-        "paper_trade": {"enabled": False},
-        "testnet": False,
         "api_key_env": "BINANCE_API_KEY",
         "api_secret_env": "BINANCE_API_SECRET",
         "api_key": "primary-key",
@@ -72,7 +70,6 @@ def safe_live_config():
         "system": {
             "market_data": {
                 "environment": "production",
-                "testnet": False,
             },
             "time_sync": {
                 "startup_required": True,
@@ -954,7 +951,6 @@ class LiveConfigGuardTests(unittest.TestCase):
         config = apply_paper_trade_mode(
             {
                 "execution": {"mode": "paper"},
-                "paper_trade": {"enabled": True},
                 "oms": {
                     "journal_enabled": True,
                     "venue_dead_man_switch": {"enabled": False},
@@ -1008,23 +1004,10 @@ class LiveConfigGuardTests(unittest.TestCase):
 
     def test_mainnet_clock_and_risk_planes_are_mandatory(self):
         cases = (
-            (("testnet",), True, "JSON boolean false"),
-            (("testnet",), 0, "JSON boolean false"),
-            (("testnet",), "false", "JSON boolean false"),
             (
                 ("system", "market_data", "environment"),
                 "testnet",
                 "market_data.environment",
-            ),
-            (
-                ("system", "market_data", "testnet"),
-                True,
-                "JSON boolean false",
-            ),
-            (
-                ("system", "market_data", "testnet"),
-                "false",
-                "JSON boolean false",
             ),
             (("risk", "active"), False, "risk.active"),
             (
@@ -1479,41 +1462,15 @@ class LiveConfigGuardTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, expected):
                     validate_live_runtime_config(config)
 
-    def test_effective_glft_alias_overrides_cannot_bypass_live_limits(self):
-        cases = (
-            ({"max_pos_usdt": 8.01}, "max_pos_usdt"),
-            ({"gamma": 1.01}, "gamma"),
-            ({"cycle_interval": 0.249}, "cycle_interval"),
-            (
-                {"execution": {"min_spread_bps": 0.99}},
-                "min_spread_bps",
-            ),
-            ({"calibrator": {"window": 49}}, "calibrator.window"),
-            (
-                {"calibrator": {"min_samples": 49}},
-                "calibrator.min_samples",
-            ),
-            (
-                {"calibrator": {"initial_sigma_bps": 0}},
-                "initial_sigma_bps",
-            ),
-            (
-                {"calibrator": {"sigma_max_bps": float("inf")}},
-                "sigma_max_bps",
-            ),
-            (
-                {"calibrator": {"max_tick_gap_sec": 0}},
-                "max_tick_gap_sec",
-            ),
-        )
-        for override, expected in cases:
-            with self.subTest(override=override):
+    def test_retired_strategy_composition_fields_are_rejected(self):
+        for field in ("models", "shared"):
+            with self.subTest(field=field):
                 config = safe_live_config()
-                config["strategy"]["models"] = {
-                    "GLFT_MultiScale": override
+                config["strategy"][field] = {
+                    "GLFT_MultiScale": {"max_pos_usdt": 8.01}
                 }
 
-                with self.assertRaisesRegex(ValueError, expected):
+                with self.assertRaisesRegex(ValueError, rf"strategy\.{field}"):
                     validate_live_runtime_config(config)
 
     def test_live_journal_and_fence_cannot_use_paper_state_paths(self):
@@ -1623,11 +1580,11 @@ class LiveConfigGuardTests(unittest.TestCase):
         ), patch(
             "infrastructure.live_config_guard."
             "validate_live_canary_local_evidence"
-        ), patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config(
-                "config.json",
-                allow_unversioned_offline=True,
-            )
+        ), patch(
+            "infrastructure.config_scaling._load_config_document",
+            return_value=(payload, True),
+        ):
+            loaded = load_root_config("config.json")
 
         self.assertEqual(loaded["symbols"], ["BTCUSDT"])
 
@@ -1637,12 +1594,12 @@ class LiveConfigGuardTests(unittest.TestCase):
         ), patch(
             "infrastructure.live_config_guard."
             "validate_live_canary_local_evidence"
-        ), patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+        ), patch(
+            "infrastructure.config_scaling._load_config_document",
+            return_value=(payload, True),
+        ):
             with self.assertRaisesRegex(ValueError, "independent_supervisor.enabled"):
-                load_root_config(
-                    "config.json",
-                    allow_unversioned_offline=True,
-                )
+                load_root_config("config.json")
 
     def test_root_live_loader_rejects_inline_credentials_without_echoing(self):
         payload = safe_live_config()
@@ -1652,12 +1609,12 @@ class LiveConfigGuardTests(unittest.TestCase):
             payload["risk"]["independent_supervisor"]["api_key"],
             payload["risk"]["independent_supervisor"]["api_secret"],
         )
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+        with patch(
+            "infrastructure.config_scaling._load_config_document",
+            return_value=(payload, True),
+        ):
             with self.assertRaisesRegex(ValueError, "must not be stored inline") as caught:
-                load_root_config(
-                    "config.json",
-                    allow_unversioned_offline=True,
-                )
+                load_root_config("config.json")
         for value in secret_values:
             self.assertNotIn(value, str(caught.exception))
 
@@ -1717,25 +1674,24 @@ class LiveConfigGuardTests(unittest.TestCase):
         }
         with patch.dict(os.environ, credential_environment), patch(
             "infrastructure.config_scaling.validate_live_calibration_approval"
-        ), patch("builtins.open", mock_open(read_data=json.dumps(payload))):
+        ), patch(
+            "infrastructure.config_scaling._load_config_document",
+            return_value=(payload, True),
+        ):
             with self.assertRaisesRegex(ValueError, "offline_evidence_path"):
-                load_root_config(
-                    "config.json",
-                    allow_unversioned_offline=True,
-                )
+                load_root_config("config.json")
 
     def test_root_loader_keeps_paper_mode_exempt(self):
         payload = {
             "execution": {"mode": "paper"},
-            "paper_trade": {"enabled": True},
             "symbols": ["BTCUSDT"],
         }
 
-        with patch("builtins.open", mock_open(read_data=json.dumps(payload))):
-            loaded = load_root_config(
-                "config.json",
-                allow_unversioned_offline=True,
-            )
+        with patch(
+            "infrastructure.config_scaling._load_config_document",
+            return_value=(payload, True),
+        ):
+            loaded = load_root_config("config.json")
 
         self.assertEqual(loaded["execution"]["mode"], "paper")
         self.assertFalse(loaded["risk"]["independent_supervisor"]["enabled"])

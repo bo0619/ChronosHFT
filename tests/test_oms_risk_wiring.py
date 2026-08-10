@@ -1,9 +1,11 @@
 import sys
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock
 
-if "requests" not in sys.modules:
+try:
+    __import__("requests")
+except ModuleNotFoundError:
     requests_stub = types.ModuleType("requests")
     requests_stub.get = lambda *args, **kwargs: None
     requests_stub.Session = lambda *args, **kwargs: None
@@ -29,7 +31,27 @@ class DummyGateway:
 
 
 class OrderValidatorTests(unittest.TestCase):
-    def make_validator(self):
+    def make_validator(
+        self,
+        *,
+        bid: float = 99.95,
+        ask: float = 100.05,
+        mark: float = 100.0,
+    ):
+        clock = Mock()
+        clock.monotonic.return_value = 1.0
+        market_cache = Mock()
+        market_cache.get_risk_snapshot.return_value = {
+            "mark_price": mark,
+            "bid_price": bid,
+            "ask_price": ask,
+            "mark_age_ms": 0.0,
+            "book_age_ms": 0.0,
+        }
+        market_cache.get_mark_price.return_value = mark
+        market_cache.get_best_quote.return_value = (bid, ask)
+        reference_data = Mock()
+        reference_data.get_info.return_value = None
         return OrderValidator(
             {
                 "risk": {
@@ -45,14 +67,14 @@ class OrderValidatorTests(unittest.TestCase):
                         "max_order_count_per_sec": 1,
                     },
                 }
-            }
+            },
+            clock=clock,
+            market_cache=market_cache,
+            reference_data=reference_data,
         )
 
-    @patch("oms.validator.ref_data_manager.get_info", return_value=None)
-    @patch("oms.validator.data_cache.get_best_quote", return_value=(99.5, 100.5))
-    @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
-    def test_rejects_order_notional_from_config(self, *_mocks):
-        validator = self.make_validator()
+    def test_rejects_order_notional_from_config(self):
+        validator = self.make_validator(bid=99.5, ask=100.5)
         intent = OrderIntent("test", "BTCUSDT", Side.BUY, 50.0, 3.0)
 
         valid, reason = validator.validate_params(intent)
@@ -60,11 +82,8 @@ class OrderValidatorTests(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIn("notional_exceeded", reason)
 
-    @patch("oms.validator.ref_data_manager.get_info", return_value=None)
-    @patch("oms.validator.data_cache.get_best_quote", return_value=(99.9, 100.1))
-    @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
-    def test_rejects_price_deviation_from_config(self, *_mocks):
-        validator = self.make_validator()
+    def test_rejects_price_deviation_from_config(self):
+        validator = self.make_validator(bid=99.9, ask=100.1)
         intent = OrderIntent("test", "BTCUSDT", Side.BUY, 103.0, 0.5)
 
         valid, reason = validator.validate_params(intent)
@@ -72,11 +91,8 @@ class OrderValidatorTests(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIn("price_deviation", reason)
 
-    @patch("oms.validator.ref_data_manager.get_info", return_value=None)
-    @patch("oms.validator.data_cache.get_best_quote", return_value=(99.0, 101.0))
-    @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
-    def test_rejects_spread_from_config(self, *_mocks):
-        validator = self.make_validator()
+    def test_rejects_spread_from_config(self):
+        validator = self.make_validator(bid=99.0, ask=101.0)
         intent = OrderIntent("test", "BTCUSDT", Side.BUY, 100.0, 0.5)
 
         valid, reason = validator.validate_params(intent)
@@ -84,10 +100,7 @@ class OrderValidatorTests(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIn("spread_too_wide", reason)
 
-    @patch("oms.validator.ref_data_manager.get_info", return_value=None)
-    @patch("oms.validator.data_cache.get_best_quote", return_value=(99.95, 100.05))
-    @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
-    def test_rejects_rate_limit_from_config(self, *_mocks):
+    def test_rejects_rate_limit_from_config(self):
         validator = self.make_validator()
         intent = OrderIntent("test", "BTCUSDT", Side.BUY, 100.0, 0.5)
 
@@ -98,10 +111,7 @@ class OrderValidatorTests(unittest.TestCase):
         self.assertFalse(second_valid)
         self.assertIn("rate_limit", second_reason)
 
-    @patch("oms.validator.ref_data_manager.get_info", return_value=None)
-    @patch("oms.validator.data_cache.get_best_quote", return_value=(99.95, 100.05))
-    @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
-    def test_reduce_only_has_an_independent_rate_limit_channel(self, *_mocks):
+    def test_reduce_only_has_an_independent_rate_limit_channel(self):
         validator = self.make_validator()
         opening = OrderIntent(
             "test",

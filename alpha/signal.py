@@ -85,7 +85,6 @@ class MultiHorizonPredictor:
         
         # 历史缓冲区: (timestamp, mid_price, features_vector)
         self.history_buffer = deque(maxlen=100) 
-        self.observation_count = 0
 
     @property
     def sample_count(self):
@@ -104,7 +103,6 @@ class MultiHorizonPredictor:
             return results
         
         # 1. 存入当前快照
-        self.observation_count += 1
         self.history_buffer.append({
             "ts": timestamp,
             "price": current_mid,

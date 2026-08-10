@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from infrastructure.runtime_application import RuntimeApplication
+from infrastructure.runtime_resources import RuntimeResources
 
 
 class _StageApplication(RuntimeApplication):
@@ -46,7 +47,7 @@ def _services(args):
 
 def test_run_exposes_ordered_independently_overridable_startup_phases():
     args = SimpleNamespace(admin_command=None)
-    app = _StageApplication({}, _services(args))
+    app = _StageApplication(RuntimeResources(), _services(args))
 
     assert app.run(["--unused"]) == 17
     assert app.calls == [
@@ -69,7 +70,7 @@ def test_configuration_short_circuit_constructs_no_runtime_components():
             self.calls.append("configuration")
             return 0
 
-    app = ConfigOnlyApplication({}, _services(args))
+    app = ConfigOnlyApplication(RuntimeResources(), _services(args))
 
     assert app.run(["--check-config"]) == 0
     assert app.calls == ["configuration"]
@@ -83,18 +84,16 @@ def test_admin_command_bypasses_configuration_and_assembly():
             self.calls.append("admin")
             return 0
 
-    app = AdminApplication({}, _services(args))
+    app = AdminApplication(RuntimeResources(), _services(args))
 
     assert app.run(["--admin-command", "status"]) == 0
     assert app.calls == ["admin"]
 
 
 def test_owned_resources_remain_visible_to_partial_startup_cleanup():
-    backing = {}
-    app = RuntimeApplication(backing, SimpleNamespace())
+    app = RuntimeApplication(RuntimeResources(), SimpleNamespace())
     gateway = object()
 
     assert app._own("gateway", gateway) is gateway
     assert app.gateway is gateway
     assert app.resources.gateway is gateway
-    assert backing["gateway"] is gateway

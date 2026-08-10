@@ -21,6 +21,15 @@ class _Rest:
     def get_positions(self):
         return _Response(self.positions.pop(0))
 
+    @staticmethod
+    def get_open_orders():
+        return _Response([])
+
+
+class _TruthReader(BinanceSidecarTruthReader):
+    def get_daily_external_cash_flow(self):
+        return self._owner.cash_flow_result
+
 
 class _Owner:
     def __init__(self, positions):
@@ -39,37 +48,11 @@ class _Owner:
         self.cash_flow_result = (True, 0.0, "")
         self._monotonic = lambda: 100.0
         self._wall_time = lambda: 1_700_000_000.0
-        self.reader = BinanceSidecarTruthReader(self)
+        self.reader = _TruthReader(self)
 
     @staticmethod
     def _ensure_exchange_clock(force=False):
         return True, ""
-
-    @staticmethod
-    def _response_payload(response, expected_type, label):
-        return BinanceSidecarTruthReader.response_payload(
-            response,
-            expected_type,
-            label,
-        )
-
-    @staticmethod
-    def _position_risk_fingerprint(positions):
-        return BinanceSidecarTruthReader.position_risk_fingerprint(
-            positions
-        )
-
-    @staticmethod
-    def _get_open_orders_snapshot():
-        return True, [], ""
-
-    @staticmethod
-    def _get_funding_observations():
-        return True, {}, ""
-
-    def _get_daily_external_cash_flow(self):
-        return self.cash_flow_result
-
 
 def test_position_fingerprint_normalizes_equivalent_numeric_strings():
     first = [{"symbol": "BTCUSDT", "positionAmt": "1.00"}]
@@ -99,9 +82,9 @@ def test_failed_cash_flow_refresh_does_not_replace_last_good_cache():
     owner = _Owner(positions)
     owner.cash_flow_result = (False, 0.0, "income_history_status=503")
 
-    result = owner.reader.get_cached_daily_external_cash_flow()
+    result = owner.reader.get_cached_external_cash_flow_truth()
 
-    assert result == (False, 0.0, "income_history_status=503")
+    assert result == (False, None, "income_history_status=503")
     assert owner._cached_external_cash_flow_total == 7.0
     assert owner._last_cash_flow_poll_monotonic == 0.0
     assert not owner._cash_flow_cache_initialized

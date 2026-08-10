@@ -8,8 +8,8 @@ from gateway.binance.constants import EP_ACCOUNT
 from gateway.binance.constants import EP_ALL_ORDERS
 from gateway.binance.constants import EP_ORDER
 from gateway.binance.constants import EP_USER_TRADES
-from gateway.binance.rate_limit_budget import BinanceRateLimitBudget
-from gateway.binance.rate_limit_budget import RateLimitDecision
+from infrastructure.binance_rate_limit_budget import BinanceRateLimitBudget
+from infrastructure.binance_rate_limit_budget import RateLimitDecision
 from gateway.binance.rest_api import BinanceRestApi
 
 

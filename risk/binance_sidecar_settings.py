@@ -183,36 +183,18 @@ class BinanceSidecarExchangeConfiguration:
                 "clock_max_initial_offset_ms",
             ),
         )
-        reduce_only_phase_setting = settings.get(
-            "clock_reduce_only_phase_error_ms"
-        )
-        reduce_only_phase_key = "clock_reduce_only_phase_error_ms"
-        if reduce_only_phase_setting is None:
-            reduce_only_phase_setting = settings.get(
-                "clock_reduce_only_offset_ms",
-                25.0,
-            )
-            reduce_only_phase_key = "clock_reduce_only_offset_ms"
         clock_reduce_only_phase_error_ms = max(
             0.0,
             finite_float(
-                reduce_only_phase_setting or 0.0,
-                reduce_only_phase_key,
+                settings.get("clock_reduce_only_phase_error_ms", 25.0) or 0.0,
+                "clock_reduce_only_phase_error_ms",
             ),
         )
-        kill_phase_setting = settings.get("clock_kill_phase_error_ms")
-        kill_phase_key = "clock_kill_phase_error_ms"
-        if kill_phase_setting is None:
-            kill_phase_setting = settings.get(
-                "clock_kill_offset_ms",
-                100.0,
-            )
-            kill_phase_key = "clock_kill_offset_ms"
         clock_kill_phase_error_ms = max(
             clock_reduce_only_phase_error_ms,
             finite_float(
-                kill_phase_setting or 0.0,
-                kill_phase_key,
+                settings.get("clock_kill_phase_error_ms", 100.0) or 0.0,
+                "clock_kill_phase_error_ms",
             ),
         )
         return cls(

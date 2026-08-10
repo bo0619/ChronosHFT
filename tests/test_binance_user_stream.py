@@ -74,7 +74,6 @@ def test_start_owns_lease_generation_and_worker_lifecycle():
     ws = FakeWebSocket()
 
     assert controller.start(ws, ["BTCUSDT"], transport_generation=3)
-    assert controller.listen_key == "lease-1"
     assert controller.generation == 1
     assert ws.market_symbols == ["BTCUSDT"]
     assert ws.listen_key == "lease-1"

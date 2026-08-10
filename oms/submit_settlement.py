@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import time
-
 from event.type import (
     EVENT_ORDER_SUBMITTED,
     CommandOutcome,
@@ -17,7 +15,6 @@ from event.type import (
     OrderSubmitted,
 )
 from infrastructure.logger import logger
-from infrastructure.time_service import time_service
 
 from .component import OMSComponent
 from .journal import JournalError
@@ -43,7 +40,6 @@ class OMSSubmitSettlement(OMSComponent):
             "_get_self_trade_prevention_rejection_locked",
             "_get_venue_dead_man_switch_rejection_locked",
             "_latch_journal_failure",
-            "_lifecycle_generation",
             "_observe_rpi_calibration_loss_locked",
             "_on_order_truth_check",
             "_outbound_all_order_seal_reason",
@@ -77,26 +73,24 @@ class OMSSubmitSettlement(OMSComponent):
             "account",
             "cancel_order",
             "capability_mode",
+            "clock",
             "degraded_aggressive_to_passive",
             "event_engine",
             "exchange_id_map",
             "exposure",
             "freeze_symbol",
             "gateway",
-            "last_freeze_reason",
+            "lifecycle_store",
             "lock",
             "order_monitor",
             "order_store",
             "orders",
-            "state",
             "symbol_guard_epoch_counters",
             "symbol_guards",
             "trigger_reconcile",
         }
     )
-    OWNER_WRITES = frozenset(
-        {"_lifecycle_generation", "last_freeze_reason", "state"}
-    )
+    OWNER_WRITES = frozenset()
 
     def _normalize_submit_command(self, raw_result) -> GatewayCommandResult:
         if isinstance(raw_result, GatewayCommandResult):
@@ -207,7 +201,7 @@ class OMSSubmitSettlement(OMSComponent):
                 "permit_inactive_at_dispatch",
             )
 
-        now_ns = time_service.now_ns()
+        now_ns = self.clock.now_ns()
         if now_ns < self._rpi_calibration["not_before_ns"]:
             return (
                 "rpi_calibration_permit_not_yet_valid_at_dispatch",
@@ -668,9 +662,9 @@ class OMSSubmitSettlement(OMSComponent):
                     OrderSubmitted(
                         request,
                         order.client_oid,
-                        time.time(),
+                        self.clock.wall_time(),
                         submitted_status,
-                        monotonic_timestamp=time.perf_counter(),
+                        monotonic_timestamp=self.clock.monotonic(),
                     ),
                 )
             )
@@ -780,16 +774,18 @@ class OMSSubmitSettlement(OMSComponent):
                     f"submit_settlement_failed:{context}",
                     hold="submit_exception_settlement_failure",
                 )
-                if self.state not in {
+                lifecycle = self.lifecycle_store.snapshot()
+                if lifecycle.state not in {
                     LifecycleState.HALTED,
                     LifecycleState.RECONCILING,
                 }:
-                    self.state = LifecycleState.FROZEN
-                    self._lifecycle_generation += 1
-                    self.last_freeze_reason = (
-                        f"submit_settlement_failed:{context}"
+                    freeze_reason = f"submit_settlement_failed:{context}"
+                    self.lifecycle_store.transition(
+                        LifecycleState.FROZEN,
+                        increment_generation=True,
+                        last_freeze_reason=freeze_reason,
                     )
-                    self._sync_capability_mode(self.last_freeze_reason)
+                    self._sync_capability_mode(freeze_reason)
         except BaseException as fence_exc:
             logger.critical(
                 "[OMS] Could not install submit settlement fallback fence "

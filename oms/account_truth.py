@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import math
-import time
 from datetime import datetime, timezone
 
 from event.type import (
@@ -20,7 +19,6 @@ from event.type import (
     TIF_RPI,
 )
 from infrastructure.logger import logger
-from infrastructure.time_service import time_service
 
 from .component import OMSComponent
 from .execution_identity import discard_cursor_covered_execution_ids
@@ -41,6 +39,7 @@ class OMSAccountTruth(OMSComponent):
             "_normalize_remote_open_orders",
             "_order_truth_resolution_inflight",
             "_record_order_snapshot",
+            "_reindex_order_locked",
             "_schedule_rpi_calibration_runtime_enforcement",
             "_shutdown_requested",
             "_stopped",
@@ -51,6 +50,7 @@ class OMSAccountTruth(OMSComponent):
             "audit_logger",
             "cancel_order",
             "clear_symbol_freeze",
+            "clock",
             "config",
             "exchange_id_map",
             "execution_ids",
@@ -277,7 +277,7 @@ class OMSAccountTruth(OMSComponent):
                 with self.lock:
                     order = self.orders.get(client_oid)
                     elapsed = (
-                        time.perf_counter() - order.updated_monotonic
+                        self.clock.monotonic() - order.updated_monotonic
                         if order
                         else 0.0
                     )
@@ -327,7 +327,7 @@ class OMSAccountTruth(OMSComponent):
             self._unknown_not_found_counts.pop(client_oid, None)
             if not self._backfill_trade_history(
                 symbols={symbol},
-                end_time_ms=time_service.now(),
+                end_time_ms=self.clock.now_ms(),
             ):
                 self.trigger_reconcile(
                     "Exact trade history unavailable during order truth query",
@@ -503,7 +503,7 @@ class OMSAccountTruth(OMSComponent):
             update_time_ms = self._finite_truth_float(
                 remote.get("updateTime")
                 or remote.get("time")
-                or time_service.now(),
+                or self.clock.now_ms(),
                 "remote_order.updateTime",
                 minimum=0.0,
             )
@@ -632,8 +632,8 @@ class OMSAccountTruth(OMSComponent):
                 minimum=0.0,
             )
             trade_time_ms = self._finite_truth_float(
-                trade.get("time", time_service.now())
-                or time_service.now(),
+                trade.get("time", self.clock.now_ms())
+                or self.clock.now_ms(),
                 "trade.time",
                 minimum=0.0,
             )
@@ -731,7 +731,7 @@ class OMSAccountTruth(OMSComponent):
                         update_time=max(original_terminal_time, update.update_time),
                     )
                 self.order_monitor.on_order_update(order.client_oid, order.status)
-                self.order_store.reindex(order)
+                self._reindex_order_locked(order)
                 self.exposure.update_open_orders(self.orders)
                 self.account.calculate()
                 self._record_order_snapshot(order, "terminal_restored_after_trade_backfill")
@@ -746,7 +746,7 @@ class OMSAccountTruth(OMSComponent):
         if not callable(query):
             return True
         symbols = set(symbols or self.config.get("symbols", []))
-        end_time_ms = int(end_time_ms or time_service.now())
+        end_time_ms = int(end_time_ms or self.clock.now_ms())
         limit = 1000
 
         for symbol in sorted(symbols):
@@ -867,7 +867,7 @@ class OMSAccountTruth(OMSComponent):
                         return
                     last_ok = self._backfill_trade_history(
                         symbols={symbol},
-                        end_time_ms=time_service.now(),
+                        end_time_ms=self.clock.now_ms(),
                     )
                     with self.lock:
                         expected = set(
@@ -899,7 +899,9 @@ class OMSAccountTruth(OMSComponent):
                         if not pending:
                             return
                     if attempt < self.trade_tail_verification_attempts:
-                        time.sleep(self.trade_tail_verification_retry_sec)
+                        self.clock.sleep(
+                            self.trade_tail_verification_retry_sec
+                        )
 
                 self._audit(
                     "trade_tail_verification_failed",
@@ -980,9 +982,9 @@ class OMSAccountTruth(OMSComponent):
         return True
 
     @staticmethod
-    def _utc_day_start_ms(now_ms: int = None) -> int:
+    def _utc_day_start_ms(now_ms: int) -> int:
         now = datetime.fromtimestamp(
-            float(now_ms or time_service.now()) / 1000.0,
+            float(now_ms) / 1000.0,
             tz=timezone.utc,
         )
         return int(
@@ -1077,7 +1079,7 @@ class OMSAccountTruth(OMSComponent):
             self.mark_external_cash_flow_truth_unavailable("income_query_unavailable")
             return False
 
-        end_time_ms = int(end_time_ms or time_service.now())
+        end_time_ms = int(end_time_ms or self.clock.now_ms())
         day_start_ms = self._utc_day_start_ms(end_time_ms)
         if self.external_cash_flow_scan_end_ms:
             start_time_ms = max(
@@ -1136,8 +1138,8 @@ class OMSAccountTruth(OMSComponent):
                 self.external_cash_flow_scan_end_ms = end_time_ms
                 self.account.sync_external_cash_flow_truth(
                     self.account.external_cash_flow_total,
-                    snapshot_time=time.time(),
-                    snapshot_monotonic=time.perf_counter(),
+                    snapshot_time=self.clock.wall_time(),
+                    snapshot_monotonic=self.clock.monotonic(),
                 )
             self._audit(
                 "external_cash_flow_truth_synced",
@@ -1158,7 +1160,7 @@ class OMSAccountTruth(OMSComponent):
     def poll_external_cash_flow_truth(self, query=None, now: float = None) -> bool:
         if not self.external_cash_flow_truth_enabled:
             return True
-        now = time.perf_counter() if now is None else float(now)
+        now = self.clock.monotonic() if now is None else float(now)
         if (
             now - self.last_external_cash_flow_poll_at
             < self.external_cash_flow_poll_interval_sec
@@ -1167,7 +1169,7 @@ class OMSAccountTruth(OMSComponent):
         self.last_external_cash_flow_poll_at = now
         return self.backfill_external_cash_flow_history(
             query=query,
-            end_time_ms=int(time.time() * 1000),
+            end_time_ms=self.clock.now_ms(),
             source="live_loop_income_history",
         )
 

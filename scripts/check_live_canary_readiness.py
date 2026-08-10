@@ -737,23 +737,17 @@ def assess_live_canary_readiness(
     checks.append(_credential_reference_check(raw_config))
 
     execution = raw_config.get("execution", {})
-    paper_trade = raw_config.get("paper_trade", {})
     mode = (
         str(execution.get("mode", "") or "").strip().lower()
         if isinstance(execution, Mapping)
         else ""
     )
-    paper_enabled = (
-        paper_trade.get("enabled") is True
-        if isinstance(paper_trade, Mapping)
-        else paper_trade is True
-    )
-    if mode == "live" and not paper_enabled:
+    if mode == "live":
         checks.append(
             _check(
                 "execution.explicit_live_canary",
                 PASS,
-                "execution.mode is explicitly live and paper mode is disabled",
+                "execution.mode is explicitly live",
             )
         )
     else:
@@ -761,7 +755,7 @@ def assess_live_canary_readiness(
             _check(
                 "execution.explicit_live_canary",
                 BLOCKED,
-                "requires execution.mode='live' and paper_trade.enabled=false",
+                "requires execution.mode='live'",
             )
         )
 

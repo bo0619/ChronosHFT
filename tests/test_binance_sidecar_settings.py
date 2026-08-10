@@ -92,8 +92,8 @@ def test_exchange_configuration_normalizes_symbols_sets_and_thresholds():
             "clock_max_offset_dispersion_ms": -1.0,
             "clock_max_wall_step_ms": -1.0,
             "clock_max_initial_offset_ms": -1.0,
-            "clock_reduce_only_offset_ms": 40.0,
-            "clock_kill_offset_ms": 20.0,
+            "clock_reduce_only_phase_error_ms": 40.0,
+            "clock_kill_phase_error_ms": 20.0,
         }
     )
     owner = SimpleNamespace()
@@ -125,22 +125,6 @@ def test_exchange_configuration_normalizes_symbols_sets_and_thresholds():
     assert owner.clock_max_initial_offset_ms == 0.0
     assert owner.clock_reduce_only_phase_error_ms == 40.0
     assert owner.clock_kill_phase_error_ms == 40.0
-
-
-def test_explicit_phase_keys_override_legacy_offset_aliases():
-    configuration = _configuration(
-        {
-            "clock_reduce_only_phase_error_ms": 30.0,
-            "clock_reduce_only_offset_ms": 99.0,
-            "clock_kill_phase_error_ms": 80.0,
-            "clock_kill_offset_ms": 100.0,
-        }
-    )
-
-    assert configuration.clock_reduce_only_phase_error_ms == 30.0
-    assert configuration.clock_kill_phase_error_ms == 80.0
-
-
 def test_rate_limit_coordination_and_finite_values_fail_closed():
     with pytest.raises(ValueError, match="rate-limit coordination"):
         BinanceSidecarExchangeConfiguration.validated_rate_limit_settings(

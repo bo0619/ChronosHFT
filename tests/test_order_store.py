@@ -1,4 +1,7 @@
+from collections import deque
+
 from event.type import OrderIntent, OrderStatus, Side
+from oms.engine import OMS
 from oms.order import Order
 from oms.order_store import OrderStore
 
@@ -60,10 +63,34 @@ def test_order_store_reindexes_terminal_orders_and_bounds_retention():
 
     assert "first" not in store.view()
     assert store.view()["second"] is second
-    snapshot = store.snapshot()
-    assert snapshot.active_count == 0
-    assert snapshot.terminal_count == 1
-    assert snapshot.terminal[0].status == OrderStatus.CANCELLED
+    assert not store.active_view()
+    assert len(store.view()) == 1
+    assert store.view()["second"].status == OrderStatus.CANCELLED
+
+
+def test_facade_reindex_retires_evicted_exchange_identity():
+    oms = object.__new__(OMS)
+    oms.order_store = OrderStore(terminal_limit=1)
+    oms.exchange_id_map = {}
+    oms.terminated_oids = set()
+    oms.terminated_oid_queue = deque()
+    oms.TOMBSTONE_MAX = 10
+    first = _order("first")
+    second = _order("second")
+    oms.order_store.add(first)
+    oms.order_store.add(second)
+    oms.exchange_id_map[first.exchange_oid] = first
+    oms.exchange_id_map[second.exchange_oid] = second
+
+    first.mark_cancelled()
+    oms._reindex_order_locked(first)
+    second.mark_cancelled()
+    oms._reindex_order_locked(second)
+
+    assert first.client_oid not in oms.orders
+    assert first.exchange_oid not in oms.exchange_id_map
+    assert first.client_oid in oms.terminated_oids
+    assert first.exchange_oid in oms.terminated_oids
 
 
 def test_order_store_replace_active_is_atomic_and_rejects_terminal_payload():

@@ -26,6 +26,7 @@ from oms.journal import (
     decode_legacy_journal,
 )
 from oms.order import Order
+from oms.shutdown_coordinator import OMSShutdownCoordinator
 from oms.order_submission import OMSOrderSubmission
 from oms.submission_transaction import (
     SubmissionAdmissionPolicy,
@@ -570,7 +571,7 @@ class DurableCommandRecoveryTests(unittest.TestCase):
             crashed.order_store.add(order)
             crashed.journal.append("order_snapshot", order.to_record())
             crashed.journal.commit_checkpoint(
-                crashed.lifecycle_controller._shutdown_checkpoint_summary()
+                OMSShutdownCoordinator(crashed).checkpoint_summary()
             )
             crashed.order_monitor.stop()
 
@@ -600,7 +601,7 @@ class DurableCommandRecoveryTests(unittest.TestCase):
                 cancel_active_orders=False,
             )
             summary = (
-                crashed.lifecycle_controller._shutdown_checkpoint_summary()
+                OMSShutdownCoordinator(crashed).checkpoint_summary()
             )
 
             self.assertEqual(

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from governance.contracts import market_data_environment
 from governance.state_paths import (
     validate_live_state_path_bindings as _validate_live_state_path_bindings,
 )
@@ -29,7 +30,6 @@ RPI_CALIBRATION_CANARY_STAGE = "rpi_calibration_canary"
 LIVE_CANARY_STAGES = frozenset(
     {CANARY_STAGE, RPI_CALIBRATION_CANARY_STAGE}
 )
-MAINNET_ENVIRONMENTS = frozenset({"mainnet", "production"})
 MAX_CANARY_DEPLOYED_EQUITY_FRACTION = 0.02
 MAX_CANARY_DEPLOYMENT_LOSS_FRACTION = 0.05
 MAX_CANARY_ORDER_FRACTION = 0.12
@@ -2354,20 +2354,10 @@ def validate_live_runtime_config(
     execution_mode = str(execution.get("mode", "") or "").strip().lower()
     if execution_mode != "live":
         violations.append("execution.mode must be explicitly set to 'live'")
-    if config.get("testnet") is not False:
+    market_environment = market_data_environment(config)
+    if market_environment != "production":
         violations.append(
-            "testnet must be the JSON boolean false for a live mainnet runtime"
-        )
-    market_environment = str(
-        market_data.get("environment", "") or ""
-    ).strip().lower()
-    if market_environment not in MAINNET_ENVIRONMENTS:
-        violations.append(
-            "system.market_data.environment must be 'production' or 'mainnet'"
-        )
-    if market_data.get("testnet") is not False:
-        violations.append(
-            "system.market_data.testnet must be the JSON boolean false"
+            "system.market_data.environment must be 'production'"
         )
     risk_latency_ms = _positive_finite_value(
         tech_health.get("max_latency_ms")

@@ -4,13 +4,10 @@ from __future__ import annotations
 
 import math
 import threading
-import time
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 
-from data.cache import data_cache
 from infrastructure.logger import logger
-from infrastructure.time_service import time_service
 
 from event.type import (
     ExecutionPolicy,
@@ -80,12 +77,14 @@ class RpiCalibrationRuntime(OMSComponent):
             "account",
             "audit_logger",
             "cancel_order",
+            "clock",
             "emergency_reduce_only_flatten",
             "exposure",
             "external_cash_flow_max_age_sec",
             "external_cash_flow_truth_enabled",
             "get_outbound_gate_snapshot",
             "lock",
+            "market_cache",
             "orders",
             "query_open_orders",
             "query_positions",
@@ -332,7 +331,7 @@ class RpiCalibrationRuntime(OMSComponent):
             return "external_cash_flow_truth_timestamp_missing", 0, 0
         cash_flow_age_sec = max(
             0.0,
-            time.perf_counter() - snapshot_monotonic,
+            self.clock.monotonic() - snapshot_monotonic,
         )
         if (
             self.external_cash_flow_max_age_sec > 0.0
@@ -350,7 +349,7 @@ class RpiCalibrationRuntime(OMSComponent):
                 "RPI calibration external cash flow",
             )
             unrealized_pnl = Decimal("0")
-            now_monotonic = time.perf_counter()
+            now_monotonic = self.clock.monotonic()
             for symbol, raw_position in self.exposure.net_positions.items():
                 position = self._finite_decimal(
                     raw_position,
@@ -362,7 +361,7 @@ class RpiCalibrationRuntime(OMSComponent):
                     self.exposure.avg_prices.get(symbol, 0.0),
                     f"RPI calibration average price {symbol}",
                 )
-                market = data_cache.get_risk_snapshot(
+                market = self.market_cache.get_risk_snapshot(
                     symbol,
                     now=now_monotonic,
                 )
@@ -572,7 +571,7 @@ class RpiCalibrationRuntime(OMSComponent):
         )
         if self._rpi_calibration_expired:
             return False
-        now_ns = time_service.now_ns()
+        now_ns = self.clock.now_ns()
         committed_seq = self.audit_logger.audit(
             "rpi_calibration_permit_expired",
             {
@@ -817,7 +816,7 @@ class RpiCalibrationRuntime(OMSComponent):
         if active_count >= self._rpi_calibration["max_active_orders"]:
             return "rpi_calibration_active_order_exists", ""
 
-        now_ns = time_service.now_ns()
+        now_ns = self.clock.now_ns()
         if now_ns < self._rpi_calibration["not_before_ns"]:
             return "rpi_calibration_permit_not_yet_valid", ""
         if now_ns >= self._rpi_calibration["expires_at_ns"]:
@@ -987,7 +986,7 @@ class RpiCalibrationRuntime(OMSComponent):
                 "permit_id": self._rpi_calibration["permit_id"],
                 "permit_sha256": self._rpi_calibration["permit_sha256"],
                 "deployment_id": self._rpi_calibration["deployment_id"],
-                "recorded_at_exchange_ns": time_service.now_ns(),
+                "recorded_at_exchange_ns": self.clock.now_ns(),
                 "symbol": request.symbol,
                 "side": request.side,
                 "price": self._decimal_text(price),
@@ -1123,7 +1122,7 @@ class RpiCalibrationRuntime(OMSComponent):
         try:
             trade_backfill_ok = self._backfill_trade_history(
                 symbols={symbol},
-                end_time_ms=time_service.now(),
+                end_time_ms=self.clock.now_ms(),
             )
         except Exception as exc:
             trade_backfill_ok = False
@@ -1323,7 +1322,7 @@ class RpiCalibrationRuntime(OMSComponent):
                 loss_terminal_reason
             )
 
-        now_ns = time_service.now_ns()
+        now_ns = self.clock.now_ns()
         if now_ns >= self._rpi_calibration["expires_at_ns"]:
             self.expire_rpi_calibration_permit("permit_expired")
 
@@ -1459,7 +1458,7 @@ class RpiCalibrationRuntime(OMSComponent):
                                 f"{type(fail_closed_exc).__name__}:"
                                 f"{fail_closed_exc}"
                             )
-                    time.sleep(retry_delay)
+                    self.clock.sleep(retry_delay)
                     retry_delay = min(5.0, retry_delay * 2.0)
             finally:
                 reschedule_terminal_convergence = False

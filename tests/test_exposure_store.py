@@ -3,8 +3,22 @@ import json
 import pytest
 
 from event.type import OrderIntent, OrderStatus, Side
-from oms.exposure import ExposureManager, ExposureStore
+from oms.exposure import ExposureStore
 from oms.order import Order
+
+
+class _MarketCache:
+    @staticmethod
+    def get_mark_price(_symbol: str) -> float:
+        return 0.0
+
+    @staticmethod
+    def get_best_quote(_symbol: str) -> tuple[float, float]:
+        return 0.0, 0.0
+
+
+def _store() -> ExposureStore:
+    return ExposureStore(market_cache=_MarketCache())
 
 
 def _active_order(
@@ -32,7 +46,7 @@ def _active_order(
 
 
 def test_exposure_store_replaces_strategy_ledgers_atomically():
-    store = ExposureStore()
+    store = _store()
     store.on_strategy_fill("alpha", "BTCUSDT", Side.BUY, 1.0, 100.0)
     before = store.snapshot()
 
@@ -76,7 +90,7 @@ def test_exposure_store_replaces_strategy_ledgers_atomically():
 
 
 def test_exposure_snapshot_is_detached_and_immutable():
-    store = ExposureStore()
+    store = _store()
     store.force_sync("BTCUSDT", 1.0, 100.0)
     snapshot = store.snapshot()
 
@@ -88,7 +102,7 @@ def test_exposure_snapshot_is_detached_and_immutable():
 
 
 def test_account_reset_owns_every_order_reservation_ledger():
-    store = ExposureStore()
+    store = _store()
     store.force_sync("BTCUSDT", 1.0, 100.0)
     store.update_open_orders(
         {
@@ -123,7 +137,7 @@ def test_account_reset_owns_every_order_reservation_ledger():
 
 
 def test_strategy_checkpoint_rows_are_deterministic_and_json_safe():
-    store = ExposureStore()
+    store = _store()
     store.restore_strategy_ledgers(
         {
             ("beta", "ETHUSDT"): -2.0,
@@ -139,11 +153,10 @@ def test_strategy_checkpoint_rows_are_deterministic_and_json_safe():
 
     assert [row["strategy_id"] for row in rows] == ["alpha", "beta"]
     assert json.loads(json.dumps(rows))[0]["symbol"] == "BTCUSDT"
-    assert ExposureManager is ExposureStore
 
 
 def test_exposure_ledger_views_reject_external_writes():
-    store = ExposureStore()
+    store = _store()
     ledgers = (
         "net_positions",
         "avg_prices",

@@ -22,8 +22,6 @@ except ModuleNotFoundError:
 
 from event.type import (
     AccountData,
-    AlertData,
-    ApiLimitData,
     ExchangeOrderUpdate,
     LifecycleState,
     OrderBook,
@@ -66,6 +64,11 @@ class StrategyTestClock:
     """Explicit deterministic ClockPort adapter for direct strategy tests."""
 
     def __init__(self, monotonic_values=None):
+        self.health = {
+            "ready": True,
+            "state": "synchronized",
+            "reason": "",
+        }
         self.set_monotonic(monotonic_values)
 
     def set_monotonic(self, values=None):
@@ -90,9 +93,64 @@ class StrategyTestClock:
     def now_seconds():
         return time.time()
 
+    def now_ms(self):
+        return int(self.now_seconds() * 1_000)
+
+    def now_ns(self):
+        return int(self.now_seconds() * 1_000_000_000)
+
+    def health_snapshot(self):
+        return dict(self.health)
+
     @staticmethod
     def sleep(seconds):
         time.sleep(seconds)
+
+
+class StrategyTestMarketCache:
+    def __init__(self, *, bid=99.9, ask=100.1, mark=100.0):
+        self.bid = float(bid)
+        self.ask = float(ask)
+        self.mark = float(mark)
+
+    def get_best_quote(self, _symbol):
+        return self.bid, self.ask
+
+    def get_mark_price(self, _symbol):
+        return self.mark
+
+    def get_last_trade_price(self, _symbol):
+        return self.mark
+
+    def get_risk_snapshot(self, _symbol, *, now=None):
+        return {
+            "mark_price": self.mark,
+            "bid_price": self.bid,
+            "ask_price": self.ask,
+            "mark_age_ms": 0.0,
+            "book_age_ms": 0.0,
+        }
+
+
+class StrategyTestReferenceData:
+    @staticmethod
+    def get_info(_symbol):
+        return None
+
+    @staticmethod
+    def round_qty(_symbol, quantity):
+        return float(quantity)
+
+
+def create_test_oms(engine, gateway, config, *, clock=None):
+    return OMS(
+        engine,
+        gateway,
+        config,
+        clock=clock or StrategyTestClock(),
+        market_cache=StrategyTestMarketCache(),
+        reference_data=StrategyTestReferenceData(),
+    )
 
 
 class GLFTStrategy(ProductionGLFTStrategy):
@@ -181,16 +239,19 @@ class DummyGateway:
 class DummyStrategy(StrategyTemplate):
     def __init__(self, *args, reference_data=ref_data_manager, **kwargs):
         super().__init__(*args, reference_data=reference_data, **kwargs)
+        self.submit_rejections = []
 
     def on_orderbook(self, orderbook):
         return None
+
+    def on_submit_rejected(self, intent, reason, client_oid=""):
+        self.submit_rejections.append((intent.symbol, reason, client_oid))
 
 
 class PassiveQuoteOMS:
     def __init__(self):
         self.config = {
             "execution": {"mode": "paper"},
-            "paper_trade": {"enabled": True},
             "backtest": {
                 "maker_fee": 0.0002,
                 "rpi_commission_rate": 0.0001,
@@ -310,8 +371,7 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
             clock=clock,
             strategy_config={
                 "cycle_interval": 1.0,
-                "lot_multiplier": 1.0,
-                "as_parameters": {
+                "avellaneda_stoikov": {
                     "gamma": 0.05,
                     "k": 1.5,
                     "vol_window": 5,
@@ -1062,17 +1122,17 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
                         0.08,
                     )
 
-    def test_market_maker_sizing_keeps_legacy_lot_multiplier_fallback(self):
+    def test_market_maker_sizing_uses_exchange_minimum_notional_fallback(self):
         strategies = (
             GLFTStrategy(
                 DispatchingEngine(),
                 PassiveQuoteOMS(),
-                strategy_config={"lot_multiplier": 1.0},
+                strategy_config={},
             ),
             AvellanedaStoikovStrategy(
                 DispatchingEngine(),
                 PassiveQuoteOMS(),
-                strategy_config={"lot_multiplier": 1.0},
+                strategy_config={},
             ),
         )
 
@@ -1220,47 +1280,42 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
                 }
             )
 
-    @patch("oms.validator.ref_data_manager.get_info", return_value=None)
-    @patch("oms.validator.data_cache.get_best_quote", return_value=(99.9, 100.1))
-    @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
-    def test_clock_health_gate_fails_closed_but_allows_reduce_only(self, *_mocks):
+    def test_clock_health_gate_fails_closed_but_allows_reduce_only(self):
         config = self.make_config()
         config["system"] = {
             "time_sync": {"require_healthy_for_trading": True}
         }
         engine = DispatchingEngine()
         gateway = DummyGateway()
-        oms = OMS(engine, gateway, config)
+        clock = StrategyTestClock()
+        clock.health = {
+            "ready": False,
+            "state": "halt",
+            "reason": "exchange clock is stale",
+        }
+        oms = create_test_oms(engine, gateway, config, clock=clock)
         oms.state = LifecycleState.LIVE
         try:
-            with patch(
-                "oms.order_policy.time_service.health_snapshot",
-                return_value={
-                    "ready": False,
-                    "state": "halt",
-                    "reason": "exchange clock is stale",
-                },
-            ):
-                rejected = oms.submit_order(
-                    OrderIntent("clocked", "BTCUSDT", Side.BUY, 100.0, 0.1)
-                )
-                self.assertFalse(rejected.accepted)
-                self.assertIn("clock_health:halt", rejected.reason)
-                self.assertEqual(gateway.sent_requests, [])
+            rejected = oms.submit_order(
+                OrderIntent("clocked", "BTCUSDT", Side.BUY, 100.0, 0.1)
+            )
+            self.assertFalse(rejected.accepted)
+            self.assertIn("clock_health:halt", rejected.reason)
+            self.assertEqual(gateway.sent_requests, [])
 
-                oms.exposure.force_sync("BTCUSDT", 0.1, 100.0)
-                reduce_result = oms.submit_order(
-                    OrderIntent(
-                        "clocked",
-                        "BTCUSDT",
-                        Side.SELL,
-                        100.0,
-                        0.1,
-                        reduce_only=True,
-                    )
+            oms.exposure.force_sync("BTCUSDT", 0.1, 100.0)
+            reduce_result = oms.submit_order(
+                OrderIntent(
+                    "clocked",
+                    "BTCUSDT",
+                    Side.SELL,
+                    100.0,
+                    0.1,
+                    reduce_only=True,
                 )
-                self.assertTrue(reduce_result.accepted)
-                self.assertEqual(len(gateway.sent_requests), 1)
+            )
+            self.assertTrue(reduce_result.accepted)
+            self.assertEqual(len(gateway.sent_requests), 1)
         finally:
             oms.stop()
 
@@ -1275,10 +1330,9 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
                 "use_rpi_for_avellaneda_stoikov": True,
                 "rpi_fallback_to_gtx": True,
                 "cycle_interval": 0.0,
-                "lot_multiplier": 1.0,
                 "target_order_notional": 8.0,
                 "max_pos_usdt": 18.0,
-                "as_parameters": {
+                "avellaneda_stoikov": {
                     "gamma": 0.05,
                     "k": 1.5,
                     "vol_window": 5,
@@ -1347,7 +1401,7 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
                 "cycle_interval": 0.0,
                 "target_order_notional": 8.0,
                 "max_pos_usdt": 18.0,
-                "as_parameters": {
+                "avellaneda_stoikov": {
                     "gamma": 0.05,
                     "k": 0.5,
                     "vol_window": 5,
@@ -1423,14 +1477,13 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         oms = PassiveQuoteOMS()
         oms.config = {
             "execution": {"mode": "live"},
-            "paper_trade": {"enabled": False},
         }
         with self.assertRaisesRegex(ValueError, "Live A-S requires adaptive"):
             AvellanedaStoikovStrategy(
                 DispatchingEngine(),
                 oms,
                 strategy_config={
-                    "as_parameters": {"adaptive": {"enabled": True}}
+                    "avellaneda_stoikov": {"adaptive": {"enabled": True}}
                 },
             )
 
@@ -1440,7 +1493,7 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             DispatchingEngine(),
             oms,
             strategy_config={
-                "as_parameters": {
+                "avellaneda_stoikov": {
                     "adaptive": {
                         "stale_quote_guard": {
                             "enabled": True,
@@ -1460,8 +1513,24 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             },
             clear=True,
         ):
-            bid_oid = strategy.buy("LTCUSDT", 99.0, 0.1)
-            strategy.sell("LTCUSDT", 101.0, 0.1)
+            bid_oid = strategy.send_intent(
+                OrderIntent(
+                    strategy.name,
+                    "LTCUSDT",
+                    Side.BUY,
+                    99.0,
+                    0.1,
+                )
+            )
+            strategy.send_intent(
+                OrderIntent(
+                    strategy.name,
+                    "LTCUSDT",
+                    Side.SELL,
+                    101.0,
+                    0.1,
+                )
+            )
 
         result = strategy._guard_stale_quotes(
             symbol="LTCUSDT",
@@ -1663,13 +1732,14 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             self.assertIn(field, params)
         json.dumps(params)
 
-    @patch("oms.validator.ref_data_manager.get_info", return_value=None)
-    @patch("oms.validator.data_cache.get_best_quote", return_value=(99.9, 100.1))
-    @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
-    def test_oms_validation_reject_reason_reaches_strategy(self, *_mocks):
+    def test_oms_validation_reject_reason_reaches_strategy(self):
         engine = DispatchingEngine()
         gateway = DummyGateway(send_order_result="ex-order")
-        oms = OMS(engine, gateway, self.make_config(max_order_notional=50.0))
+        oms = create_test_oms(
+            engine,
+            gateway,
+            self.make_config(max_order_notional=50.0),
+        )
         strategy = DummyStrategy(engine, oms)
         engine.register(EVENT_ORDER_UPDATE, lambda event: strategy.on_order(event.data))
         oms.state = LifecycleState.LIVE
@@ -1677,7 +1747,7 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             oid = strategy.send_intent(OrderIntent("dummy", "BTCUSDT", Side.BUY, 100.0, 1.0))
 
             self.assertIsNone(oid)
-            self.assertIn("notional_exceeded", strategy.last_submit_reject_reason)
+            self.assertIn("notional_exceeded", strategy.submit_rejections[-1][1])
             order_updates = [event.data for event in engine.events if event.type == EVENT_ORDER_UPDATE]
             self.assertEqual(len(order_updates), 1)
             self.assertEqual(order_updates[0].status, OrderStatus.REJECTED_LOCALLY)
@@ -1685,13 +1755,10 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         finally:
             oms.stop()
 
-    @patch("oms.validator.ref_data_manager.get_info", return_value=None)
-    @patch("oms.validator.data_cache.get_best_quote", return_value=(99.9, 100.1))
-    @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
-    def test_gateway_send_failed_reason_reaches_strategy(self, *_mocks):
+    def test_gateway_send_failed_reason_reaches_strategy(self):
         engine = DispatchingEngine()
         gateway = DummyGateway(send_order_result=None)
-        oms = OMS(engine, gateway, self.make_config())
+        oms = create_test_oms(engine, gateway, self.make_config())
         strategy = DummyStrategy(engine, oms)
         engine.register(EVENT_ORDER_UPDATE, lambda event: strategy.on_order(event.data))
         oms.state = LifecycleState.LIVE
@@ -1699,7 +1766,7 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             oid = strategy.send_intent(OrderIntent("dummy", "BTCUSDT", Side.BUY, 100.0, 1.0))
 
             self.assertIsNone(oid)
-            self.assertEqual(strategy.last_submit_reject_reason, "gateway_send_failed")
+            self.assertEqual(strategy.submit_rejections[-1][1], "gateway_send_failed")
             order_updates = [event.data for event in engine.events if event.type == EVENT_ORDER_UPDATE]
             self.assertEqual(len(order_updates), 1)
             self.assertEqual(order_updates[0].status, OrderStatus.REJECTED_LOCALLY)
@@ -1707,17 +1774,12 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         finally:
             oms.stop()
 
-    @patch("oms.validator.ref_data_manager.get_info", return_value=None)
-    @patch("oms.validator.data_cache.get_best_quote", return_value=(99.9, 100.1))
-    @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
-    @patch("oms.exposure.data_cache.get_best_quote", return_value=(99.9, 100.1))
-    @patch("oms.exposure.data_cache.get_mark_price", return_value=100.0)
-    def test_account_gross_limit_rejects_when_total_multi_symbol_risk_is_full(self, *_mocks):
+    def test_account_gross_limit_rejects_when_total_multi_symbol_risk_is_full(self):
         engine = DispatchingEngine()
         gateway = DummyGateway(send_order_result="ex-order")
         config = self.make_config(max_order_notional=5000.0, max_account_gross_notional=150.0)
         config["symbols"] = ["BTCUSDT", "ETHUSDT"]
-        oms = OMS(engine, gateway, config)
+        oms = create_test_oms(engine, gateway, config)
         strategy = DummyStrategy(engine, oms)
         engine.register(EVENT_ORDER_UPDATE, lambda event: strategy.on_order(event.data))
         oms.state = LifecycleState.LIVE
@@ -1726,7 +1788,7 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             oid = strategy.send_intent(OrderIntent("dummy", "BTCUSDT", Side.BUY, 100.0, 0.4))
 
             self.assertIsNone(oid)
-            self.assertIn("Account Gross Exposure", strategy.last_submit_reject_reason)
+            self.assertIn("Account Gross Exposure", strategy.submit_rejections[-1][1])
             order_updates = [event.data for event in engine.events if event.type == EVENT_ORDER_UPDATE]
             self.assertEqual(len(order_updates), 1)
             self.assertEqual(order_updates[0].status, OrderStatus.REJECTED_LOCALLY)
@@ -1734,18 +1796,13 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         finally:
             oms.stop()
 
-    @patch("oms.validator.ref_data_manager.get_info", return_value=None)
-    @patch("oms.validator.data_cache.get_best_quote", return_value=(99.9, 100.1))
-    @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
-    @patch("oms.exposure.data_cache.get_best_quote", return_value=(99.9, 100.1))
-    @patch("oms.exposure.data_cache.get_mark_price", return_value=100.0)
-    def test_concurrent_symbol_limit_rejects_a_new_risk_symbol(self, *_mocks):
+    def test_concurrent_symbol_limit_rejects_a_new_risk_symbol(self):
         engine = DispatchingEngine()
         gateway = DummyGateway(send_order_result="ex-order")
         config = self.make_config()
         config["symbols"] = ["BTCUSDT", "ETHUSDT"]
         config["risk"]["limits"]["max_concurrent_symbols"] = 1
-        oms = OMS(engine, gateway, config)
+        oms = create_test_oms(engine, gateway, config)
         strategy = DummyStrategy(engine, oms)
         engine.register(
             EVENT_ORDER_UPDATE,
@@ -1767,16 +1824,13 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             self.assertIsNone(oid)
             self.assertIn(
                 "Concurrent Symbol Limit",
-                strategy.last_submit_reject_reason,
+                strategy.submit_rejections[-1][1],
             )
             self.assertEqual(gateway.sent_requests, [])
         finally:
             oms.stop()
 
-    @patch("oms.validator.ref_data_manager.get_info", return_value=None)
-    @patch("oms.validator.data_cache.get_best_quote", return_value=(99.9, 100.1))
-    @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
-    def test_gateway_submit_commit_runs_after_durable_pending_ack(self, *_mocks):
+    def test_gateway_submit_commit_runs_after_durable_pending_ack(self):
         engine = DispatchingEngine()
 
         class StagedGateway(DummyGateway):
@@ -1797,7 +1851,7 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
                 )
 
         gateway = StagedGateway()
-        oms = OMS(engine, gateway, self.make_config())
+        oms = create_test_oms(engine, gateway, self.make_config())
         gateway.oms = oms
         oms.state = LifecycleState.LIVE
         try:
@@ -1819,19 +1873,25 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         finally:
             oms.stop()
 
-    @patch("oms.validator.ref_data_manager.get_info", return_value=None)
-    @patch("oms.validator.data_cache.get_best_quote", return_value=(99.9, 100.1))
-    @patch("oms.validator.data_cache.get_mark_price", return_value=100.0)
-    def test_exit_orders_are_submitted_as_reduce_only(self, *_mocks):
+    def test_exit_orders_are_submitted_as_reduce_only(self):
         engine = DispatchingEngine()
         gateway = DummyGateway(send_order_result="ex-order")
-        oms = OMS(engine, gateway, self.make_config())
+        oms = create_test_oms(engine, gateway, self.make_config())
         strategy = DummyStrategy(engine, oms)
         oms.state = LifecycleState.LIVE
         oms._sync_capability_mode("test_live")
         oms.exposure.force_sync("BTCUSDT", -1.0, 100.0)
         try:
-            oid = strategy.exit_short("BTCUSDT", 100.0, 1.0)
+            oid = strategy.send_intent(
+                OrderIntent(
+                    strategy.name,
+                    "BTCUSDT",
+                    Side.BUY,
+                    100.0,
+                    1.0,
+                    reduce_only=True,
+                )
+            )
 
             self.assertTrue(oid)
             self.assertEqual(len(gateway.sent_requests), 1)
@@ -1845,11 +1905,11 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
 class LocalWebDashboardTests(unittest.TestCase):
     def make_config(self):
         return {
-            "testnet": True,
             "api_key": "dashboard-must-not-leak-this-key",
             "api_secret": "dashboard-must-not-leak-this-secret",
             "symbols": ["BTCUSDT"],
             "system": {
+                "market_data": {"environment": "testnet"},
                 "web_dashboard": {
                     "host": "127.0.0.1",
                     "port": 0,
@@ -1944,10 +2004,17 @@ class LocalWebDashboardTests(unittest.TestCase):
             )
         )
         dashboard.update_api_limit(
-            ApiLimitData(weight_used_1m=12, timestamp=datetime.now().timestamp())
+            SimpleNamespace(
+                weight_used_1m=12,
+                timestamp=datetime.now().timestamp(),
+            )
         )
         dashboard.update_alert(
-            AlertData(level="WARNING", msg="test alert", timestamp=datetime.now().timestamp())
+            SimpleNamespace(
+                level="WARNING",
+                msg="test alert",
+                timestamp=datetime.now().timestamp(),
+            )
         )
         dashboard.add_log("[INFO] signature=must-not-leak")
         dashboard.publish_snapshot(
@@ -2111,13 +2178,8 @@ class LocalWebDashboardTests(unittest.TestCase):
 
     def test_paper_dashboard_never_labels_simulated_execution_as_live_money(self):
         config = self.make_config()
-        config["testnet"] = False
+        config["system"]["market_data"]["environment"] = "production"
         config["execution"] = {"mode": "paper"}
-        config["paper_trade"] = {
-            "enabled": True,
-            "market_data_environment": "production",
-            "rpi_fill_model": "disabled",
-        }
 
         dashboard = LocalWebDashboard(config=config)
         snapshot = dashboard.get_snapshot()
@@ -2188,13 +2250,13 @@ class LiveAcceptanceDashboardTests(unittest.TestCase):
     @staticmethod
     def make_live_config():
         return {
-            "testnet": False,
             "execution": {"mode": "live"},
             "record_data": True,
             "symbols": ["XAUUSDT"],
             "alert": {"active": True},
             "system": {
                 "evidence_recorder": {"enabled": True},
+                "market_data": {"environment": "production"},
                 "web_dashboard": {"host": "127.0.0.1", "port": 0},
             },
             "strategy": {"primary_model": "glft", "use_rpi": True},
@@ -2287,7 +2349,6 @@ class LiveAcceptanceDashboardTests(unittest.TestCase):
     def test_paper_runtime_health_does_not_block_readiness(self):
         config = self.make_live_config()
         config["execution"] = {"mode": "paper"}
-        config["paper_trade"] = {"enabled": True}
         dashboard = LocalWebDashboard(config=config)
         dashboard.publish_snapshot(
             {
@@ -2326,31 +2387,28 @@ class StrategyRegistryTests(unittest.TestCase):
     @staticmethod
     def make_root_config(primary_model):
         return {
+            "execution": {"mode": "paper"},
             "strategy": {
                 "registered_models": [
-                    "GLFT_MultiScale",
-                    "as",
+                    "glft",
+                    "avellaneda_stoikov",
                 ],
                 "primary_model": primary_model,
-                "shared": {
-                    "lot_multiplier": 2.5,
-                    "cycle_interval": 3.0,
-                    "use_rpi": True,
-                    "execution": {
-                        "cycle_interval_sec": 2.0,
-                        "min_spread_bps": 9.0,
-                    },
+                "target_order_notional": 13.75,
+                "cycle_interval": 3.0,
+                "use_rpi": True,
+                "execution": {
+                    "cycle_interval_sec": 2.0,
+                    "min_spread_bps": 9.0,
                 },
-                "models": {
-                    "GLFT": {
-                        "gamma": 0.42,
-                        "execution": {"min_spread_bps": 7.5},
-                    },
-                    "AvellanedaStoikov": {
-                        "gamma": 0.23,
-                        "k": 2.75,
-                        "vol_window": 17,
-                    },
+                "glft": {
+                    "gamma": 0.42,
+                    "execution": {"min_spread_bps": 7.5},
+                },
+                "avellaneda_stoikov": {
+                    "gamma": 0.23,
+                    "k": 2.75,
+                    "vol_window": 17,
                 },
             },
         }
@@ -2373,13 +2431,13 @@ class StrategyRegistryTests(unittest.TestCase):
     def test_registry_constructs_each_primary_but_only_one_execution_instance(self):
         cases = (
             (
-                "GLFT_MultiScale",
+                "glft",
                 ProductionGLFTStrategy,
                 "glft",
                 "GLFT_MultiScale",
             ),
             (
-                "as",
+                "avellaneda_stoikov",
                 ProductionAvellanedaStoikovStrategy,
                 "avellaneda_stoikov",
                 "AvellanedaStoikov",
@@ -2407,12 +2465,11 @@ class StrategyRegistryTests(unittest.TestCase):
                     strategy.registered_models,
                     ("glft", "avellaneda_stoikov"),
                 )
-                self.assertEqual(strategy.execution_role, "primary")
 
     def test_production_strategy_ports_are_required(self):
         engine = DispatchingEngine()
         oms = PassiveQuoteOMS()
-        config = self.make_root_config("GLFT")
+        config = self.make_root_config("glft")
         clock = StrategyTestClock()
 
         for strategy_type in (
@@ -2456,13 +2513,13 @@ class StrategyRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "reference_data"):
             StrategyTemplate(engine, oms)
 
-    def test_registry_deep_merges_shared_and_model_parameters(self):
+    def test_registry_merges_root_and_model_parameters(self):
         glft = create_primary_strategy(
             DispatchingEngine(),
             PassiveQuoteOMS(),
-            self.make_root_config("GLFT"),
+            self.make_root_config("glft"),
         )
-        self.assertEqual(glft.lot_multiplier, 2.5)
+        self.assertEqual(glft.target_order_notional, 13.75)
         self.assertEqual(glft.cycle_interval, 3.0)
         self.assertEqual(glft.gamma_base, 0.42)
         self.assertEqual(glft.min_spread_bps, 7.5)
@@ -2470,9 +2527,9 @@ class StrategyRegistryTests(unittest.TestCase):
         avellaneda_stoikov = create_primary_strategy(
             DispatchingEngine(),
             PassiveQuoteOMS(),
-            self.make_root_config("AvellanedaStoikov"),
+            self.make_root_config("avellaneda_stoikov"),
         )
-        self.assertEqual(avellaneda_stoikov.lot_multiplier, 2.5)
+        self.assertEqual(avellaneda_stoikov.target_order_notional, 13.75)
         self.assertEqual(avellaneda_stoikov.interval, 3.0)
         self.assertEqual(avellaneda_stoikov.gamma, 0.23)
         self.assertEqual(avellaneda_stoikov.k, 2.75)

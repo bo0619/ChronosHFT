@@ -6,7 +6,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from threading import Condition, Lock
-from typing import Generic, Protocol, TypeVar
 
 
 class SubmissionState(str, Enum):
@@ -38,7 +37,6 @@ class SubmissionFinalizationError(RuntimeError):
     """Raised after all resource cleanup was attempted and one step failed."""
 
     def __init__(self, errors: tuple[BaseException, ...]):
-        self.errors = errors
         detail = "; ".join(
             f"{type(error).__name__}:{error}" for error in errors
         )
@@ -63,11 +61,11 @@ GateCleanup = Callable[[str, BaseException], None]
 
 
 class SubmissionTransaction:
-    """Own one submission's durable phases and acquired resources.
+    """Own one submission's durable phases and outbound permit.
 
     Normal progress is deliberately linear. Failure may terminate from any
-    phase, but resource release always runs through :meth:`finalize`, in
-    reverse acquisition order, exactly once.
+    phase, but permit release always runs through :meth:`finalize` exactly
+    once.
     """
 
     _NEXT_STATE = {
@@ -94,7 +92,7 @@ class SubmissionTransaction:
         self._history = [SubmissionState.CREATED]
         self._permit_epoch: int | None = None
         self._terminal_outcome: SubmissionTerminalOutcome | None = None
-        self._leases: list[tuple[str, Cleanup]] = []
+        self._permit_release: Cleanup | None = None
         self._gate_cleanup: GateCleanup | None = None
         self._gate_failure: tuple[str, BaseException] | None = None
         self._finalized = False
@@ -174,10 +172,10 @@ class SubmissionTransaction:
         with self._lock:
             if self._state is not SubmissionState.PREPARED_DURABLE:
                 self._raise_bad_transition(SubmissionState.PERMIT_ACQUIRED)
-            if any(name == "outbound-permit" for name, _ in self._leases):
+            if self._permit_release is not None:
                 raise SubmissionTransitionError("permit already acquired")
             self._permit_epoch = int(permit_epoch)
-            self._leases.append(("outbound-permit", release))
+            self._permit_release = release
         # Register the externally acquired permit before the phase barrier.
         # A fault at the barrier can then be finalized without leaking it.
         self._inject(SubmissionState.PERMIT_ACQUIRED)
@@ -188,21 +186,6 @@ class SubmissionTransaction:
                 self._raise_bad_transition(SubmissionState.PERMIT_ACQUIRED)
             self._state = SubmissionState.PERMIT_ACQUIRED
             self._history.append(self._state)
-
-    def acquire_lease(self, name: str, release: Cleanup) -> None:
-        normalized_name = str(name).strip()
-        if not normalized_name:
-            raise ValueError("lease name is required")
-        with self._lock:
-            if self._finalized:
-                raise SubmissionTransitionError(
-                    "cannot acquire lease after finalization"
-                )
-            if any(existing == normalized_name for existing, _ in self._leases):
-                raise SubmissionTransitionError(
-                    f"lease already acquired: {normalized_name}"
-                )
-            self._leases.append((normalized_name, release))
 
     def dispatched(self) -> None:
         self._advance(SubmissionState.DISPATCHED)
@@ -217,7 +200,7 @@ class SubmissionTransaction:
         gate_failure_context: str = "",
         gate_failure: BaseException | None = None,
     ) -> None:
-        """Close the gate when requested and release every held lease.
+        """Close the gate when requested and release the outbound permit.
 
         Cleanup is idempotent so exception handlers and an outer ``finally``
         may both call it. The first call owns the terminal outcome.
@@ -245,8 +228,8 @@ class SubmissionTransaction:
         with self._condition:
             gate_cleanup = self._gate_cleanup
             recorded_gate_failure = self._gate_failure
-            leases = tuple(reversed(self._leases))
-            self._leases.clear()
+            permit_release = self._permit_release
+            self._permit_release = None
             self._terminal_outcome = outcome
             self._state = SubmissionState.TERMINAL
             self._history.append(self._state)
@@ -266,9 +249,9 @@ class SubmissionTransaction:
                     gate_cleanup(*effective_gate_failure)
                 except BaseException as exc:
                     errors.append(exc)
-            for _name, release in leases:
+            if permit_release is not None:
                 try:
-                    release()
+                    permit_release()
                 except BaseException as exc:
                     errors.append(exc)
             if errors and gate_cleanup is not None and not gate_cleanup_attempted:
@@ -309,13 +292,6 @@ class SubmissionTransaction:
             f"invalid submission transition {self._state.value} -> "
             f"{target.value}"
         )
-
-
-ResultT = TypeVar("ResultT")
-
-
-class SubmissionReturnAdapter(Protocol, Generic[ResultT]):
-    def result(self, *, accepted: bool, reason: str = "") -> ResultT: ...
 
 
 @dataclass(frozen=True, slots=True)

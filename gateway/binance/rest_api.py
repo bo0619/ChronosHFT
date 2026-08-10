@@ -31,7 +31,7 @@ from .constants import (
     REST_URL_MAIN,
     REST_URL_TEST,
 )
-from .rate_limit_budget import BinanceRateLimitBudget
+from infrastructure.binance_rate_limit_budget import BinanceRateLimitBudget
 from .rest_metrics import BinanceRestMetrics
 
 

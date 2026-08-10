@@ -1,8 +1,10 @@
 import pytest
 
+from event.type import LifecycleState
 from oms.component import OMSComponent, component_method
 from oms.engine import OMS
 from oms.lifecycle_controller import OMSLifecycleController
+from oms.lifecycle_store import LifecycleStore
 
 
 class _ExampleComponent(OMSComponent):
@@ -99,18 +101,20 @@ def test_declared_component_state_stays_off_the_facade():
     assert "counter" not in vars(facade)
 
 
-def test_oms_shared_state_is_partitioned_by_canonical_owner():
+def test_extracted_lifecycle_state_bypasses_shared_state_registry():
     oms = object.__new__(OMS)
-    oms.state = "RECOVERING"
+    oms.lifecycle_store = LifecycleStore()
+    oms.state = LifecycleState.RECONCILING
 
     registry = vars(oms)["_component_state"]
     assert "state" not in vars(oms)
-    assert registry.owner_of("state") == "OMSLifecycleController"
-    assert registry.read("state") == "RECOVERING"
-    assert registry.last_writer("state") == "OMSFacade"
+    assert "state" not in registry.field_owners
+    assert registry.owner_of("lifecycle_store") == "OMSInitializer"
 
     context = oms._component_context_for(OMSLifecycleController)
-    context.write("state", "RUNNING")
+    assert context.read("state") == LifecycleState.RECONCILING
+    with pytest.raises(AttributeError, match="cannot write"):
+        context.write("state", LifecycleState.LIVE)
+    oms.lifecycle_store.transition(LifecycleState.LIVE)
 
-    assert oms.state == "RUNNING"
-    assert registry.last_writer("state") == "OMSLifecycleController"
+    assert oms.state == LifecycleState.LIVE

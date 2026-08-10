@@ -23,11 +23,7 @@ class _ResourceSlot(Generic[T]):
 
 
 class RuntimeResources(MutableMapping[str, object]):
-    """Runtime resource registry with typed fields and legacy mapping access.
-
-    Wrapping an existing mutable mapping keeps startup tests and partial-failure
-    cleanup compatible while new application code uses named dependencies.
-    """
+    """Runtime resource registry shared by startup and shutdown."""
 
     __slots__ = ("_values",)
 
@@ -57,21 +53,8 @@ class RuntimeResources(MutableMapping[str, object]):
     control_loop: object | None = _ResourceSlot("control_loop")
     watchdog_state: object | None = _ResourceSlot("watchdog_state")
 
-    def __init__(self, values: MutableMapping[str, object] | None = None):
-        self._values = values if values is not None else {}
-
-    @classmethod
-    def coerce(
-        cls,
-        runtime: RuntimeResources | MutableMapping[str, object] | None,
-    ) -> RuntimeResources:
-        if isinstance(runtime, cls):
-            return runtime
-        if runtime is None:
-            return cls()
-        if not isinstance(runtime, MutableMapping):
-            raise TypeError("runtime resources must be a mutable mapping")
-        return cls(runtime)
+    def __init__(self):
+        self._values: dict[str, object] = {}
 
     @property
     def config(self) -> dict:

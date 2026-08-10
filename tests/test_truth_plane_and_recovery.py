@@ -310,35 +310,35 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway = BinanceGateway.__new__(BinanceGateway)
         gateway.event_engine = DummyEngine()
         gateway.gateway_name = "BINANCE"
-        gateway._book_lock = threading.RLock()
-        gateway._book_generation = 1
-        gateway.keep_alive_generation = 1
+        gateway._order_books().generation = 1
+        gateway._user_streams().generation = 1
         gateway.active = True
         gateway.state = GatewayState.READY
         gateway.set_state = lambda state: setattr(gateway, "state", state)
-        gateway.ws = SimpleNamespace(close=lambda: None)
+        connections = gateway._connections()
+        connections.ws = SimpleNamespace(close=lambda: None)
         return gateway
 
     def test_orderbook_recovery_freeze_and_clear_share_unique_token(self):
         gateway = BinanceGateway.__new__(BinanceGateway)
         gateway.event_engine = DummyEngine()
         gateway.gateway_name = "BINANCE"
-        gateway._book_lock = threading.RLock()
-        gateway._book_generation = 3
-        gateway._book_recovery_token = 0
-        gateway.book_resyncing = set()
-        gateway.book_recovery_generation = {}
-        gateway.book_recovery_tokens = {}
-        gateway.orderbooks = {}
-        gateway.ws_buffer = {}
-        gateway.book_resync_max_attempts = 1
-        gateway.book_resync_retry_sec = 0.0
+        books = gateway._order_books()
+        books.generation = 3
+        books.recovery_token = 0
+        books.resyncing = set()
+        books.recovery_generations = {}
+        books.recovery_tokens = {}
+        books.orderbooks = {}
+        books.buffers = {}
+        books.config.resync_max_attempts = 1
+        books.config.resync_retry_sec = 0.0
         gateway._new_local_orderbook = lambda symbol: LocalOrderBook(symbol)
         gateway._resync_book = lambda symbol, **_kwargs: True
 
-        gateway._schedule_book_recovery("BTCUSDT", freeze_reason="FATAL_GAP")
+        books.schedule_recovery("BTCUSDT", freeze_reason="FATAL_GAP")
         deadline = time.perf_counter() + 1.0
-        while "BTCUSDT" in gateway.book_resyncing and time.perf_counter() < deadline:
+        while "BTCUSDT" in books.resyncing and time.perf_counter() < deadline:
             time.sleep(0.005)
 
         messages = [event.data for event in gateway.event_engine.events]
@@ -354,16 +354,16 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway = BinanceGateway.__new__(BinanceGateway)
         gateway.event_engine = DummyEngine()
         gateway.gateway_name = "BINANCE"
-        gateway._book_lock = threading.RLock()
-        gateway._book_generation = 1
-        gateway._book_recovery_token = 0
-        gateway.book_resyncing = set()
-        gateway.book_recovery_generation = {}
-        gateway.book_recovery_tokens = {}
-        gateway.orderbooks = {}
-        gateway.ws_buffer = {}
-        gateway.book_resync_max_attempts = 1
-        gateway.book_resync_retry_sec = 0.0
+        books = gateway._order_books()
+        books.generation = 1
+        books.recovery_token = 0
+        books.resyncing = set()
+        books.recovery_generations = {}
+        books.recovery_tokens = {}
+        books.orderbooks = {}
+        books.buffers = {}
+        books.config.resync_max_attempts = 1
+        books.config.resync_retry_sec = 0.0
         gateway._new_local_orderbook = lambda symbol: LocalOrderBook(symbol)
         first_started = threading.Event()
         second_started = threading.Event()
@@ -382,9 +382,9 @@ class GatewayRecoveryTests(unittest.TestCase):
             return True
 
         gateway._resync_book = blocked_resync
-        gateway._schedule_book_recovery("BTCUSDT", freeze_reason="FATAL_GAP")
+        books.schedule_recovery("BTCUSDT", freeze_reason="FATAL_GAP")
         self.assertTrue(first_started.wait(timeout=1.0))
-        gateway._schedule_book_recovery("BTCUSDT", freeze_reason="FATAL_GAP")
+        books.schedule_recovery("BTCUSDT", freeze_reason="FATAL_GAP")
         self.assertTrue(second_started.wait(timeout=1.0))
 
         release_first.set()
@@ -395,11 +395,11 @@ class GatewayRecoveryTests(unittest.TestCase):
             "CLEAR_SYMBOL:BTCUSDT:ORDERBOOK_RESYNCED:1",
             messages,
         )
-        self.assertEqual(gateway.book_recovery_tokens["BTCUSDT"], 2)
+        self.assertEqual(books.recovery_tokens["BTCUSDT"], 2)
 
         release_second.set()
         deadline = time.perf_counter() + 1.0
-        while "BTCUSDT" in gateway.book_resyncing and time.perf_counter() < deadline:
+        while "BTCUSDT" in books.resyncing and time.perf_counter() < deadline:
             time.sleep(0.005)
         messages = [event.data for event in gateway.event_engine.events]
         self.assertIn(
@@ -411,21 +411,21 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway = BinanceGateway.__new__(BinanceGateway)
         gateway.event_engine = DummyEngine()
         gateway.gateway_name = "BINANCE"
-        gateway._book_lock = threading.RLock()
-        gateway._book_generation = 1
-        gateway._book_recovery_token = 1
-        gateway.book_resyncing = {"BTCUSDT"}
-        gateway.book_recovery_generation = {"BTCUSDT": 1}
-        gateway.book_recovery_tokens = {"BTCUSDT": 1}
-        gateway.ws_buffer = {"BTCUSDT": None}
-        gateway.max_book_buffer = 100
+        books = gateway._order_books()
+        books.generation = 1
+        books.recovery_token = 1
+        books.resyncing = {"BTCUSDT"}
+        books.recovery_generations = {"BTCUSDT": 1}
+        books.recovery_tokens = {"BTCUSDT": 1}
+        books.buffers = {"BTCUSDT": None}
+        books.config.max_buffer = 100
         gateway._new_local_orderbook = lambda symbol: LocalOrderBook(symbol)
 
         class BrokenBook:
             def process_delta(self, _delta):
                 raise OrderBookGapError("forced gap")
 
-        gateway.orderbooks = {"BTCUSDT": BrokenBook()}
+        books.orderbooks = {"BTCUSDT": BrokenBook()}
         launch_entered = threading.Event()
         allow_launch = threading.Event()
         launched = []
@@ -446,10 +446,10 @@ class GatewayRecoveryTests(unittest.TestCase):
         worker.start()
         self.assertTrue(launch_entered.wait(timeout=1.0))
 
-        with gateway._book_lock:
-            self.assertEqual(gateway.book_recovery_tokens["BTCUSDT"], 2)
+        with books.lock:
+            self.assertEqual(books.recovery_tokens["BTCUSDT"], 2)
             self.assertFalse(
-                gateway._release_book_recovery_locked("BTCUSDT", 1, 1)
+                books.release_recovery_locked("BTCUSDT", 1, 1)
             )
 
         allow_launch.set()
@@ -459,18 +459,18 @@ class GatewayRecoveryTests(unittest.TestCase):
 
     def test_book_recovery_retry_wait_is_interruptible_and_joined(self):
         gateway = BinanceGateway.__new__(BinanceGateway)
-        gateway._book_lock = threading.RLock()
-        gateway._book_generation = 1
-        gateway.book_resyncing = {"BTCUSDT"}
-        gateway.book_recovery_generation = {"BTCUSDT": 1}
-        gateway.book_recovery_tokens = {"BTCUSDT": 1}
-        gateway._book_recovery_threads = set()
-        gateway._book_recovery_stop = threading.Event()
-        gateway.book_recovery_join_timeout_sec = 0.5
-        gateway.book_resync_max_attempts = 3
-        gateway.book_resync_retry_sec = 10.0
-        gateway.orderbooks = {"BTCUSDT": LocalOrderBook("BTCUSDT")}
-        gateway.ws_buffer = {"BTCUSDT": []}
+        books = gateway._order_books()
+        books.generation = 1
+        books.resyncing = {"BTCUSDT"}
+        books.recovery_generations = {"BTCUSDT": 1}
+        books.recovery_tokens = {"BTCUSDT": 1}
+        books.recovery_threads = set()
+        books.recovery_stop = threading.Event()
+        books.config.recovery_join_timeout_sec = 0.5
+        books.config.resync_max_attempts = 3
+        books.config.resync_retry_sec = 10.0
+        books.orderbooks = {"BTCUSDT": LocalOrderBook("BTCUSDT")}
+        books.buffers = {"BTCUSDT": []}
         gateway._new_local_orderbook = lambda symbol: LocalOrderBook(symbol)
         first_attempt = threading.Event()
 
@@ -480,34 +480,35 @@ class GatewayRecoveryTests(unittest.TestCase):
 
         gateway._resync_book = failed_resync
         worker = threading.Thread(
-            target=gateway._run_book_recovery,
+            target=books.run_recovery,
             args=("BTCUSDT", 1, 1),
         )
-        gateway._book_recovery_threads.add(worker)
+        books.recovery_threads.add(worker)
         worker.start()
         self.assertTrue(first_attempt.wait(timeout=0.5))
 
         started_at = time.perf_counter()
-        gateway._book_recovery_stop.set()
-        self.assertTrue(gateway._join_book_recovery_threads())
+        books.recovery_stop.set()
+        self.assertTrue(books.join_recovery_threads())
 
         self.assertLess(time.perf_counter() - started_at, 0.5)
         self.assertFalse(worker.is_alive())
-        self.assertEqual(gateway._book_recovery_threads, set())
+        self.assertEqual(books.recovery_threads, set())
 
     def test_stale_live_transport_callbacks_cannot_touch_current_connection(self):
         engine = DummyEngine()
         gateway = BinanceGateway.__new__(BinanceGateway)
         gateway.event_engine = engine
         gateway.gateway_name = "BINANCE"
-        gateway._book_lock = threading.RLock()
-        gateway._book_generation = 2
+        books = gateway._order_books()
+        books.generation = 2
         gateway.latency_stats = {"rest_rtt": 0.0, "ws_delay": 0.0}
         gateway.active = True
         gateway.state = GatewayState.READY
         gateway.set_state = lambda state: setattr(gateway, "state", state)
         closed = []
-        gateway.ws = SimpleNamespace(close=lambda: closed.append(True))
+        connections = gateway._connections()
+        connections.ws = SimpleNamespace(close=lambda: closed.append(True))
         payload = json.dumps(
             {
                 "stream": "btcusdt@aggTrade",
@@ -537,8 +538,8 @@ class GatewayRecoveryTests(unittest.TestCase):
         original_emit_fault = gateway._emit_ws_fault
 
         def advance_generation_then_emit(*args, **kwargs):
-            with gateway._book_lock:
-                gateway._book_generation += 1
+            with books.lock:
+                books.generation += 1
             return original_emit_fault(*args, **kwargs)
 
         gateway._emit_ws_fault = advance_generation_then_emit
@@ -555,13 +556,17 @@ class GatewayRecoveryTests(unittest.TestCase):
     def test_listen_key_keep_alive_failure_freezes_current_transport(self):
         gateway = self.make_keep_alive_gateway()
         closed = []
-        gateway.ws = SimpleNamespace(close=lambda: closed.append(True))
+        connections = gateway._connections()
+        connections.ws = SimpleNamespace(close=lambda: closed.append(True))
         gateway.rest = SimpleNamespace(
             keep_alive_listen_key=lambda: SimpleNamespace(status_code=503)
         )
 
         self.assertFalse(
-            gateway._keep_alive_once(1, transport_generation=1)
+            gateway._user_streams().keep_alive_once(
+                1,
+                transport_generation=1,
+            )
         )
 
         self.assertFalse(gateway.active)
@@ -575,14 +580,15 @@ class GatewayRecoveryTests(unittest.TestCase):
     def test_stale_keep_alive_failure_cannot_fault_replacement_transport(self):
         gateway = self.make_keep_alive_gateway()
         replacement_closed = []
-        gateway.ws = SimpleNamespace(
+        connections = gateway._connections()
+        connections.ws = SimpleNamespace(
             close=lambda: replacement_closed.append(True)
         )
 
         def stale_failure():
-            with gateway._book_lock:
-                gateway._book_generation = 2
-                gateway.keep_alive_generation = 2
+            with gateway._order_books().lock:
+                gateway._order_books().generation = 2
+                gateway._user_streams().generation = 2
             return SimpleNamespace(status_code=503)
 
         gateway.rest = SimpleNamespace(
@@ -590,7 +596,10 @@ class GatewayRecoveryTests(unittest.TestCase):
         )
 
         self.assertFalse(
-            gateway._keep_alive_once(1, transport_generation=1)
+            gateway._user_streams().keep_alive_once(
+                1,
+                transport_generation=1,
+            )
         )
 
         self.assertTrue(gateway.active)
@@ -602,7 +611,7 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway = self.make_keep_alive_gateway()
         stop_event = threading.Event()
         worker = threading.Thread(
-            target=gateway._keep_alive_loop,
+            target=gateway._user_streams().keep_alive_loop,
             args=(1, 1, stop_event),
         )
         worker.start()
@@ -618,13 +627,13 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway = BinanceGateway.__new__(BinanceGateway)
         gateway.event_engine = DummyEngine()
         gateway.gateway_name = "BINANCE"
-        gateway._book_lock = threading.RLock()
-        gateway._book_generation = 1
-        gateway.max_book_buffer = 100
-        gateway.book_resyncing = set()
-        gateway.book_recovery_generation = {}
-        gateway.orderbooks = {"BTCUSDT": LocalOrderBook("BTCUSDT")}
-        gateway.ws_buffer = {
+        books = gateway._order_books()
+        books.generation = 1
+        books.config.max_buffer = 100
+        books.resyncing = set()
+        books.recovery_generations = {}
+        books.orderbooks = {"BTCUSDT": LocalOrderBook("BTCUSDT")}
+        books.buffers = {
             "BTCUSDT": [
                 {
                     "U": 101,
@@ -653,7 +662,7 @@ class GatewayRecoveryTests(unittest.TestCase):
         }
         worker_done = threading.Event()
         workers = []
-        book = gateway.orderbooks["BTCUSDT"]
+        book = books.orderbooks["BTCUSDT"]
         original_generate = book.generate_event_data
 
         def generate_with_cutover_delta():
@@ -678,7 +687,7 @@ class GatewayRecoveryTests(unittest.TestCase):
 
         self.assertTrue(worker_done.is_set())
         self.assertEqual(book.last_update_id, 102)
-        self.assertIsNone(gateway.ws_buffer["BTCUSDT"])
+        self.assertIsNone(books.buffers["BTCUSDT"])
 
     @patch(
         "gateway.binance.gateway.time_service.capture_timestamp",
@@ -774,15 +783,15 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway = BinanceGateway.__new__(BinanceGateway)
         gateway.event_engine = engine
         gateway.gateway_name = "BINANCE"
-        gateway._book_lock = threading.RLock()
-        gateway._book_generation = 1
+        gateway._order_books().generation = 1
         gateway.max_market_event_ingress_age_ms = 1200.0
         gateway.latency_stats = {"rest_rtt": 0.0, "ws_delay": 0.0}
         gateway.active = True
         gateway.state = GatewayState.READY
         gateway.set_state = lambda state: setattr(gateway, "state", state)
         closed = []
-        gateway.ws = SimpleNamespace(close=lambda: closed.append(True))
+        connections = gateway._connections()
+        connections.ws = SimpleNamespace(close=lambda: closed.append(True))
         gateway._process_book = lambda *_args, **_kwargs: self.fail(
             "stale depth reached the local order book"
         )
@@ -800,7 +809,7 @@ class GatewayRecoveryTests(unittest.TestCase):
             },
         }
 
-        gateway._handle_market_update(
+        gateway._websocket_events().handle_market_update(
             message,
             received_timestamp=2000.0,
             received_monotonic=70.0,
@@ -830,21 +839,14 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway.gateway_name = "BINANCE"
         gateway.testnet = True
         gateway.symbols = ["BTCUSDT"]
-        gateway.orderbooks = {}
-        gateway.ws_buffer = {}
-        gateway.book_resyncing = set()
-        gateway.book_recovery_generation = {}
-        gateway._book_generation = 0
-        gateway._book_lock = threading.RLock()
         gateway.active = True
-        gateway.listen_key = ""
         gateway.target_leverage = 0
         gateway.target_margin_type = "ISOLATED"
         gateway.target_position_mode = "ONE_WAY"
-        gateway.recovery_lock = threading.Lock()
-        gateway.keep_alive_generation = 0
+        gateway._user_streams().generation = 0
         gateway.state = GatewayState.READY
-        gateway.ws = SimpleNamespace(close=lambda: None)
+        connections = gateway._connections()
+        connections.ws = SimpleNamespace(close=lambda: None)
         gateway.set_state = lambda state: setattr(gateway, "state", state)
 
         gateway.on_ws_error(
@@ -871,25 +873,16 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway.gateway_name = "BINANCE"
         gateway.testnet = True
         gateway.symbols = ["BTCUSDT"]
-        gateway.orderbooks = {}
-        gateway.ws_buffer = {}
-        gateway.book_resyncing = set()
-        gateway.book_recovery_generation = {}
-        gateway.book_recovery_tokens = {}
-        gateway._book_recovery_token = 0
-        gateway._book_generation = 0
-        gateway._book_lock = threading.RLock()
         gateway.active = False
-        gateway.listen_key = ""
         gateway.target_leverage = 0
         gateway.target_margin_type = "ISOLATED"
         gateway.target_position_mode = "ONE_WAY"
-        gateway.recovery_lock = threading.Lock()
-        gateway.keep_alive_generation = 0
+        gateway._user_streams().generation = 0
         gateway.stream_ready_timeout_sec = 1.0
         gateway.state = GatewayState.ERROR
-        gateway.ws = SimpleNamespace(close=lambda: None)
-        gateway._start_streams = lambda **_kwargs: True
+        connections = gateway._connections()
+        connections.ws = SimpleNamespace(close=lambda: None)
+        gateway._start_streams = lambda *_args, **_kwargs: True
         gateway._resync_book = lambda symbol, **_kwargs: True
 
         recovered = gateway.recover_connectivity()
@@ -907,25 +900,16 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway.gateway_name = "BINANCE"
         gateway.testnet = True
         gateway.symbols = ["BTCUSDT"]
-        gateway.orderbooks = {}
-        gateway.ws_buffer = {}
-        gateway.book_resyncing = set()
-        gateway.book_recovery_generation = {}
-        gateway.book_recovery_tokens = {}
-        gateway._book_recovery_token = 0
-        gateway._book_generation = 0
-        gateway._book_lock = threading.RLock()
         gateway.active = False
-        gateway.listen_key = ""
         gateway.target_leverage = 0
         gateway.target_margin_type = "ISOLATED"
         gateway.target_position_mode = "ONE_WAY"
-        gateway.recovery_lock = threading.Lock()
-        gateway.keep_alive_generation = 0
+        gateway._user_streams().generation = 0
         gateway.stream_ready_timeout_sec = 1.0
         gateway.state = GatewayState.ERROR
-        gateway.ws = SimpleNamespace(close=lambda: None)
-        gateway._start_streams = lambda **_kwargs: True
+        connections = gateway._connections()
+        connections.ws = SimpleNamespace(close=lambda: None)
+        gateway._start_streams = lambda *_args, **_kwargs: True
         gateway._resync_book = lambda symbol, **_kwargs: True
 
         recovered = gateway.recover_connectivity(
@@ -951,25 +935,16 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway.gateway_name = "BINANCE"
         gateway.testnet = True
         gateway.symbols = ["BTCUSDT"]
-        gateway.orderbooks = {}
-        gateway.ws_buffer = {}
-        gateway.book_resyncing = set()
-        gateway.book_recovery_generation = {}
-        gateway.book_recovery_tokens = {}
-        gateway._book_recovery_token = 0
-        gateway._book_generation = 0
-        gateway._book_lock = threading.RLock()
         gateway.active = False
-        gateway.listen_key = ""
         gateway.target_leverage = 0
         gateway.target_margin_type = "ISOLATED"
         gateway.target_position_mode = "ONE_WAY"
-        gateway.recovery_lock = threading.Lock()
-        gateway.keep_alive_generation = 0
+        gateway._user_streams().generation = 0
         gateway.stream_ready_timeout_sec = 1.0
         gateway.state = GatewayState.ERROR
-        gateway.ws = SimpleNamespace(close=lambda: None)
-        gateway._start_streams = lambda **_kwargs: True
+        connections = gateway._connections()
+        connections.ws = SimpleNamespace(close=lambda: None)
+        gateway._start_streams = lambda *_args, **_kwargs: True
 
         def fault_during_resync(_symbol, **_kwargs):
             gateway.active = False
@@ -1005,27 +980,17 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway.gateway_name = "BINANCE"
         gateway.testnet = True
         gateway.symbols = ["BTCUSDT"]
-        gateway.orderbooks = {}
-        gateway.ws_buffer = {}
-        gateway.book_resyncing = set()
-        gateway.book_recovery_generation = {}
-        gateway.book_recovery_tokens = {}
-        gateway._book_recovery_token = 0
-        gateway._book_generation = 0
-        gateway._book_lock = threading.RLock()
         gateway.active = False
-        gateway.listen_key = ""
         gateway.target_leverage = 0
         gateway.target_margin_type = "ISOLATED"
         gateway.target_position_mode = "ONE_WAY"
-        gateway.recovery_lock = threading.Lock()
-        gateway.keep_alive_generation = 0
+        gateway._user_streams().generation = 0
         gateway.stream_ready_timeout_sec = 1.0
         gateway.state = GatewayState.ERROR
-        gateway.ws = SimpleNamespace(close=lambda: None)
+        connections = gateway._connections()
+        connections.ws = SimpleNamespace(close=lambda: None)
         gateway.session = SimpleNamespace(close=lambda: None)
-        gateway._closing = False
-        gateway._start_streams = lambda **_kwargs: True
+        gateway._start_streams = lambda *_args, **_kwargs: True
 
         def blocked_resync(_symbol, **_kwargs):
             entered_resync.set()
@@ -1046,11 +1011,11 @@ class GatewayRecoveryTests(unittest.TestCase):
             close_thread.start()
             deadline = time.perf_counter() + 1.0
             while (
-                not gateway._closing
+                not connections.closing
                 and time.perf_counter() < deadline
             ):
                 time.sleep(0.005)
-            self.assertTrue(gateway._closing)
+            self.assertTrue(connections.closing)
 
             release_resync.set()
             recovery_thread.join(timeout=1.0)
@@ -1077,9 +1042,9 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway.gateway_name = "BINANCE"
         gateway.active = True
         gateway.state = GatewayState.READY
-        gateway._book_lock = threading.RLock()
-        gateway.book_resyncing = {"BTCUSDT"}
-        gateway.ws_buffer = {"BTCUSDT": []}
+        books = gateway._order_books()
+        books.resyncing = {"BTCUSDT"}
+        books.buffers = {"BTCUSDT": []}
         gateway.require_healthy_clock = False
         rest_calls = []
         gateway.rest = SimpleNamespace(
@@ -1103,11 +1068,11 @@ class GatewayRecoveryTests(unittest.TestCase):
     def test_superseded_book_launch_cannot_emit_stale_freeze(self):
         gateway = BinanceGateway.__new__(BinanceGateway)
         gateway.event_engine = DummyEngine()
-        gateway._book_lock = threading.RLock()
-        gateway._book_generation = 3
-        gateway.book_resyncing = {"BTCUSDT"}
-        gateway.book_recovery_generation = {"BTCUSDT": 3}
-        gateway.book_recovery_tokens = {"BTCUSDT": 2}
+        books = gateway._order_books()
+        books.generation = 3
+        books.resyncing = {"BTCUSDT"}
+        books.recovery_generations = {"BTCUSDT": 3}
+        books.recovery_tokens = {"BTCUSDT": 2}
 
         self.assertFalse(
             gateway._launch_book_recovery(
@@ -1123,21 +1088,11 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway.gateway_name = "BINANCE"
         gateway.testnet = True
         gateway.symbols = []
-        gateway.orderbooks = {}
-        gateway.ws_buffer = {}
-        gateway.book_resyncing = set()
-        gateway.book_recovery_generation = {}
-        gateway.book_recovery_tokens = {}
-        gateway._book_recovery_token = 0
-        gateway._book_generation = 0
-        gateway._book_lock = threading.RLock()
         gateway.active = False
-        gateway.listen_key = ""
         gateway.target_leverage = 0
         gateway.target_margin_type = "ISOLATED"
         gateway.target_position_mode = "ONE_WAY"
-        gateway.recovery_lock = threading.Lock()
-        gateway.keep_alive_generation = 0
+        gateway._user_streams().generation = 0
         gateway.state = GatewayState.DISCONNECTED
         gateway.rest = SimpleNamespace(
             response_succeeded=lambda *_args, **_kwargs: True,
@@ -1145,8 +1100,9 @@ class GatewayRecoveryTests(unittest.TestCase):
             set_margin_type=lambda *_args, **_kwargs: None,
             set_leverage=lambda *_args, **_kwargs: None,
         )
-        gateway.ws = SimpleNamespace(close=lambda: None)
-        gateway._start_streams = lambda **_kwargs: False
+        connections = gateway._connections()
+        connections.ws = SimpleNamespace(close=lambda: None)
+        gateway._start_streams = lambda *_args, **_kwargs: False
 
         gateway.connect(["BTCUSDT"])
 
@@ -1161,21 +1117,11 @@ class GatewayRecoveryTests(unittest.TestCase):
         gateway.gateway_name = "BINANCE"
         gateway.testnet = True
         gateway.symbols = []
-        gateway.orderbooks = {}
-        gateway.ws_buffer = {}
-        gateway.book_resyncing = set()
-        gateway.book_recovery_generation = {}
-        gateway.book_recovery_tokens = {}
-        gateway._book_recovery_token = 0
-        gateway._book_generation = 0
-        gateway._book_lock = threading.RLock()
         gateway.active = False
-        gateway.listen_key = ""
         gateway.target_leverage = 8
         gateway.target_margin_type = "ISOLATED"
         gateway.target_position_mode = "ONE_WAY"
-        gateway.recovery_lock = threading.Lock()
-        gateway.keep_alive_generation = 0
+        gateway._user_streams().generation = 0
         gateway.state = GatewayState.DISCONNECTED
 
         class FailedResponse:
@@ -1190,8 +1136,9 @@ class GatewayRecoveryTests(unittest.TestCase):
             set_margin_type=lambda *_args, **_kwargs: FailedResponse(),
             set_leverage=lambda *_args, **_kwargs: FailedResponse(),
         )
-        gateway.ws = SimpleNamespace(close=lambda: None)
-        gateway._start_streams = lambda **_kwargs: True
+        connections = gateway._connections()
+        connections.ws = SimpleNamespace(close=lambda: None)
+        gateway._start_streams = lambda *_args, **_kwargs: True
 
         gateway.connect(["BTCUSDT"])
 

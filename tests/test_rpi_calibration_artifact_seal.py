@@ -12,7 +12,7 @@ from infrastructure.single_writer_fence import (
 from scripts import build_rpi_calibration_artifact as artifact_builder
 from scripts.build_rpi_calibration_artifact import (
     CalibrationArtifactError,
-    _authorized_journal_fence,
+    authorized_journal_fence,
     _CalibrationJournalReplay,
 )
 from strategy import model_readiness
@@ -93,7 +93,7 @@ def test_authorized_journal_validation_requires_existing_writer_fence(
     config_path = tmp_path / "calibration.json"
 
     with pytest.raises(CalibrationArtifactError, match="fence file is missing"):
-        with _authorized_journal_fence(
+        with authorized_journal_fence(
             journal.resolve(),
             calibration_config=_calibration_config(journal),
             calibration_config_path=config_path,
@@ -112,7 +112,7 @@ def test_authorized_journal_validation_rejects_active_writer(tmp_path):
             CalibrationArtifactError,
             match="still owned by an OMS writer",
         ):
-            with _authorized_journal_fence(
+            with authorized_journal_fence(
                 journal.resolve(),
                 calibration_config=_calibration_config(journal),
                 calibration_config_path=tmp_path / "calibration.json",

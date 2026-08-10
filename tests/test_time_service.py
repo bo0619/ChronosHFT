@@ -18,7 +18,6 @@ class TimeServiceTests(unittest.TestCase):
     def setUp(self):
         self.service = TimeService()
         self.service.stop()
-        self.service.clear_listeners()
         self.service._offset_ms = 0.0
         self.service.last_sync_time = 0.0
         self.service.last_rtt_ms = 0.0
@@ -33,16 +32,14 @@ class TimeServiceTests(unittest.TestCase):
         self.service._anchor_epoch_ns = 0
         self.service._anchor_mono_ns = 0
         self.service._anchor_wall_ns = 0
-        self.service._anchor_offset_ms = 0.0
         self.service._last_sync_mono_ns = 0
         self.service._last_now_ns = 0
         self.service._last_phase_error_ms = 0.0
         self.service._last_notified_fault = ""
         self.service.configure(
             {
-                # Legacy keys remain supported, but now mean phase error.
-                "max_offset_ms": 25.0,
-                "halt_offset_ms": 100.0,
+                "max_phase_error_ms": 25.0,
+                "halt_phase_error_ms": 100.0,
                 "max_initial_offset_ms": 5000.0,
                 "max_rtt_ms": 5000.0,
                 "max_uncertainty_ms": 5000.0,
@@ -183,7 +180,7 @@ class TimeServiceTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 self.service.configure(invalid)
 
-    def test_explicit_phase_thresholds_update_legacy_aliases(self):
+    def test_explicit_phase_thresholds_update_canonical_fields(self):
         self.service.configure(
             {
                 "max_phase_error_ms": 30.0,
@@ -193,8 +190,6 @@ class TimeServiceTests(unittest.TestCase):
 
         self.assertEqual(self.service.max_phase_error_ms, 30.0)
         self.assertEqual(self.service.halt_phase_error_ms, 120.0)
-        self.assertEqual(self.service.max_offset_ms, 30.0)
-        self.assertEqual(self.service.halt_offset_ms, 120.0)
 
     def test_initial_offset_over_hard_limit_is_halted_without_anchor(self):
         self.assertFalse(

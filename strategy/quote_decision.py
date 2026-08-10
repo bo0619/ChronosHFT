@@ -31,10 +31,6 @@ class QuoteDecision:
     effective_ask_depth_bps: float
     post_only_adjusted: bool
 
-    def spread_bps(self, mid_price: float) -> float:
-        mid = _positive_finite(mid_price, "mid_price")
-        return (self.target_ask - self.target_bid) / mid * 10_000.0
-
 
 def _finite(value: object, field: str) -> float:
     try:

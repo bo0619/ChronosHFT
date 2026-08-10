@@ -196,10 +196,6 @@ class OutboundMessageBudget:
             )
             return reservation, ""
 
-    def reserve(self, message_kind: str, now: float | None = None) -> str:
-        _reservation, rejection = self.reserve_token(message_kind, now)
-        return rejection
-
     def rollback(self, reservation: OutboundMessageReservation | None) -> bool:
         if reservation is None or not self.enabled:
             return False

@@ -113,10 +113,6 @@ class BinanceRateLimitBudget:
         )
 
     @property
-    def normal_limit(self) -> int:
-        return self.background_limit
-
-    @property
     def background_limit(self) -> int:
         return (
             self.request_weight_limit

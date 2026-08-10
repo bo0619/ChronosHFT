@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from governance.contracts import is_testnet_environment
 from infrastructure.runtime_configuration import print_config_summary
 from infrastructure.runtime_readiness import (
     RuntimeReadinessController,
@@ -100,10 +101,12 @@ class RuntimeApplication:
 
     def __init__(
         self,
-        resources: RuntimeResources | dict | None,
+        resources: RuntimeResources | None,
         services: RuntimeApplicationServices,
     ) -> None:
-        self.resources = RuntimeResources.coerce(resources)
+        if resources is not None and not isinstance(resources, RuntimeResources):
+            raise TypeError("resources must be RuntimeResources")
+        self.resources = resources if resources is not None else RuntimeResources()
         self.services = services
         self.args = None
         self.config: dict = {}
@@ -122,14 +125,10 @@ class RuntimeApplication:
         self.data_recorder = None
         self.resource_monitor = None
         self.live_evidence_recorder = None
-        self.recorder = None
         self.truth_monitor = None
         self.venue_supervisor = None
         self.admin_control = None
         self.web_dashboard = None
-        self.watchdog_state = None
-        self.event_bindings = None
-        self.control_loop = None
         self.event_engine_config: dict = {}
         self.web_dashboard_config: dict = {}
         self._listener_unsubscribers: list[Callable[[], object]] = []
@@ -138,12 +137,8 @@ class RuntimeApplication:
             if hasattr(services, "platform")
             else time.perf_counter,
         )
-        self.readiness_controller = RuntimeReadinessController(
-            self.readiness_evaluator
-        )
+        self.readiness_controller = RuntimeReadinessController(self.readiness_evaluator)
         self.readiness_components: dict[str, bool | None] = {}
-        self.readiness_required: tuple[str, ...] = ()
-        self.runtime_readiness_snapshot = None
     def run(self, argv=None):
         try:
             self.args = self.services.configuration.parse_cli_args(argv)
@@ -275,7 +270,9 @@ class RuntimeApplication:
         clock = services.platform.time_service
         time_sync_config = config.get("system", {}).get("time_sync", {}) or {}
         clock.configure(time_sync_config)
-        initial_clock_sync_ok = clock.start(testnet=config["testnet"])
+        initial_clock_sync_ok = clock.start(
+            testnet=is_testnet_environment(config)
+        )
         clock_required = bool(time_sync_config.get("startup_required", True))
         if clock_required and not (
             initial_clock_sync_ok and clock.is_ready()
@@ -526,7 +523,9 @@ class RuntimeApplication:
             )
             services.platform.logger.set_ui_callback(dashboard.add_log)
         self._own("web_dashboard", dashboard)
-        services.factories.ref_data_manager.init(testnet=config["testnet"])
+        services.factories.ref_data_manager.init(
+            testnet=is_testnet_environment(config)
+        )
 
     def _register_events_and_start_core(self) -> None:
         services = self.services

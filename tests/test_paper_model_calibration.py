@@ -181,7 +181,7 @@ def test_conditional_markout_uses_chronological_oos_and_handles_empty_columns():
 def _paper_config(tmp_path: Path) -> dict:
     return {
         "execution": {"mode": "paper"},
-        "paper_trade": {"enabled": True, "initial_balance_usdt": 10_000.0},
+        "paper_trade": {"initial_balance_usdt": 10_000.0},
         "paper_trade_database": {
             "enabled": True,
             "path": str(tmp_path / "trades.sqlite3"),

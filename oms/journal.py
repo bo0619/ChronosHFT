@@ -160,7 +160,6 @@ class OMSJournal:
         self._recent_commit_order = deque()
         self._checkpoint: dict | None = None
         self._checkpoint_marker_seq = 0
-        self._checkpoint_marker_hash = ""
         self._verified_start_seq = 1
         self._disk_free_bytes = None
         self._last_space_check_monotonic = 0.0
@@ -708,7 +707,6 @@ class OMSJournal:
                 )
             self._checkpoint = checkpoint
             self._checkpoint_marker_seq = int(pointer["marker_seq"])
-            self._checkpoint_marker_hash = str(pointer["marker_hash"])
             self._verified_start_seq = anchor_seq
 
         self._next_seq = last_seq + 1
@@ -968,7 +966,6 @@ class OMSJournal:
             )
             self._checkpoint = checkpoint
             self._checkpoint_marker_seq = marker_seq
-            self._checkpoint_marker_hash = str(marker["hash"])
             return dict(checkpoint)
 
     def recovery_checkpoint(self) -> dict | None:

@@ -308,52 +308,6 @@ class RPIIntensityAccumulator:
     def invalid_sample_count(self) -> int:
         return sum(self._invalid_reasons.values())
 
-    def add_acked_interval(
-        self,
-        *,
-        depth_bps: Any,
-        acknowledged_at_seconds: Any,
-        ended_at_seconds: Any,
-        fill_count: Any = 0,
-    ) -> bool:
-        """Add exposure measured strictly after a successful venue ACK."""
-
-        acknowledged_at = _finite_float(acknowledged_at_seconds)
-        ended_at = _finite_float(ended_at_seconds)
-        if (
-            acknowledged_at is None
-            or ended_at is None
-            or acknowledged_at < 0.0
-            or ended_at <= acknowledged_at
-        ):
-            self._invalid_reasons["invalid_ack_interval"] += 1
-            return False
-        return self.add_acked_exposure(
-            depth_bps=depth_bps,
-            exposure_seconds=ended_at - acknowledged_at,
-            fill_count=fill_count,
-        )
-
-    def add_acked_exposure(
-        self,
-        *,
-        depth_bps: Any,
-        exposure_seconds: Any,
-        fill_count: Any = 0,
-    ) -> bool:
-        """Add an already measured post-ACK exposure, including zero fills."""
-
-        normalized, reason = _normalize_values(
-            depth_bps=depth_bps,
-            exposure_seconds=exposure_seconds,
-            fill_count=fill_count,
-            sample_count=1,
-        )
-        if normalized is None:
-            self._invalid_reasons[reason] += 1
-            return False
-        return self._add_normalized_bin(normalized)
-
     def add_acked_bin(self, exposure_bin: RPIExposureBin) -> bool:
         """Merge a pre-aggregated, post-ACK depth bin."""
 

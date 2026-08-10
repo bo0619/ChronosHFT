@@ -14,8 +14,6 @@ from governance.contracts import (
     CONFIG_UNKNOWN_KEY_POLICY,
 )
 
-LEGACY_CONFIG_MANIFEST_SCHEMA = "chronoshft.config_manifest.v1"
-VERSIONED_CONFIG_MANIFEST_SCHEMA = CONFIG_MANIFEST_SCHEMA
 CONFIG_FRAGMENT_METADATA_KEYS = frozenset({"$schema", "fragment", "version"})
 
 
@@ -372,10 +370,6 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
             {
                 "paper_trade": _object(
                     {
-                        "enabled": BOOL,
-                        "market_data_environment": _string(
-                            choices=("production", "testnet")
-                        ),
                         "maker_fee": PROBABILITY,
                         "taker_fee": PROBABILITY,
                         "rpi_commission_rate": PROBABILITY,
@@ -587,8 +581,6 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                                     min_items=1,
                                 ),
                                 "position_buffer_orders": _number(1.0),
-                                "reference_min_notional": POSITIVE,
-                                "notional_buffer": _number(1.0),
                             }
                         ),
                     }
@@ -701,7 +693,6 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                                         "initial_sigma_bps": POSITIVE,
                                         "initial_A": POSITIVE,
                                         "initial_k": POSITIVE,
-                                        "learning_rate": POSITIVE,
                                         "sigma_max_bps": POSITIVE,
                                         "sigma_ema_alpha": _number(
                                             0.0,
@@ -928,7 +919,6 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                                 "environment": _string(
                                     choices=("production", "testnet")
                                 ),
-                                "testnet": BOOL,
                                 "public_only": BOOL,
                                 "publish_depth_levels": POSITIVE_INT,
                                 "emit_full_orderbook_events": BOOL,
@@ -1074,8 +1064,8 @@ def validate_versioned_manifest(payload: Mapping[str, object]) -> list[FragmentI
         violations.append(f"unknown manifest keys: {unknown}")
     if missing:
         violations.append(f"missing manifest keys: {missing}")
-    if payload.get("schema") != VERSIONED_CONFIG_MANIFEST_SCHEMA:
-        violations.append(f"schema must be {VERSIONED_CONFIG_MANIFEST_SCHEMA!r}")
+    if payload.get("schema") != CONFIG_MANIFEST_SCHEMA:
+        violations.append(f"schema must be {CONFIG_MANIFEST_SCHEMA!r}")
     config_version = payload.get("config_version")
     if (
         isinstance(config_version, bool)
@@ -1500,24 +1490,7 @@ def validate_composed_config(config: Mapping[str, object]) -> None:
 
     paper = _mapping(config.get("paper_trade"))
     market_data = _mapping(system.get("market_data"))
-    execution = _mapping(config.get("execution"))
-    if execution and paper:
-        mode_is_paper = execution.get("mode") == "paper"
-        if paper.get("enabled") is not mode_is_paper:
-            violations.append(
-                "paper_trade.enabled must be true exactly when execution.mode='paper'"
-            )
     if paper and market_data:
-        environment = market_data.get("environment")
-        if paper.get("market_data_environment") != environment:
-            violations.append(
-                "paper_trade.market_data_environment must equal "
-                "system.market_data.environment"
-            )
-        if market_data.get("testnet") is not (environment == "testnet"):
-            violations.append(
-                "system.market_data.testnet must match market_data.environment"
-            )
         if market_data.get("public_only") is not True:
             violations.append(
                 "Paper market data must set system.market_data.public_only=true"

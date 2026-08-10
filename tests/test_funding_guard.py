@@ -168,7 +168,6 @@ class FundingGuardTests(unittest.TestCase):
             "funding_guard:snapshot_unavailable",
         )
         self.assertTrue(decision.blocks_open_risk)
-        self.assertTrue(decision.allows_reduce_only)
 
         decision, state = self.recover(state)
         self.assertEqual(decision.action, ALLOW)

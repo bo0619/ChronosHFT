@@ -2,39 +2,25 @@
 # [FIX-RISK] check_risk(): ?? worst-case ?????????
 
 import math
-from collections.abc import Iterator, Mapping
-from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
 from event.type import Side, PositionData
-from data.cache import data_cache
 
 
-class _ReadOnlyLedgerView(Mapping):
-    """Read-only compatibility view over one owned exposure ledger.
+class _ZeroDefaultLedger(dict):
+    """Owned ledger with non-mutating zero-default reads.
 
     The old exposure API was backed by ``defaultdict(float)`` instances, so
     callers commonly used ``ledger[symbol]`` for a missing value.  A plain
-    ``MappingProxyType`` would make that read raise ``KeyError`` and would
-    encourage callers to reach into the store for a workaround.  This view
-    preserves the zero-default read semantics while exposing no mutating
-    operation; all writes remain methods on :class:`ExposureStore`.
+    dictionary would make that read raise ``KeyError``.  Returning zero from
+    ``__missing__`` preserves the read contract without inserting a key; the
+    public port wraps each instance in ``MappingProxyType``.
     """
 
-    __slots__ = ("_values",)
-
-    def __init__(self, values: defaultdict) -> None:
-        self._values = values
-
-    def __getitem__(self, key: object) -> float:
-        return self._values.get(key, 0.0)
-
-    def __iter__(self) -> Iterator:
-        return iter(self._values)
-
-    def __len__(self) -> int:
-        return len(self._values)
+    def __missing__(self, _key: object) -> float:
+        return 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,41 +44,41 @@ class ExposureStore:
     [Single Source of Truth] ????????
     """
 
-    def __init__(self, market_cache=None):
-        self._market_cache = market_cache or data_cache
+    def __init__(self, *, market_cache):
+        self._market_cache = market_cache
         # The dictionaries below are the sole mutable storage cells.  Public
         # ledger names are read-only Mapping views declared just below.
-        self._net_positions = defaultdict(float)
-        self._avg_prices = defaultdict(float)
-        self._open_buy_qty = defaultdict(float)
-        self._open_sell_qty = defaultdict(float)
-        self._reduce_only_buy_qty = defaultdict(float)
-        self._reduce_only_sell_qty = defaultdict(float)
-        self._strategy_net_positions = defaultdict(float)
-        self._strategy_avg_prices = defaultdict(float)
-        self._strategy_open_buy_qty = defaultdict(float)
-        self._strategy_open_sell_qty = defaultdict(float)
+        self._net_positions = _ZeroDefaultLedger()
+        self._avg_prices = _ZeroDefaultLedger()
+        self._open_buy_qty = _ZeroDefaultLedger()
+        self._open_sell_qty = _ZeroDefaultLedger()
+        self._reduce_only_buy_qty = _ZeroDefaultLedger()
+        self._reduce_only_sell_qty = _ZeroDefaultLedger()
+        self._strategy_net_positions = _ZeroDefaultLedger()
+        self._strategy_avg_prices = _ZeroDefaultLedger()
+        self._strategy_open_buy_qty = _ZeroDefaultLedger()
+        self._strategy_open_sell_qty = _ZeroDefaultLedger()
 
-        self._net_positions_view = _ReadOnlyLedgerView(self._net_positions)
-        self._avg_prices_view = _ReadOnlyLedgerView(self._avg_prices)
-        self._open_buy_qty_view = _ReadOnlyLedgerView(self._open_buy_qty)
-        self._open_sell_qty_view = _ReadOnlyLedgerView(self._open_sell_qty)
-        self._reduce_only_buy_qty_view = _ReadOnlyLedgerView(
+        self._net_positions_view = MappingProxyType(self._net_positions)
+        self._avg_prices_view = MappingProxyType(self._avg_prices)
+        self._open_buy_qty_view = MappingProxyType(self._open_buy_qty)
+        self._open_sell_qty_view = MappingProxyType(self._open_sell_qty)
+        self._reduce_only_buy_qty_view = MappingProxyType(
             self._reduce_only_buy_qty
         )
-        self._reduce_only_sell_qty_view = _ReadOnlyLedgerView(
+        self._reduce_only_sell_qty_view = MappingProxyType(
             self._reduce_only_sell_qty
         )
-        self._strategy_net_positions_view = _ReadOnlyLedgerView(
+        self._strategy_net_positions_view = MappingProxyType(
             self._strategy_net_positions
         )
-        self._strategy_avg_prices_view = _ReadOnlyLedgerView(
+        self._strategy_avg_prices_view = MappingProxyType(
             self._strategy_avg_prices
         )
-        self._strategy_open_buy_qty_view = _ReadOnlyLedgerView(
+        self._strategy_open_buy_qty_view = MappingProxyType(
             self._strategy_open_buy_qty
         )
-        self._strategy_open_sell_qty_view = _ReadOnlyLedgerView(
+        self._strategy_open_sell_qty_view = MappingProxyType(
             self._strategy_open_sell_qty
         )
 
@@ -215,8 +201,8 @@ class ExposureStore:
                 "strategy average-price ledger contains unknown positions"
             )
 
-        restored_positions = defaultdict(float)
-        restored_average_prices = defaultdict(float)
+        restored_positions = _ZeroDefaultLedger()
+        restored_average_prices = _ZeroDefaultLedger()
         for raw_key, raw_quantity in positions.items():
             key = self._strategy_key(raw_key)
             try:
@@ -809,7 +795,3 @@ class ExposureStore:
             )
         self._net_positions[symbol] = volume
         self._avg_prices[symbol] = price if abs(volume) > 1e-9 else 0.0
-
-
-# Transitional import compatibility. Runtime composition uses ExposureStore.
-ExposureManager = ExposureStore

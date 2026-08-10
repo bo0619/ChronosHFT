@@ -25,7 +25,6 @@ class OMSDurabilityManager(OMSComponent):
             "_cancel_all_orders_unchecked",
             "_close_outbound_gate_locked",
             "_ensure_symbol_guard_records_locked",
-            "_lifecycle_generation",
             "_outbound_all_order_seal_reason",
             "_outbound_gate_holds",
             "_refresh_symbol_guard_effective_locked",
@@ -35,24 +34,16 @@ class OMSDurabilityManager(OMSComponent):
             "capability_mode",
             "capability_reason",
             "event_engine",
-            "last_freeze_reason",
-            "last_halt_reason",
+            "lifecycle_store",
             "lock",
-            "manual_rearm_required",
-            "state",
             "symbol_guard_epoch_counters",
         }
     )
     OWNER_WRITES = frozenset(
         {
-            "_lifecycle_generation",
             "_outbound_all_order_seal_reason",
             "capability_mode",
             "capability_reason",
-            "last_freeze_reason",
-            "last_halt_reason",
-            "manual_rearm_required",
-            "state",
         }
     )
 
@@ -116,12 +107,13 @@ class OMSDurabilityManager(OMSComponent):
             reason,
             hold="journal_failure",
         )
-        self.state = LifecycleState.HALTED
-        if not already_latched:
-            self._lifecycle_generation += 1
-        self.manual_rearm_required = True
-        self.last_halt_reason = reason
-        self.last_freeze_reason = ""
+        self.lifecycle_store.transition(
+            LifecycleState.HALTED,
+            increment_generation=not already_latched,
+            manual_rearm_required=True,
+            last_halt_reason=reason,
+            last_freeze_reason="",
+        )
         self.capability_mode = OMSCapabilityMode.CANCEL_ONLY
         self.capability_reason = reason
         if symbol:

@@ -154,7 +154,6 @@ class OMSGuardManager(OMSComponent):
     def _enforce_symbol_guard(
         self,
         symbol: str,
-        reason: str,
         epoch: int,
         cancel_active_orders: bool,
     ) -> None:
@@ -203,7 +202,6 @@ class OMSGuardManager(OMSComponent):
             logger.error(f"[OMS] Symbol frozen {symbol}: {reason}")
         self._enforce_symbol_guard(
             symbol,
-            reason,
             epoch,
             cancel_active_orders,
         )
@@ -918,9 +916,6 @@ class OMSGuardManager(OMSComponent):
 
     def can_submit_for_strategy(self, strategy_id: str, symbol: str = "") -> bool:
         return self._get_order_block_reason(strategy_id, symbol) == ""
-
-    def get_order_block_reason(self, strategy_id: str = "", symbol: str = "") -> str:
-        return self._get_order_block_reason(strategy_id, symbol)
 
     def _cancel_orders_matching(self, predicate):
         with self.lock:

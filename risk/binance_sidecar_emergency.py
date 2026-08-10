@@ -4,22 +4,7 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
 from typing import Protocol
-
-
-@dataclass(frozen=True, slots=True)
-class _EmergencyOrder:
-    symbol: str
-    price: float
-    volume: float
-    side: str
-    order_type: str
-    time_in_force: str
-    reduce_only: bool
-    is_rpi: bool = False
-    post_only: bool = False
-    self_trade_prevention_mode: str = ""
 
 
 class BinanceSidecarEmergencyOwner(Protocol):
@@ -138,33 +123,16 @@ class BinanceSidecarEmergencyActions:
             if not symbol or abs(amount) <= 1e-9:
                 continue
             side = "SELL" if amount > 0.0 else "BUY"
-            request = _EmergencyOrder(
-                symbol=symbol,
-                price=0.0,
-                volume=abs(amount),
-                side=side,
-                order_type="MARKET",
-                time_in_force="IOC",
-                reduce_only=True,
-            )
             client_oid = (
                 f"crsk-{os.getpid()}-{timestamp_fragment}-{index}"
             )[:36]
             try:
-                submit = getattr(
-                    owner.rest,
-                    "new_reduce_only_market_order",
-                    None,
+                response = owner.rest.new_reduce_only_market_order(
+                    symbol=symbol,
+                    side=side,
+                    quantity=abs(amount),
+                    client_oid=client_oid,
                 )
-                if callable(submit):
-                    response = submit(
-                        symbol=symbol,
-                        side=side,
-                        quantity=abs(amount),
-                        client_oid=client_oid,
-                    )
-                else:
-                    response = owner.rest.new_order(request, client_oid)
                 if getattr(response, "status_code", None) != 200:
                     failures.append(
                         f"{symbol}:flatten_status="

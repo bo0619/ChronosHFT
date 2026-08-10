@@ -39,6 +39,7 @@ from governance.deployment_identity import (  # noqa: E402
 from governance.contracts import (  # noqa: E402
     RPI_CALIBRATION_ARTIFACT_SCHEMA,
     RPI_EXPOSURE_SAMPLE_SCHEMA,
+    market_data_environment,
 )
 from governance.strategy_identity import (  # noqa: E402
     canonical_model_key,
@@ -115,13 +116,6 @@ _TERMINAL_STATUSES = frozenset(
         "REJECTED",
         "REJECTED_LOCALLY",
         "EXPIRED",
-    }
-)
-_EXCHANGE_ACK_STATUSES = frozenset(
-    {
-        "NEW",
-        "PARTIALLY_FILLED",
-        "FILLED",
     }
 )
 _EXECUTION_STATUSES = frozenset({"PARTIALLY_FILLED", "FILLED"})
@@ -2984,7 +2978,7 @@ def _resolved_config_path(base_dir: Path, value: Any, field: str) -> Path:
 
 
 @contextmanager
-def _authorized_journal_fence(
+def authorized_journal_fence(
     journal_path: Path,
     *,
     calibration_config: Mapping[str, Any] | None,
@@ -3072,7 +3066,7 @@ def _authorized_journal_fence(
             ) from exc
 
 
-def _validate_rpi_calibration_journal_unlocked(
+def validate_rpi_calibration_journal_unlocked(
     journal_path: str | Path,
     *,
     symbol: str,
@@ -3442,12 +3436,12 @@ def validate_rpi_calibration_journal(
 ) -> RPIJournalValidationSummary:
     """Validate one stable journal while excluding its configured OMS writer."""
     source = Path(journal_path).resolve()
-    with _authorized_journal_fence(
+    with authorized_journal_fence(
         source,
         calibration_config=calibration_config,
         calibration_config_path=calibration_config_path,
     ):
-        return _validate_rpi_calibration_journal_unlocked(
+        return validate_rpi_calibration_journal_unlocked(
             source,
             symbol=symbol,
             calibration_config=calibration_config,
@@ -3455,18 +3449,6 @@ def validate_rpi_calibration_journal(
             calibration_config_path=calibration_config_path,
             target_deployment_config_path=target_deployment_config_path,
         )
-
-
-def load_rpi_exposure_bins(
-    journal_path: str | Path,
-    *,
-    symbol: str,
-) -> tuple[RPIExposureBin, ...]:
-    """Compatibility wrapper returning bins from fully validated evidence."""
-    return validate_rpi_calibration_journal(
-        journal_path,
-        symbol=symbol,
-    ).exposure_bins
 
 
 def _artifact_from_estimate(
@@ -3722,7 +3704,7 @@ def _build_rpi_calibration_artifact_with_fence_held(
         "deployment_config_sha256",
         0,
     )
-    journal_summary = _validate_rpi_calibration_journal_unlocked(
+    journal_summary = validate_rpi_calibration_journal_unlocked(
         source,
         symbol=target_symbol,
         calibration_config=calibration_config,
@@ -3792,7 +3774,7 @@ def build_rpi_calibration_artifact(
 ) -> dict[str, Any]:
     """Build and publish while excluding the configured live journal writer."""
     source = Path(journal_path).resolve()
-    with _authorized_journal_fence(
+    with authorized_journal_fence(
         source,
         calibration_config=calibration_config,
         calibration_config_path=calibration_config_path,
@@ -3811,7 +3793,7 @@ def build_rpi_calibration_artifact(
         )
 
 
-def _load_effective_deployment_config(path: str | Path) -> dict[str, Any]:
+def load_effective_deployment_config(path: str | Path) -> dict[str, Any]:
     source = Path(path).resolve()
     try:
         with source.open("r", encoding="utf-8") as handle:
@@ -3839,13 +3821,10 @@ def _load_effective_deployment_config(path: str | Path) -> dict[str, Any]:
 
     configured = normalize_root_config_preapproval(raw)
     execution = configured.get("execution", {})
-    paper_trade = configured.get("paper_trade", {})
     if (
         not isinstance(execution, Mapping)
         or execution.get("mode") != "live"
-        or not isinstance(paper_trade, Mapping)
-        or paper_trade.get("enabled") is not False
-        or configured.get("testnet") is not False
+        or market_data_environment(configured) != "production"
     ):
         raise CalibrationArtifactError(
             "calibration artifact binding requires an explicit production "
@@ -3928,21 +3907,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-# Public governance API used by both runtime approval validation and the
-# offline CLI. The underscore aliases remain available only for compatibility
-# with older test/tool imports.
-authorized_journal_fence = _authorized_journal_fence
-load_effective_deployment_config = _load_effective_deployment_config
-validate_rpi_calibration_journal_unlocked = (
-    _validate_rpi_calibration_journal_unlocked
-)
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
     try:
-        deployment_config = _load_effective_deployment_config(args.config)
-        calibration_config = _load_effective_deployment_config(
+        deployment_config = load_effective_deployment_config(args.config)
+        calibration_config = load_effective_deployment_config(
             args.calibration_config
         )
         strategy = deployment_config.get("strategy", {})

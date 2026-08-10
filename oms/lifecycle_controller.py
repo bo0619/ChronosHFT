@@ -362,11 +362,6 @@ class OMSLifecycleController(OMSComponent):
             )
         return False
 
-    def _shutdown_checkpoint_summary(self) -> dict:
-        return self._spawn_component(
-            OMSShutdownCoordinator
-        ).checkpoint_summary()
-
     def stop(self, clean_shutdown: bool = False, reason: str = ""):
         return self._spawn_component(OMSShutdownCoordinator).stop(
             clean_shutdown,

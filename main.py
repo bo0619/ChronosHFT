@@ -12,9 +12,10 @@ from data.ref_data import ref_data_manager
 from event.engine import EventEngine
 from event.type import OMSCapabilityMode
 from gateway.binance.gateway import BinanceGateway
-from gateway.binance.rate_limit_budget import BinanceRateLimitBudget
+from infrastructure.binance_rate_limit_budget import BinanceRateLimitBudget
 from gateway.binance.truth_provider import BinanceTruthSnapshotProvider
 from governance import calibration_artifact as calibration_artifact_port
+from governance.contracts import is_testnet_environment
 from infrastructure.admin_control import (
     AdminControlServer,
     coordinated_rearm,
@@ -683,18 +684,19 @@ def build_gateway_bundle(engine, config, market_data_config):
         or 60.0
     )
 
+    testnet = is_testnet_environment(config)
     gateway = BinanceGateway(
         engine,
         config["api_key"],
         config["api_secret"],
-        testnet=config["testnet"],
+        testnet=testnet,
         market_data_config=market_data_config,
         rate_limit_budget=rate_limit_budget,
     )
     truth_provider = BinanceTruthSnapshotProvider(
         config["api_key"],
         config["api_secret"],
-        testnet=config["testnet"],
+        testnet=testnet,
         rate_limit_budget=rate_limit_budget,
         symbols=config.get("symbols", ()),
         full_open_orders_audit_interval_sec=(

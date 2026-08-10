@@ -17,7 +17,13 @@ class ClockPort(Protocol):
 
     def wall_time(self) -> float: ...
 
+    def now_ms(self) -> int: ...
+
+    def now_ns(self) -> int: ...
+
     def now_seconds(self) -> float: ...
+
+    def health_snapshot(self) -> dict: ...
 
     def sleep(self, seconds: float) -> None: ...
 
@@ -27,6 +33,15 @@ class MarketCachePort(Protocol):
     def get_mark_price(self, symbol: str) -> float: ...
 
     def get_best_quote(self, symbol: str) -> tuple[float, float]: ...
+
+    def get_last_trade_price(self, symbol: str) -> float: ...
+
+    def get_risk_snapshot(
+        self,
+        symbol: str,
+        *,
+        now: float | None = None,
+    ) -> dict: ...
 
 
 @runtime_checkable
@@ -66,11 +81,32 @@ class MainProcessClock:
     def wall_time(self) -> float:
         return float(self.wall_time_fn())
 
+    def now_ms(self) -> int:
+        return self.now_ns() // 1_000_000
+
+    def now_ns(self) -> int:
+        reader = getattr(self.exchange_clock, "now_ns", None)
+        if not callable(reader):
+            raise RuntimeError("exchange clock does not provide now_ns")
+        return int(reader())
+
     def now_seconds(self) -> float:
         reader = getattr(self.exchange_clock, "now_seconds", None)
         if not callable(reader):
             raise RuntimeError("exchange clock does not provide now_seconds")
         return float(reader())
+
+    def health_snapshot(self) -> dict:
+        reader = getattr(self.exchange_clock, "health_snapshot", None)
+        if not callable(reader):
+            raise RuntimeError("exchange clock does not provide health_snapshot")
+        try:
+            snapshot = reader(notify_listeners=False)
+        except TypeError:
+            snapshot = reader()
+        if not isinstance(snapshot, dict):
+            raise RuntimeError("exchange clock health snapshot must be an object")
+        return snapshot
 
     def sleep(self, seconds: float) -> None:
         self.sleep_fn(float(seconds))
@@ -122,7 +158,12 @@ def compose_runtime_domain(
     )
     return RuntimeDomainComposition(
         ports=ports,
-        oms_type=partial(oms_type, market_cache=ports.market_cache),
+        oms_type=partial(
+            oms_type,
+            clock=ports.clock,
+            market_cache=ports.market_cache,
+            reference_data=ports.reference_data,
+        ),
         strategy_factory=partial(
             strategy_factory,
             clock=ports.clock,

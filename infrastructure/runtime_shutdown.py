@@ -88,7 +88,9 @@ class RuntimeShutdownCoordinator:
             return bool(runtime and runtime.get("_shutdown_verified", False))
         if runtime.get("_shutdown_in_progress"):
             return False
-        resources = RuntimeResources.coerce(runtime)
+        if not isinstance(runtime, RuntimeResources):
+            raise TypeError("runtime must be RuntimeResources")
+        resources = runtime
         resources["_shutdown_in_progress"] = True
         coordinator = cls(resources, reason, services)
         try:

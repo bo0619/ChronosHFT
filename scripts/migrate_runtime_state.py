@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
-from migration.runtime_state import (
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from migration.runtime_state import (  # noqa: E402
     apply_migration_plan,
     build_migration_plan,
     inspect_sources,

@@ -9,6 +9,7 @@ from infrastructure.runtime_ports import (
     MarketCachePort,
     ReferenceDataPort,
 )
+from infrastructure.runtime_resources import RuntimeResources
 from infrastructure.runtime_telemetry import TelemetryPublisher
 from infrastructure.time_service import TimeService
 from main import build_runtime_application
@@ -137,7 +138,6 @@ def test_telemetry_publisher_replaces_backlog_with_latest_value():
 def test_time_service_listener_unsubscribe_is_owned_and_idempotent():
     service = TimeService()
     service.stop()
-    service.clear_listeners()
 
     def first(*_args):
         return None
@@ -146,17 +146,17 @@ def test_time_service_listener_unsubscribe_is_owned_and_idempotent():
         return None
 
     unsubscribe_first = service.register_listener(first)
-    service.register_listener(second)
+    unsubscribe_second = service.register_listener(second)
 
     assert unsubscribe_first() is True
     assert unsubscribe_first() is False
     assert first not in service.listeners
     assert second in service.listeners
-    service.clear_listeners()
+    assert unsubscribe_second() is True
 
 
 def test_composition_root_injects_one_domain_port_bundle():
-    application = build_runtime_application({})
+    application = build_runtime_application(RuntimeResources())
     services = application.services
     ports = services.platform.domain_ports
 
@@ -166,6 +166,10 @@ def test_composition_root_injects_one_domain_port_bundle():
     assert services.factories.ref_data_manager is ports.reference_data
     assert services.factories.oms_type.keywords["market_cache"] is (
         ports.market_cache
+    )
+    assert services.factories.oms_type.keywords["clock"] is ports.clock
+    assert services.factories.oms_type.keywords["reference_data"] is (
+        ports.reference_data
     )
     strategy_keywords = (
         services.factories.create_primary_strategy.keywords

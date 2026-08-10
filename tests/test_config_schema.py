@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from governance.contracts import CONFIG_MANIFEST_SCHEMA
 from infrastructure.config_scaling import (
-    CURRENT_CONFIG_MANIFEST_SCHEMA,
     load_config_document,
     load_root_config,
 )
@@ -34,7 +34,7 @@ def _fragment(fragment, content, *, version=1):
 
 def _manifest(*includes):
     return {
-        "schema": CURRENT_CONFIG_MANIFEST_SCHEMA,
+        "schema": CONFIG_MANIFEST_SCHEMA,
         "config_version": CONFIG_DOCUMENT_VERSION,
         "unknown_keys": CONFIG_UNKNOWN_KEY_POLICY,
         "includes": list(includes),
@@ -52,7 +52,7 @@ def _raw_tracked_config():
 def test_tracked_manifest_versions_every_fragment():
     manifest = json.loads((REPOSITORY_ROOT / "config.json").read_text(encoding="utf-8"))
 
-    assert manifest["schema"] == CURRENT_CONFIG_MANIFEST_SCHEMA
+    assert manifest["schema"] == CONFIG_MANIFEST_SCHEMA
     assert manifest["config_version"] == CONFIG_DOCUMENT_VERSION
     assert manifest["unknown_keys"] == CONFIG_UNKNOWN_KEY_POLICY
     assert len(manifest["includes"]) == 31
@@ -360,12 +360,6 @@ def test_legacy_v1_manifest_is_rejected_at_runtime(tmp_path):
             "sample counts",
         ),
         (
-            lambda config: config["paper_trade"].__setitem__(
-                "market_data_environment", "testnet"
-            ),
-            "market_data_environment",
-        ),
-        (
             lambda config: config["strategy"].__setitem__(
                 "registered_models", ["avellaneda_stoikov"]
             ),
@@ -374,10 +368,6 @@ def test_legacy_v1_manifest_is_rejected_at_runtime(tmp_path):
         (
             lambda config: config["strategy"].__setitem__("name", "AvellanedaStoikov"),
             "strategy.name",
-        ),
-        (
-            lambda config: config["execution"].__setitem__("mode", "live"),
-            "paper_trade.enabled",
         ),
         (
             lambda config: config["risk"]["price_sanity"].__setitem__(

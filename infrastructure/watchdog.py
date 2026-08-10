@@ -290,11 +290,8 @@ def _lane_trip(
 
 
 def _lane_config_value(raw_value, lane: str, default):
-    if isinstance(raw_value, (int, float)):
-        return raw_value
     raw_value = raw_value or {}
-    fallback = raw_value.get("hot", default) if lane in {"market", "execution"} else raw_value.get("cold", default)
-    return raw_value.get(lane, fallback)
+    return raw_value.get(lane, default)
 
 
 def _metric_trip(depth: int, backlog_ms: float, config: dict, depth_key: str, backlog_key: str, default_depth: int, default_backlog_ms: float):

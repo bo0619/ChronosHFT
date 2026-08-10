@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from governance.canonical import canonical_json_bytes
-from governance.release_manifest import build_release_manifest, release_files
+from governance.release_manifest import build_release_manifest
 from strategy.quote_math import (
     AS_FORMULA_VERSION,
     GLFT_FORMULA_VERSION,
@@ -23,7 +23,8 @@ _ALIASES = {
     "as": "avellaneda_stoikov",
     "avellanedastoikov": "avellaneda_stoikov",
 }
-_CONTROL_KEYS = {"name", "primary_model", "registered_models", "shared", "models"}
+_CONTROL_KEYS = {"name", "primary_model", "registered_models"}
+_RETIRED_CONFIG_KEYS = frozenset({"shared", "models"})
 _TRUST_KEYS = frozenset(
     {
         "_rpi_sampling_identity",
@@ -89,26 +90,19 @@ def _effective_strategy_config(
     strategy = config.get("strategy")
     if not isinstance(strategy, Mapping):
         raise ValueError("strategy must be an object")
+    retired = sorted(_RETIRED_CONFIG_KEYS.intersection(strategy))
+    if retired:
+        raise ValueError(
+            "Unsupported strategy configuration fields: "
+            + ", ".join(f"strategy.{key}" for key in retired)
+        )
     shared = {
         key: deepcopy(value)
         for key, value in strategy.items()
         if key not in _CONTROL_KEYS
-        and key != "as_parameters"
         and _known_model(key) is None
     }
-    explicit_shared = strategy.get("shared", {})
-    if not isinstance(explicit_shared, Mapping):
-        raise TypeError("strategy.shared must be an object")
-    _reject_trust_overrides(explicit_shared, "strategy.shared")
-    shared = _deep_merge(shared, explicit_shared)
-
     model_config: dict[str, Any] = {}
-    if model == "avellaneda_stoikov":
-        legacy = strategy.get("as_parameters", {})
-        if not isinstance(legacy, Mapping):
-            raise TypeError("strategy.as_parameters must be an object")
-        _reject_trust_overrides(legacy, "strategy.as_parameters")
-        model_config = _deep_merge(model_config, legacy)
     for key, value in strategy.items():
         if _known_model(key) != model:
             continue
@@ -116,17 +110,6 @@ def _effective_strategy_config(
             raise TypeError(f"strategy.{key} must be an object")
         _reject_trust_overrides(value, f"strategy.{key}")
         model_config = _deep_merge(model_config, value)
-    models = strategy.get("models", {})
-    if not isinstance(models, Mapping):
-        raise TypeError("strategy.models must be an object")
-    for key, value in models.items():
-        if _known_model(key) != model:
-            continue
-        if not isinstance(value, Mapping):
-            raise TypeError(f"strategy.models.{key} must be an object")
-        _reject_trust_overrides(value, f"strategy.models.{key}")
-        model_config = _deep_merge(model_config, value)
-
     effective = _deep_merge(shared, model_config)
     for key in _TRUST_KEYS:
         if key in strategy:
@@ -134,7 +117,7 @@ def _effective_strategy_config(
     if model == "glft":
         effective["glft"] = deepcopy(model_config)
     else:
-        effective["as_parameters"] = deepcopy(model_config)
+        effective["avellaneda_stoikov"] = deepcopy(model_config)
     return effective
 
 
@@ -205,7 +188,7 @@ def strategy_policy_sha256(config: Mapping[str, Any], model: Any) -> str:
             ),
         }
     else:
-        model_config = effective.get("as_parameters", {})
+        model_config = effective.get("avellaneda_stoikov", {})
         policy = {
             "model": model_key,
             "symbols": list(_normalized_symbols(config.get("symbols"))),
@@ -215,19 +198,13 @@ def strategy_policy_sha256(config: Mapping[str, Any], model: Any) -> str:
             "rpi_fallback_to_gtx": effective.get("rpi_fallback_to_gtx"),
             "target_order_notional": effective.get("target_order_notional"),
             "max_pos_usdt": effective.get("max_pos_usdt"),
-            "as_parameters": dict(model_config)
+            "avellaneda_stoikov": dict(model_config)
             if isinstance(model_config, Mapping)
             else {},
         }
     return hashlib.sha256(
         canonical_json_bytes(policy, label="effective strategy policy")
     ).hexdigest()
-
-
-def implementation_source_paths_for_model(model: Any) -> tuple[Path, ...]:
-    canonical_model_key(model)
-    root = Path(__file__).resolve().parents[1]
-    return tuple(root / path for path, _kind in release_files(root))
 
 
 def implementation_sha256_for_model(model: Any) -> str:
@@ -241,6 +218,5 @@ __all__ = [
     "effective_strategy_config",
     "formula_version_for_model",
     "implementation_sha256_for_model",
-    "implementation_source_paths_for_model",
     "strategy_policy_sha256",
 ]

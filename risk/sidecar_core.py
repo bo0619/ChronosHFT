@@ -6,11 +6,9 @@ import secrets
 from risk.exchange_port import StateVersion
 from risk.sidecar_account_risk import SidecarAccountRiskController
 from risk.sidecar_command_runtime import (
-    check_rearm_safety,
     commit_rearm as run_commit_rearm,
     complete_stop_request,
     prepare_rearm as run_prepare_rearm,
-    rearm_proof_binding,
 )
 from risk.sidecar_control_state import ControlEffects, SidecarControlController
 from risk.sidecar_core_status import RiskSidecarStatusProjection
@@ -20,8 +18,6 @@ from risk.sidecar_observation import SidecarObservationController
 from risk.sidecar_policy import RiskSidecarPolicy
 from risk.runtime_clock import system_runtime_clock
 from risk.sidecar_state_projection import (
-    apply_state_store_payload,
-    build_state_store_payload,
     close_state_store,
     open_state_store,
     persist_state,
@@ -119,8 +115,6 @@ class RiskSidecarCore:
         self.clock_sync_enabled = self.policy.clock_sync_enabled
         self.clock_reduce_only_phase_error_ms = self.policy.clock_reduce_only_phase_error_ms
         self.clock_kill_phase_error_ms = self.policy.clock_kill_phase_error_ms
-        self.clock_reduce_only_offset_ms = self.policy.clock_reduce_only_offset_ms
-        self.clock_kill_offset_ms = self.policy.clock_kill_offset_ms
         self.clock_max_rtt_ms = self.policy.clock_max_rtt_ms
         self.clock_max_uncertainty_ms = self.policy.clock_max_uncertainty_ms
         self.clock_max_offset_dispersion_ms = self.policy.clock_max_offset_dispersion_ms
@@ -173,7 +167,6 @@ class RiskSidecarCore:
         self.started_at = now
         self.last_parent_heartbeat_at = now
         self.last_parent_heartbeat_sent_monotonic = 0.0
-        self.last_parent_heartbeat_received_at = 0.0
         self.parent_heartbeat_error = ""
         self.last_parent_sequence = 0
         self.last_cancel_attempt_at = 0.0
@@ -215,12 +208,6 @@ class RiskSidecarCore:
 
     def _open_state_store(self, root: str, settings: dict) -> None:
         open_state_store(self, root, settings, _finite_float)
-
-    def _apply_state_store_payload(self, payload: dict) -> None:
-        apply_state_store_payload(self, payload, _finite_float)
-
-    def _state_store_payload(self) -> dict:
-        return build_state_store_payload(self)
 
     def _persist_durable_state(self, event: str, force: bool = False) -> bool:
         return persist_state(
@@ -276,7 +263,6 @@ class RiskSidecarCore:
 
         self.last_parent_heartbeat_at = min(now, sent_monotonic)
         self.last_parent_heartbeat_sent_monotonic = sent_monotonic
-        self.last_parent_heartbeat_received_at = now
         self.parent_heartbeat_error = ""
         return True
 
@@ -356,14 +342,8 @@ class RiskSidecarCore:
     def _complete_stop_request(self, now: float) -> bool | None:
         return complete_stop_request(self, now)
 
-    def _check_rearm_safety(self, now: float):
-        return check_rearm_safety(self, now)
-
     def prepare_rearm(self, request_id: str, reason: str, now: float = None):
         return run_prepare_rearm(self, request_id, reason, now)
-
-    def _rearm_proof_binding(self, now: float | None = None) -> tuple | None:
-        return rearm_proof_binding(self, now)
 
     def commit_rearm(
         self,
@@ -378,37 +358,6 @@ class RiskSidecarCore:
 
     def _evaluate_funding_guard(self, now: float):
         return self.observation.evaluate_funding_guard(now)
-
-    def _mark_exchange_snapshot_unhealthy(self, reason: str):
-        self.observation.mark_unhealthy(reason)
-
-    def _snapshot_wall_time(self, snapshot: dict, fallback: float) -> float:
-        return self.observation.snapshot_wall_time(snapshot, fallback)
-
-    def _apply_exchange_risk_result(
-        self,
-        *,
-        healthy: bool,
-        snapshot,
-        reason: str,
-        completed_monotonic: float,
-        completed_at: float,
-        full_snapshot: bool,
-    ):
-        self.observation.apply_result(
-            healthy=healthy,
-            snapshot=snapshot,
-            reason=reason,
-            completed_monotonic=completed_monotonic,
-            completed_at=completed_at,
-            full_snapshot=full_snapshot,
-        )
-
-    def _poll_exchange_risk(self, now: float):
-        self.observation.poll(now)
-
-    def _service_snapshot_worker(self, now: float, force: bool = False):
-        self.observation.service_worker(now, force=force)
 
     def _service_exchange_risk(self, now: float, force: bool = False):
         self.observation.service(now, force=force)

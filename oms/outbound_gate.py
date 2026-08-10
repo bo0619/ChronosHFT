@@ -32,16 +32,17 @@ class OMSOutboundGate(OMSComponent):
             "_sync_capability_mode",
             "audit_logger",
             "capability_mode",
+            "lifecycle_store",
             "lock",
             "orders",
             "outbound_gate_drain_timeout_sec",
+            "state",
             "symbol_guards",
             "venue_guards",
         }
     )
     OWNER_WRITES = frozenset(
         {
-            "_lifecycle_generation",
             "_outbound_gate_epoch",
             "_outbound_gate_open",
             "_outbound_gate_reason",
@@ -50,8 +51,6 @@ class OMSOutboundGate(OMSComponent):
             "_shutdown_cancel_verified",
             "_shutdown_reason",
             "_shutdown_requested",
-            "last_freeze_reason",
-            "state",
         }
     )
 
@@ -134,15 +133,6 @@ class OMSOutboundGate(OMSComponent):
                     )
             return self._outbound_gate_epoch, ""
 
-    def _acquire_outbound_risk_send_permit_locked(
-        self,
-        symbol: str = "",
-    ) -> tuple[int | None, str]:
-        return self._acquire_outbound_order_send_permit_locked(
-            risk_increasing=True,
-            symbol=symbol,
-        )
-
     def _release_outbound_order_send_permit(
         self,
         *,
@@ -182,12 +172,6 @@ class OMSOutboundGate(OMSComponent):
                             symbol_inflight - 1
                         )
             self._outbound_gate_condition.notify_all()
-
-    def _release_outbound_risk_send_permit(self, symbol: str = "") -> None:
-        self._release_outbound_order_send_permit(
-            risk_increasing=True,
-            symbol=symbol,
-        )
 
     def _submit_settlement_count_locked(
         self,
@@ -323,10 +307,18 @@ class OMSOutboundGate(OMSComponent):
                 self._shutdown_reason = reason
                 self._shutdown_cancel_verified = False
             self._close_outbound_gate_locked(reason, hold="shutdown")
-            self._lifecycle_generation += 1
-            if self.state != LifecycleState.HALTED:
-                self.state = LifecycleState.FROZEN
-                self.last_freeze_reason = f"Shutdown: {reason}"
+            current_state = self.state
+            if current_state == LifecycleState.HALTED:
+                self.lifecycle_store.transition(
+                    LifecycleState.HALTED,
+                    increment_generation=True,
+                )
+            else:
+                self.lifecycle_store.transition(
+                    LifecycleState.FROZEN,
+                    increment_generation=True,
+                    last_freeze_reason=f"Shutdown: {reason}",
+                )
                 try:
                     self._sync_capability_mode(f"shutdown:{reason}")
                 except Exception as exc:

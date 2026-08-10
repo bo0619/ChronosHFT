@@ -6,7 +6,6 @@ import threading
 import time
 
 from infrastructure.logger import logger
-from infrastructure.time_service import time_service
 
 from event.type import LifecycleState
 
@@ -47,12 +46,14 @@ class OMSReconciler(OMSComponent):
             "_sync_capability_mode",
             "account",
             "clear_venue_freeze",
+            "clock",
             "config",
             "exposure",
             "freeze_system",
             "halt_system",
             "last_reconcile_failure_ts",
             "last_reconcile_request_ts",
+            "lifecycle_store",
             "lock",
             "orders",
             "query_account_info",
@@ -68,14 +69,11 @@ class OMSReconciler(OMSComponent):
     )
     OWNER_WRITES = frozenset(
         {
-            "_lifecycle_generation",
             "_reconcile_thread",
             "consecutive_reconcile_api_failures",
-            "last_freeze_reason",
             "last_reconcile_failure_ts",
             "last_reconcile_request_ts",
             "reconcile_retry_scheduled",
-            "state",
         }
     )
 
@@ -110,7 +108,7 @@ class OMSReconciler(OMSComponent):
                 )
             ),
             audit=lambda event, **fields: self._audit(event, **fields),
-            now_ms=lambda: time_service.now(),
+            now_ms=self.clock.now_ms,
             sleep=lambda delay: time.sleep(delay),
         )
 
@@ -213,7 +211,7 @@ class OMSReconciler(OMSComponent):
                 not self._pending_reconcile_requests
                 or self._shutdown_requested
                 or self._stopped
-                or self.state in {
+                or self.lifecycle_store.state in {
                     LifecycleState.RECONCILING,
                     LifecycleState.HALTED,
                 }
@@ -236,7 +234,7 @@ class OMSReconciler(OMSComponent):
         suspicious_oid = str(suspicious_oid or "")
         if self._shutdown_requested or self._stopped:
             return False
-        if self.state == LifecycleState.HALTED:
+        if self.lifecycle_store.state == LifecycleState.HALTED:
             return False
 
         request = (reason, suspicious_oid)
@@ -252,11 +250,15 @@ class OMSReconciler(OMSComponent):
                 return False
             self._pending_reconcile_requests.append(request)
 
-        if self.state != LifecycleState.RECONCILING:
-            if self.state != LifecycleState.FROZEN:
-                self._lifecycle_generation += 1
-            self.state = LifecycleState.FROZEN
-            self.last_freeze_reason = reason
+        current_lifecycle = self.lifecycle_store.snapshot()
+        if current_lifecycle.state != LifecycleState.RECONCILING:
+            self.lifecycle_store.transition(
+                LifecycleState.FROZEN,
+                increment_generation=(
+                    current_lifecycle.state != LifecycleState.FROZEN
+                ),
+                last_freeze_reason=reason,
+            )
             self._sync_capability_mode(reason)
         return self._schedule_pending_reconcile_requests()
 
@@ -265,7 +267,7 @@ class OMSReconciler(OMSComponent):
             if (
                 self._shutdown_requested
                 or self._stopped
-                or self.state in {
+                or self.lifecycle_store.state in {
                     LifecycleState.RECONCILING,
                     LifecycleState.HALTED,
                 }
@@ -287,7 +289,7 @@ class OMSReconciler(OMSComponent):
         with self.lock:
             needs_successor = bool(
                 self._pending_reconcile_requests
-                and self.state
+                and self.lifecycle_store.state
                 not in {
                     LifecycleState.RECONCILING,
                     LifecycleState.HALTED,
@@ -312,7 +314,10 @@ class OMSReconciler(OMSComponent):
         with self.lock:
             if self._shutdown_requested or self._stopped:
                 return False
-            if self.state in [LifecycleState.RECONCILING, LifecycleState.HALTED]:
+            if self.lifecycle_store.state in [
+                LifecycleState.RECONCILING,
+                LifecycleState.HALTED,
+            ]:
                 return False
 
         self.freeze_system(
@@ -329,10 +334,11 @@ class OMSReconciler(OMSComponent):
             if (
                 self._shutdown_requested
                 or self._stopped
-                or self.state in {LifecycleState.RECONCILING, LifecycleState.HALTED}
+                or self.lifecycle_store.state
+                in {LifecycleState.RECONCILING, LifecycleState.HALTED}
             ):
                 return False
-            if self.state != LifecycleState.FROZEN:
+            if self.lifecycle_store.state != LifecycleState.FROZEN:
                 return False
 
             now = time.perf_counter()
@@ -358,13 +364,15 @@ class OMSReconciler(OMSComponent):
             else:
                 self.last_reconcile_request_ts = now
                 logger.warning(f"OMS dirty: {reason}. State -> RECONCILING")
-                self.state = LifecycleState.RECONCILING
-                self._lifecycle_generation += 1
-                reconcile_generation = self._lifecycle_generation
+                self.lifecycle_store.transition(
+                    LifecycleState.RECONCILING,
+                    increment_generation=True,
+                )
+                reconcile_generation = self.lifecycle_store.generation
                 self._sync_capability_mode(reason)
                 self._audit(
                     "reconcile_requested",
-                    state=self.state.value,
+                    state=self.lifecycle_store.state.value,
                     reason=reason,
                     suspicious_oid=suspicious_oid,
                 )
@@ -399,9 +407,11 @@ class OMSReconciler(OMSComponent):
         )
         with self.lock:
             if reconcile_thread is None:
-                if self.state == LifecycleState.RECONCILING:
-                    self.state = LifecycleState.FROZEN
-                    self._lifecycle_generation += 1
+                if self.lifecycle_store.state == LifecycleState.RECONCILING:
+                    self.lifecycle_store.transition(
+                        LifecycleState.FROZEN,
+                        increment_generation=True,
+                    )
                     self._sync_capability_mode(
                         "reconcile_worker_unavailable"
                     )
@@ -422,7 +432,7 @@ class OMSReconciler(OMSComponent):
                 self._shutdown_requested
                 or self._stopped
                 or self.reconcile_retry_scheduled
-                or self.state == LifecycleState.HALTED
+                or self.lifecycle_store.state == LifecycleState.HALTED
             ):
                 return False
             now = time.perf_counter()
@@ -458,7 +468,9 @@ class OMSReconciler(OMSComponent):
                 self.reconcile_retry_scheduled = False
                 if self._shutdown_requested or self._stopped:
                     return
-                should_retry = self.state == LifecycleState.FROZEN
+                should_retry = (
+                    self.lifecycle_store.state == LifecycleState.FROZEN
+                )
             if not should_retry:
                 return
             self.trigger_reconcile(reason, suspicious_oid=suspicious_oid)
@@ -488,7 +500,7 @@ class OMSReconciler(OMSComponent):
             if self._shutdown_requested or self._stopped:
                 return
             if reconcile_generation is None:
-                reconcile_generation = self._lifecycle_generation
+                reconcile_generation = self.lifecycle_store.generation
         self._audit("reconcile_started", suspicious_oid=suspicious_oid)
         try:
             try:
@@ -538,7 +550,7 @@ class OMSReconciler(OMSComponent):
                 end_time_ms=(
                     exchange_snapshot.trade_watermark_ms
                     if exchange_snapshot is not None
-                    else time_service.now()
+                    else self.clock.now_ms()
                 ),
             )
             if trade_backfill_ok and exchange_snapshot is not None:
@@ -718,24 +730,34 @@ class OMSReconciler(OMSComponent):
                             reason="shutdown_requested",
                         )
                         return
+                    current_lifecycle = self.lifecycle_store.snapshot()
                     if (
-                        self.state != LifecycleState.RECONCILING
-                        or self._lifecycle_generation != reconcile_generation
+                        current_lifecycle.state
+                        != LifecycleState.RECONCILING
+                        or current_lifecycle.generation
+                        != reconcile_generation
                     ):
                         self._audit(
                             "reconcile_resume_suppressed",
                             reason="lifecycle_superseded",
-                            current_state=self.state.value,
+                            current_state=current_lifecycle.state.value,
                             expected_generation=reconcile_generation,
-                            current_generation=self._lifecycle_generation,
+                            current_generation=(
+                                current_lifecycle.generation
+                            ),
                         )
                         return
-                    self.state = LifecycleState.LIVE
-                    self._lifecycle_generation += 1
+                    self.lifecycle_store.transition(
+                        LifecycleState.LIVE,
+                        increment_generation=True,
+                        last_freeze_reason="",
+                    )
                     self._sync_capability_mode("reconcile_cleared")
-                    self.last_freeze_reason = ""
                     self._clear_recovered_guards_if_pending("reconcile_cleared")
-                    self._audit("reconcile_cleared", state=self.state.value)
+                    self._audit(
+                        "reconcile_cleared",
+                        state=self.lifecycle_store.state.value,
+                    )
                 logger.info("[Reconcile] False alarm. Resuming LIVE.")
 
         except Exception as exc:
@@ -762,7 +784,8 @@ class OMSReconciler(OMSComponent):
                     self._reconcile_thread = None
                 schedule_pending = bool(
                     self._pending_reconcile_requests
-                    and self.state != LifecycleState.HALTED
+                    and self.lifecycle_store.state
+                    != LifecycleState.HALTED
                     and not self._shutdown_requested
                     and not self._stopped
                 )
@@ -778,7 +801,7 @@ class OMSReconciler(OMSComponent):
     ) -> bool:
         venue = str(venue or "").upper()
         with self.lock:
-            if self.state != LifecycleState.LIVE:
+            if self.lifecycle_store.state != LifecycleState.LIVE:
                 return False
             records = self._ensure_venue_guard_records_locked(venue)
             record = records.get(str(expected_owner or ""))
@@ -798,12 +821,15 @@ class OMSReconciler(OMSComponent):
                 or current_epoch != int(expected_epoch)
                 or current_reason != str(expected_reason or "")
             ):
-                self.state = LifecycleState.FROZEN
-                self._lifecycle_generation += 1
-                self.last_freeze_reason = (
-                    f"Venue recovery owner changed for {venue}: "
-                    f"owner={expected_owner} expected_epoch={expected_epoch} "
-                    f"current_epoch={current_epoch}"
+                self.lifecycle_store.transition(
+                    LifecycleState.FROZEN,
+                    increment_generation=True,
+                    last_freeze_reason=(
+                        f"Venue recovery owner changed for {venue}: "
+                        f"owner={expected_owner} "
+                        f"expected_epoch={expected_epoch} "
+                        f"current_epoch={current_epoch}"
+                    ),
                 )
                 self._sync_capability_mode("venue_recovery_epoch_changed")
                 self._audit(

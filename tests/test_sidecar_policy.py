@@ -47,8 +47,8 @@ def test_funding_guard_caps_exchange_poll_to_half_snapshot_age():
 def test_related_kill_thresholds_cannot_be_weaker_than_reduce_only():
     policy = RiskSidecarPolicy.from_settings(
         {
-            "clock_reduce_only_offset_ms": 40.0,
-            "clock_kill_offset_ms": 20.0,
+            "clock_reduce_only_phase_error_ms": 40.0,
+            "clock_kill_phase_error_ms": 20.0,
             "margin_reduce_only_ratio": 0.8,
             "margin_kill_ratio": 0.7,
             "liquidation_reduce_only_distance_pct": 0.04,
@@ -59,8 +59,6 @@ def test_related_kill_thresholds_cannot_be_weaker_than_reduce_only():
 
     assert policy.clock_reduce_only_phase_error_ms == 40.0
     assert policy.clock_kill_phase_error_ms == 40.0
-    assert policy.clock_reduce_only_offset_ms == 40.0
-    assert policy.clock_kill_offset_ms == 40.0
     assert policy.margin_kill_ratio == 0.8
     assert policy.liquidation_kill_distance_pct == 0.04
 

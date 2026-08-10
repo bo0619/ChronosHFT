@@ -41,11 +41,11 @@ class OMSExchangeEventProcessor(OMSComponent):
             "_get_fill_commission",
             "_has_active_orders_locked",
             "_install_symbol_guard_locked",
-            "_lifecycle_generation",
             "_position_state_event_time",
             "_queue_reconcile_request_locked",
             "_record_execution",
             "_record_order_snapshot",
+            "_reindex_order_locked",
             "_schedule_rpi_calibration_runtime_enforcement",
             "_schedule_trade_tail_verification",
             "_submit_background_task",
@@ -60,11 +60,10 @@ class OMSExchangeEventProcessor(OMSComponent):
             "exchange_id_map",
             "execution_ids",
             "exposure",
-            "last_freeze_reason",
+            "lifecycle_store",
             "lock",
             "mark_external_cash_flow_truth_unavailable",
             "order_monitor",
-            "order_store",
             "orders",
             "state",
             "terminated_oids",
@@ -75,10 +74,7 @@ class OMSExchangeEventProcessor(OMSComponent):
         {
             "_account_state_event_time",
             "_exchange_account_event_time",
-            "_lifecycle_generation",
             "event_log_evictions",
-            "last_freeze_reason",
-            "state",
         }
     )
 
@@ -372,16 +368,17 @@ class OMSExchangeEventProcessor(OMSComponent):
             LifecycleState.HALTED,
             LifecycleState.RECONCILING,
         }:
-            previous_state = self.state
-            self.state = LifecycleState.FROZEN
-            self._lifecycle_generation += 1
-            self.last_freeze_reason = reason
+            previous = self.lifecycle_store.transition(
+                LifecycleState.FROZEN,
+                increment_generation=True,
+                last_freeze_reason=reason,
+            )
             self._sync_capability_mode(reason)
             self._audit(
                 "lifecycle",
                 state=self.state.value,
                 reason=reason,
-                previous_state=previous_state.value,
+                previous_state=previous.state.value,
             )
         self._queue_reconcile_request_locked(
             f"Invalid exchange account update: {detail}",
@@ -421,16 +418,17 @@ class OMSExchangeEventProcessor(OMSComponent):
             LifecycleState.HALTED,
             LifecycleState.RECONCILING,
         }:
-            previous_state = self.state
-            self.state = LifecycleState.FROZEN
-            self._lifecycle_generation += 1
-            self.last_freeze_reason = reason
+            previous = self.lifecycle_store.transition(
+                LifecycleState.FROZEN,
+                increment_generation=True,
+                last_freeze_reason=reason,
+            )
             self._sync_capability_mode(reason)
             self._audit(
                 "lifecycle",
                 state=self.state.value,
                 reason=reason,
-                previous_state=previous_state.value,
+                previous_state=previous.state.value,
             )
         self._queue_reconcile_request_locked(
             f"Unverified execution gap {order.client_oid}",
@@ -532,16 +530,17 @@ class OMSExchangeEventProcessor(OMSComponent):
             LifecycleState.HALTED,
             LifecycleState.RECONCILING,
         }:
-            previous_state = self.state
-            self.state = LifecycleState.FROZEN
-            self._lifecycle_generation += 1
-            self.last_freeze_reason = reason
+            previous = self.lifecycle_store.transition(
+                LifecycleState.FROZEN,
+                increment_generation=True,
+                last_freeze_reason=reason,
+            )
             self._sync_capability_mode(reason)
             self._audit(
                 "lifecycle",
                 state=self.state.value,
                 reason=reason,
-                previous_state=previous_state.value,
+                previous_state=previous.state.value,
             )
         self._queue_reconcile_request_locked(
             f"Invalid exchange order update: {detail}",
@@ -939,7 +938,7 @@ class OMSExchangeEventProcessor(OMSComponent):
                 return
 
             self.order_monitor.on_order_update(order.client_oid, order.status)
-            self.order_store.reindex(order)
+            self._reindex_order_locked(order)
             self.exposure.update_open_orders(self.orders)
             self.account.calculate()
 

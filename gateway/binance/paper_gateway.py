@@ -25,7 +25,6 @@ from typing import Any
 
 import requests
 
-from data.orderbook import LocalOrderBook
 from data.ref_data import ref_data_manager
 from event.type import (
     AggTradeData,
@@ -193,96 +192,6 @@ class BinancePaperGateway(BaseGateway):
     """Binance production-public-data gateway with a local paper venue."""
 
     supports_outbound_send_guard = True
-
-    # Compatibility views for diagnostics and existing recovery tooling. The
-    # synchronizer remains the sole owner of the underlying mutable state.
-    @property
-    def orderbooks(self):
-        return self._book_feed_state.orderbooks
-
-    @orderbooks.setter
-    def orderbooks(self, value):
-        self._book_feed_state.orderbooks = value
-
-    @property
-    def ws_buffer(self):
-        return self._book_feed_state.ws_buffer
-
-    @ws_buffer.setter
-    def ws_buffer(self, value):
-        self._book_feed_state.ws_buffer = value
-
-    @property
-    def book_resyncing(self):
-        return self._book_feed_state.resyncing
-
-    @book_resyncing.setter
-    def book_resyncing(self, value):
-        self._book_feed_state.resyncing = value
-
-    @property
-    def book_recovery_generation(self):
-        return self._book_feed_state.recovery_generation
-
-    @book_recovery_generation.setter
-    def book_recovery_generation(self, value):
-        self._book_feed_state.recovery_generation = value
-
-    @property
-    def book_recovery_tokens(self):
-        return self._book_feed_state.recovery_tokens
-
-    @book_recovery_tokens.setter
-    def book_recovery_tokens(self, value):
-        self._book_feed_state.recovery_tokens = value
-
-    @property
-    def _book_recovery_token(self):
-        return self._book_feed_state.recovery_token
-
-    @_book_recovery_token.setter
-    def _book_recovery_token(self, value):
-        self._book_feed_state.recovery_token = int(value)
-
-    @property
-    def _book_generation(self):
-        return self._book_feed_state.generation
-
-    @_book_generation.setter
-    def _book_generation(self, value):
-        self._book_feed_state.generation = int(value)
-
-    @property
-    def _book_lock(self):
-        return self._book_feed_state.lock
-
-    @_book_lock.setter
-    def _book_lock(self, value):
-        self._book_feed_state.replace_lock(value)
-
-    @property
-    def _book_recovery_threads(self):
-        return self._book_feed_state.recovery_threads
-
-    @_book_recovery_threads.setter
-    def _book_recovery_threads(self, value):
-        self._book_feed_state.recovery_threads = value
-
-    @property
-    def _book_recovery_stop(self):
-        return self._book_feed_state.recovery_stop
-
-    @_book_recovery_stop.setter
-    def _book_recovery_stop(self, value):
-        self._book_feed_state.recovery_stop = value
-
-    @property
-    def _last_ws_mark_received_monotonic(self):
-        return self._book_feed_state.last_ws_mark_received_monotonic
-
-    @_last_ws_mark_received_monotonic.setter
-    def _last_ws_mark_received_monotonic(self, value):
-        self._book_feed_state.last_ws_mark_received_monotonic = value
 
     def __init__(self, event_engine, config: dict, market_data_config: dict | None = None):
         super().__init__(event_engine, "BINANCE_PAPER")
@@ -537,19 +446,6 @@ class BinancePaperGateway(BaseGateway):
             balances={self.balance_asset: self.initial_balance},
             trades=deque(maxlen=self.max_trade_history),
         )
-        # Legacy facade views. PaperVenueState owns these objects; gateway and
-        # ledger methods operate on the same single-writer collections.
-        self._balances = self._venue_state.balances
-        self._orders = self._venue_state.orders
-        self._exchange_to_client = self._venue_state.exchange_to_client
-        self._positions = self._venue_state.positions
-        self._books = self._venue_state.books
-        self._liquidity = self._venue_state.liquidity
-        self._marks = self._venue_state.marks
-        self._last_market_trade_id = self._venue_state.last_market_trade_id
-        self._trades = self._venue_state.trades
-        self._dms_deadlines = self._venue_state.dms_deadlines
-        self._cancel_generations = self._venue_state.cancel_generations
         self._book_sync = PaperBookSynchronizer(
             self._book_feed_state,
             PaperBookFeedPort(
@@ -657,11 +553,14 @@ class BinancePaperGateway(BaseGateway):
                 return False
             if not self.balance_asset:
                 self.balance_asset = self._default_balance_asset(self.symbols)
-                self._balances.setdefault(self.balance_asset, self.initial_balance)
+                self._venue_state.balances.setdefault(
+                    self.balance_asset,
+                    self.initial_balance,
+                )
 
             self.set_state(GatewayState.CONNECTING)
             self.active = True
-            self._book_recovery_stop.clear()
+            self._book_feed_state.recovery_stop.clear()
             self._accepting_orders = False
             self._start_worker()
             generation = self._reset_public_books()
@@ -718,7 +617,7 @@ class BinancePaperGateway(BaseGateway):
             self._accepting_orders = False
             self.active = False
             self._mark_fallback_stop.set()
-            self._book_recovery_stop.set()
+            self._book_feed_state.recovery_stop.set()
             self._invalidate_public_book_lifecycle()
             ws = self.ws
             self.ws = None
@@ -910,12 +809,12 @@ class BinancePaperGateway(BaseGateway):
     ):
         data = dict(data)
         symbol = str(data.get("s", "") or "").upper()
-        with self._book_lock:
+        with self._book_feed_state.lock:
             if not self._book_generation_matches_locked(expected_generation):
                 return
-            if not symbol or symbol not in self.orderbooks:
+            if not symbol or symbol not in self._book_feed_state.orderbooks:
                 return
-            message_generation = self._book_generation
+            message_generation = self._book_feed_state.generation
 
         received_timestamp = float(received_timestamp or time.time())
         received_monotonic = float(received_monotonic or time.perf_counter())
@@ -997,10 +896,12 @@ class BinancePaperGateway(BaseGateway):
                 corrected_received_timestamp=corrected_received_timestamp,
                 next_funding_timestamp=next_funding_timestamp,
             )
-            with self._book_lock:
+            with self._book_feed_state.lock:
                 if not self._book_generation_matches_locked(message_generation):
                     return
-                self._last_ws_mark_received_monotonic[symbol] = received_monotonic
+                self._book_feed_state.last_ws_mark_received_monotonic[symbol] = (
+                    received_monotonic
+                )
             self._publish_public_market_update(
                 message_generation,
                 EVENT_MARK_PRICE,
@@ -1169,11 +1070,11 @@ class BinancePaperGateway(BaseGateway):
     ) -> None:
         fallback_logged = False
         while not stop_event.wait(self.mark_rest_poll_interval_sec):
-            with self._book_lock:
+            with self._book_feed_state.lock:
                 if (
                     self._closing
                     or not self.active
-                    or self._book_generation != generation
+                    or self._book_feed_state.generation != generation
                 ):
                     return
                 now = time.perf_counter()
@@ -1182,7 +1083,10 @@ class BinancePaperGateway(BaseGateway):
                     for symbol in self.symbols
                     if now
                     - float(
-                        self._last_ws_mark_received_monotonic.get(symbol, 0.0)
+                        self._book_feed_state.last_ws_mark_received_monotonic.get(
+                            symbol,
+                            0.0,
+                        )
                         or 0.0
                     )
                     > self.mark_ws_stale_after_sec
@@ -1269,7 +1173,7 @@ class BinancePaperGateway(BaseGateway):
                     or not self.active
                     or self.state == GatewayState.ERROR
                     or self._fault_epoch != expected_fault_epoch
-                    or self._book_generation != expected_generation
+                    or self._book_feed_state.generation != expected_generation
                 ):
                     return False
                 self._accepting_orders = True
@@ -1329,49 +1233,6 @@ class BinancePaperGateway(BaseGateway):
             matching_book=matching_book,
         )
 
-    def _full_matching_book(self, book: LocalOrderBook):
-        return self._book_sync.full_matching_book(book)
-
-    def _owns_book_recovery_locked(self, symbol, generation, recovery_token):
-        return self._book_sync.owns_recovery_locked(
-            symbol,
-            generation,
-            recovery_token,
-        )
-
-    def _release_book_recovery_locked(self, symbol, generation, recovery_token):
-        return self._book_sync.release_recovery_locked(
-            symbol,
-            generation,
-            recovery_token,
-        )
-
-    def _schedule_book_recovery(
-        self,
-        symbol: str,
-        freeze_reason: str = "",
-        *,
-        expected_generation=None,
-    ):
-        return self._book_sync.schedule_recovery(
-            symbol,
-            freeze_reason,
-            expected_generation=expected_generation,
-        )
-
-    def _begin_book_recovery_locked(
-        self,
-        symbol: str,
-        freeze_reason: str = "",
-        *,
-        expected_generation=None,
-    ):
-        return self._book_sync.begin_recovery_locked(
-            symbol,
-            freeze_reason,
-            expected_generation=expected_generation,
-        )
-
     def _launch_book_recovery(self, recovery):
         return self._book_sync.launch_recovery(recovery)
 
@@ -1387,13 +1248,6 @@ class BinancePaperGateway(BaseGateway):
 
     def _join_book_recovery_threads(self) -> bool:
         return self._book_sync.join_recovery_threads()
-
-    def _recover_orderbook(self, symbol, generation, recovery_token):
-        return self._book_sync.recover_orderbook(
-            symbol,
-            generation,
-            recovery_token,
-        )
 
     # ------------------------------------------------------------------
     # OMS command/query surface
@@ -1430,10 +1284,10 @@ class BinancePaperGateway(BaseGateway):
             )
         if not req.reduce_only:
             symbol = str(req.symbol or "").upper()
-            with self._book_lock:
+            with self._book_feed_state.lock:
                 if (
-                    symbol in self.book_resyncing
-                    or self.ws_buffer.get(symbol) is not None
+                    symbol in self._book_feed_state.resyncing
+                    or self._book_feed_state.ws_buffer.get(symbol) is not None
                 ):
                     return GatewayCommandResult(
                         CommandOutcome.REJECTED,
@@ -1509,9 +1363,6 @@ class BinancePaperGateway(BaseGateway):
                 str(client_oid or ""),
             )
         )
-
-    # Alias for adapters which prefer a shorter hook name.
-    commit_order = commit_order_submission
 
     def cancel_order(self, req: CancelRequest):
         try:
@@ -1736,7 +1587,9 @@ class BinancePaperGateway(BaseGateway):
             if not self._book_sync.claim_dispatch(generation):
                 return False
             try:
-                self._marks[mark.symbol] = float(mark.mark_price or 0.0)
+                self._venue_state.marks[mark.symbol] = float(
+                    mark.mark_price or 0.0
+                )
                 return True
             finally:
                 self._book_sync.release_dispatch()
@@ -1777,11 +1630,11 @@ class BinancePaperGateway(BaseGateway):
         if command.kind != "stage_order":
             return
         _request, client_oid = command.payload
-        order = self._orders.get(str(client_oid or ""))
+        order = self._venue_state.orders.get(str(client_oid or ""))
         if order is None or order.status != "STAGED" or order.committed:
             return
-        self._orders.pop(order.client_oid, None)
-        self._exchange_to_client.pop(order.exchange_oid, None)
+        self._venue_state.orders.pop(order.client_oid, None)
+        self._venue_state.exchange_to_client.pop(order.exchange_oid, None)
 
     def _submit_worker(self, kind: str, payload) -> bool:
         if not self._worker_running:
@@ -1807,7 +1660,7 @@ class BinancePaperGateway(BaseGateway):
         request: OrderRequest,
         client_oid: str,
     ) -> GatewayCommandResult:
-        existing = self._orders.get(client_oid)
+        existing = self._venue_state.orders.get(client_oid)
         if existing is not None:
             if self._same_request(existing.request, request):
                 return GatewayCommandResult(
@@ -1855,13 +1708,13 @@ class BinancePaperGateway(BaseGateway):
             created_monotonic=now_monotonic,
             update_ms=now_ms,
             fill_model=fill_model,
-            cancel_generation_at_stage=self._cancel_generations.get(
+            cancel_generation_at_stage=self._venue_state.cancel_generations.get(
                 request.symbol,
                 0,
             ),
         )
-        self._orders[client_oid] = order
-        self._exchange_to_client[exchange_oid] = client_oid
+        self._venue_state.orders[client_oid] = order
+        self._venue_state.exchange_to_client[exchange_oid] = client_oid
         self._prune_terminal_orders()
         return GatewayCommandResult(
             CommandOutcome.ACKNOWLEDGED,
@@ -1870,13 +1723,16 @@ class BinancePaperGateway(BaseGateway):
         )
 
     def _commit_staged_order(self, client_oid: str):
-        order = self._orders.get(str(client_oid or ""))
+        order = self._venue_state.orders.get(str(client_oid or ""))
         if order is None:
             return False
         if order.status != "STAGED":
             return order.committed or order.status in _TERMINAL_STATUSES
 
-        cancel_generation = self._cancel_generations.get(order.request.symbol, 0)
+        cancel_generation = self._venue_state.cancel_generations.get(
+            order.request.symbol,
+            0,
+        )
         if (
             order.pending_cancel_reason
             or cancel_generation != order.cancel_generation_at_stage
@@ -2012,7 +1868,7 @@ class BinancePaperGateway(BaseGateway):
             ):
                 return f"price_not_tick_aligned:{request.price}:{info.tick_size}"
 
-        book = self._books.get(request.symbol)
+        book = self._venue_state.books.get(request.symbol)
         if book is None or not book.bids or not book.asks:
             return f"market_data_unavailable:{request.symbol}"
         best_bid, _ = book.get_best_bid()
@@ -2037,7 +1893,10 @@ class BinancePaperGateway(BaseGateway):
             return f"post_only_would_cross:{request.symbol}"
 
         if request.reduce_only:
-            position = self._positions.get(request.symbol, _PaperPosition())
+            position = self._venue_state.positions.get(
+                request.symbol,
+                _PaperPosition(),
+            )
             if abs(position.quantity) <= 1e-12:
                 return f"reduce_only_without_position:{request.symbol}"
             if position.quantity > 0.0 and request.side != "SELL":
@@ -2046,7 +1905,7 @@ class BinancePaperGateway(BaseGateway):
                 return f"reduce_only_wrong_side:{request.symbol}"
             reserved = sum(
                 candidate.remaining
-                for candidate in self._orders.values()
+                for candidate in self._venue_state.orders.values()
                 if candidate.active
                 and candidate.request.symbol == request.symbol
                 and candidate.request.reduce_only
@@ -2086,20 +1945,6 @@ class BinancePaperGateway(BaseGateway):
             fill_context=fill_context,
         )
 
-    def _apply_position_fill(
-        self,
-        symbol: str,
-        side: str,
-        quantity: float,
-        price: float,
-    ) -> float:
-        return self._ledger.apply_position_fill(
-            symbol,
-            side,
-            quantity,
-            price,
-        )
-
     def _expire_order(self, order: _PaperOrder, reason: str):
         return self._ledger.expire_order(order, reason)
 
@@ -2129,11 +1974,14 @@ class BinancePaperGateway(BaseGateway):
 
     def _cancel_all_internal(self, symbol: str, reason: str):
         symbol = str(symbol or "").upper()
-        self._cancel_generations[symbol] = (
-            self._cancel_generations.get(symbol, 0) + 1
+        self._venue_state.cancel_generations[symbol] = (
+            self._venue_state.cancel_generations.get(symbol, 0) + 1
         )
         canceled = []
-        for order in sorted(self._orders.values(), key=lambda item: item.accept_seq):
+        for order in sorted(
+            self._venue_state.orders.values(),
+            key=lambda item: item.accept_seq,
+        ):
             if order.request.symbol != symbol or not order.active:
                 continue
             if self._cancel_order_internal(order, reason):
@@ -2146,9 +1994,11 @@ class BinancePaperGateway(BaseGateway):
         if countdown_ms < 0:
             raise ValueError("countdown_time_ms cannot be negative")
         if countdown_ms == 0:
-            self._dms_deadlines.pop(symbol, None)
+            self._venue_state.dms_deadlines.pop(symbol, None)
         else:
-            self._dms_deadlines[symbol] = time.perf_counter() + countdown_ms / 1000.0
+            self._venue_state.dms_deadlines[symbol] = (
+                time.perf_counter() + countdown_ms / 1000.0
+            )
         return {
             "symbol": symbol,
             "countdownTime": countdown_ms,
@@ -2156,16 +2006,16 @@ class BinancePaperGateway(BaseGateway):
         }
 
     def _check_dms_deadlines(self):
-        if not self._dms_deadlines:
+        if not self._venue_state.dms_deadlines:
             return
         now = time.perf_counter()
         expired = [
             symbol
-            for symbol, deadline in self._dms_deadlines.items()
+            for symbol, deadline in self._venue_state.dms_deadlines.items()
             if deadline <= now
         ]
         for symbol in expired:
-            self._dms_deadlines.pop(symbol, None)
+            self._venue_state.dms_deadlines.pop(symbol, None)
             self._cancel_all_internal(symbol, reason="PAPER_DMS_EXPIRED")
             self.event_engine.put(
                 Event(
@@ -2178,24 +2028,8 @@ class BinancePaperGateway(BaseGateway):
     # Queue model and price/fee helpers
     # ------------------------------------------------------------------
 
-    def _local_queue_priority(self, order: _PaperOrder):
-        return self._matching.local_queue_priority(order)
-
-    def _passive_match_priority(self, order: _PaperOrder):
-        return self._matching.passive_match_priority(order)
-
-    def _same_local_level(
-        self,
-        left: _PaperOrder,
-        right: _PaperOrder,
-    ) -> bool:
-        return self._matching.same_local_level(left, right)
-
     def _insert_into_local_queue(self, order: _PaperOrder):
         return self._matching.insert_into_local_queue(order)
-
-    def _set_initial_queue_ahead(self, order: _PaperOrder):
-        return self._matching.set_initial_queue_ahead(order)
 
     def _remove_from_later_local_queue(self, order: _PaperOrder, removed_quantity: float):
         return self._matching.remove_from_later_local_queue(
@@ -2203,20 +2037,8 @@ class BinancePaperGateway(BaseGateway):
             removed_quantity,
         )
 
-    def _apply_conservative_cancel_ahead(self, previous: OrderBook, current: OrderBook):
-        return self._matching.apply_conservative_cancel_ahead(
-            previous,
-            current,
-        )
-
     def _would_cross(self, request: OrderRequest, best_bid: float, best_ask: float):
         return self._matching.would_cross(request, best_bid, best_ask)
-
-    def _price_is_executable(self, order: _PaperOrder, external_price: float):
-        return self._matching.price_is_executable(order, external_price)
-
-    def _passive_trade_relation(self, order: _PaperOrder, trade_price: float):
-        return self._matching.passive_trade_relation(order, trade_price)
 
     def _reduce_only_fill_cap(self, order: _PaperOrder):
         return self._matching.reduce_only_fill_cap(order)
@@ -2239,7 +2061,10 @@ class BinancePaperGateway(BaseGateway):
         if query_name == "open_orders":
             return [
                 self._order_payload(order)
-                for order in sorted(self._orders.values(), key=lambda item: item.accept_seq)
+                for order in sorted(
+                    self._venue_state.orders.values(),
+                    key=lambda item: item.accept_seq,
+                )
                 if order.active
             ]
         if query_name == "order":
@@ -2283,7 +2108,7 @@ class BinancePaperGateway(BaseGateway):
         }
 
     def _position_payload(self, symbol: str):
-        position = self._positions.get(symbol, _PaperPosition())
+        position = self._venue_state.positions.get(symbol, _PaperPosition())
         mark = self._mark_price(symbol)
         unrealized = (
             (mark - position.entry_price) * position.quantity
@@ -2307,8 +2132,10 @@ class BinancePaperGateway(BaseGateway):
     def _account_payload(self):
         metrics = self._account_metrics()
         assets = []
-        for asset in sorted(self._balances):
-            wallet = float(self._balances.get(asset, 0.0) or 0.0)
+        for asset in sorted(self._venue_state.balances):
+            wallet = float(
+                self._venue_state.balances.get(asset, 0.0) or 0.0
+            )
             asset_available = float(metrics["available_by_asset"].get(asset, wallet))
             assets.append(
                 {
@@ -2340,9 +2167,9 @@ class BinancePaperGateway(BaseGateway):
         initial_by_asset: dict[str, float] = {}
         maintenance_by_asset: dict[str, float] = {}
 
-        for symbol in set(self.symbols) | set(self._positions):
+        for symbol in set(self.symbols) | set(self._venue_state.positions):
             asset = self._quote_asset(symbol)
-            position = self._positions.get(symbol, _PaperPosition())
+            position = self._venue_state.positions.get(symbol, _PaperPosition())
             mark = self._mark_price(symbol)
             if mark <= 0.0:
                 mark = position.entry_price
@@ -2359,7 +2186,7 @@ class BinancePaperGateway(BaseGateway):
                 position_notional * self.maintenance_margin_rate
             )
 
-        for order in self._orders.values():
+        for order in self._venue_state.orders.values():
             if not order.active or order.request.reduce_only:
                 continue
             asset = self._quote_asset(order.request.symbol)
@@ -2368,7 +2195,9 @@ class BinancePaperGateway(BaseGateway):
                 order.remaining * max(0.0, reference) / self.leverage
             )
 
-        wallet_balance = sum(float(value) for value in self._balances.values())
+        wallet_balance = sum(
+            float(value) for value in self._venue_state.balances.values()
+        )
         unrealized_pnl = sum(unrealized_by_asset.values())
         initial_margin = sum(initial_by_asset.values())
         maintenance_margin = sum(maintenance_by_asset.values())
@@ -2376,8 +2205,14 @@ class BinancePaperGateway(BaseGateway):
         available_balance = max(0.0, margin_balance - initial_margin)
         available_by_asset = {}
         margin_by_asset = {}
-        for asset in set(self._balances) | set(unrealized_by_asset) | set(initial_by_asset):
-            asset_margin = float(self._balances.get(asset, 0.0)) + float(
+        for asset in (
+            set(self._venue_state.balances)
+            | set(unrealized_by_asset)
+            | set(initial_by_asset)
+        ):
+            asset_margin = float(
+                self._venue_state.balances.get(asset, 0.0)
+            ) + float(
                 unrealized_by_asset.get(asset, 0.0)
             )
             margin_by_asset[asset] = asset_margin
@@ -2454,19 +2289,6 @@ class BinancePaperGateway(BaseGateway):
             quote_age_ms=quote_age_ms,
         )
 
-    def _emit_account_update(
-        self,
-        symbol: str,
-        *,
-        transaction_time: float,
-        reason: str,
-    ):
-        return self._ledger.emit_account_update(
-            symbol,
-            transaction_time=transaction_time,
-            reason=reason,
-        )
-
     def _emit_full_account_update(self, reason: str):
         return self._ledger.emit_full_account_update(reason)
 
@@ -2476,7 +2298,10 @@ class BinancePaperGateway(BaseGateway):
     def _all_orders_payload(self, symbol: str, kwargs: dict):
         orders = [
             self._order_payload(order)
-            for order in sorted(self._orders.values(), key=lambda item: item.accept_seq)
+            for order in sorted(
+                self._venue_state.orders.values(),
+                key=lambda item: item.accept_seq,
+            )
             if not symbol or order.request.symbol == symbol
         ]
         start_time = self._kwarg_int(kwargs, "start_time", "startTime")
@@ -2491,7 +2316,7 @@ class BinancePaperGateway(BaseGateway):
     def _user_trades_payload(self, symbol: str, kwargs: dict):
         trades = [
             copy.deepcopy(trade)
-            for trade in self._trades
+            for trade in self._venue_state.trades
             if not symbol or trade.get("symbol") == symbol
         ]
         from_id = self._kwarg_int(kwargs, "from_id", "fromId")
@@ -2511,24 +2336,24 @@ class BinancePaperGateway(BaseGateway):
 
     def _find_order(self, identifier: str):
         identifier = str(identifier or "")
-        order = self._orders.get(identifier)
+        order = self._venue_state.orders.get(identifier)
         if order is not None:
             return order
-        client_oid = self._exchange_to_client.get(identifier)
-        return self._orders.get(client_oid) if client_oid else None
+        client_oid = self._venue_state.exchange_to_client.get(identifier)
+        return self._venue_state.orders.get(client_oid) if client_oid else None
 
     def _mark_price(self, symbol: str):
-        mark = float(self._marks.get(symbol, 0.0) or 0.0)
+        mark = float(self._venue_state.marks.get(symbol, 0.0) or 0.0)
         if mark > 0.0:
             return mark
-        book = self._books.get(symbol)
+        book = self._venue_state.books.get(symbol)
         if book is not None:
             bid = float(book.get_best_bid()[0] or 0.0)
             ask = float(book.get_best_ask()[0] or 0.0)
             if bid > 0.0 and ask > 0.0:
                 return (bid + ask) / 2.0
             return max(bid, ask)
-        position = self._positions.get(symbol)
+        position = self._venue_state.positions.get(symbol)
         return float(position.entry_price) if position is not None else 0.0
 
     def _prune_terminal_orders(self):

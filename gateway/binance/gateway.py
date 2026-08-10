@@ -60,8 +60,6 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
         rate_limit_budget=None,
     ):
         super().__init__(event_engine, "BINANCE")
-        self.api_key = api_key
-        self.api_secret = api_secret
         self.testnet = testnet
         market_data_config = dict(market_data_config or {})
 
@@ -82,27 +80,26 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
         # A websocket is bound to the book lifecycle generation at connect
         # time.  Keeping an unversioned client here would allow callbacks from
         # a closed transport to mutate the replacement connection.
-        self._order_book_component = self._build_order_book_controller()
-        self.max_book_buffer = max(
+        max_book_buffer = max(
             100,
             int(market_data_config.get("max_book_buffer", 2048) or 2048),
         )
-        self.book_resync_max_attempts = max(
+        book_resync_max_attempts = max(
             1,
             int(market_data_config.get("book_resync_max_attempts", 3) or 3),
         )
-        self.book_resync_retry_sec = max(
+        book_resync_retry_sec = max(
             0.0,
             float(market_data_config.get("book_resync_retry_sec", 0.25) or 0.0),
         )
-        self.max_book_recovery_threads = max(
+        max_book_recovery_threads = max(
             1,
             int(
                 market_data_config.get("max_book_recovery_threads", 4)
                 or 4
             ),
         )
-        self.book_recovery_join_timeout_sec = max(
+        book_recovery_join_timeout_sec = max(
             0.5,
             float(
                 market_data_config.get(
@@ -116,15 +113,15 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
             1.0,
             float(market_data_config.get("stream_ready_timeout_sec", 10.0) or 10.0),
         )
-        self.publish_depth_levels = max(
+        publish_depth_levels = max(
             1,
             int(market_data_config.get("publish_depth_levels", 5) or 5),
         )
-        self.emit_full_orderbook_events = bool(
+        emit_full_orderbook_events = bool(
             market_data_config.get("emit_full_orderbook_events", False)
         )
-        self.max_orderbook_levels_per_side = max(
-            self.publish_depth_levels,
+        max_orderbook_levels_per_side = max(
+            publish_depth_levels,
             int(
                 market_data_config.get(
                     "max_orderbook_levels_per_side",
@@ -133,7 +130,7 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
                 or 4096
             ),
         )
-        self.max_delta_levels_per_side = max(
+        max_delta_levels_per_side = max(
             1,
             int(
                 market_data_config.get(
@@ -142,6 +139,19 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
                 )
                 or 2048
             ),
+        )
+        self._order_book_component = self._build_order_book_controller(
+            BinanceOrderBookConfig(
+                max_buffer=max_book_buffer,
+                resync_max_attempts=book_resync_max_attempts,
+                resync_retry_sec=book_resync_retry_sec,
+                max_recovery_threads=max_book_recovery_threads,
+                recovery_join_timeout_sec=book_recovery_join_timeout_sec,
+                publish_depth_levels=publish_depth_levels,
+                emit_full_book=emit_full_orderbook_events,
+                max_levels_per_side=max_orderbook_levels_per_side,
+                max_delta_levels_per_side=max_delta_levels_per_side,
+            )
         )
         try:
             ingress_age_ms = float(
@@ -165,7 +175,10 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
         self._connection_component = self._build_connection_controller()
         self._rest_gateway_component = self._build_rest_gateway()
 
-    def _build_order_book_controller(self):
+    def _build_order_book_controller(
+        self,
+        config: BinanceOrderBookConfig | None = None,
+    ):
         dependencies = BinanceOrderBookDependencies(
             create_orderbook=lambda symbol: self._new_local_orderbook(symbol),
             fetch_snapshot=lambda symbol: self.rest.get_depth_snapshot(symbol),
@@ -192,7 +205,7 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
         )
         return BinanceOrderBookController(
             dependencies,
-            BinanceOrderBookConfig(),
+            config,
         )
 
     def _order_books(self):
@@ -214,18 +227,16 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
                 emit_fault=lambda code, detail="", **kwargs: (
                     self._emit_ws_fault(code, detail, **kwargs)
                 ),
-                is_transport_active=lambda: bool(
-                    getattr(self, "active", False)
-                ),
+                is_transport_active=lambda: self._connections().active,
                 is_transport_closing=lambda: bool(
-                    getattr(self, "_closing", False)
+                    self._connections().closing
                 ),
                 transport_generation_matches_locked=(
                     lambda generation: self._book_generation_matches_locked(
                         generation
                     )
                 ),
-                transport_lock=self._book_lock,
+                transport_lock=self._order_books().lock,
                 log_critical=logger.critical,
             )
         )
@@ -234,7 +245,7 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
         return BinanceAccountConfigurationController(
             BinanceAccountConfigurationDependencies(
                 rest=lambda: self.rest,
-                symbols=lambda: list(self.symbols),
+                symbols=lambda: list(self._connections().symbols),
                 venue_name=lambda: self.gateway_name,
                 log_error=logger.error,
                 log_critical=logger.critical,
@@ -273,8 +284,10 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
                     lambda: self._apply_account_trading_configuration()
                 ),
                 create_ws=lambda generation: self._new_ws(generation),
-                start_streams=lambda _ws, _symbols, generation: (
+                start_streams=lambda ws, symbols, generation: (
                     self._start_streams(
+                        ws,
+                        symbols,
                         expected_generation=generation,
                     )
                 ),
@@ -308,7 +321,7 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
             BinanceRestGatewayDependencies(
                 rest=self.rest,
                 transport_lock=books.lock,
-                is_transport_active=lambda: bool(self.active),
+                is_transport_active=lambda: self._connections().active,
                 gateway_state=lambda: self.state,
                 symbol_ready_locked=books.symbol_ready_locked,
                 require_healthy_clock=lambda: bool(
@@ -335,9 +348,6 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
 
     def connect(self, symbols: list):
         return self._connections().connect(symbols)
-
-    def _connect_once(self, symbols: list):
-        return self._connections().connect_once(symbols)
 
     def begin_shutdown(self):
         return self._connections().begin_shutdown()
@@ -403,51 +413,21 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
     def get_commission_rate(self, symbol: str):
         return self._rest_gateway().get_commission_rate(symbol)
 
-    def _start_streams(self, *, expected_generation=None):
-        return self._user_streams().start(
-            self.ws,
-            self.symbols,
-            transport_generation=expected_generation,
-        )
-
-    def _keep_alive_loop(
+    def _start_streams(
         self,
-        generation,
-        transport_generation=None,
-        stop_event=None,
-    ):
-        return self._user_streams().keep_alive_loop(
-            generation,
-            transport_generation,
-            stop_event,
-        )
-
-    def _keep_alive_once(
-        self,
-        generation,
+        ws,
+        symbols,
         *,
-        transport_generation=None,
+        expected_generation=None,
     ):
-        return self._user_streams().keep_alive_once(
-            generation,
-            transport_generation=transport_generation,
+        return self._user_streams().start(
+            ws,
+            symbols,
+            transport_generation=expected_generation,
         )
 
     def _apply_account_trading_configuration(self):
         return self._account_configuration().apply()
-
-    def _verify_account_trading_configuration(
-        self,
-        *,
-        target_leverage: int,
-        target_margin_type: str,
-        target_position_mode: str,
-    ) -> bool:
-        return self._account_configuration().verify(
-            target_leverage=target_leverage,
-            target_margin_type=target_margin_type,
-            target_position_mode=target_position_mode,
-        )
 
     def _build_websocket_dispatcher(self):
         return BinanceWebSocketDispatcher(
@@ -465,7 +445,7 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
                     **kwargs,
                 ),
                 tracked_symbols=lambda: tuple(
-                    getattr(self, "symbols", ())
+                    self._connections().symbols
                 ),
                 latency_stats=lambda: self.latency_stats,
                 max_ingress_age_ms=lambda: float(
@@ -529,9 +509,6 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
             expected_generation=expected_generation,
         )
 
-    def _is_control_message(self, msg):
-        return self._websocket_events().is_control_message(msg)
-
     def _emit_ws_fault(
         self,
         code: str,
@@ -550,18 +527,19 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
         else:
             logger.error(f"[{self.gateway_name}] {message}")
 
-        with self._book_lock:
+        with self._order_books().lock:
             if (
                 not self._book_generation_matches_locked(expected_generation)
                 or (
                     expected_keep_alive_generation is not None
-                    and self.keep_alive_generation
+                    and self._user_streams().generation
                     != expected_keep_alive_generation
                 )
             ):
                 return False
-            self.active = False
-            ws_client = getattr(self, "ws", None)
+            connections = self._connections()
+            connections.active = False
+            ws_client = connections.ws
             if self.state != GatewayState.ERROR:
                 self.set_state(GatewayState.ERROR)
             # Queue the fault while generation ownership is still held.  A
@@ -576,80 +554,6 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
             ws_client.close()
         return True
 
-    def _handle_user_update(
-        self,
-        msg,
-        *,
-        received_timestamp: float = None,
-        received_monotonic: float = None,
-        corrected_received_timestamp: float = None,
-        clock_offset_ms: float = None,
-        expected_generation=None,
-    ):
-        return self._websocket_events().handle_user_update(
-            msg,
-            received_timestamp=received_timestamp,
-            received_monotonic=received_monotonic,
-            corrected_received_timestamp=corrected_received_timestamp,
-            clock_offset_ms=clock_offset_ms,
-            expected_generation=expected_generation,
-        )
-
-    def _handle_account_update(
-        self,
-        msg,
-        *,
-        received_timestamp: float = None,
-        received_monotonic: float = None,
-        corrected_received_timestamp: float = None,
-        clock_offset_ms: float = None,
-        expected_generation=None,
-    ):
-        return self._websocket_events().handle_account_update(
-            msg,
-            received_timestamp=received_timestamp,
-            received_monotonic=received_monotonic,
-            corrected_received_timestamp=corrected_received_timestamp,
-            clock_offset_ms=clock_offset_ms,
-            expected_generation=expected_generation,
-        )
-
-    def _handle_market_update(
-        self,
-        msg,
-        *,
-        received_timestamp: float = None,
-        received_monotonic: float = None,
-        clock_offset_ms: float = None,
-        corrected_received_timestamp: float = None,
-        expected_generation=None,
-    ):
-        return self._websocket_events().handle_market_update(
-            msg,
-            received_timestamp=received_timestamp,
-            received_monotonic=received_monotonic,
-            corrected_received_timestamp=corrected_received_timestamp,
-            clock_offset_ms=clock_offset_ms,
-            expected_generation=expected_generation,
-        )
-
-    def _reject_stale_market_event(
-        self,
-        *,
-        stream: str,
-        symbol: str,
-        event_time_ms: int,
-        corrected_received_timestamp: float,
-        expected_generation=None,
-    ) -> bool:
-        return self._websocket_events().reject_stale_market_event(
-            stream=stream,
-            symbol=symbol,
-            event_time_ms=event_time_ms,
-            corrected_received_timestamp=corrected_received_timestamp,
-            expected_generation=expected_generation,
-        )
-
     def _dispatch_transport_callback(
         self,
         expected_generation,
@@ -659,7 +563,7 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
         if expected_generation is None:
             callback(*args)
             return True
-        with self._book_lock:
+        with self._order_books().lock:
             if not self._book_generation_matches_locked(expected_generation):
                 return False
             callback(*args)
@@ -689,50 +593,8 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
             expected_generation=expected_generation,
         )
 
-    def _init_books(self):
-        return self._order_books().initialize_books(self.symbols)
-
-    def _begin_book_recovery_locked(
-        self,
-        symbol,
-        freeze_reason: str = "",
-        *,
-        expected_generation=None,
-    ):
-        return self._order_books().begin_recovery_locked(
-            symbol,
-            freeze_reason,
-            expected_generation=expected_generation,
-        )
-
     def _launch_book_recovery(self, recovery):
         return self._order_books().launch_recovery(recovery)
-
-    def _run_book_recovery(self, symbol, generation, recovery_token):
-        return self._order_books().run_recovery(
-            symbol,
-            generation,
-            recovery_token,
-        )
-
-    def _book_recovery_threads_stopped(self) -> bool:
-        return self._order_books().recovery_threads_stopped()
-
-    def _join_book_recovery_threads(self) -> bool:
-        return self._order_books().join_recovery_threads()
-
-    def _schedule_book_recovery(
-        self,
-        symbol,
-        freeze_reason: str = "",
-        *,
-        expected_generation=None,
-    ):
-        return self._order_books().schedule_recovery(
-            symbol,
-            freeze_reason,
-            expected_generation=expected_generation,
-        )
 
     def _recover_orderbook(self, symbol, generation, recovery_token):
         return self._order_books().recover_orderbook(
@@ -749,26 +611,6 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
             expected_generation
         )
 
-    def _owns_transport_lifecycle_locked(
-        self,
-        generation,
-        expected_ws=None,
-    ):
-        return self._connections().owns_lifecycle_locked(
-            generation,
-            expected_ws,
-        )
-
-    def _mark_transport_failure_if_current(
-        self,
-        generation,
-        expected_ws=None,
-    ):
-        return self._connections().mark_failure_if_current(
-            generation,
-            expected_ws,
-        )
-
     def _book_generation_is_current(self, expected_generation):
         return self._order_books().generation_is_current(
             expected_generation
@@ -776,20 +618,6 @@ class BinanceGateway(BinanceGatewayCompatibilityFields, BaseGateway):
 
     def _new_local_orderbook(self, symbol: str):
         return self._order_books().create_local_orderbook(symbol)
-
-    def _owns_book_recovery_locked(self, symbol, generation, recovery_token):
-        return self._order_books().owns_recovery_locked(
-            symbol,
-            generation,
-            recovery_token,
-        )
-
-    def _release_book_recovery_locked(self, symbol, generation, recovery_token):
-        return self._order_books().release_recovery_locked(
-            symbol,
-            generation,
-            recovery_token,
-        )
 
     def _resync_book(
         self,

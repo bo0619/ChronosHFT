@@ -1,15 +1,14 @@
 import time
 import unittest
+from types import SimpleNamespace
 
-from event.type import Event, OrderRequest, OrderStatus, OrderSubmitted
+from event.type import OrderStatus
 from oms.order_manager import OrderManager
 
 
 class OrderManagerAckTimeoutTests(unittest.TestCase):
     def test_stop_interrupts_long_poll_and_joins_worker(self):
         monitor = OrderManager(
-            engine=None,
-            gateway=None,
             monitor_config={"monitor_check_interval_sec": 60.0},
         )
 
@@ -22,8 +21,6 @@ class OrderManagerAckTimeoutTests(unittest.TestCase):
     def test_ack_timeout_only_escalates_once_within_cooldown(self):
         callbacks = []
         monitor = OrderManager(
-            engine=None,
-            gateway=None,
             dirty_callback=lambda reason, suspicious_oid=None: callbacks.append((reason, suspicious_oid)),
             monitor_config={
                 "ack_timeout_sec": 1.0,
@@ -33,12 +30,14 @@ class OrderManagerAckTimeoutTests(unittest.TestCase):
             start_thread=False,
         )
         try:
-            submitted = OrderSubmitted(
-                req=OrderRequest(symbol="BTCUSDT", price=100.0, volume=1.0, side="BUY"),
-                order_id="oid-1",
-                timestamp=10.0,
+            monitor.track_prepared_order(
+                SimpleNamespace(
+                    client_oid="oid-1",
+                    intent=SimpleNamespace(symbol="BTCUSDT"),
+                    status=OrderStatus.PENDING_ACK,
+                )
             )
-            monitor.on_order_submitted(Event("eOrderSubmitted", submitted))
+            monitor.monitored_orders["oid-1"]["submit_time"] = 10.0
 
             monitor._check_once(now=12.0)
             monitor._check_once(now=13.0)
@@ -51,8 +50,6 @@ class OrderManagerAckTimeoutTests(unittest.TestCase):
     def test_ack_timeout_rearms_after_ack_progress(self):
         callbacks = []
         monitor = OrderManager(
-            engine=None,
-            gateway=None,
             dirty_callback=lambda reason, suspicious_oid=None: callbacks.append((reason, suspicious_oid)),
             monitor_config={
                 "ack_timeout_sec": 1.0,
@@ -61,12 +58,14 @@ class OrderManagerAckTimeoutTests(unittest.TestCase):
             start_thread=False,
         )
         try:
-            submitted = OrderSubmitted(
-                req=OrderRequest(symbol="BTCUSDT", price=100.0, volume=1.0, side="BUY"),
-                order_id="oid-2",
-                timestamp=10.0,
+            monitor.track_prepared_order(
+                SimpleNamespace(
+                    client_oid="oid-2",
+                    intent=SimpleNamespace(symbol="BTCUSDT"),
+                    status=OrderStatus.PENDING_ACK,
+                )
             )
-            monitor.on_order_submitted(Event("eOrderSubmitted", submitted))
+            monitor.monitored_orders["oid-2"]["submit_time"] = 10.0
             monitor._check_once(now=12.0)
             monitor.on_order_update("oid-2", OrderStatus.NEW)
 

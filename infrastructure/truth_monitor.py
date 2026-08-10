@@ -3,6 +3,7 @@ import time
 from copy import deepcopy
 from decimal import Decimal
 
+from governance.contracts import is_testnet_environment
 from infrastructure.commission_truth import parse_commission_rate_payload
 from infrastructure.logger import logger
 from infrastructure.paper_trade import is_paper_trade
@@ -17,7 +18,7 @@ class TruthMonitor:
         self.oms = oms
         self.snapshot_provider = snapshot_provider
         self.config = config or {}
-        self.is_testnet = bool(self.config.get("testnet", False))
+        self.is_testnet = is_testnet_environment(self.config)
 
         cfg = config.get("oms", {}).get("truth_monitor", {})
         self.poll_interval_sec = float(cfg.get("poll_interval_sec", 5.0))

@@ -93,7 +93,6 @@
         "initial_sigma_bps": 10.0,
         "initial_A": 10.0,
         "initial_k": 0.8,
-        "learning_rate": 0.005,
         "sigma_max_bps": 100.0,
         "sigma_ema_alpha": 0.1,
         "max_tick_gap_sec": 2.0

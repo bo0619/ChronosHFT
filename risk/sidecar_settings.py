@@ -6,6 +6,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import Callable
 
+from governance.contracts import is_testnet_environment
 from risk.limit_contract import (
     DEFAULT_MAX_ACCOUNT_GROSS_NOTIONAL,
     DEFAULT_MAX_DAILY_LOSS,
@@ -243,7 +244,7 @@ class SidecarSupervisorConfiguration:
             "api_secret": str(
                 supervisor_config.get("api_secret", "") or ""
             ),
-            "testnet": bool(config.get("testnet", False)),
+            "testnet": is_testnet_environment(config),
             "symbols": list(config.get("symbols", [])),
             "rest_rate_limit": rest_rate_limit_config,
             "full_open_orders_audit_interval_sec": float(
