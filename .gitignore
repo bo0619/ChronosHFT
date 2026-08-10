@@ -58,6 +58,7 @@ tests/*
 !tests/test_paper_ledger.py
 !tests/test_paper_matching.py
 !tests/test_main_dashboard_startup.py
+!tests/test_web_dashboard_admin_actions.py
 !tests/test_process_resource_monitor.py
 !tests/test_runtime_hot_path_benchmark.py
 !tests/test_runtime_soak_analysis.py

@@ -1,10 +1,10 @@
-"""Thread-safe, read-only local web dashboard backend.
+"""Thread-safe local web dashboard backend with bounded admin actions.
 
 The event callbacks in :class:`LocalWebDashboard` only copy primitive values
 into a small in-memory cache.  ``publish_snapshot`` creates one coherent JSON
 document on the caller's thread and atomically publishes it.  HTTP request
-threads only ever read those already-serialized bytes; they never touch the
-OMS, gateway, strategy, or risk components.
+threads read already-serialized snapshot bytes and may submit a small set of
+loopback-only operator actions through the live OMS and risk collaborators.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from governance.contracts import is_testnet_environment
+from ui.dashboard_admin_actions import serve_dashboard_admin_post
 
 _DEFAULT_STATIC_PATH = Path(__file__).resolve().parents[1] / "web" / "dashboard.html"
 _ACTIVE_ORDER_STATUSES = frozenset(
@@ -3131,7 +3132,7 @@ class LocalWebDashboard:
                 self._send(b"", "application/json; charset=utf-8", 405)
 
             def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
-                self._method_not_allowed()
+                serve_dashboard_admin_post(owner, self)
 
             def do_PUT(self) -> None:  # noqa: N802 - stdlib handler API
                 self._method_not_allowed()
@@ -3147,10 +3148,10 @@ class LocalWebDashboard:
 
             def _method_not_allowed(self) -> None:
                 self._send(
-                    b'{"error":"method_not_allowed","allow":"GET"}',
+                    b'{"error":"method_not_allowed","allow":"GET, POST"}',
                     "application/json; charset=utf-8",
                     405,
-                    extra_headers={"Allow": "GET"},
+                    extra_headers={"Allow": "GET, POST"},
                 )
 
             def _send(

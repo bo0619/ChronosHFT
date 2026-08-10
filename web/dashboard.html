@@ -83,6 +83,21 @@
     }
     button.control { cursor: pointer; }
     button.control:hover { border-color: var(--cyan); color: var(--cyan); }
+    button.control:disabled { cursor: not-allowed; opacity: .55; }
+    button.control.danger { color: #ff97a0; border-color: #5a2d36; background: #171018; }
+    button.control.danger:hover { border-color: var(--red); color: var(--red); }
+    button.control.good { color: #91e7bb; border-color: #26453a; background: #101815; }
+    button.control.good:hover { border-color: var(--green); color: var(--green); }
+    button.control.tiny { height: 26px; padding: 0 9px; font-size: 12px; }
+    .action-status {
+      display: inline-flex; align-items: center; min-width: 172px; height: 34px;
+      padding: 0 10px; border: 1px solid var(--line); border-radius: 4px;
+      background: #0c1219; color: var(--muted); white-space: nowrap;
+    }
+    .action-status.good { color: var(--green); border-color: rgba(66, 211, 146, .35); }
+    .action-status.warn { color: var(--amber); border-color: rgba(244, 190, 85, .35); }
+    .action-status.bad { color: var(--red); border-color: rgba(255, 107, 120, .35); }
+    .position-action { text-align: right; }
     .connection { display: flex; align-items: center; gap: 7px; color: var(--muted); white-space: nowrap; }
     .dot { width: 8px; height: 8px; border-radius: 50%; background: #627182; }
     .dot.live { background: var(--green); box-shadow: 0 0 10px rgba(66, 211, 146, .65); }
@@ -313,6 +328,9 @@
       <select id="symbolSelect" class="control" aria-label="选择焦点标的"><option>等待数据</option></select>
       <select id="refreshSelect" class="control" aria-label="刷新频率"><option value="500">0.5 秒</option><option value="1000" selected>1 秒</option><option value="2000">2 秒</option><option value="5000">5 秒</option></select>
       <button id="pauseButton" class="control" type="button">暂停刷新</button>
+      <button id="flattenAllButton" class="control danger" type="button">一键平仓</button>
+      <button id="rearmButton" class="control good" type="button">Rearm</button>
+      <span id="actionStatus" class="action-status">就绪</span>
     </div>
   </header>
 
@@ -336,7 +354,7 @@
 
   <main>
     <section id="overview">
-      <div class="section-head"><h2>系统总览</h2><p id="overviewModeText">只读本地遥测 · 无交易操作入口</p></div>
+      <div class="section-head"><h2>系统总览</h2><p id="overviewModeText">本地遥测 + 操作入口 · 仅限 loopback</p></div>
       <div id="statusMetrics" class="grid status-grid"></div>
       <div style="height:10px"></div>
       <div id="accountMetrics" class="grid account-grid"></div>
@@ -363,7 +381,7 @@
       <div style="height:10px"></div>
       <div class="grid split">
         <article class="panel"><div class="panel-head"><h3>持仓明细</h3><small>本地 OMS + Mark 派生</small></div><div class="table-wrap"><table>
-          <thead><tr><th>标的</th><th>方向</th><th>数量</th><th>均价</th><th>Mark</th><th>名义价值</th><th>未实现 PnL</th><th>买挂单</th><th>卖挂单</th><th>Reduce-only</th></tr></thead><tbody id="positionRows"></tbody>
+          <thead><tr><th>标的</th><th>方向</th><th>数量</th><th>均价</th><th>Mark</th><th>名义价值</th><th>未实现 PnL</th><th>买挂单</th><th>卖挂单</th><th>Reduce-only</th><th>操作</th></tr></thead><tbody id="positionRows"></tbody>
         </table></div></article>
         <article class="panel"><div class="panel-head"><h3>合约规则</h3><small>exchangeInfo 启动快照</small></div><div class="table-wrap"><table>
           <thead><tr><th>标的</th><th>状态</th><th>Tick</th><th>Step</th><th>最小数量</th><th>最小名义</th><th>价格精度</th><th>数量精度</th><th>RPI 权限</th></tr></thead><tbody id="contractRows"></tbody>
@@ -451,7 +469,7 @@
       <article class="panel"><div class="panel-head"><h3>全量原始遥测</h3><small>便于审计新增字段；服务端已做凭证白名单隔离</small></div><details><summary>展开当前 JSON 快照（可能较大）</summary><pre id="rawTelemetry">{}</pre></details></article>
     </section>
 
-    <div class="footer"><span>ChronosHFT Local Dashboard · Read-only · Loopback only</span><span id="schemaVersion">schema —</span></div>
+    <div class="footer"><span>ChronosHFT Local Dashboard · Operator actions enabled · Loopback only</span><span id="schemaVersion">schema —</span></div>
   </main>
 
   <div id="fatalOverlay" class="fatal-overlay"><div class="fatal-card"><h2>本地监控服务不可达</h2><p id="fatalMessage">无法读取 /api/snapshot。</p><button id="retryButton" class="control" type="button">立即重试</button></div></div>
@@ -461,7 +479,8 @@
     const state = {
       paused: false, timer: null, freshnessTimer: null, failures: 0, data: null, selectedSymbol: "",
       history: { account: [], symbols: {} }, maxHistory: 600,
-      lastSequence: null, lastSequenceAt: 0, staleAfterMs: 2000
+      lastSequence: null, lastSequenceAt: 0, staleAfterMs: 2000,
+      actionBusy: false, actionMessage: "就绪", actionTone: ""
     };
     const $ = (id) => document.getElementById(id);
     const path = (obj, dotted, fallback = null) => dotted.split(".").reduce((v, k) => v != null ? v[k] : undefined, obj) ?? fallback;
@@ -509,6 +528,83 @@
     const metric = (label, value, note = "", tone = "") => `<div class="metric ${tone}"><div class="metric-label">${esc(label)}</div><div class="metric-value">${value}</div><div class="metric-note">${note}</div></div>`;
     const kv = (label, value) => `<div class="kv"><span title="${esc(label)}">${esc(label)}</span><span>${value}</span></div>`;
     const emptyRow = (cols, text = "暂无数据") => `<tr><td colspan="${cols}" class="empty">${esc(text)}</td></tr>`;
+    function confirmDashboardAction(action, symbol = "") {
+      if (action === "flatten_all") {
+        return window.confirm("确认一键平仓全部标的？\n\n后端会关闭新风险出站、提交 reduce-only 平仓单，然后 HALT OMS。");
+      }
+      if (action === "flatten_symbol") {
+        return window.confirm(`确认平仓 ${symbol || "该标的"}？\n\n后端会提交该标的 reduce-only 平仓单，并冻结该标的。`);
+      }
+      if (action === "rearm") {
+        return window.confirm("确认 Rearm？\n\n只有风控已验证全平时后端才会接受，成功后 OMS 会恢复可交易状态。");
+      }
+      return true;
+    }
+    function renderActionStatus(text = state.actionMessage, tone = state.actionTone) {
+      state.actionMessage = text || "就绪";
+      state.actionTone = tone || "";
+      const el = $("actionStatus");
+      if (!el) return;
+      el.textContent = state.actionMessage;
+      el.className = state.actionTone ? `action-status ${state.actionTone}` : "action-status";
+    }
+    function syncActionButtons() {
+      const disabled = state.actionBusy || !state.data;
+      const flattenAll = $("flattenAllButton");
+      const rearm = $("rearmButton");
+      if (flattenAll) flattenAll.disabled = disabled;
+      if (rearm) rearm.disabled = disabled;
+      document.querySelectorAll(".symbol-flatten-button").forEach(button => {
+        button.disabled = disabled;
+      });
+    }
+    async function submitDashboardAction(action, {symbol = "", reason = ""} = {}) {
+      if (state.actionBusy) return null;
+      if (!confirmDashboardAction(action, symbol)) {
+        renderActionStatus("已取消", "warn");
+        return null;
+      }
+      state.actionBusy = true;
+      syncActionButtons();
+      renderActionStatus("执行中…", "warn");
+      try {
+        const payload = {
+          action,
+          symbol,
+          reason: reason || `dashboard_${action}${symbol ? `:${symbol}` : ""}`,
+        };
+        const response = await fetch("/api/admin/action", {
+          method: "POST",
+          cache: "no-store",
+          headers: {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-Chronos-Action": "dashboard",
+          },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data.accepted === false) {
+          throw new Error(first(data.message, `HTTP ${response.status}`));
+        }
+        renderActionStatus(first(data.message, "已完成"), "good");
+        if (data.snapshot) {
+          render(data.snapshot);
+        } else if (state.data) {
+          render(state.data);
+        }
+        return data;
+      } catch (error) {
+        renderActionStatus(first(error?.message, "操作失败"), "bad");
+        if (state.data) {
+          render(state.data);
+        }
+        return null;
+      } finally {
+        state.actionBusy = false;
+        syncActionButtons();
+      }
+    }
 
     function normalizeSymbols(data) {
       const raw = data.symbols;
@@ -548,8 +644,8 @@
       $("envState").textContent = context.label;
       $("envState").className = context.isPaper || context.isTestnet ? "warning" : "negative";
       $("overviewModeText").textContent = context.isPaper
-        ? "BINANCE 主网公开行情 · 本地模拟账户/订单/成交 · 私有 API 禁用"
-        : "只读本地遥测 · 无交易操作入口";
+        ? "BINANCE 主网公开行情 · 本地模拟账户/订单/成交 · 操作入口仅作用于本地模拟"
+        : "本地遥测 + 操作入口 · 平仓/Rearm 仅限 loopback";
       $("executionModeText").textContent = context.isPaper
         ? "所有订单、成交、费用与 PnL 均为本地模拟结果"
         : "所有 TIF、RPI 路由、状态、成交率、拒单与延迟";
@@ -617,9 +713,17 @@
       }).join("") : emptyRow(18,"等待市场事件");
       $("positionRows").innerHTML = symbols.length ? symbols.map(s => {
         const p=obj(s.position), e=obj(s.exposure), m=obj(s.market), q=first(p.volume,p.quantity,p.net_position);
-        return `<tr><td><strong>${esc(s.symbol)}</strong></td><td class="${valueClass(q)}">${finite(q) ? Number(q)>0?"LONG":Number(q)<0?"SHORT":"FLAT" : "不可用"}</td><td>${fmt(q,5)}</td><td>${fmtPrice(first(p.avg_price,p.entry_price,e.avg_price))}</td><td>${fmtPrice(m.mark_price)}</td><td>${fmt(first(p.notional,e.notional),3)}</td><td class="${valueClass(p.unrealized_pnl)}">${fmt(p.unrealized_pnl,4)}</td><td>${fmt(first(e.open_buy_qty,p.open_buy_qty),5)}</td><td>${fmt(first(e.open_sell_qty,p.open_sell_qty),5)}</td><td>${fmt(first(e.reduce_only_qty,p.reduce_only_qty),5)}</td></tr>`;
-      }).join("") : emptyRow(10);
+        return `<tr><td><strong>${esc(s.symbol)}</strong></td><td class="${valueClass(q)}">${finite(q) ? Number(q)>0?"LONG":Number(q)<0?"SHORT":"FLAT" : "不可用"}</td><td>${fmt(q,5)}</td><td>${fmtPrice(first(p.avg_price,p.entry_price,e.avg_price))}</td><td>${fmtPrice(m.mark_price)}</td><td>${fmt(first(p.notional,e.notional),3)}</td><td class="${valueClass(p.unrealized_pnl)}">${fmt(p.unrealized_pnl,4)}</td><td>${fmt(first(e.open_buy_qty,p.open_buy_qty),5)}</td><td>${fmt(first(e.open_sell_qty,p.open_sell_qty),5)}</td><td>${fmt(first(e.reduce_only_qty,p.reduce_only_qty),5)}</td><td class="position-action"><button class="control danger tiny symbol-flatten-button" type="button" data-symbol="${esc(s.symbol)}" title="平掉 ${esc(s.symbol)}">平仓</button></td></tr>`;
+      }).join("") : emptyRow(11);
       $("contractRows").innerHTML = symbols.length ? symbols.map(s=>{const c=obj(s.contract); return `<tr><td><strong>${esc(s.symbol)}</strong></td><td>${statusBadge(c.status)}</td><td>${fmt(c.tick_size,8)}</td><td>${fmt(c.step_size,8)}</td><td>${fmt(c.min_qty,8)}</td><td>${fmt(c.min_notional,2)}</td><td>${fmt(c.price_precision,0)}</td><td>${fmt(c.qty_precision,0)}</td><td>${boolText(c.supports_rpi)}</td></tr>`}).join("") : emptyRow(9);
+      document.querySelectorAll(".symbol-flatten-button").forEach(button => {
+        button.addEventListener("click", () => {
+          submitDashboardAction("flatten_symbol", {
+            symbol: button.dataset.symbol || "",
+            reason: `dashboard_symbol_flatten:${button.dataset.symbol || ""}`,
+          });
+        });
+      });
     }
 
     function renderExecution(data) {
@@ -753,6 +857,7 @@
       state.data=data; const symbols=normalizeSymbols(data); ensureSymbol(symbols);
       setTop(data); renderOverview(data,symbols); renderMarket(symbols); renderExecution(data); renderStrategy(symbols); renderRisk(data); renderAcceptance(data); renderRuntime(data); renderRpi(data,symbols); renderLogs(data); updateHistory(data,symbols); drawCharts(data,symbols);
       $("rawTelemetry").textContent=JSON.stringify(data,null,2);
+      syncActionButtons();
     }
 
     function ensureSymbol(symbols){
@@ -879,12 +984,16 @@
       }
     }
     $("pauseButton").addEventListener("click",()=>{state.paused=!state.paused;$("pauseButton").textContent=state.paused?"继续刷新":"暂停刷新";if(state.paused){$("connectionDot").className="dot warn";$("connectionText").textContent="已暂停";}else fetchSnapshot();});
+    $("flattenAllButton").addEventListener("click",()=>{submitDashboardAction("flatten_all",{reason:"dashboard_flatten_all"});});
+    $("rearmButton").addEventListener("click",()=>{submitDashboardAction("rearm",{reason:"dashboard_rearm"});});
     $("refreshSelect").addEventListener("change",schedule);
     $("symbolSelect").addEventListener("change",e=>{state.selectedSymbol=e.target.value;if(state.data){renderStrategy(normalizeSymbols(state.data));drawCharts(state.data,normalizeSymbols(state.data));}});
     $("retryButton").addEventListener("click",()=>{state.failures=0;$("fatalOverlay").classList.remove("visible");fetchSnapshot();});
     window.addEventListener("resize",()=>{if(state.data)drawCharts(state.data,normalizeSymbols(state.data));});
     document.addEventListener("visibilitychange",()=>{if(!document.hidden){monitorFreshness();fetchSnapshot();}});
     state.freshnessTimer=setInterval(monitorFreshness,250);
+    renderActionStatus();
+    syncActionButtons();
     schedule(); fetchSnapshot();
   </script>
 </body>
