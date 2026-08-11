@@ -79,7 +79,7 @@
     .top-actions { display: flex; align-items: center; gap: 9px; }
     .control {
       height: 34px; padding: 0 11px; color: var(--text); background: #101923;
-      border: 1px solid var(--line); border-radius: 4px;
+      border: 1px solid var(--line); border-radius: 4px; white-space: nowrap;
     }
     button.control { cursor: pointer; }
     button.control:hover { border-color: var(--cyan); color: var(--cyan); }
@@ -146,7 +146,6 @@
     .grid { display: grid; gap: 10px; }
     .status-grid { grid-template-columns: repeat(8, minmax(120px, 1fr)); }
     .account-grid { grid-template-columns: repeat(10, minmax(105px, 1fr)); }
-    .chart-grid { grid-template-columns: 1.25fr 1fr .75fr; }
     .split { grid-template-columns: 1.1fr .9fr; }
     .triple { grid-template-columns: repeat(3, 1fr); }
     .quad { grid-template-columns: repeat(4, 1fr); }
@@ -196,9 +195,66 @@
     .simulation-badge { display: none; margin-left: 7px; border-color: #9c742d; color: #f8c767; background: #241c0e; }
     body.paper-mode .simulation-badge { display: inline-block; }
 
-    .chart { width: 100%; height: 220px; display: block; }
-    .chart-legend { display: flex; gap: 16px; color: var(--muted); font-size: 10px; }
-    .legend-key::before { content: ""; display: inline-block; width: 10px; height: 2px; margin: 0 5px 3px 0; background: currentColor; }
+    .readiness-shell {
+      overflow: hidden; border: 1px solid var(--line); border-left: 4px solid var(--amber);
+      background: #0d131b;
+    }
+    .readiness-shell.ready { border-left-color: var(--green); }
+    .readiness-shell.blocked { border-left-color: var(--red); }
+    .readiness-shell.limited { border-left-color: var(--amber); }
+    .readiness-shell.unknown { border-left-color: #6f8091; }
+    .readiness-overview {
+      display: grid; grid-template-columns: minmax(280px, .8fr) minmax(560px, 1.2fr);
+      gap: 18px; align-items: stretch; padding: 16px 18px;
+      border-bottom: 1px solid var(--line-soft); background: #0f1720;
+    }
+    .readiness-state { min-width: 0; align-self: center; }
+    .readiness-kicker { color: var(--muted); font: 10px var(--mono); text-transform: uppercase; }
+    .readiness-state strong { display: block; margin-top: 7px; font-size: 24px; line-height: 1.2; }
+    .readiness-shell.ready .readiness-state strong { color: var(--green); }
+    .readiness-shell.blocked .readiness-state strong { color: var(--red); }
+    .readiness-shell.limited .readiness-state strong { color: var(--amber); }
+    .readiness-state p { margin: 7px 0 0; color: var(--muted); line-height: 1.55; overflow-wrap: anywhere; }
+    .readiness-capabilities {
+      display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+      border: 1px solid var(--line-soft); background: #0b1118;
+    }
+    .capability-cell { min-width: 0; padding: 11px 12px; border-right: 1px solid var(--line-soft); }
+    .capability-cell:last-child { border-right: 0; }
+    .capability-cell span { display: block; color: var(--muted); font-size: 10px; }
+    .capability-cell strong {
+      display: block; margin-top: 7px; font: 700 12px var(--mono);
+      white-space: normal; overflow-wrap: anywhere;
+    }
+    .readiness-meta {
+      display: flex; flex-wrap: wrap; gap: 8px 18px; padding: 9px 18px;
+      color: var(--muted); border-bottom: 1px solid var(--line-soft); font: 10px var(--mono);
+    }
+    .readiness-meta strong { color: var(--text); }
+    .blocker-list { min-height: 70px; }
+    .blocker-item {
+      display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 12px;
+      padding: 13px 18px; border-bottom: 1px solid var(--line-soft);
+    }
+    .blocker-item:last-child { border-bottom: 0; }
+    .blocker-index {
+      width: 34px; height: 34px; display: grid; place-items: center;
+      color: var(--red); border: 1px solid #60303a; background: #1d1115; font: 700 11px var(--mono);
+    }
+    .blocker-item.scope .blocker-index { color: var(--amber); border-color: #66502a; background: #1b170f; }
+    .blocker-item.info .blocker-index { color: var(--blue); border-color: #304b69; background: #101925; }
+    .blocker-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 7px 10px; }
+    .blocker-heading strong { font-size: 13px; }
+    .blocker-category {
+      padding: 2px 5px; color: var(--muted); border: 1px solid var(--line);
+      font: 700 9px var(--mono); text-transform: uppercase;
+    }
+    .blocker-code { color: #76899c; font: 10px var(--mono); overflow-wrap: anywhere; }
+    .blocker-detail { margin: 6px 0 0; color: #c5d0da; line-height: 1.55; overflow-wrap: anywhere; }
+    .blocker-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 20px; margin-top: 8px; }
+    .blocker-fact { min-width: 0; color: var(--muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+    .blocker-fact b { color: #9fb0c0; font-weight: 600; }
+    .readiness-clear { padding: 22px 18px; color: var(--green); line-height: 1.6; }
 
     .kv-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
     .kv { min-width: 0; display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid #18222d; }
@@ -245,8 +301,7 @@
     @media (max-width: 1500px) {
       .status-grid { grid-template-columns: repeat(4, 1fr); }
       .account-grid { grid-template-columns: repeat(5, 1fr); }
-      .chart-grid { grid-template-columns: 1fr 1fr; }
-      .chart-grid > :last-child { grid-column: 1 / -1; }
+      .readiness-overview { grid-template-columns: 1fr; }
     }
 
     @media (max-width: 1399px) {
@@ -281,6 +336,7 @@
         grid-column: 1; justify-content: start; overflow-x: auto;
         padding-bottom: 2px;
       }
+      .top-actions > * { flex: 0 0 auto; }
       .top-status {
         grid-column: 1; grid-template-columns: repeat(2, minmax(0, 1fr));
       }
@@ -297,8 +353,16 @@
       .section-head { display: block; }
       .section-head p { margin-top: 5px; line-height: 1.5; }
       .status-grid, .account-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .chart-grid, .triple, .quad { grid-template-columns: 1fr; }
-      .chart-grid > :last-child { grid-column: auto; }
+      .triple, .quad { grid-template-columns: 1fr; }
+      .readiness-overview { grid-template-columns: 1fr; padding: 14px 12px; }
+      .readiness-state strong { font-size: 20px; }
+      .readiness-capabilities { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .capability-cell:nth-child(2) { border-right: 0; }
+      .capability-cell:nth-child(-n+2) { border-bottom: 1px solid var(--line-soft); }
+      .readiness-meta { padding-right: 12px; padding-left: 12px; }
+      .blocker-item { grid-template-columns: 34px minmax(0, 1fr); gap: 9px; padding: 12px; }
+      .blocker-index { width: 30px; height: 30px; }
+      .blocker-facts { grid-template-columns: 1fr; gap: 4px; }
       .strategy-list { grid-template-columns: 1fr; }
       .strategy-tabs { border-right: 0; border-bottom: 1px solid var(--line-soft); }
       .metric { min-width: 0; }
@@ -349,28 +413,43 @@
   </div>
 
   <nav class="subnav" aria-label="页面区域">
-    <a href="#overview">总览</a><a href="#market">市场</a><a href="#execution">执行</a><a href="#strategy">策略</a><a href="#risk">风控</a><a href="#acceptance">实盘验收</a><a href="#runtime">运行时</a><a href="#rpi">RPI</a><a href="#logs">日志</a>
+    <a href="#trade-readiness">交易诊断</a><a href="#overview">总览</a><a href="#market">市场</a><a href="#execution">执行</a><a href="#strategy">策略</a><a href="#risk">风控</a><a href="#acceptance">实盘验收</a><a href="#runtime">运行时</a><a href="#rpi">RPI</a><a href="#logs">日志</a>
     <span class="spacer"></span><span id="asOf">尚未收到快照</span>
   </nav>
 
   <main>
+    <section id="trade-readiness" aria-labelledby="tradeReadinessHeading">
+      <div class="section-head"><h2 id="tradeReadinessHeading">交易可用性</h2><p>全局就绪条件与局部交易限制</p></div>
+      <div id="readinessShell" class="readiness-shell unknown">
+        <div class="readiness-overview">
+          <div class="readiness-state">
+            <span class="readiness-kicker">Configured mode readiness</span>
+            <strong id="readinessTitle">正在核对交易条件</strong>
+            <p id="readinessSummary">等待第一份运行快照。</p>
+          </div>
+          <div class="readiness-capabilities" aria-label="OMS 当前执行能力">
+            <div class="capability-cell"><span>OMS 新开风险</span><strong id="openRiskState" class="muted">待确认</strong></div>
+            <div class="capability-cell"><span>OMS 减仓</span><strong id="reduceRiskState" class="muted">待确认</strong></div>
+            <div class="capability-cell"><span>OMS 撤单</span><strong id="cancelState" class="muted">待确认</strong></div>
+            <div class="capability-cell"><span>订单去向</span><strong id="executionTarget" class="muted">待确认</strong></div>
+          </div>
+        </div>
+        <div class="readiness-meta">
+          <span>全局阻断 <strong id="globalBlockerCount">0</strong></span>
+          <span>局部限制 <strong id="scopedBlockerCount">0</strong></span>
+          <span id="readinessEvaluated">尚未评估</span>
+        </div>
+        <div id="blockerList" class="blocker-list" aria-live="polite">
+          <div class="readiness-clear muted">等待交易状态。</div>
+        </div>
+      </div>
+    </section>
+
     <section id="overview">
       <div class="section-head"><h2>系统总览</h2><p id="overviewModeText">本地遥测 + 操作入口 · 仅限 loopback</p></div>
       <div id="statusMetrics" class="grid status-grid"></div>
       <div style="height:10px"></div>
       <div id="accountMetrics" class="grid account-grid"></div>
-      <div style="height:10px"></div>
-      <div class="grid chart-grid">
-        <article class="panel">
-          <div class="panel-head"><h3>权益 / 现金流调整后 PnL</h3><div class="chart-legend"><span class="legend-key accent">Equity</span><span class="legend-key positive">PnL</span></div></div>
-          <canvas id="equityChart" class="chart" aria-label="权益与损益曲线"></canvas>
-        </article>
-        <article class="panel">
-          <div class="panel-head"><h3 id="marketChartTitle">焦点行情</h3><div class="chart-legend"><span class="legend-key accent">Mid</span><span class="legend-key warning">Fair</span></div></div>
-          <canvas id="marketChart" class="chart" aria-label="焦点标的行情曲线"></canvas>
-        </article>
-        <article class="panel"><div class="panel-head"><h3>关键保护状态</h3></div><div id="guardSummary" class="panel-body kv-grid"></div></article>
-      </div>
     </section>
 
     <section id="market">
@@ -466,8 +545,6 @@
         <article class="panel"><div class="panel-head"><h3>运行日志</h3><small id="logCountText">0 条</small></div><div id="logList" class="log-list"></div></article>
         <article class="panel"><div class="panel-head"><h3>告警</h3><small id="alertCountText">0 条</small></div><div id="alertList" class="log-list"></div></article>
       </div>
-      <div style="height:10px"></div>
-      <article class="panel"><div class="panel-head"><h3>全量原始遥测</h3><small>便于审计新增字段；服务端已做凭证白名单隔离</small></div><details><summary>展开当前 JSON 快照（可能较大）</summary><pre id="rawTelemetry">{}</pre></details></article>
     </section>
 
     <div class="footer"><span>ChronosHFT Local Dashboard · Operator actions enabled · Loopback only</span><span id="schemaVersion">schema —</span></div>
@@ -479,9 +556,8 @@
     "use strict";
     const state = {
       paused: false, timer: null, freshnessTimer: null, failures: 0, data: null, selectedSymbol: "",
-      history: { account: [], symbols: {} }, maxHistory: 600,
       lastSequence: null, lastSequenceAt: 0, staleAfterMs: 2000,
-      actionBusy: false, actionMessage: "就绪", actionTone: ""
+      actionBusy: false, actionMessage: "就绪", actionTone: "", health: null
     };
     const $ = (id) => document.getElementById(id);
     const path = (obj, dotted, fallback = null) => dotted.split(".").reduce((v, k) => v != null ? v[k] : undefined, obj) ?? fallback;
@@ -529,6 +605,153 @@
     const metric = (label, value, note = "", tone = "") => `<div class="metric ${tone}"><div class="metric-label">${esc(label)}</div><div class="metric-value">${value}</div><div class="metric-note">${note}</div></div>`;
     const kv = (label, value) => `<div class="kv"><span title="${esc(label)}">${esc(label)}</span><span>${value}</span></div>`;
     const emptyRow = (cols, text = "暂无数据") => `<tr><td colspan="${cols}" class="empty">${esc(text)}</td></tr>`;
+    const diagnosticValue = (value, fallback = "未提供") => {
+      if (value === undefined || value === null || value === "") return fallback;
+      if (Array.isArray(value)) return value.length ? value.map(item => diagnosticValue(item, "")).join(", ") : "空";
+      if (typeof value === "object") {
+        const entries = Object.entries(value);
+        return entries.length ? entries.map(([key, item]) => `${key}=${diagnosticValue(item, "")}`).join("；") : "空";
+      }
+      return String(value);
+    };
+    const diagnosticFacts = (...parts) => parts.filter(part => part && !part.endsWith("=未提供")).join(" · ") || "未提供";
+
+    function readinessReasonInfo(rawReason, data) {
+      const raw=String(rawReason || "readiness_not_confirmed"), separator=raw.indexOf(":"), code=separator<0?raw:raw.slice(0,separator), suffix=separator<0?"":raw.slice(separator+1);
+      const system=obj(data.system), startup=obj(first(data.startup,system.startup,{})), gateway=obj(system.gateway), oms=obj(system.oms), capability=obj(oms.capability), gate=obj(capability.outbound_gate);
+      const risk=obj(data.risk?.status), supervisor=obj(system.risk_supervisor||system.independent_risk_supervisor), dms=obj(capability.venue_dead_man_switch), fence=obj(capability.single_writer_fence);
+      const clock=obj(system.time_service), truth=obj(system.truth_monitor), venue=obj(system.venue_supervisor), runtime=obj(data.runtime), event=obj(first(system.event_engine,runtime.event_engine,{})), strategy=obj(first(system.strategy_runtime,runtime.strategy_runtime,{}));
+      const alerts=obj(runtime.external_alerts), evidence=obj(runtime.live_evidence);
+      const result={kind:"global",category:"系统",title:"交易就绪条件未通过",detail:"该原因由后端就绪检查返回，正常交易按失败关闭处理。",evidence:"原因详情未提供",recovery:"核对原始原因码和对应运行日志。",raw};
+
+      if(code==="dashboard_not_running") return {...result,category:"监控",title:"监控服务尚未进入运行态",detail:"本地仪表盘没有处于 RUNNING，当前快照不能证明交易系统持续健康。",evidence:diagnosticFacts(`service_state=${diagnosticValue(data.meta?.service_state)}`,`startup=${diagnosticValue(startup.state)}`),recovery:"确认主进程和仪表盘已启动，并持续发布新快照。"};
+      if(code==="dashboard_snapshot_stale") return {...result,category:"监控",title:"交易快照已陈旧",detail:"快照序列没有在允许时间内推进，页面无法确认当前交易状态。",evidence:suffix||"快照超过陈旧阈值",recovery:"检查主控制循环、仪表盘发布线程和浏览器连接。"};
+      if(code==="dashboard_api_unreachable") return {...result,category:"监控",title:"交易快照接口不可达",detail:"页面无法继续读取 /api/snapshot，因此当前状态必须视为未知。",evidence:suffix||"请求失败",recovery:"恢复本地仪表盘端口或主进程后重新读取快照。"};
+      if(code==="readiness_snapshot_unavailable") return {...result,category:"监控",title:"交易就绪快照不可用",detail:"readiness 没有明确声明 available=true，页面不能把 ready 或原因列表视为完整、可信的交易判断。",evidence:diagnosticFacts(`available=${diagnosticValue(data.readiness?.available)}`,`ready=${diagnosticValue(data.readiness?.ready)}`,`status=${diagnosticValue(data.readiness?.status)}`),recovery:"恢复后端就绪快照生产，并返回 available=true、ready 和 reasons 后重新评估。"};
+      if(code==="readiness_not_confirmed") return {...result,category:"监控",title:"后端没有确认交易就绪",detail:"readiness.ready 不是 true，且没有返回更具体的原因。",evidence:diagnosticFacts(`available=${diagnosticValue(data.readiness?.available)}`,`status=${diagnosticValue(data.readiness?.status)}`),recovery:"检查就绪快照生产者和 /readyz 返回值。"};
+      if(code==="startup_state") return {...result,category:"启动",title:`启动流程未完成：${suffix||"UNKNOWN"}`,detail:"启动闸门未全部通过，执行侧不会开放正常交易。",evidence:diagnosticFacts(`state=${diagnosticValue(startup.state)}`,`mode=${diagnosticValue(startup.operating_mode)}`,`reason=${diagnosticValue(startup.reason)}`),recovery:"处理启动原因后重启进程；execution_enabled 不会在同一失败启动中自动恢复。"};
+      if(code==="execution_disabled") return {...result,category:"启动",title:"执行总开关为关闭状态",detail:"行情和监控仍可运行，但任何正常交易执行都没有被启动流程授权。",evidence:diagnosticFacts(`execution_enabled=${diagnosticValue(startup.execution_enabled)}`,`reason=${diagnosticValue(startup.reason)}`),recovery:"解决启动闸门失败并重启，使 execution_enabled=true。"};
+      if(code==="gateway_unavailable") return {...result,category:"网关",title:"交易网关快照不可用",detail:"系统无法确认交易所连接、行情传输和订单传输状态。",evidence:diagnosticFacts(`available=${diagnosticValue(gateway.available)}`,`error=${diagnosticValue(gateway.error)}`),recovery:"恢复网关实例及其状态采集。"};
+      if(code==="gateway_not_ready") return {...result,category:"网关",title:`交易网关未就绪：${suffix||diagnosticValue(gateway.state)}`,detail:"网关未同时满足 active=true 和 state=READY，订单不能正常发送。",evidence:diagnosticFacts(`active=${diagnosticValue(gateway.active)}`,`state=${diagnosticValue(gateway.state)}`,`error=${diagnosticValue(gateway.error)}`),recovery:"恢复 REST/WebSocket 连接并等待网关进入 READY。"};
+      if(code==="oms_unavailable") return {...result,category:"OMS",title:"OMS 状态不可用",detail:"订单管理系统没有提供可验证状态，不能安全接收新交易。",evidence:diagnosticFacts(`available=${diagnosticValue(oms.available)}`,`error=${diagnosticValue(oms.error)}`),recovery:"恢复 OMS 实例、状态锁和快照采集。"};
+      if(code==="oms_not_live") return {...result,category:"OMS",title:`OMS 生命周期不是 LIVE：${suffix||diagnosticValue(oms.state)}`,detail:"OMS 处于启动、冻结、停止或故障状态，正常订单入口不会开放。",evidence:diagnosticFacts(`state=${diagnosticValue(oms.state)}`,`halt=${diagnosticValue(oms.last_halt_reason)}`,`freeze=${diagnosticValue(oms.last_freeze_reason)}`),recovery:"先处理 Halt/Freeze 根因；满足全平与真值条件后再执行 Rearm。"};
+      if(code==="oms_capability_not_live") return {...result,category:"OMS",title:`OMS 能力模式受限：${suffix||diagnosticValue(capability.mode)}`,detail:"当前能力模式不允许完整的正常交易，可能只允许减仓、撤单或查询。",evidence:diagnosticFacts(`mode=${diagnosticValue(capability.mode)}`,`reason=${diagnosticValue(capability.reason)}`,`override=${diagnosticValue(capability.override_reason)}`),recovery:"清除下面列出的能力约束，并确认 OMS capability 回到 LIVE。"};
+      if(code==="oms_outbound_gate_closed") return {...result,category:"OMS",title:"新风险出站闸门关闭",detail:"即使策略产生订单，增加风险的订单也会在最终发送前被拒绝。",evidence:diagnosticFacts(`reason=${diagnosticValue(gate.reason)}`,`holds=${diagnosticValue(gate.holds)}`,`all_order_seal=${diagnosticValue(gate.all_order_seal_reason)}`,`shutdown=${diagnosticValue(gate.shutdown_requested)}`),recovery:"解除所有 gate holds、关闭原因和全订单封印，再确认 open=true。"};
+      if(code==="risk_status_unavailable") return {...result,category:"风控",title:"风险状态不可用",detail:"系统无法确认账户风险、冻结范围和 Kill Switch，必须禁止正常交易。",evidence:diagnosticFacts(`available=${diagnosticValue(risk.available)}`,`error=${diagnosticValue(risk.error)}`),recovery:"恢复 Risk Manager 状态生产与快照发布。"};
+      if(code==="risk_manager_inactive") return {...result,category:"风控",title:"Risk Manager 未运行",detail:"实时限额、账户风险和 Kill Switch 保护没有处于活动状态。",evidence:`active=${diagnosticValue(risk.active)}`,recovery:"启动 Risk Manager 并等待风险快照健康。"};
+      if(code==="kill_switch") return {...result,category:"风控",title:`Kill Switch 已触发：${suffix||diagnosticValue(risk.kill_state)}`,detail:"风控已锁定交易；系统通常只保留撤单、减仓或查询能力。",evidence:diagnosticFacts(`state=${diagnosticValue(risk.kill_state)}`,`reason=${diagnosticValue(risk.kill_reason)}`),recovery:"完成全平和账户真值验证后，使用 Rearm 清除锁存。"};
+      if(code==="risk_symbol_guard_active") return {...result,category:"风控",title:"存在被冻结标的",detail:"至少一个标的不能增加风险，具体标的和原因列在局部限制中。",evidence:diagnosticValue(risk.frozen_symbols),recovery:"逐项消除标的冻结原因并满足连续健康恢复条件。"};
+      if(code==="risk_venue_guard_active") return {...result,category:"风控",title:"存在被冻结场所",detail:"交易场所级保护已生效，该场所上的正常交易被阻止。",evidence:diagnosticValue(risk.frozen_venues),recovery:"恢复场所连接与真值一致性，等待场所保护解除。"};
+      if(code.startsWith("risk_supervisor_")) return {...result,category:"独立风控",title:code==="risk_supervisor_kill_latched"?"独立风控 Kill 已锁存":code==="risk_supervisor_quiesced"?"独立风控已静默":"独立风控不健康",detail:"独立风控进程没有提供持续健康的第二道保护，实盘按失败关闭。",evidence:diagnosticFacts(`enabled=${diagnosticValue(supervisor.enabled)}`,`alive=${diagnosticValue(supervisor.process_alive)}`,`healthy=${diagnosticValue(supervisor.healthy)}`,`quiesced=${diagnosticValue(supervisor.quiesced)}`,`reason=${diagnosticValue(first(supervisor.reason,supervisor.last_status_protocol_error))}`),recovery:"恢复 sidecar 进程、心跳和状态协议；若 Kill 锁存，完成验证后 Rearm。"};
+      if(code==="venue_dead_man_switch_invalid") return {...result,category:"DMS",title:"交易所 Dead Man Switch 无效",detail:"订单自动撤销保护未启用、未续期或已过期，不能继续正常交易。",evidence:diagnosticFacts(`enabled=${diagnosticValue(dms.enabled)}`,`valid=${diagnosticValue(dms.valid)}`,`reason=${diagnosticValue(first(dms.reason,dms.failure_reason))}`),recovery:"恢复 DMS 续期与独立风控健康，确认 valid=true。"};
+      if(code==="single_writer_fence_not_held") return {...result,category:"一致性",title:"单写者 Fence 未持有",detail:"系统不能证明当前只有一个订单写入者，继续交易可能产生重复或冲突订单。",evidence:diagnosticFacts(`enabled=${diagnosticValue(fence.enabled)}`,`held=${diagnosticValue(fence.held)}`,`reason=${diagnosticValue(first(fence.reason,fence.error))}`),recovery:"排除重复实例或失效租约，并由当前进程重新获取 Fence。"};
+      if(code==="clock_not_ready") return {...result,category:"时钟",title:"交易时钟未就绪",detail:"交易所校时、相位误差或同步新鲜度不满足要求，时间敏感订单不能安全发送。",evidence:diagnosticFacts(`active=${diagnosticValue(clock.active)}`,`ready=${diagnosticValue(clock.ready)}`,`health=${diagnosticValue(clock.health)}`,`offset_ms=${diagnosticValue(clock.offset_ms)}`,`sync_age_sec=${diagnosticValue(first(clock.sync_age_sec,clock.last_sync_age_sec))}`,`reason=${diagnosticValue(first(clock.reason,clock.last_error))}`),recovery:"恢复 Binance server time 同步，并等待偏移、误差和新鲜度回到阈值内。"};
+      if(code==="truth_monitor_inactive") return {...result,category:"真值",title:"账户真值监控未运行",detail:"本地订单、持仓与交易所真实状态没有持续核对，不能开放正常交易。",evidence:diagnosticFacts(`available=${diagnosticValue(truth.available)}`,`active=${diagnosticValue(truth.active)}`),recovery:"启动 Truth Monitor 并完成首个账户快照。"};
+      if(code==="truth_monitor_api_failure") return {...result,category:"真值",title:"账户真值 API 核对失败",detail:"最近的账户或订单真值轮询出现失败，状态一致性无法确认。",evidence:diagnosticFacts(`consecutive_failures=${diagnosticValue(truth.consecutive_api_failures)}`,`last_error=${diagnosticValue(truth.last_error)}`),recovery:"恢复私有 API 访问并等待连续成功的真值轮询。"};
+      if(code==="truth_snapshot_stale") return {...result,category:"真值",title:"账户真值快照已过期",detail:"最近一次交易所账户快照超过允许年龄，不能确认当前订单和持仓。",evidence:diagnosticFacts(`age_sec=${diagnosticValue(truth.last_snapshot_age_sec)}`,`poll_sec=${diagnosticValue(truth.poll_interval_sec)}`),recovery:"恢复 Truth Monitor 轮询并获取新账户快照。"};
+      if(code.startsWith("rpi_commission_truth_")) return {...result,category:"RPI 真值",title:code.endsWith("failure")?"RPI 手续费真值轮询失败":"RPI 手续费真值已过期",detail:"RPI 实际费率无法被可靠确认，RPI 实盘执行条件不成立。",evidence:diagnosticFacts(`failures=${diagnosticValue(truth.consecutive_rpi_commission_failures)}`,`age_sec=${diagnosticValue(truth.last_rpi_commission_poll_age_sec)}`,`interval_sec=${diagnosticValue(truth.rpi_commission_poll_interval_sec)}`),recovery:"恢复 commissionRate 查询并获得新鲜、有效的 RPI 费率。"};
+      if(code==="venue_supervisor_inactive") return {...result,category:"场所恢复",title:"Venue Supervisor 未运行",detail:"连接中断后的场所级恢复与一致性流程没有处于活动状态。",evidence:diagnosticFacts(`available=${diagnosticValue(venue.available)}`,`active=${diagnosticValue(venue.active)}`,`reason=${diagnosticValue(venue.reason)}`),recovery:"启动 Venue Supervisor 并完成场所状态确认。"};
+      if(code==="external_alerts_unhealthy") return {...result,category:"实盘保障",title:"外部告警链路不健康",detail:"实盘要求的外部告警无法可靠投递，正常交易按失败关闭。",evidence:diagnosticFacts(`reason=${suffix||diagnosticValue(alerts.reason)}`,`worker_alive=${diagnosticValue(alerts.worker_alive)}`,`failures=${diagnosticValue(alerts.consecutive_failures)}`),recovery:"恢复告警 worker 和投递目标，等待健康探测通过。"};
+      if(code==="live_evidence_unhealthy") return {...result,category:"实盘保障",title:"实时证据链路不健康",detail:"实盘审计记录无法可靠提交或 fsync，不能继续正常交易。",evidence:diagnosticFacts(`reason=${suffix||diagnosticValue(evidence.failure_reason)}`,`fence=${diagnosticValue(evidence.fence_held)}`,`dropped=${diagnosticValue(evidence.dropped_records)}`),recovery:"恢复证据写入、Fence 和持久化健康。"};
+      if(code==="event_engine_inactive") return {...result,category:"运行时",title:"Event Engine 未运行",detail:"市场、订单和风控事件无法被正常分发，策略执行链路不完整。",evidence:diagnosticFacts(`available=${diagnosticValue(event.available)}`,`active=${diagnosticValue(event.active)}`,`error=${diagnosticValue(event.error)}`),recovery:"启动事件引擎并确认各 lane 持续消费。"};
+      if(code==="strategy_runtime_inactive") return {...result,category:"运行时",title:"Strategy Runtime 未运行",detail:"策略 worker 没有处理行情与控制事件，自动交易不能正常工作。",evidence:diagnosticFacts(`available=${diagnosticValue(strategy.available)}`,`active=${diagnosticValue(strategy.active)}`,`error=${diagnosticValue(strategy.error)}`),recovery:"启动策略运行时并确认控制队列与行情队列正常消费。"};
+
+      const runtimeMatch=code.match(/^(clock|transport|risk_supervisor|truth|account_truth|risk_policy|market_data|alerts|evidence|resources|oms|execution)_(unready|unknown)$/);
+      if(runtimeMatch){
+        const labels={clock:"交易时钟",transport:"执行传输",risk_supervisor:"独立风控",truth:"真值监控",account_truth:"账户真值",risk_policy:"风险策略",market_data:"市场数据",alerts:"告警链路",evidence:"证据链路",resources:"运行资源",oms:"OMS",execution:"执行开关"};
+        return {...result,category:"运行时就绪",title:`${labels[runtimeMatch[1]]}为${runtimeMatch[2]==="unknown"?"未知":"未就绪"}`,detail:"权威运行时就绪检查未通过该必需组件，正常交易不会被授权。",evidence:raw,recovery:`恢复${labels[runtimeMatch[1]]}并等待 runtime_readiness 变为 ready。`};
+      }
+      return {...result,evidence:raw};
+    }
+
+    function collectScopedRestrictions(data) {
+      const items=[], seen=new Set(), system=obj(data.system), oms=obj(system.oms), capability=obj(oms.capability), gate=obj(capability.outbound_gate), risk=obj(data.risk?.status);
+      const add=item=>{if(!item.raw||seen.has(item.raw))return;seen.add(item.raw);items.push({kind:"scope",...item});};
+      Object.entries(obj(capability.mode_constraints)).forEach(([name, value])=>{
+        const constraint=obj(value), mode=String(first(constraint.mode,"UNKNOWN")).toUpperCase();
+        if(mode==="LIVE"&&!constraint.reason)return;
+        add({category:"OMS 约束",title:`${name} 将能力限制为 ${mode}`,detail:diagnosticValue(constraint.reason,"能力约束已生效"),evidence:diagnosticFacts(`generation=${diagnosticValue(constraint.generation)}`,`capability=${diagnosticValue(capability.mode)}`),recovery:"解除该约束的原始健康条件；不要只清除前端提示。",raw:`mode_constraint:${name}`});
+      });
+      arr(gate.holds).forEach(hold=>add({category:"出站闸门",title:`出站闸门 Hold：${hold}`,detail:diagnosticValue(gate.reason,"新风险发送保持关闭"),evidence:`open=${diagnosticValue(gate.open)}`,recovery:"由持有该 Hold 的控制流程完成恢复并释放。",raw:`outbound_gate_hold:${hold}`}));
+      if(gate.all_order_seal_reason)add({category:"出站闸门",title:"所有订单发送已封印",detail:diagnosticValue(gate.all_order_seal_reason),evidence:`shutdown_requested=${diagnosticValue(gate.shutdown_requested)}`,recovery:"完成停机/故障处置并重新启动受信任的订单发送路径。",raw:`all_order_seal:${gate.all_order_seal_reason}`});
+      if(gate.shutdown_requested===true)add({category:"OMS",title:"OMS 已请求停机",detail:diagnosticValue(gate.reason,"停机流程已开始"),evidence:`shutdown_cancel_verified=${diagnosticValue(gate.shutdown_cancel_verified)}`,recovery:"完成停机处置后重新启动服务；不要在旧进程中恢复交易。",raw:"oms_shutdown_requested"});
+      if(oms.manual_rearm_required===true)add({category:"OMS",title:"OMS 要求人工 Rearm",detail:diagnosticValue(first(oms.last_halt_reason,oms.last_freeze_reason,capability.reason),"保护状态已锁存"),evidence:`capability=${diagnosticValue(capability.mode)}`,recovery:"先完成全平和账户真值验证，再由操作员执行 Rearm。",raw:"manual_rearm_required"});
+
+      const scopes=[
+        ["标的",{...obj(oms.frozen_symbols),...obj(risk.frozen_symbols)}],
+        ["场所",{...obj(oms.frozen_venues),...obj(risk.frozen_venues)}],
+        ["策略",obj(oms.frozen_strategies)]
+      ];
+      scopes.forEach(([label, values])=>Object.entries(values).forEach(([name, reason])=>add({category:`${label}限制`,title:`${label} ${name} 已冻结`,detail:diagnosticValue(reason,"未提供冻结原因"),evidence:"该范围不能增加风险",recovery:`消除 ${label} 冻结根因并满足恢复确认条件。`,raw:`${label}:${name}:${diagnosticValue(reason)}`})));
+
+      const funding=obj(risk.funding_guard);
+      Object.entries(obj(funding.symbols)).forEach(([symbol, value])=>{
+        const decision=obj(value), action=String(decision.action||"").toUpperCase();
+        if(!action||action==="ALLOW")return;
+        add({category:"资金费率",title:`${symbol} 仅允许 ${action}`,detail:diagnosticValue(decision.reason,"资金费率保护已生效"),evidence:diagnosticFacts(`rate=${diagnosticValue(decision.funding_rate)}`,`to_funding_sec=${diagnosticValue(decision.seconds_to_funding)}`,`age_ms=${diagnosticValue(decision.snapshot_age_ms)}`),recovery:"等待资金费率窗口结束并满足连续健康更新。",raw:`funding_guard:${symbol}:${diagnosticValue(decision.reason)}`});
+      });
+
+      normalizeSymbols(data).forEach(row=>{
+        const symbol=String(row.symbol||"未知标的"), market=obj(row.market), contract=obj(row.contract), strategy=obj(row.strategy), params=obj(strategy.params), contractState=String(contract.status||"").toUpperCase();
+        if(market.available===false)add({category:"行情",title:`${symbol} 行情不可用`,detail:"该标的尚无可验证订单簿，策略无法形成可执行价格。",evidence:"market.available=false",recovery:"恢复该标的 WebSocket 深度流并完成订单簿同步。",raw:`market_unavailable:${symbol}`});
+        if(contract.available===false)add({category:"合约",title:`${symbol} 合约规则不可用`,detail:"缺少下单所需的 tick、step、最小数量或交易状态。",evidence:"contract.available=false",recovery:"重新加载并验证 exchangeInfo 合约快照。",raw:`contract_unavailable:${symbol}`});
+        else if(contractState&&contractState!=="TRADING")add({category:"合约",title:`${symbol} 交易状态为 ${contractState}`,detail:"交易所合约状态不是 TRADING，该标的不能正常下单。",evidence:`status=${contractState}`,recovery:"等待交易所恢复该合约的 TRADING 状态。",raw:`contract_not_trading:${symbol}:${contractState}`});
+        const strategyState=String(first(params.State,params.state,strategy.state,"")||"").toUpperCase();
+        if(strategyState&&/(WARM|BLOCK|HALT|ERROR|STOP|PAUS|DISABLED|NOT_READY|INACTIVE)/.test(strategyState))add({category:"策略",title:`${symbol} 策略状态为 ${strategyState}`,detail:"该标的策略没有进入可持续报价的就绪状态。",evidence:diagnosticFacts(`health=${diagnosticValue(first(params.Health,params.health,strategy.health))}`,`mode=${diagnosticValue(first(params.Mode,params.mode,strategy.mode))}`),recovery:"满足模型样本、行情与策略健康条件，等待状态进入 READY/LIVE。",raw:`strategy_not_ready:${symbol}:${strategyState}`});
+      });
+      return items;
+    }
+
+    function renderBlocker(item, index) {
+      const itemClass=item.kind==="scope"?"scope":item.kind==="info"?"info":"global";
+      return `<article class="blocker-item ${itemClass}"><div class="blocker-index">${String(index+1).padStart(2,"0")}</div><div><div class="blocker-heading"><span class="blocker-category">${esc(item.category)}</span><strong>${esc(item.title)}</strong><code class="blocker-code">${esc(item.raw)}</code></div><p class="blocker-detail">${esc(item.detail)}</p><div class="blocker-facts"><div class="blocker-fact"><b>现场值：</b>${esc(item.evidence)}</div><div class="blocker-fact"><b>恢复条件：</b>${esc(item.recovery)}</div></div></div></article>`;
+    }
+
+    function setCapabilityState(id, value, allowedText="允许", blockedText="禁止") {
+      const element=$(id), known=value===true||value===false;
+      element.textContent=known?(value?allowedText:blockedText):"未知";
+      element.className=known?(value?"positive":"negative"):"muted";
+    }
+
+    function renderTradingReadiness(data, health=state.health) {
+      const readiness=obj(data.readiness), runtimeReadiness=obj(data.runtime?.runtime_readiness), oms=obj(data.system?.oms), capability=obj(oms.capability), gate=obj(capability.outbound_gate), context=executionContext(data);
+      const rawReasons=[...arr(readiness.reasons),...(runtimeReadiness.ready===false?arr(runtimeReadiness.reasons):[])];
+      if(health?.stale)rawReasons.push(`dashboard_snapshot_stale:${finite(health.ageMs)?Math.round(health.ageMs)+"ms":"age unknown"}`);
+      if(health?.fetchError)rawReasons.push(`dashboard_api_unreachable:${health.fetchError}`);
+      if(!rawReasons.length&&readiness.reason)rawReasons.push(String(readiness.reason));
+      if(readiness.available!==true)rawReasons.push("readiness_snapshot_unavailable");
+      if(readiness.ready!==true&&!rawReasons.length)rawReasons.push("readiness_not_confirmed");
+      const canonical=[...new Set(rawReasons.map(String))].map(reason=>readinessReasonInfo(reason,data));
+      const scoped=collectScopedRestrictions(data);
+      const informational=[];
+      if(context.isPaper)informational.push({kind:"info",category:"执行边界",title:"当前只进行本地模拟交易",detail:"订单、成交、资金和 PnL 不会发送到 Binance 私有交易接口。",evidence:diagnosticFacts(`venue=${context.executionVenue}`,`private_api=${context.privateApiEnabled}`),recovery:"若目标是实盘，必须使用通过全部实盘启动闸门的 live 配置。",raw:"paper_execution_only"});
+      else if(context.isTestnet)informational.push({kind:"info",category:"执行边界",title:"当前订单发送到测试网",detail:"测试网交易不会形成 Binance 主网真实仓位。",evidence:`venue=${context.executionVenue}`,recovery:"若目标是主网实盘，使用完成审批与验收的 live 配置。",raw:"testnet_execution_only"});
+
+      const unknown=Boolean(health?.fetchError)||readiness.available!==true;
+      const blocked=canonical.length>0||readiness.ready!==true;
+      const limited=!blocked&&scoped.length>0;
+      const shell=$("readinessShell");
+      shell.className=`readiness-shell ${unknown?"unknown":blocked?"blocked":limited?"limited":"ready"}`;
+      $("readinessTitle").textContent=unknown?"交易状态无法确认":blocked?"当前不能正常交易":limited?"系统就绪，但存在局部限制":context.isPaper?"模拟交易条件已就绪":context.isTestnet?"测试网交易条件已就绪":"正常交易条件已就绪";
+      $("readinessSummary").textContent=unknown?"本地页面无法取得可信的新快照；不要据此判断订单能力。":blocked?`${canonical.length} 个全局条件未通过。${scoped.length?`另有 ${scoped.length} 个具体限制。`:""}`:limited?`全局就绪检查通过，但 ${scoped.length} 个范围仍不能正常交易。`:"未发现后端就绪阻断或局部交易限制。";
+      $("globalBlockerCount").textContent=String(canonical.length);
+      $("scopedBlockerCount").textContent=String(scoped.length);
+      $("readinessEvaluated").textContent=`评估 ${strip(fmtTime(first(readiness.evaluated_at,data.meta?.generated_at),true))}`;
+
+      const mode=String(first(capability.mode,oms.capability_mode,"")||"").toUpperCase();
+      const openRiskKnown=capability.can_open_risk===true||capability.can_open_risk===false;
+      const gateKnown=gate.open===true||gate.open===false;
+      setCapabilityState("openRiskState",openRiskKnown&&gateKnown?capability.can_open_risk===true&&gate.open===true:null);
+      setCapabilityState("reduceRiskState",mode?["LIVE","DEGRADED","PASSIVE_ONLY","REDUCE_ONLY"].includes(mode)&&!gate.all_order_seal_reason&&!gate.shutdown_requested:null);
+      setCapabilityState("cancelState",capability.can_cancel);
+      const target=$("executionTarget");
+      target.textContent=context.isPaper?"本地模拟器":context.isTestnet?"Binance 测试网":"Binance 主网";
+      target.className=context.isPaper||context.isTestnet?"warning":"accent";
+
+      const items=[...canonical,...scoped,...informational];
+      $("blockerList").innerHTML=items.length?items.map(renderBlocker).join(""):'<div class="readiness-clear">所有已配置的全局就绪条件均已通过，且未发现范围级交易限制。</div>';
+    }
+
     function currentRearmDiagnostic(data = state.data) {
       const snapshot = obj(data);
       const oms = obj(path(snapshot, "system.oms", {}));
@@ -730,14 +953,6 @@
         metric("Budget Available", fmt(account.budget_available, 4), `预算 ${strip(fmt(account.budget_balance,2))}`),
         metric("Gross Exposure", fmt(gross, 4), "账户总名义敞口")
       ].join("");
-
-      const guards = {
-        "OMS 状态": first(oms.state, "不可用"), "能力原因": first(oms.capability_reason, oms.reason, "无"),
-        "手动 Rearm": boolWord(oms.manual_rearm_required), "最后 Halt": first(oms.last_halt_reason, "无"),
-        "最后 Freeze": first(oms.last_freeze_reason, "无"), "风险日": first(rs.risk_day, "不可用"),
-        "Margin 快照": freshness(rs.margin_snapshot_synced, rs.margin_snapshot_age_sec), "Cash-flow 快照": freshness(rs.cash_flow_snapshot_synced, rs.cash_flow_snapshot_age_sec)
-      };
-      $("guardSummary").innerHTML = kvEntries(guards);
     }
 
     function renderMarket(symbols) {
@@ -794,7 +1009,7 @@
     function renderStrategy(symbols) {
       const selected=state.selectedSymbol || symbols[0]?.symbol || "";
       $("strategyTabs").innerHTML=symbols.length?symbols.map(s=>{const st=obj(s.strategy), active=s.symbol===selected?"active":""; return `<button class="strategy-tab ${active}" data-symbol="${esc(s.symbol)}"><strong>${esc(s.symbol)}</strong><small>${esc(first(st.params?.strategy,st.name,"strategy —"))} · α ${strip(fmt(st.alpha_bps,2))} bp</small></button>`}).join(""):'<p class="empty">暂无标的</p>';
-      document.querySelectorAll(".strategy-tab").forEach(button=>button.addEventListener("click",()=>{state.selectedSymbol=button.dataset.symbol; syncSymbolSelect(); renderStrategy(normalizeSymbols(state.data)); drawCharts(state.data,normalizeSymbols(state.data));}));
+      document.querySelectorAll(".strategy-tab").forEach(button=>button.addEventListener("click",()=>{state.selectedSymbol=button.dataset.symbol; syncSymbolSelect(); renderStrategy(normalizeSymbols(state.data));}));
       const row=symbols.find(s=>s.symbol===selected)||symbols[0];
       if(!row){$("strategyDetail").innerHTML='<p class="muted">等待策略数据</p>';return;}
       const st=obj(row.strategy), params=obj(st.params);
@@ -890,8 +1105,7 @@
 
     function render(data) {
       state.data=data; const symbols=normalizeSymbols(data); ensureSymbol(symbols);
-      setTop(data); renderOverview(data,symbols); renderMarket(symbols); renderExecution(data); renderStrategy(symbols); renderRisk(data); renderAcceptance(data); renderRuntime(data); renderRpi(data,symbols); renderLogs(data); updateHistory(data,symbols); drawCharts(data,symbols);
-      $("rawTelemetry").textContent=JSON.stringify(data,null,2);
+      setTop(data); renderTradingReadiness(data); renderOverview(data,symbols); renderMarket(symbols); renderExecution(data); renderStrategy(symbols); renderRisk(data); renderAcceptance(data); renderRuntime(data); renderRpi(data,symbols); renderLogs(data);
       syncActionButtons();
     }
 
@@ -902,23 +1116,6 @@
       syncSymbolSelect();
     }
     function syncSymbolSelect(){if($("symbolSelect").value!==state.selectedSymbol)$("symbolSelect").value=state.selectedSymbol;}
-    function updateHistory(data,symbols){
-      const now=Date.now(), a=obj(data.account), rs=obj(data.risk?.status); const equity=first(a.equity,rs.equity), pnl=first(a.daily_pnl,rs.cash_flow_adjusted_daily_pnl,rs.daily_pnl);
-      pushSeries(state.history.account,{t:now,equity:numOrNull(equity),pnl:numOrNull(pnl)});
-      symbols.forEach(s=>{if(!state.history.symbols[s.symbol])state.history.symbols[s.symbol]=[]; const m=obj(s.market),st=obj(s.strategy); pushSeries(state.history.symbols[s.symbol],{t:now,mid:numOrNull(m.mid_price),fair:numOrNull(st.fair_value),spread:numOrNull(m.spread_bps),alpha:numOrNull(st.alpha_bps)});});
-    }
-    function pushSeries(series,point){const prev=series[series.length-1]; if(!prev||JSON.stringify({...prev,t:0})!==JSON.stringify({...point,t:0}))series.push(point); if(series.length>state.maxHistory)series.splice(0,series.length-state.maxHistory);}
-    function drawCharts(data,symbols){
-      drawCanvas($("equityChart"),state.history.account,[{key:"equity",color:"#45d7e8"},{key:"pnl",color:"#42d392",separate:true}]);
-      const sym=state.selectedSymbol, points=state.history.symbols[sym]||[]; $("marketChartTitle").textContent=`${sym||"焦点标的"} · Mid / Fair`;
-      drawCanvas($("marketChart"),points,[{key:"mid",color:"#45d7e8"},{key:"fair",color:"#f4be55"}]);
-    }
-    function drawCanvas(canvas,points,series){
-      const ratio=window.devicePixelRatio||1, rect=canvas.getBoundingClientRect(),w=Math.max(100,rect.width),h=Math.max(100,rect.height); canvas.width=w*ratio; canvas.height=h*ratio; const c=canvas.getContext("2d"); c.scale(ratio,ratio); c.clearRect(0,0,w,h); c.fillStyle="#0b1118"; c.fillRect(0,0,w,h);
-      c.strokeStyle="#1d2935"; c.lineWidth=1; for(let i=1;i<5;i++){const y=10+(h-30)*i/5;c.beginPath();c.moveTo(0,y);c.lineTo(w,y);c.stroke();}
-      const valid=series.flatMap(s=>points.map(p=>p[s.key]).filter(finite).map(Number)); if(valid.length<2){c.fillStyle="#718295";c.font="12px Segoe UI";c.textAlign="center";c.fillText("等待形成历史曲线",w/2,h/2);return;}
-      series.forEach(s=>{const vals=points.map(p=>finite(p[s.key])?Number(p[s.key]):null);const own=vals.filter(v=>v!==null); if(own.length<2)return; let min=Math.min(...(s.separate?own:valid)),max=Math.max(...(s.separate?own:valid)); if(max===min){max+=1;min-=1;} c.strokeStyle=s.color;c.lineWidth=1.6;c.beginPath();let started=false;vals.forEach((v,i)=>{if(v===null)return;const x=8+i*(w-16)/Math.max(1,points.length-1),y=10+(max-v)*(h-28)/(max-min);if(!started){c.moveTo(x,y);started=true;}else c.lineTo(x,y);});c.stroke();});
-    }
 
     function renderLaneRuntime(event){
       const lanes=obj(event.lanes),queues=obj(event.queues); if(!Object.keys(lanes).length&&!Object.keys(queues).length)return renderObject(event,2);
@@ -980,7 +1177,6 @@
     function formatMap(v){const entries=Object.entries(obj(v));return entries.length?entries.map(([k,x])=>`${k}: ${x}`).join(" | "):"无";}
     function shortId(v){const x=String(v??"");return x.length>14?`${x.slice(0,6)}…${x.slice(-5)}`:x||"—";}
     function shortText(v,n){const x=String(v??"");return x.length>n?x.slice(0,n-1)+"…":x;}
-    function numOrNull(v){return finite(v)?Number(v):null;}
     function strip(v){const d=document.createElement("div");d.innerHTML=String(v);return d.textContent||d.innerText||"";}
 
     function snapshotReadiness(data){
@@ -1004,27 +1200,29 @@
       if(state.paused)return;
       try{
         const response=await fetch("/api/snapshot",{cache:"no-store",headers:{"Accept":"application/json"}}); if(!response.ok)throw new Error(`HTTP ${response.status}`);
-        const data=await response.json(),health=snapshotReadiness(data); state.failures=0;
+        const data=await response.json(),health=snapshotReadiness(data); state.failures=0; state.health=health;
         $("connectionDot").className=health.ready?"dot live":health.stale?"dot bad":"dot warn";
         $("connectionText").textContent=health.ready?"就绪":health.stale?"快照陈旧":"交易锁定";
         $("fatalOverlay").classList.remove("visible"); render(data);
-      }catch(error){state.failures++; $("connectionDot").className=`dot ${state.failures>2?'bad':'warn'}`; $("connectionText").textContent=state.failures>2?"已断开":"重连中"; if(state.failures>5){$("fatalMessage").textContent=`连续 ${state.failures} 次读取失败：${error.message}。交易主程序可能未启动，或本地端口已关闭。`;$("fatalOverlay").classList.add("visible");}}
+      }catch(error){state.failures++; state.health={...(state.health||{}),ready:false,fetchError:String(error.message||error)}; $("connectionDot").className=`dot ${state.failures>2?'bad':'warn'}`; $("connectionText").textContent=state.failures>2?"已断开":"重连中"; if(state.data)renderTradingReadiness(state.data,state.health); if(state.failures>5){$("fatalMessage").textContent=`连续 ${state.failures} 次读取失败：${error.message}。交易主程序可能未启动，或本地端口已关闭。`;$("fatalOverlay").classList.add("visible");}}
     }
     function schedule(){clearInterval(state.timer);state.timer=setInterval(fetchSnapshot,Number($("refreshSelect").value));}
     function monitorFreshness(){
       if(state.paused||!state.lastSequenceAt)return;
       if(Date.now()-state.lastSequenceAt>state.staleAfterMs){
+        const becameStale=state.health?.stale!==true;
         $("connectionDot").className="dot bad";
         $("connectionText").textContent="快照陈旧";
+        state.health={...(state.health||{}),ready:false,stale:true,ageMs:Date.now()-state.lastSequenceAt};
+        if(becameStale&&state.data)renderTradingReadiness(state.data,state.health);
       }
     }
     $("pauseButton").addEventListener("click",()=>{state.paused=!state.paused;$("pauseButton").textContent=state.paused?"继续刷新":"暂停刷新";if(state.paused){$("connectionDot").className="dot warn";$("connectionText").textContent="已暂停";}else fetchSnapshot();});
     $("flattenAllButton").addEventListener("click",()=>{submitDashboardAction("flatten_all",{reason:"dashboard_flatten_all"});});
     $("rearmButton").addEventListener("click",()=>{submitDashboardAction("rearm",{reason:"dashboard_rearm"});});
     $("refreshSelect").addEventListener("change",schedule);
-    $("symbolSelect").addEventListener("change",e=>{state.selectedSymbol=e.target.value;if(state.data){renderStrategy(normalizeSymbols(state.data));drawCharts(state.data,normalizeSymbols(state.data));}});
+    $("symbolSelect").addEventListener("change",e=>{state.selectedSymbol=e.target.value;if(state.data)renderStrategy(normalizeSymbols(state.data));});
     $("retryButton").addEventListener("click",()=>{state.failures=0;$("fatalOverlay").classList.remove("visible");fetchSnapshot();});
-    window.addEventListener("resize",()=>{if(state.data)drawCharts(state.data,normalizeSymbols(state.data));});
     document.addEventListener("visibilitychange",()=>{if(!document.hidden){monitorFreshness();fetchSnapshot();}});
     state.freshnessTimer=setInterval(monitorFreshness,250);
     renderActionStatus();
