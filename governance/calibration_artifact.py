@@ -40,6 +40,7 @@ from governance.contracts import (  # noqa: E402
 from governance.deployment_identity import (  # noqa: E402
     deployment_config_sha256,
 )
+from infrastructure.durability import sync_directory as _sync_directory  # noqa: E402
 from governance.strategy_identity import (  # noqa: E402
     canonical_model_key,
     implementation_sha256_for_model,
@@ -3572,20 +3573,6 @@ def _aggregate_samples(
             )
         )
     return tuple(aggregated)
-
-
-def _sync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    except OSError:
-        pass
-    finally:
-        os.close(descriptor)
 
 
 def _atomic_write_json(

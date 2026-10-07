@@ -27,6 +27,7 @@ from governance.contracts import market_data_environment  # noqa: E402
 from infrastructure.config_scaling import (  # noqa: E402
     normalize_root_config_preapproval,
 )
+from infrastructure.durability import sync_directory as _sync_directory  # noqa: E402
 from infrastructure.single_writer_fence import (  # noqa: E402
     SingleWriterFence,
 )
@@ -195,20 +196,6 @@ def _acquire_fences(
 def _release_fences(fences: Sequence[SingleWriterFence]) -> None:
     for fence in reversed(fences):
         fence.release()
-
-
-def _sync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    except OSError:
-        pass
-    finally:
-        os.close(descriptor)
 
 
 def _atomic_write_json(
