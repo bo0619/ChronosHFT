@@ -3792,19 +3792,12 @@ def build_rpi_calibration_artifact(
 
 
 def load_effective_deployment_config(path: str | Path) -> dict[str, Any]:
+    from infrastructure.config_scaling import load_config_document
+
     source = Path(path).resolve()
     try:
-        with source.open("r", encoding="utf-8") as handle:
-            raw = json.load(
-                handle,
-                parse_constant=_reject_json_constant,
-                object_pairs_hook=_object_without_duplicate_keys,
-            )
-    except (
-        OSError,
-        json.JSONDecodeError,
-        CalibrationArtifactError,
-    ) as exc:
+        raw = load_config_document(str(source))
+    except (OSError, ValueError) as exc:
         raise CalibrationArtifactError(
             f"cannot read deployment config {source}: {exc}"
         ) from exc

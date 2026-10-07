@@ -98,10 +98,14 @@ after both deployment configurations are final.
 
 ## Prepare deployment files
 
-1. Create operator-owned `config.live.rpi-calibration.json` and
-   `config.live.canary.json` files when Live deployment work resumes. These
-   files are intentionally ignored by Git.
-2. Set one fresh, matching `deployment_id` in both files.
+1. Live configs are strict v3 manifests: a manifest file lists fragments, and
+   Live-only fields (launch envelope, webhook alerts, journals, risk caps,
+   credential environment-variable names) live in the `live` fragment. Unknown
+   fields and inline key or secret values are rejected. Copy
+   `deploy/live/rpi-200u/` (the 200 USDT profile: manifests
+   `rpi-calibration.json` and `canary.json`) outside the repository and edit
+   that copy; see its `README.md` for every placeholder.
+2. Set one fresh, matching `deployment_id` in both profiles.
 3. From the allowed host, inspect current symbol metadata, RPI eligibility,
    account-specific commission, tick size, spread, and minimum notional. Select
    exactly one symbol; treat `XAUUSDT` as illustrative only. This early check is
@@ -160,10 +164,10 @@ $depth2 = Read-Host "Second permitted depth in bps"
 $depth3 = Read-Host "Third permitted depth in bps"
 
 .\.venv\Scripts\python.exe scripts\create_rpi_calibration_permit.py sign `
-  --calibration-config config.live.rpi-calibration.json `
-  --target-config config.live.canary.json `
+  --calibration-config rpi-calibration.json `
+  --target-config canary.json `
   --private-key C:\ChronosHFT-offline\rpi-calibration-key.pem `
-  --output config.live.rpi-calibration.permit.json `
+  --output rpi-calibration.permit.json `
   --key-id personal-rpi-calibration-2026 `
   --authorized-by "Personal Operator" `
   --permit-id $permitId `
@@ -179,7 +183,7 @@ $depth3 = Read-Host "Third permitted depth in bps"
   --min-order-notional-usdt 5 `
   --max-order-notional-usdt 8 `
   --max-cumulative-submitted-notional-usdt 80 `
-  --max-calibration-loss-usdt 1
+  --max-calibration-loss-usdt 0.4
 ```
 
 Clear the passphrase from the environment after signing:
@@ -205,7 +209,7 @@ paths are rejected.
 ```powershell
 Set-Location C:\ChronosHFT-deploy
 .\.venv\Scripts\python.exe scripts\collect_live_canary_evidence.py `
-  --config .\config.live.rpi-calibration.json `
+  --config .\rpi-calibration.json `
   --confirm-legal-access `
   --confirm-single-process `
   --confirm-same-futures-account `
@@ -225,7 +229,7 @@ network request and constructs no Gateway or OMS:
 ```powershell
 Set-Location C:\ChronosHFT-deploy
 .\.venv\Scripts\python.exe scripts\check_live_canary_readiness.py `
-  --config .\config.live.rpi-calibration.json
+  --config .\rpi-calibration.json
 ```
 
 Do not start unless every offline check reports `PASS`. Offline preflight has no
@@ -244,7 +248,7 @@ and can fail closed.
    ```powershell
    Set-Location C:\ChronosHFT-deploy
    .\.venv\Scripts\python.exe main.py `
-     --config .\config.live.rpi-calibration.json
+     --config .\rpi-calibration.json
    ```
 
    The Live canary fails before Gateway connection if the loopback dashboard

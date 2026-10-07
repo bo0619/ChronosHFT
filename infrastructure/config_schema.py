@@ -247,6 +247,239 @@ def _model_readiness_counts() -> ObjectSpec:
     )
 
 
+ENV_NAME_TEXT = _string(pattern=r"^[A-Za-z_][A-Za-z0-9_]{1,127}$")
+
+
+def _optional_object(fields: Mapping[str, object]) -> ObjectSpec:
+    return _object(fields, optional=tuple(fields))
+
+
+def _writer_fence_schema() -> ObjectSpec:
+    return _optional_object({"enabled": BOOL, "path": NONEMPTY_TEXT})
+
+
+def _live_deployment_schema() -> ObjectSpec:
+    """Live-only deployment fields; the Live guard enforces their values."""
+    return _optional_object(
+        {
+            "api_key_env": ENV_NAME_TEXT,
+            "api_secret_env": ENV_NAME_TEXT,
+            "live_launch": _optional_object(
+                {
+                    "stage": _string(
+                        choices=("canary", "rpi_calibration_canary")
+                    ),
+                    "deployment_id": NONEMPTY_TEXT,
+                    "declared_account_equity_usdt": POSITIVE,
+                    "max_deployed_capital_usdt": POSITIVE,
+                    "max_deployment_loss_usdt": POSITIVE,
+                    "deployment_loss_reduce_only_fraction": PROBABILITY,
+                    "rpi_only": BOOL,
+                    "calibration_permit_path": NONEMPTY_TEXT,
+                    "target_deployment_config_path": NONEMPTY_TEXT,
+                    "calibration_permit_trusted_signers": MappingSpec(
+                        values=_object(
+                            {
+                                "algorithm": _string(choices=("ED25519",)),
+                                "public_key_base64": NONEMPTY_TEXT,
+                            }
+                        ),
+                    ),
+                    "offline_evidence_path": NONEMPTY_TEXT,
+                }
+            ),
+            "alert": _optional_object(
+                {
+                    "active": BOOL,
+                    "transport": _string(choices=("https_webhook",)),
+                    "webhook_url_env": ENV_NAME_TEXT,
+                    "minimum_level": _string(choices=("WARNING",)),
+                    "queue_capacity": POSITIVE_INT,
+                    "connect_timeout_sec": POSITIVE,
+                    "read_timeout_sec": POSITIVE,
+                    "max_attempts": POSITIVE_INT,
+                    "retry_backoff_sec": NONNEGATIVE,
+                    "startup_probe_required": BOOL,
+                    "startup_probe_timeout_sec": POSITIVE,
+                    "runtime_fail_closed": BOOL,
+                    "recovery_probe_interval_sec": POSITIVE,
+                    "shutdown_flush_timeout_sec": POSITIVE,
+                    "failure_spool_path": NONEMPTY_TEXT,
+                    "failure_spool_fsync": BOOL,
+                    "failure_spool_min_free_bytes": NONNEGATIVE_INT,
+                }
+            ),
+            "system": _optional_object(
+                {
+                    "evidence_recorder": _optional_object(
+                        {
+                            "enabled": BOOL,
+                            "path": NONEMPTY_TEXT,
+                            "queue_capacity": POSITIVE_INT,
+                            "max_batch_records": POSITIVE_INT,
+                            "fsync_interval_sec": POSITIVE,
+                            "close_timeout_sec": POSITIVE,
+                            "min_free_bytes": NONNEGATIVE_INT,
+                            "single_writer_fence": _writer_fence_schema(),
+                        }
+                    )
+                }
+            ),
+            "account": _optional_object(
+                {
+                    "configuration_mode": _string(choices=("VERIFY_ONLY",)),
+                    "trading_budget_total": POSITIVE,
+                    "trading_budget_by_asset": MappingSpec(
+                        values=POSITIVE,
+                        key_pattern=r"^[A-Z0-9]{2,20}$",
+                    ),
+                }
+            ),
+            "oms": _optional_object(
+                {
+                    "journal_enabled": BOOL,
+                    "replay_journal_on_startup": BOOL,
+                    "journal_fsync": BOOL,
+                    "journal_integrity_check": BOOL,
+                    "journal_path": NONEMPTY_TEXT,
+                    "max_total_active_orders": POSITIVE_INT,
+                    "max_symbol_active_orders": POSITIVE_INT,
+                    "max_strategy_active_orders": POSITIVE_INT,
+                    "max_strategy_symbol_active_orders": POSITIVE_INT,
+                    "single_writer_fence": _writer_fence_schema(),
+                    "truth_monitor": _optional_object(
+                        {
+                            "enabled": BOOL,
+                            "rpi_commission_poll_interval_sec": POSITIVE,
+                            "rpi_commission_halt_threshold": POSITIVE_INT,
+                            "rpi_commission_clean_polls_to_clear": POSITIVE_INT,
+                        }
+                    ),
+                    "outbound_message_budget": _optional_object(
+                        {
+                            "enabled": BOOL,
+                            "window_sec": POSITIVE,
+                            "max_total_messages_per_window": POSITIVE_INT,
+                            "max_new_orders_per_window": POSITIVE_INT,
+                            "max_reduce_orders_per_window": POSITIVE_INT,
+                            "max_cancel_messages_per_window": POSITIVE_INT,
+                            "reserved_risk_messages_per_window": NONNEGATIVE_INT,
+                            "reserved_cancel_messages_per_window": NONNEGATIVE_INT,
+                        }
+                    ),
+                    "venue_dead_man_switch": _optional_object(
+                        {
+                            "enabled": BOOL,
+                            "countdown_time_ms": POSITIVE_INT,
+                            "renewal_interval_sec": POSITIVE,
+                            "max_renewal_age_sec": POSITIVE,
+                            "recovery_checks": POSITIVE_INT,
+                        }
+                    ),
+                }
+            ),
+            "risk": _optional_object(
+                {
+                    "limits": _optional_object(
+                        {
+                            "max_order_qty": POSITIVE,
+                            "max_order_notional": POSITIVE,
+                            "max_pos_notional": POSITIVE,
+                            "max_account_gross_notional": POSITIVE,
+                            "max_daily_loss": POSITIVE,
+                        }
+                    ),
+                    "market_data_freshness": _optional_object(
+                        {
+                            "enabled": BOOL,
+                            "require_mark_price": BOOL,
+                            "require_book": BOOL,
+                            "max_mark_age_ms": POSITIVE,
+                            "max_book_age_ms": POSITIVE,
+                        }
+                    ),
+                    "funding_guard": _optional_object(
+                        {
+                            "enabled": BOOL,
+                            "require_snapshot": BOOL,
+                            "max_snapshot_age_ms": POSITIVE,
+                            "pre_funding_reduce_only_sec": NONNEGATIVE,
+                            "post_funding_hold_sec": NONNEGATIVE,
+                            "max_abs_funding_rate": PROBABILITY,
+                            "max_next_funding_horizon_sec": POSITIVE,
+                            "recovery_updates": POSITIVE_INT,
+                        }
+                    ),
+                    "margin_health": _optional_object(
+                        {
+                            "enabled": BOOL,
+                            "require_snapshot": BOOL,
+                            "max_snapshot_age_sec": POSITIVE,
+                        }
+                    ),
+                    "cash_flow_truth": _optional_object(
+                        {
+                            "enabled": BOOL,
+                            "require_snapshot": BOOL,
+                            "max_snapshot_age_sec": POSITIVE,
+                        }
+                    ),
+                    "risk_control_heartbeat": _optional_object(
+                        {
+                            "enabled": BOOL,
+                            "required_source": _string(
+                                choices=("independent_supervisor",)
+                            ),
+                            "max_age_sec": POSITIVE,
+                        }
+                    ),
+                    "strategy_risk_budgets": _optional_object(
+                        {
+                            "enabled": BOOL,
+                            "require_explicit_strategy": BOOL,
+                            "budgets": MappingSpec(
+                                values=_object(
+                                    {
+                                        "auto_scale": BOOL,
+                                        "max_gross_notional": POSITIVE,
+                                        "max_symbol_notional": POSITIVE,
+                                    },
+                                    optional=("auto_scale",),
+                                ),
+                            ),
+                        }
+                    ),
+                    "independent_supervisor": _optional_object(
+                        {
+                            "api_key_env": ENV_NAME_TEXT,
+                            "api_secret_env": ENV_NAME_TEXT,
+                            "flatten_enabled": BOOL,
+                            "daily_loss_enabled": BOOL,
+                            "clock_sync_enabled": BOOL,
+                            "liquidation_proximity_enabled": BOOL,
+                            "require_liquidation_price": BOOL,
+                            "max_open_orders": POSITIVE_INT,
+                            "exchange_poll_interval_sec": POSITIVE,
+                        }
+                    ),
+                }
+            ),
+            "strategy": _optional_object(
+                {
+                    "target_order_notional": POSITIVE,
+                    "max_pos_usdt": POSITIVE,
+                    "glft": _optional_object(
+                        {"inventory_lot_notional_usdt": POSITIVE}
+                    ),
+                    "avellaneda_stoikov": _optional_object(
+                        {"inventory_lot_notional_usdt": POSITIVE}
+                    ),
+                }
+            ),
+        }
+    )
+
+
 FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
     "account": {
         1: _object(
@@ -1051,6 +1284,7 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
             }
         )
     },
+    "live": {1: _live_deployment_schema()},
 }
 
 
@@ -1558,7 +1792,7 @@ def validate_composed_config(config: Mapping[str, object]) -> None:
             "system.admin_control.session_max_age_sec must not exceed command_ttl_sec"
         )
     alert = _mapping(config.get("alert"))
-    if alert.get("active") is True and (
+    if alert.get("active") is True and alert.get("transport") != "https_webhook" and (
         not str(alert.get("telegram_token", "")).strip()
         or not str(alert.get("telegram_chat_id", "")).strip()
     ):

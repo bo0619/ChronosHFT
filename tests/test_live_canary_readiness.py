@@ -29,6 +29,7 @@ from scripts.check_live_canary_readiness import (
 from tests.test_live_config_guard import (
     safe_live_config,
     safe_rpi_calibration_config,
+    write_live_config_manifest,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -211,7 +212,7 @@ def _write_case(directory, config, evidence):
     config_path = root / "canary.json"
     evidence_path = root / "evidence.json"
     config["live_launch"]["offline_evidence_path"] = evidence_path.name
-    config_path.write_text(json.dumps(config), encoding="utf-8")
+    write_live_config_manifest(config_path, config)
     evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
     return config_path
 
@@ -438,7 +439,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
             config_path = config_directory / "canary.json"
             evidence_path = root / "evidence.json"
             config["live_launch"]["offline_evidence_path"] = str(evidence_path)
-            config_path.write_text(json.dumps(config), encoding="utf-8")
+            write_live_config_manifest(config_path, config)
             evidence_path.write_text("{}", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "config directory"):
                 validate_live_canary_local_evidence(
@@ -625,7 +626,7 @@ class LiveCanaryReadinessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = _write_case(temp_dir, config, evidence)
             config["live_launch"]["offline_evidence_path"] = "../evidence.json"
-            config_path.write_text(json.dumps(config), encoding="utf-8")
+            write_live_config_manifest(config_path, config)
             with patch(
                 "scripts.check_live_canary_readiness."
                 "validate_live_calibration_approval",
@@ -656,8 +657,10 @@ class LiveCanaryReadinessTests(unittest.TestCase):
                     now_utc=FIXED_NOW,
                 )
 
-        check = _check_by_id(report, "credentials.references")
+        # The strict v3 Live schema has no inline credential fields.
+        check = _check_by_id(report, "config.json")
         self.assertEqual(check["status"], BLOCKED)
+        self.assertIn("api_key is an unknown field", check["message"])
         self.assertNotIn(secret, json.dumps(report))
 
     def test_cli_json_is_machine_readable_and_blocked_exit_is_two(self):

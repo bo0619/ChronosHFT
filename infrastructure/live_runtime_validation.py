@@ -942,6 +942,7 @@ def _validate_live_canary_launch_config(
     *,
     config_path: str | Path | None,
     target_config_normalizer: Callable[[dict], Mapping] | None,
+    target_config_loader: Callable[[str], dict] | None,
     now_utc: datetime | None,
     violations: list[str],
     guard: ModuleType,
@@ -991,6 +992,7 @@ def _validate_live_canary_launch_config(
                         config,
                         config_path=config_path,
                         target_config_normalizer=target_config_normalizer,
+                        target_config_loader=target_config_loader,
                         now_utc=now_utc,
                     )
                 )

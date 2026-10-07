@@ -25,6 +25,7 @@ from data.oos_reconstruction import (  # noqa: E402
 )
 from governance.contracts import market_data_environment  # noqa: E402
 from infrastructure.config_scaling import (  # noqa: E402
+    load_config_document,
     normalize_root_config_preapproval,
 )
 from infrastructure.single_writer_fence import (  # noqa: E402
@@ -39,36 +40,10 @@ from strategy.model_readiness import (  # noqa: E402
 OUTPUT_SCHEMA = "chronoshft.glft_rpi_oos_reconstruction_output.v1"
 
 
-def _reject_json_constant(value: str):
-    raise OOSReconstructionError(
-        f"non-finite JSON constant is not allowed: {value}"
-    )
-
-
-def _object_without_duplicate_keys(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise OOSReconstructionError(
-                f"duplicate JSON key is not allowed: {key!r}"
-            )
-        result[key] = value
-    return result
-
-
 def _read_config(path: Path) -> dict:
     try:
-        with path.open("r", encoding="utf-8-sig") as handle:
-            raw = json.load(
-                handle,
-                parse_constant=_reject_json_constant,
-                object_pairs_hook=_object_without_duplicate_keys,
-            )
-    except (
-        OSError,
-        json.JSONDecodeError,
-        OOSReconstructionError,
-    ) as exc:
+        raw = load_config_document(str(path))
+    except (OSError, ValueError) as exc:
         raise OOSReconstructionError(
             f"cannot read strict deployment config {path}: {exc}"
         ) from exc

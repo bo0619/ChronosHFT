@@ -23,6 +23,7 @@ from infrastructure.config_scaling import (
     load_root_config as _load_root_config,
 )
 from infrastructure.config_scaling import (
+    load_config_document,
     normalize_root_config_preapproval,
 )
 from infrastructure.rpi_calibration_permit import (
@@ -68,7 +69,10 @@ from strategy.model_readiness import (
 from strategy.model_readiness import (
     validate_live_calibration_approval as _validate_live_calibration_approval,
 )
-from tests.test_live_config_guard import safe_live_config
+from tests.test_live_config_guard import (
+    safe_live_config,
+    write_live_config_manifest,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TEST_CASH_FLOW_DEPLOYMENT_START_MS = 1_753_248_000_000
@@ -938,17 +942,17 @@ class ModelReadinessTests(unittest.TestCase):
                 }
             )
             _set_test_state_paths(raw_calibration_config, "calibration")
-            calibration_config = normalize_root_config_preapproval(
-                raw_calibration_config
-            )
             calibration_config_path = root / "calibration-config.json"
-            target_config_path.write_text(
-                json.dumps(config),
-                encoding="utf-8",
+            write_live_config_manifest(target_config_path, raw_target_config)
+            write_live_config_manifest(
+                calibration_config_path,
+                raw_calibration_config,
             )
-            calibration_config_path.write_text(
-                json.dumps(calibration_config),
-                encoding="utf-8",
+            config = normalize_root_config_preapproval(
+                load_config_document(str(target_config_path))
+            )
+            calibration_config = normalize_root_config_preapproval(
+                load_config_document(str(calibration_config_path))
             )
             policy_sha256 = strategy_policy_sha256(config, model)
             self.assertEqual(

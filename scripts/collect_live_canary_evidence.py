@@ -29,6 +29,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from infrastructure.config_scaling import load_config_document  # noqa: E402
 from infrastructure.live_config_guard import (  # noqa: E402
     LIVE_CANARY_ACCOUNT_SOURCE,
     LIVE_CANARY_API_RESTRICTIONS_SOURCE,
@@ -250,17 +251,6 @@ class ReadOnlyBinanceClient:
 
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-standard JSON number {value!r} is not allowed")
-
-
-def _read_json_object(path: Path, label: str) -> dict[str, Any]:
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            value = json.load(handle, parse_constant=_reject_json_constant)
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
-        raise ValueError(f"cannot read {label} at {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise ValueError(f"{label} must be a JSON object")
-    return value
 
 
 def _nested(config: Mapping[str, Any], path: Sequence[str]) -> Any:
@@ -701,7 +691,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         config_path = Path(os.path.abspath(args.config))
-        config = _read_json_object(config_path, "Live canary config")
+        config = load_config_document(str(config_path))
         output_path = resolve_evidence_output_path(
             config,
             config_path=config_path,
