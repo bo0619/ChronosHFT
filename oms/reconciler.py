@@ -644,8 +644,11 @@ class OMSReconciler(OMSComponent):
                 self._perform_full_reset()
                 return
 
-            remote_balance = float(
-                remote_account.get("totalWalletBalance", 0.0) or 0.0
+            # Compare like with like: totalWalletBalance is USDT-only in
+            # Binance single-asset mode, the local ledger is per asset.
+            remote_balance = self.account.snapshot_balance(
+                remote_account.get("totalWalletBalance", 0.0) or 0.0,
+                self._normalize_remote_account_balances(remote_account),
             )
             truth_config = self.config.get("oms", {}).get("truth_monitor", {}) or {}
             balance_tolerance = max(
