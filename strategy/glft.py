@@ -56,6 +56,9 @@ from strategy.quote_decision import (
     QuoteDecisionEngine,
     QuoteDecisionInput,
 )
+from strategy.quote_retention import (
+    KEEP, RISK_REQUOTE, QueueRetention,
+)
 from strategy.quote_math import (
     ADAPTIVE_GLFT_FORMULA_VERSION,
     GLFT_FORMULA_VERSION,
@@ -286,6 +289,12 @@ class GLFTStrategy(StrategyTemplate):
         self.min_spread_bps = self._positive_finite(
             configured_min_spread_bps,
             5.0,
+        )
+        self.queue_retention = QueueRetention.from_config(
+            self.strat_conf.get(
+                "queue_retention", self.glft_conf.get("queue_retention", {})
+            ),
+            owner=self.name,
         )
         self.readiness_requirements = readiness_requirements(
             self.strat_conf,
@@ -699,6 +708,8 @@ class GLFTStrategy(StrategyTemplate):
                 "ask_price": None,
                 "bid_volume": None,
                 "ask_volume": None,
+                "bid_placed_at": float("-inf"),
+                "ask_placed_at": float("-inf"),
                 "last_update": float("-inf"),
             }
         )
@@ -2706,6 +2717,8 @@ class GLFTStrategy(StrategyTemplate):
         if info is None:
             return
         tick = float(info.tick_size or 0.0)
+        if not math.isfinite(tick) or tick <= 0.0:
+            return
         now = self.clock.monotonic()
         time_in_force = time_in_force or self.resolve_passive_time_in_force(
             symbol,
@@ -2725,75 +2738,59 @@ class GLFTStrategy(StrategyTemplate):
         if (now - state["last_update"]) * 1_000.0 < self.cooldown_ms:
             return
 
-        bid_price_changed = (
-            state["bid_price"] is None
-            or abs(bid - state["bid_price"]) >= tick
-        )
-        bid_volume_changed = (
-            state.get("bid_volume") is None
-            or abs(bid_volume - state["bid_volume"]) >= qty_step
-        )
-        if bid_volume <= 0.0:
-            if state["bid_oid"]:
-                self.cancel_order(state["bid_oid"])
-            else:
-                state["bid_price"] = None
-                state["bid_volume"] = None
-        elif bid_price_changed or bid_volume_changed:
-            if state["bid_oid"]:
-                self.cancel_order(state["bid_oid"])
-            else:
-                oid = self.send_intent(
-                    OrderIntent(
-                        self.name,
-                        symbol,
-                        Side.BUY,
-                        bid,
-                        bid_volume,
-                        time_in_force=time_in_force,
-                        is_post_only=True,
-                    )
-                )
-                if oid:
-                    state["bid_oid"] = oid
-                    state["bid_price"] = bid
-                    state["bid_volume"] = bid_volume
-
-        ask_price_changed = (
-            state["ask_price"] is None
-            or abs(ask - state["ask_price"]) >= tick
-        )
-        ask_volume_changed = (
-            state.get("ask_volume") is None
-            or abs(ask_volume - state["ask_volume"]) >= qty_step
-        )
-        if ask_volume <= 0.0:
-            if state["ask_oid"]:
-                self.cancel_order(state["ask_oid"])
-            else:
-                state["ask_price"] = None
-                state["ask_volume"] = None
-        elif ask_price_changed or ask_volume_changed:
-            if state["ask_oid"]:
-                self.cancel_order(state["ask_oid"])
-            else:
-                oid = self.send_intent(
-                    OrderIntent(
-                        self.name,
-                        symbol,
-                        Side.SELL,
-                        ask,
-                        ask_volume,
-                        time_in_force=time_in_force,
-                        is_post_only=True,
-                    )
-                )
-                if oid:
-                    state["ask_oid"] = oid
-                    state["ask_price"] = ask
-                    state["ask_volume"] = ask_volume
+        for key, side, price, side_volume in (
+            ("bid", Side.BUY, bid, bid_volume),
+            ("ask", Side.SELL, ask, ask_volume),
+        ):
+            self._update_quote_side(
+                symbol, state, key, side, price, side_volume,
+                tick, qty_step, now, time_in_force,
+            )
 
         state["last_update"] = now
+
+    def _update_quote_side(
+        self, symbol, state, key, side, target_price, target_volume,
+        tick, qty_step, now, time_in_force,
+    ):
+        oid_key, price_key, volume_key = (
+            f"{key}_oid", f"{key}_price", f"{key}_volume"
+        )
+        resting_oid = state[oid_key]
+        if target_volume <= 0.0:
+            if resting_oid:
+                self.cancel_order(resting_oid)
+            else:
+                state[price_key] = state[volume_key] = None
+            return
+        wall_time = self.clock.wall_time()
+        if resting_oid:
+            if resting_oid in self.orders_cancelling:
+                return
+            action = self.queue_retention.policy.classify_state(
+                state, key, side == Side.BUY, target_price, target_volume,
+                tick, qty_step, now,
+            )
+            # Risk requotes always go out; a conservative requote is only
+            # worth losing the queue if a replacement can be sent.
+            if action == RISK_REQUOTE or (
+                action != KEEP
+                and self.queue_retention.budget.has_capacity(symbol, wall_time)
+            ):
+                self.cancel_order(resting_oid)
+            return
+        if not self.queue_retention.budget.has_capacity(symbol, wall_time):
+            return
+        oid = self.send_intent(
+            OrderIntent(
+                self.name, symbol, side, target_price, target_volume,
+                time_in_force=time_in_force, is_post_only=True,
+            )
+        )
+        if oid:
+            self.queue_retention.budget.record(symbol, wall_time)
+            state[oid_key], state[price_key] = oid, target_price
+            state[volume_key], state[f"{key}_placed_at"] = target_volume, now
 
     def on_market_trade(self, trade: AggTradeData):
         self.feature_engine.on_trade(trade)

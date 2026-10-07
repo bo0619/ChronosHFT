@@ -708,6 +708,15 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                                         "paper_min_spread_bps": NONNEGATIVE,
                                     }
                                 ),
+                                "queue_retention": _object(
+                                    {
+                                        "conservative_tolerance_ticks": NONNEGATIVE,
+                                        "conservative_tolerance_bps": NONNEGATIVE,
+                                        "min_rest_sec": NONNEGATIVE,
+                                        "size_tolerance_ratio": NONNEGATIVE,
+                                        "max_new_orders_per_symbol_per_10min": POSITIVE_INT,
+                                    }
+                                ),
                             }
                         )
                     }

@@ -42,6 +42,7 @@ tests/*
 !tests/test_guard_store.py
 !tests/test_exposure_store.py
 !tests/test_quote_decision.py
+!tests/test_quote_retention.py
 !tests/test_adaptive_pipeline.py
 !tests/test_exchange_snapshot.py
 !tests/test_oms_risk_port.py

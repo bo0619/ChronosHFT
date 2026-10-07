@@ -100,6 +100,14 @@
       "execution": {
         "min_spread_bps": 5.0,
         "paper_min_spread_bps": 8.0
+      },
+      "queue_retention": {
+        "_comment": "Binance re-queues on every cancel/replace and modify. More-aggressive drift (1 tick, or size above target by the ratio) moves at once; more-conservative drift moves only past the tolerance and after min_rest_sec (>=5s keeps Binance ICR safe). New quote orders are capped per symbol per UTC 10-minute window, far below the ICR 5000 and dust-ratio 10000 order thresholds.",
+        "conservative_tolerance_ticks": 2,
+        "conservative_tolerance_bps": 1.0,
+        "min_rest_sec": 5.0,
+        "size_tolerance_ratio": 0.1,
+        "max_new_orders_per_symbol_per_10min": 1500
       }
     }
   }
