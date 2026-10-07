@@ -216,7 +216,15 @@ class AccountRiskController:
         current_external_cash_flow_total = account_numbers[
             "external_cash_flow_total"
         ]
-        if self._check_cash_flow_truth(account):
+        cash_flow_truth_stale = self._check_cash_flow_truth(account)
+        # Margin health does not depend on external cash-flow truth, so a
+        # stale income-history snapshot must not suppress it.
+        if self._check_margin_health(account):
+            return
+        if cash_flow_truth_stale:
+            # An unrecorded deposit or withdrawal would read as profit or
+            # loss, so loss limits wait for fresh cash-flow truth while the
+            # account stays reduce-only.
             return
         if self.max_deployed_capital > 0.0:
             try:
@@ -239,7 +247,7 @@ class AccountRiskController:
                 return
         current_risk_day = self._current_risk_day()
         risk_state_changed = False
-        if self.risk_day != current_risk_day:
+        if self.initial_equity == 0:
             self.risk_day = current_risk_day
             self.initial_equity = account_equity
             self.initial_external_cash_flow_total = (
@@ -247,12 +255,19 @@ class AccountRiskController:
             )
             self.peak_equity = account_equity
             risk_state_changed = True
-        elif self.initial_equity == 0:
+        elif self.risk_day != current_risk_day:
+            # The daily-loss baseline resets every risk day, but the peak is
+            # cumulative. Re-express it in the new day's cash-flow frame so
+            # flows recorded before the rollover keep being netted out.
+            self.peak_equity += (
+                current_external_cash_flow_total
+                - self.initial_external_cash_flow_total
+            )
+            self.risk_day = current_risk_day
             self.initial_equity = account_equity
             self.initial_external_cash_flow_total = (
                 current_external_cash_flow_total
             )
-            self.peak_equity = account_equity
             risk_state_changed = True
 
         external_cash_flow_delta = (
@@ -282,9 +297,6 @@ class AccountRiskController:
 
         if risk_state_changed:
             self.risk_state_repository.persist("account_baseline_or_peak")
-
-        if self._check_margin_health(account):
-            return
 
         deployment_action = deployment_loss_action(
             loss=self.deployment_loss,
@@ -333,6 +345,7 @@ class AccountRiskController:
                 )
 
     def _check_cash_flow_truth(self, account) -> bool:
+        """Return True while external cash-flow truth is missing or stale."""
         if not self.cash_flow_truth_enabled:
             return False
 
@@ -379,15 +392,17 @@ class AccountRiskController:
             self.cash_flow_recovery_count = 0
             return False
 
+        # The snapshot is fresh again: loss limits are evaluated normally while
+        # the reduce-only constraint waits for the recovery confirmations.
         self.cash_flow_recovery_count += 1
         if self.cash_flow_recovery_count < self.cash_flow_recovery_checks:
-            return True
+            return False
         self._clear_trading_mode(
             reason="external cash-flow truth recovered",
             prefixes=("daily_pnl_truth:",),
         )
         self.cash_flow_recovery_count = 0
-        return True
+        return False
 
     def _check_margin_health(self, account) -> bool:
         if not self.margin_health_enabled or not bool(
