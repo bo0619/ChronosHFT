@@ -1594,6 +1594,136 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             self.assertEqual(len(oms.submitted), 4)
             self.assertTrue(all(order.time_in_force == TIF_RPI for order in oms.submitted))
 
+    def _cancelled_snapshot(self, oid):
+        return OrderStateSnapshot(
+            client_oid=oid,
+            exchange_oid=f"exchange-{oid}",
+            symbol="LTCUSDT",
+            status=OrderStatus.CANCELLED,
+            price=0.0,
+            volume=0.1,
+            filled_volume=0.0,
+            avg_price=0.0,
+            update_time=0.0,
+        )
+
+    def test_glft_keeps_queue_for_conservative_drift_until_min_rest(self):
+        oms = PassiveQuoteOMS()
+        clock = StrategyTestClock([0.0, 1.0, 6.0, 7.0])
+        strategy = GLFTStrategy(
+            DispatchingEngine(),
+            oms,
+            clock=clock,
+            strategy_config={"execution": {"min_spread_bps": 5.0}},
+        )
+        strategy.cooldown_ms = 0
+
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"LTCUSDT": self.make_contract("LTCUSDT", supports_rpi=False)},
+            clear=True,
+        ):
+            strategy._update_quotes("LTCUSDT", 99.0, 101.0, 0.1)
+            self.assertEqual(len(oms.submitted), 2)
+
+            # Three ticks more conservative plus size jitter, but too young.
+            strategy._update_quotes("LTCUSDT", 99.3, 100.7, 0.104)
+            self.assertEqual(oms.cancelled, [])
+
+            strategy._update_quotes("LTCUSDT", 99.3, 100.7, 0.104)
+            self.assertCountEqual(oms.cancelled, ["passive-1", "passive-2"])
+
+    def test_glft_keeps_queue_inside_conservative_tolerance(self):
+        oms = PassiveQuoteOMS()
+        clock = StrategyTestClock([0.0, 60.0])
+        strategy = GLFTStrategy(
+            DispatchingEngine(),
+            oms,
+            clock=clock,
+            strategy_config={"execution": {"min_spread_bps": 5.0}},
+        )
+        strategy.cooldown_ms = 0
+
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"LTCUSDT": self.make_contract("LTCUSDT", supports_rpi=False)},
+            clear=True,
+        ):
+            strategy._update_quotes("LTCUSDT", 99.0, 101.0, 0.1)
+            strategy._update_quotes("LTCUSDT", 99.2, 100.8, 0.109)
+
+        self.assertEqual(len(oms.submitted), 2)
+        self.assertEqual(oms.cancelled, [])
+
+    def test_glft_requotes_aggressive_drift_and_oversize_immediately(self):
+        oms = PassiveQuoteOMS()
+        clock = StrategyTestClock([0.0, 0.5])
+        strategy = GLFTStrategy(
+            DispatchingEngine(),
+            oms,
+            clock=clock,
+            strategy_config={"execution": {"min_spread_bps": 5.0}},
+        )
+        strategy.cooldown_ms = 0
+
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"LTCUSDT": self.make_contract("LTCUSDT", supports_rpi=False)},
+            clear=True,
+        ):
+            strategy._update_quotes("LTCUSDT", 99.0, 101.0, 0.1)
+            # Bid one tick too high; ask resting size 25% above target.
+            strategy._update_quotes(
+                "LTCUSDT",
+                98.9,
+                101.0,
+                0.1,
+                ask_volume=0.08,
+            )
+
+        self.assertEqual(oms.cancelled, ["passive-1", "passive-2"])
+
+    def test_glft_quote_order_budget_never_blocks_risk_cancels(self):
+        oms = PassiveQuoteOMS()
+        clock = StrategyTestClock([0.0, 10.0, 11.0, 12.0])
+        wall = {"now": 1_200.0}
+        clock.wall_time = lambda: wall["now"]
+        strategy = GLFTStrategy(
+            DispatchingEngine(),
+            oms,
+            clock=clock,
+            strategy_config={
+                "execution": {"min_spread_bps": 5.0},
+                "queue_retention": {
+                    "max_new_orders_per_symbol_per_10min": 2,
+                },
+            },
+        )
+        strategy.cooldown_ms = 0
+
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"LTCUSDT": self.make_contract("LTCUSDT", supports_rpi=False)},
+            clear=True,
+        ):
+            strategy._update_quotes("LTCUSDT", 99.0, 101.0, 0.1)
+            self.assertEqual(len(oms.submitted), 2)
+
+            # Bid drifted aggressive (risk); ask drifted conservative but a
+            # replacement could not be sent, so the ask keeps its queue.
+            strategy._update_quotes("LTCUSDT", 98.5, 100.5, 0.1)
+            self.assertEqual(oms.cancelled, ["passive-1"])
+
+            strategy.on_order(self._cancelled_snapshot("passive-1"))
+            strategy._update_quotes("LTCUSDT", 98.5, 100.5, 0.1)
+            self.assertEqual(len(oms.submitted), 2)
+
+            wall["now"] = 1_800.0
+            strategy._update_quotes("LTCUSDT", 98.5, 100.5, 0.1)
+            self.assertEqual(len(oms.submitted), 3)
+            self.assertEqual(oms.submitted[-1].price, 98.5)
+            self.assertEqual(oms.cancelled, ["passive-1", "passive-2"])
+
     def test_glft_does_not_generate_quote_intents_while_oms_is_gated(self):
         oms = PassiveQuoteOMS()
         oms.submit_allowed = False
