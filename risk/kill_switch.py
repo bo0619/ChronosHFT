@@ -167,6 +167,11 @@ class RiskKillSwitchController:
         )
         if state != "LIVE" or manual_rearm_required:
             return
+        if str(self.kill_reason or "").startswith("Drawdown"):
+            # The peak is cumulative across risk days. An operator rearm after
+            # a drawdown kill accepts the current equity as the new peak;
+            # otherwise the first account update would kill again.
+            self.risk_state_repository.state.peak_equity = 0.0
         self.kill_switch_triggered = False
         self.kill_reason = ""
         self.kill_state = "ARMED"

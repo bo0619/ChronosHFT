@@ -1389,6 +1389,183 @@ class RiskExecutionTests(unittest.TestCase):
         risk.account_risk.on_account_update(Event(EVENT_ACCOUNT_UPDATE, healthy))
         self.assertTrue(oms.cleared_trading_modes)
 
+    def make_cash_flow_risk(self, recovery_checks=2):
+        config = self.make_risk_config()
+        config["risk"]["limits"]["max_daily_loss"] = 50.0
+        config["risk"]["cash_flow_truth"] = {
+            "enabled": True,
+            "require_snapshot": True,
+            "max_snapshot_age_sec": 45.0,
+            "recovery_checks": recovery_checks,
+        }
+        return RiskManager(
+            DummyEngine(),
+            config,
+            oms=DummyOMS(),
+            gateway=DummyGateway(),
+        )
+
+    @staticmethod
+    def cash_flow_account(
+        equity,
+        *,
+        fresh=True,
+        external_flow=0.0,
+        maintenance_margin_ratio=0.0,
+    ):
+        now = time.time()
+        return Event(
+            EVENT_ACCOUNT_UPDATE,
+            AccountData(
+                balance=equity,
+                equity=equity,
+                available=equity,
+                used_margin=0.0,
+                datetime=datetime.now(),
+                maintenance_margin_ratio=maintenance_margin_ratio,
+                margin_snapshot_time=now,
+                margin_snapshot_synced=True,
+                external_cash_flow_total=external_flow,
+                cash_flow_snapshot_time=now if fresh else now - 120.0,
+                cash_flow_snapshot_synced=True,
+            ),
+        )
+
+    def test_stale_cash_flow_truth_does_not_skip_margin_kill(self):
+        risk = self.make_cash_flow_risk()
+        risk.account_risk.on_account_update(self.cash_flow_account(1000.0))
+
+        risk.account_risk.on_account_update(
+            self.cash_flow_account(
+                1000.0,
+                fresh=False,
+                maintenance_margin_ratio=0.95,
+            )
+        )
+
+        self.assertTrue(risk.kill_switch_triggered)
+        self.assertIn("Maintenance margin ratio", risk.kill_reason)
+
+    def test_stale_cash_flow_truth_still_enforces_daily_loss(self):
+        risk = self.make_cash_flow_risk()
+        risk.account_risk.on_account_update(self.cash_flow_account(1000.0))
+
+        risk.account_risk.on_account_update(
+            self.cash_flow_account(600.0, fresh=False)
+        )
+
+        self.assertTrue(risk.kill_switch_triggered)
+        self.assertIn("Daily loss", risk.kill_reason)
+
+    def test_stale_cash_flow_truth_does_not_move_peak_or_baseline(self):
+        risk = self.make_cash_flow_risk()
+        risk.account_risk.on_account_update(self.cash_flow_account(1000.0))
+
+        # An unseen deposit must not raise the peak while truth is stale.
+        risk.account_risk.on_account_update(
+            self.cash_flow_account(1500.0, fresh=False)
+        )
+        self.assertEqual(risk.peak_equity, 1000.0)
+        self.assertEqual(risk.initial_equity, 1000.0)
+
+        risk.account_risk.on_account_update(
+            self.cash_flow_account(1500.0, external_flow=500.0)
+        )
+        self.assertFalse(risk.kill_switch_triggered)
+        self.assertEqual(risk.peak_equity, 1000.0)
+
+    def test_cash_flow_recovery_window_enforces_daily_loss(self):
+        risk = self.make_cash_flow_risk(recovery_checks=3)
+        risk.account_risk.on_account_update(self.cash_flow_account(1000.0))
+        risk.account_risk.on_account_update(
+            self.cash_flow_account(1000.0, fresh=False)
+        )
+        risk.account_risk.on_account_update(self.cash_flow_account(1000.0))
+
+        risk.account_risk.on_account_update(self.cash_flow_account(600.0))
+
+        self.assertTrue(risk.kill_switch_triggered)
+        self.assertIn("Daily loss", risk.kill_reason)
+
+    def make_multi_day_risk(self):
+        config = self.make_risk_config()
+        config["risk"]["limits"]["max_daily_loss"] = 100.0
+        config["risk"]["limits"]["max_drawdown_pct"] = 0.05
+        risk = RiskManager(
+            DummyEngine(),
+            config,
+            oms=DummyOMS(),
+            gateway=DummyGateway(),
+        )
+        day = {"value": "2026-10-01"}
+        risk.account_risk._current_risk_day = lambda: day["value"]
+        return risk, day
+
+    @staticmethod
+    def plain_account(equity, external_flow=0.0):
+        return Event(
+            EVENT_ACCOUNT_UPDATE,
+            AccountData(
+                equity,
+                equity,
+                equity,
+                0.0,
+                datetime.now(),
+                external_cash_flow_total=external_flow,
+            ),
+        )
+
+    def test_peak_drawdown_accumulates_across_risk_days(self):
+        risk, day = self.make_multi_day_risk()
+        equity = 10000.0
+        for index in range(1, 8):
+            day["value"] = f"2026-10-0{index}"
+            risk.account_risk.on_account_update(self.plain_account(equity))
+            equity -= 99.0
+            risk.account_risk.on_account_update(self.plain_account(equity))
+            if risk.kill_switch_triggered:
+                break
+
+        self.assertTrue(risk.kill_switch_triggered)
+        self.assertIn("Drawdown", risk.kill_reason)
+        self.assertEqual(risk.peak_equity, 10000.0)
+
+    def test_peak_rollover_keeps_netting_out_external_cash_flow(self):
+        risk, day = self.make_multi_day_risk()
+        risk.account_risk.on_account_update(self.plain_account(10000.0))
+        # A 2000 USDT withdrawal is not a trading loss.
+        risk.account_risk.on_account_update(
+            self.plain_account(8000.0, external_flow=-2000.0)
+        )
+
+        day["value"] = "2026-10-02"
+        risk.account_risk.on_account_update(
+            self.plain_account(8000.0, external_flow=-2000.0)
+        )
+
+        self.assertFalse(risk.kill_switch_triggered)
+        self.assertEqual(risk.peak_equity, 8000.0)
+
+    def test_rearm_after_drawdown_kill_resets_peak(self):
+        oms = DummyOMS()
+        oms.state = types.SimpleNamespace(value="LIVE")
+        oms.manual_rearm_required = False
+        risk = RiskManager(
+            DummyEngine(),
+            self.make_risk_config(),
+            oms=oms,
+            gateway=DummyGateway(),
+        )
+        risk.peak_equity = 1000.0
+        risk.kill_switch_triggered = True
+        risk.kill_reason = "Drawdown 3.00% > 2.00%"
+        risk.kill_state = "FLAT_VERIFIED"
+
+        risk.kill_switch._refresh_rearm_state()
+
+        self.assertFalse(risk.kill_switch_triggered)
+        self.assertEqual(risk.peak_equity, 0.0)
+
     def test_live_risk_cycle_renews_oms_heartbeat_lease(self):
         engine = DummyEngine()
         gateway = DummyGateway()

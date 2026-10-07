@@ -216,8 +216,7 @@ class AccountRiskController:
         current_external_cash_flow_total = account_numbers[
             "external_cash_flow_total"
         ]
-        if self._check_cash_flow_truth(account):
-            return
+        cash_flow_truth_stale = self._check_cash_flow_truth(account)
         if self.max_deployed_capital > 0.0:
             try:
                 capital_envelope_safe = (
@@ -237,9 +236,26 @@ class AccountRiskController:
                     "account equity"
                 )
                 return
+        # Margin health does not depend on external cash-flow truth, so it is
+        # evaluated before any cash-flow-dependent loss accounting.
+        if self._check_margin_health(account):
+            return
+
         current_risk_day = self._current_risk_day()
+        if cash_flow_truth_stale:
+            # Without fresh cash-flow truth, never move baselines or the peak:
+            # an unseen deposit would inflate them. Loss limits are still
+            # evaluated against the last known cash-flow total; an unseen
+            # withdrawal can only make this check more conservative.
+            self._evaluate_loss_limits_without_baseline_update(
+                account_equity=account_equity,
+                external_cash_flow_total=current_external_cash_flow_total,
+                same_risk_day=self.risk_day == current_risk_day,
+            )
+            return
+
         risk_state_changed = False
-        if self.risk_day != current_risk_day:
+        if self.initial_equity == 0:
             self.risk_day = current_risk_day
             self.initial_equity = account_equity
             self.initial_external_cash_flow_total = (
@@ -247,12 +263,19 @@ class AccountRiskController:
             )
             self.peak_equity = account_equity
             risk_state_changed = True
-        elif self.initial_equity == 0:
+        elif self.risk_day != current_risk_day:
+            # The daily-loss baseline resets every risk day, but the peak is
+            # cumulative. Re-express it in the new day's cash-flow frame so
+            # flows recorded before the rollover keep being netted out.
+            self.peak_equity += (
+                current_external_cash_flow_total
+                - self.initial_external_cash_flow_total
+            )
+            self.risk_day = current_risk_day
             self.initial_equity = account_equity
             self.initial_external_cash_flow_total = (
                 current_external_cash_flow_total
             )
-            self.peak_equity = account_equity
             risk_state_changed = True
 
         external_cash_flow_delta = (
@@ -283,11 +306,54 @@ class AccountRiskController:
         if risk_state_changed:
             self.risk_state_repository.persist("account_baseline_or_peak")
 
-        if self._check_margin_health(account):
-            return
+        self._evaluate_loss_limits(
+            adjusted_equity=adjusted_equity,
+            deployment_loss=self.deployment_loss,
+            check_daily_loss=True,
+            allow_recovery=True,
+        )
 
+    def _evaluate_loss_limits_without_baseline_update(
+        self,
+        *,
+        account_equity: float,
+        external_cash_flow_total: float,
+        same_risk_day: bool,
+    ) -> None:
+        if self.initial_equity == 0:
+            return
+        adjusted_equity = account_equity - (
+            external_cash_flow_total - self.initial_external_cash_flow_total
+        )
+        deployment_loss = 0.0
+        if self.max_deployment_loss > 0.0 and self.deployment_start_equity > 0.0:
+            _, _, _, deployment_loss = update_deployment_loss(
+                equity=account_equity,
+                external_cash_flow_total=external_cash_flow_total,
+                start_equity=self.deployment_start_equity,
+                start_external_cash_flow_total=(
+                    self.deployment_start_external_cash_flow_total
+                ),
+            )
+        self._evaluate_loss_limits(
+            adjusted_equity=adjusted_equity,
+            deployment_loss=deployment_loss,
+            # After an unobserved rollover the stored baseline belongs to an
+            # earlier day; the cumulative peak and deployment checks still hold.
+            check_daily_loss=same_risk_day,
+            allow_recovery=False,
+        )
+
+    def _evaluate_loss_limits(
+        self,
+        *,
+        adjusted_equity: float,
+        deployment_loss: float,
+        check_daily_loss: bool,
+        allow_recovery: bool,
+    ) -> None:
         deployment_action = deployment_loss_action(
-            loss=self.deployment_loss,
+            loss=deployment_loss,
             maximum_loss=self.max_deployment_loss,
             reduce_only_fraction=(
                 self.deployment_loss_reduce_only_fraction
@@ -296,7 +362,7 @@ class AccountRiskController:
         if deployment_action == "KILL":
             self.trigger_kill_switch(
                 "Deployment loss limit breached: "
-                f"-{self.deployment_loss:.2f} "
+                f"-{deployment_loss:.2f} "
                 f">= {self.max_deployment_loss:.2f}"
             )
             return
@@ -305,20 +371,20 @@ class AccountRiskController:
             self._set_trading_mode(
                 OMSCapabilityMode.REDUCE_ONLY,
                 "deployment_loss_reduce_only:"
-                f"{self.deployment_loss:.6f}",
+                f"{deployment_loss:.6f}",
             )
-        else:
+        elif allow_recovery:
             self._clear_trading_mode(
                 reason="deployment loss recovered",
                 prefixes=("deployment_loss_reduce_only:",),
             )
 
-        drawdown = (
-            self.initial_equity
-            - account_equity
-            + external_cash_flow_delta
-        )
-        if self.max_daily_loss > 0 and drawdown > self.max_daily_loss:
+        drawdown = self.initial_equity - adjusted_equity
+        if (
+            check_daily_loss
+            and self.max_daily_loss > 0
+            and drawdown > self.max_daily_loss
+        ):
             self.trigger_kill_switch(f"Daily loss limit breached: -{drawdown:.2f}")
             return
 
@@ -333,6 +399,7 @@ class AccountRiskController:
                 )
 
     def _check_cash_flow_truth(self, account) -> bool:
+        """Return True while external cash-flow truth is missing or stale."""
         if not self.cash_flow_truth_enabled:
             return False
 
@@ -379,15 +446,17 @@ class AccountRiskController:
             self.cash_flow_recovery_count = 0
             return False
 
+        # The snapshot is fresh again: loss limits are evaluated normally while
+        # the reduce-only constraint waits for the recovery confirmations.
         self.cash_flow_recovery_count += 1
         if self.cash_flow_recovery_count < self.cash_flow_recovery_checks:
-            return True
+            return False
         self._clear_trading_mode(
             reason="external cash-flow truth recovered",
             prefixes=("daily_pnl_truth:",),
         )
         self.cash_flow_recovery_count = 0
-        return True
+        return False
 
     def _check_margin_health(self, account) -> bool:
         if not self.margin_health_enabled or not bool(
