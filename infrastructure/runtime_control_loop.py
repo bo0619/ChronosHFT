@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from infrastructure.interpreter_tuning import tune_interpreter_for_runtime
 from infrastructure.runtime_telemetry import TelemetryPublisher
 from infrastructure.watchdog import (
     emit_event_engine_backlog_if_needed,
@@ -109,6 +110,7 @@ class RuntimeControlLoop:
         self.last_recorded_resource_sample_at = None
 
     def run_forever(self) -> None:
+        tune_interpreter_for_runtime()
         try:
             while True:
                 self.sleep(0.1)

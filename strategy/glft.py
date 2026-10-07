@@ -47,7 +47,10 @@ from strategy.adaptive_pipeline import (
     AdaptivePipelineInput,
     AdaptiveQuotePipeline,
 )
-from strategy.base import StrategyTemplate
+from strategy.adaptive_quoting import (
+    AdaptiveQuotingStrategy,
+    negative_infinity as _negative_infinity,
+)
 from strategy.model_readiness import (
     evaluate_symbol_readiness,
     readiness_requirements,
@@ -66,10 +69,6 @@ from strategy.quote_math import (
     portfolio_glft_quote_offsets,
     robust_adaptive_portfolio_glft_quote_offsets,
 )
-
-
-def _negative_infinity() -> float:
-    return -math.inf
 
 
 @dataclass(slots=True)
@@ -113,7 +112,7 @@ class _PortfolioAssetState:
     updated_at_monotonic: float
 
 
-class GLFTStrategy(StrategyTemplate):
+class GLFTStrategy(AdaptiveQuotingStrategy):
     """GLFT Model A strategy with one fixed-notional inventory unit."""
 
     def __init__(
@@ -320,7 +319,7 @@ class GLFTStrategy(StrategyTemplate):
             else {}
         )
         self.alpha_enabled = bool(self.alpha_config.get("enabled", False))
-        self.target_inventory_notional_usdt = self._finite_float(
+        self.target_inventory_notional_usdt = self._strict_finite(
             self.strat_conf.get(
                 "target_inventory_notional_usdt",
                 self.glft_conf.get("target_inventory_notional_usdt", 0.0),
@@ -328,11 +327,11 @@ class GLFTStrategy(StrategyTemplate):
             "target_inventory_notional_usdt",
         )
         self.alpha_weights = {
-            "short_fv_weight": self._finite_float(
+            "short_fv_weight": self._strict_finite(
                 self.alpha_config.get("short_fv_weight", 1.0),
                 "alpha.short_fv_weight",
             ),
-            "long_pos_weight": self._finite_float(
+            "long_pos_weight": self._strict_finite(
                 self.alpha_config.get("long_pos_weight", 500.0),
                 "alpha.long_pos_weight",
             ),
@@ -520,7 +519,7 @@ class GLFTStrategy(StrategyTemplate):
                 "must be an array"
             )
         self.adaptive_size_candidates = tuple(
-            self._finite_float(
+            self._strict_finite(
                 value,
                 "glft.adaptive.size_optimization.candidate_multipliers",
             )
@@ -720,72 +719,6 @@ class GLFTStrategy(StrategyTemplate):
         )
 
     @staticmethod
-    def _finite_float(value, field: str) -> float:
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{field} must be finite") from exc
-        if not math.isfinite(parsed):
-            raise ValueError(f"{field} must be finite")
-        return parsed
-
-    @staticmethod
-    def _config_mapping(value, field: str) -> dict:
-        if not isinstance(value, dict):
-            raise ValueError(f"{field} must be an object")
-        return dict(value)
-
-    @classmethod
-    def _ratio_at_least_one(cls, value, field: str) -> float:
-        parsed = cls._finite_float(value, field)
-        if parsed < 1.0:
-            raise ValueError(f"{field} must be at least one")
-        return parsed
-
-    def _parse_portfolio_correlations(
-        self,
-        raw_correlations,
-    ) -> dict[tuple[str, str], float]:
-        if not isinstance(raw_correlations, dict):
-            raise ValueError("portfolio_risk.correlations must be an object")
-        configured_symbols = set(self.portfolio_symbols)
-        correlations: dict[tuple[str, str], float] = {}
-        for raw_pair, raw_value in raw_correlations.items():
-            pair_parts = str(raw_pair or "").split("|")
-            if len(pair_parts) != 2:
-                raise ValueError(
-                    "portfolio_risk correlation keys must use SYMBOL|SYMBOL"
-                )
-            left, right = (
-                part.strip().upper() for part in pair_parts
-            )
-            if not left or not right or left == right:
-                raise ValueError(
-                    "portfolio_risk correlation keys require two symbols"
-                )
-            if configured_symbols and (
-                left not in configured_symbols or right not in configured_symbols
-            ):
-                raise ValueError(
-                    "portfolio_risk correlation references an unknown symbol"
-                )
-            correlation = self._finite_float(
-                raw_value,
-                f"portfolio_risk.correlations.{raw_pair}",
-            )
-            if correlation < -1.0 or correlation > 1.0:
-                raise ValueError(
-                    "portfolio_risk correlations must be between -1 and 1"
-                )
-            normalized_pair = tuple(sorted((left, right)))
-            if normalized_pair in correlations:
-                raise ValueError(
-                    "portfolio_risk correlation pair is configured twice"
-                )
-            correlations[normalized_pair] = correlation
-        return correlations
-
-    @staticmethod
     def _sha256_identity(value) -> str:
         normalized = str(value or "").strip().lower()
         if len(normalized) != 64 or any(
@@ -881,55 +814,6 @@ class GLFTStrategy(StrategyTemplate):
             self.models[symbol],
             self.gates[symbol],
         )
-
-    def _calculate_safe_vol(
-        self,
-        symbol,
-        price,
-        *,
-        side=None,
-        current_position=0.0,
-        reference_price=None,
-    ):
-        return self.calculate_quote_volume(
-            symbol,
-            price,
-            side=side,
-            current_position=current_position,
-            reference_price=reference_price,
-        )
-
-    def _scale_safe_volume(
-        self,
-        symbol: str,
-        safe_volume: float,
-        multiplier: float,
-        price: float,
-    ) -> float:
-        """Scale a pre-validated volume down without expanding its risk bound."""
-
-        if safe_volume <= 0.0:
-            return 0.0
-        bounded_multiplier = min(1.0, max(0.0, float(multiplier)))
-        if bounded_multiplier >= 1.0:
-            return safe_volume
-        info = self.reference_data.get_info(symbol)
-        if info is None:
-            return 0.0
-        scaled = self.reference_data.round_qty(
-            symbol,
-            safe_volume * bounded_multiplier,
-        )
-        min_qty = max(0.0, float(info.min_qty or 0.0))
-        min_notional = max(5.0, float(info.min_notional or 0.0))
-        if (
-            scaled <= 0.0
-            or scaled > safe_volume + 1e-12
-            or scaled < min_qty
-            or scaled * price + 1e-9 < min_notional
-        ):
-            return 0.0
-        return scaled
 
     def _approved_rpi_intensity(self, symbol):
         return estimate_rpi_intensity(
@@ -2594,29 +2478,6 @@ class GLFTStrategy(StrategyTemplate):
         age_s = now_monotonic - updated_at
         decay = math.exp(-math.log(2.0) * age_s / self.flow_half_life_s)
         return raw * decay
-
-    def _record_resolved_paper_markouts(self) -> None:
-        resolved = self.adaptive_markout.drain_resolved()
-        if not resolved or self.live_mode:
-            return
-        for observation in resolved:
-            self.execution.record_paper_markout(
-                {
-                    "client_oid": observation.client_oid,
-                    "trade_id": observation.trade_id,
-                    "symbol": observation.symbol,
-                    "side": observation.side.value,
-                    "fill_price": observation.fill_price,
-                    "horizon_ms": observation.horizon_ms,
-                    "mid_price": observation.mid_price,
-                    "signed_markout_bps": observation.signed_markout_bps,
-                    "fill_observed_monotonic": (
-                        observation.fill_observed_monotonic
-                    ),
-                    "mid_observed_monotonic": observation.mid_observed_monotonic,
-                    "observation_lag_ms": observation.observation_lag_ms,
-                }
-            )
 
     def _guard_stale_quotes(
         self,

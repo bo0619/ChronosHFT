@@ -14,6 +14,8 @@ from numbers import Real
 
 import numpy as np
 
+_INFINITY = math.inf
+
 UNITS_VERSION = "chronoshft.log_bps_seconds_fixed_notional_lot.v1"
 AS_FORMULA_VERSION = "avellaneda_stoikov.log_bps_finite_horizon.v1"
 PORTFOLIO_AS_FORMULA_VERSION = (
@@ -233,6 +235,35 @@ def adaptive_portfolio_as_quote_offsets(
     quote size in the strategy layer.
     """
 
+    mids, inventories, gamma, order_sizes, horizon = _as_shared_inputs(
+        mid_prices=mid_prices,
+        inventory_lots=inventory_lots,
+        gamma_per_bps=gamma_per_bps,
+        order_size_lots=order_size_lots,
+        horizon_s=horizon_s,
+    )
+    return _solve_adaptive_portfolio_as(
+        mids=mids,
+        inventories=inventories,
+        gamma=gamma,
+        order_sizes=order_sizes,
+        horizon=horizon,
+        covariance_bps2_per_s=covariance_bps2_per_s,
+        bid_k_per_bps=bid_k_per_bps,
+        ask_k_per_bps=ask_k_per_bps,
+        bid_adverse_cost_bps=bid_adverse_cost_bps,
+        ask_adverse_cost_bps=ask_adverse_cost_bps,
+    )
+
+
+def _as_shared_inputs(
+    *,
+    mid_prices,
+    inventory_lots,
+    gamma_per_bps,
+    order_size_lots,
+    horizon_s,
+):
     mids = _finite_vector(mid_prices, "mid_prices", positive=True)
     size = len(mids)
     if size == 0:
@@ -244,6 +275,30 @@ def adaptive_portfolio_as_quote_offsets(
     )
     gamma = _positive_finite(gamma_per_bps, "gamma_per_bps")
     horizon = _positive_finite(horizon_s, "horizon_s")
+    order_sizes = _finite_vector(
+        order_size_lots,
+        "order_size_lots",
+        expected_size=size,
+        positive=True,
+    )
+    return mids, inventories, gamma, order_sizes, horizon
+
+
+def _solve_adaptive_portfolio_as(
+    *,
+    mids: tuple[float, ...],
+    inventories: tuple[float, ...],
+    gamma: float,
+    order_sizes: tuple[float, ...],
+    horizon: float,
+    covariance_bps2_per_s,
+    bid_k_per_bps,
+    ask_k_per_bps,
+    bid_adverse_cost_bps,
+    ask_adverse_cost_bps,
+    scenario_cache: dict | None = None,
+) -> PortfolioASQuoteSolution:
+    size = len(mids)
     bid_k = _finite_vector(
         bid_k_per_bps,
         "bid_k_per_bps",
@@ -253,12 +308,6 @@ def adaptive_portfolio_as_quote_offsets(
     ask_k = _finite_vector(
         ask_k_per_bps,
         "ask_k_per_bps",
-        expected_size=size,
-        positive=True,
-    )
-    order_sizes = _finite_vector(
-        order_size_lots,
-        "order_size_lots",
         expected_size=size,
         positive=True,
     )
@@ -274,15 +323,33 @@ def adaptive_portfolio_as_quote_offsets(
     )
     if min((*bid_adverse, *ask_adverse)) < 0.0:
         raise ValueError("adverse selection costs must be nonnegative")
-    covariance = _covariance_matrix(covariance_bps2_per_s, size)
-
-    curvature = gamma * horizon * covariance
-    if not np.isfinite(curvature).all():
-        raise ValueError("portfolio A-S risk curvature is not finite")
-    inventory = np.asarray(inventories, dtype=float)
-    marginal_risk = curvature @ inventory
-    inventory_penalty = 0.5 * float(inventory @ marginal_risk)
-    covariance_scale = max(1.0, float(np.linalg.norm(covariance, ord=2)))
+    if size == 1:
+        # Scalar form of the matrix code below; numpy's per-call overhead
+        # dominates a 1x1 problem.
+        covariance_value = _scalar_covariance(covariance_bps2_per_s)
+        curvature_value = gamma * horizon * covariance_value
+        if not math.isfinite(curvature_value):
+            raise ValueError("portfolio A-S risk curvature is not finite")
+        curvature_rows = ((curvature_value,),)
+        marginal_risk = (curvature_value * inventories[0],)
+        inventory_penalty = 0.5 * (inventories[0] * marginal_risk[0])
+        covariance_scale = max(1.0, abs(covariance_value))
+        diagonal = (curvature_value,)
+    else:
+        covariance, covariance_scale = _validated_covariance(
+            covariance_bps2_per_s,
+            size,
+            scenario_cache,
+        )
+        curvature = gamma * horizon * covariance
+        if not np.isfinite(curvature).all():
+            raise ValueError("portfolio A-S risk curvature is not finite")
+        inventory = np.asarray(inventories, dtype=float)
+        marginal_array = curvature @ inventory
+        inventory_penalty = 0.5 * float(inventory @ marginal_array)
+        curvature_rows = tuple(map(tuple, curvature.tolist()))
+        marginal_risk = tuple(marginal_array.tolist())
+        diagonal = tuple(curvature_rows[index][index] for index in range(size))
     if inventory_penalty < -1e-10 * covariance_scale:
         raise ValueError("portfolio A-S inventory penalty is negative")
     inventory_penalty = max(0.0, inventory_penalty)
@@ -305,7 +372,7 @@ def adaptive_portfolio_as_quote_offsets(
     )
     quotes = []
     for index in range(size):
-        diagonal_charge = 0.5 * order_sizes[index] * curvature[index, index]
+        diagonal_charge = 0.5 * order_sizes[index] * diagonal[index]
         quotes.append(
             _build_quote_from_depths(
                 mids[index],
@@ -326,12 +393,8 @@ def adaptive_portfolio_as_quote_offsets(
 
     return PortfolioASQuoteSolution(
         quotes=tuple(quotes),
-        risk_curvature_bps=tuple(
-            tuple(float(value) for value in row) for row in curvature
-        ),
-        marginal_inventory_risk_bps=tuple(
-            float(value) for value in marginal_risk
-        ),
+        risk_curvature_bps=curvature_rows,
+        marginal_inventory_risk_bps=marginal_risk,
         inventory_penalty_bps=inventory_penalty,
         bid_liquidity_depth_bps=bid_liquidity,
         ask_liquidity_depth_bps=ask_liquidity,
@@ -360,22 +423,32 @@ def robust_adaptive_portfolio_as_quote_offsets(
     if len(set(normalized_names)) != len(normalized_names):
         raise ValueError("A-S scenario names must be unique")
 
+    mids, inventories, gamma, order_sizes, horizon = _as_shared_inputs(
+        mid_prices=mid_prices,
+        inventory_lots=inventory_lots,
+        gamma_per_bps=gamma_per_bps,
+        order_size_lots=order_size_lots,
+        horizon_s=horizon_s,
+    )
+    # Scenarios share covariance objects and liquidity inputs; compute each
+    # distinct one once per solve.
+    scenario_cache: dict = {}
     solutions = tuple(
-        adaptive_portfolio_as_quote_offsets(
-            mid_prices=mid_prices,
-            inventory_lots=inventory_lots,
+        _solve_adaptive_portfolio_as(
+            mids=mids,
+            inventories=inventories,
+            gamma=gamma,
+            order_sizes=order_sizes,
+            horizon=horizon,
             covariance_bps2_per_s=scenario.covariance_bps2_per_s,
-            gamma_per_bps=gamma_per_bps,
             bid_k_per_bps=scenario.bid_k_per_bps,
             ask_k_per_bps=scenario.ask_k_per_bps,
-            order_size_lots=order_size_lots,
             bid_adverse_cost_bps=scenario.bid_adverse_cost_bps,
             ask_adverse_cost_bps=scenario.ask_adverse_cost_bps,
-            horizon_s=horizon_s,
+            scenario_cache=scenario_cache,
         )
         for scenario in scenarios
     )
-    mids = _finite_vector(mid_prices, "mid_prices", positive=True)
     robust_quotes = []
     selected_bid = []
     selected_ask = []
@@ -618,6 +691,37 @@ def adaptive_portfolio_glft_quote_offsets(
     the asymptotic algebraic Riccati solution.
     """
 
+    mids, inventories, gamma, order_sizes, parsed_horizon = _glft_shared_inputs(
+        mid_prices=mid_prices,
+        inventory_lots=inventory_lots,
+        gamma_per_bps=gamma_per_bps,
+        order_size_lots=order_size_lots,
+        horizon_s=horizon_s,
+    )
+    return _solve_adaptive_portfolio_glft(
+        mids=mids,
+        inventories=inventories,
+        gamma=gamma,
+        order_sizes=order_sizes,
+        parsed_horizon=parsed_horizon,
+        covariance_bps2_per_s=covariance_bps2_per_s,
+        bid_A_per_s=bid_A_per_s,
+        ask_A_per_s=ask_A_per_s,
+        bid_k_per_bps=bid_k_per_bps,
+        ask_k_per_bps=ask_k_per_bps,
+        bid_adverse_cost_bps=bid_adverse_cost_bps,
+        ask_adverse_cost_bps=ask_adverse_cost_bps,
+    )
+
+
+def _glft_shared_inputs(
+    *,
+    mid_prices,
+    inventory_lots,
+    gamma_per_bps,
+    order_size_lots,
+    horizon_s,
+):
     mids = _finite_vector(mid_prices, "mid_prices", positive=True)
     size = len(mids)
     if size == 0:
@@ -628,6 +732,38 @@ def adaptive_portfolio_glft_quote_offsets(
         expected_size=size,
     )
     gamma = _positive_finite(gamma_per_bps, "gamma_per_bps")
+    order_sizes = _finite_vector(
+        order_size_lots,
+        "order_size_lots",
+        expected_size=size,
+        positive=True,
+    )
+    if horizon_s is None:
+        parsed_horizon = None
+    else:
+        parsed_horizon = _finite_real(horizon_s, "horizon_s")
+        if parsed_horizon < 0.0:
+            raise ValueError("horizon_s must be nonnegative")
+    return mids, inventories, gamma, order_sizes, parsed_horizon
+
+
+def _solve_adaptive_portfolio_glft(
+    *,
+    mids: tuple[float, ...],
+    inventories: tuple[float, ...],
+    gamma: float,
+    order_sizes: tuple[float, ...],
+    parsed_horizon: float | None,
+    covariance_bps2_per_s,
+    bid_A_per_s,
+    ask_A_per_s,
+    bid_k_per_bps,
+    ask_k_per_bps,
+    bid_adverse_cost_bps,
+    ask_adverse_cost_bps,
+    scenario_cache: dict | None = None,
+) -> AdaptivePortfolioQuoteSolution:
+    size = len(mids)
     bid_A = _finite_vector(
         bid_A_per_s,
         "bid_A_per_s",
@@ -652,12 +788,6 @@ def adaptive_portfolio_glft_quote_offsets(
         expected_size=size,
         positive=True,
     )
-    order_sizes = _finite_vector(
-        order_size_lots,
-        "order_size_lots",
-        expected_size=size,
-        positive=True,
-    )
     bid_adverse = _finite_vector(
         bid_adverse_cost_bps,
         "bid_adverse_cost_bps",
@@ -670,52 +800,80 @@ def adaptive_portfolio_glft_quote_offsets(
     )
     if min((*bid_adverse, *ask_adverse)) < 0.0:
         raise ValueError("adverse selection costs must be nonnegative")
-    covariance = _covariance_matrix(covariance_bps2_per_s, size)
-    if horizon_s is None:
-        parsed_horizon = None
-    else:
-        parsed_horizon = _finite_real(horizon_s, "horizon_s")
-        if parsed_horizon < 0.0:
-            raise ValueError("horizon_s must be nonnegative")
 
     bid_terms = tuple(
-        _glft_liquidity_terms(
-            gamma_per_bps=gamma,
-            A_per_s=bid_A[index],
-            k_per_bps=bid_k[index],
-            order_size_lots=order_sizes[index],
+        _cached_glft_liquidity_terms(
+            gamma,
+            bid_A[index],
+            bid_k[index],
+            order_sizes[index],
+            scenario_cache,
         )
         for index in range(size)
     )
     ask_terms = tuple(
-        _glft_liquidity_terms(
-            gamma_per_bps=gamma,
-            A_per_s=ask_A[index],
-            k_per_bps=ask_k[index],
-            order_size_lots=order_sizes[index],
+        _cached_glft_liquidity_terms(
+            gamma,
+            ask_A[index],
+            ask_k[index],
+            order_sizes[index],
+            scenario_cache,
         )
         for index in range(size)
     )
-    bid_c1 = np.asarray([item[0] for item in bid_terms], dtype=float)
-    ask_c1 = np.asarray([item[0] for item in ask_terms], dtype=float)
-    bid_c2 = np.asarray([item[1] for item in bid_terms], dtype=float)
-    ask_c2 = np.asarray([item[1] for item in ask_terms], dtype=float)
-    effective_d_inverse = 0.5 * (
-        1.0 / np.square(bid_c2) + 1.0 / np.square(ask_c2)
-    )
-    effective_c2 = np.sqrt(1.0 / effective_d_inverse)
-    curvature = _riccati_curvature(
-        covariance,
-        effective_c2,
-        horizon_s=parsed_horizon,
-    )
+    bid_c1 = tuple(item[0] for item in bid_terms)
+    ask_c1 = tuple(item[0] for item in ask_terms)
+    bid_c2 = tuple(item[1] for item in bid_terms)
+    ask_c2 = tuple(item[1] for item in ask_terms)
+    if size == 1:
+        # Scalar form of the matrix code below; numpy's per-call overhead
+        # dominates a 1x1 problem.
+        covariance_value = _scalar_covariance(covariance_bps2_per_s)
+        effective_d_inverse = 0.5 * (
+            1.0 / (bid_c2[0] * bid_c2[0]) + 1.0 / (ask_c2[0] * ask_c2[0])
+        )
+        effective_c2 = (math.sqrt(1.0 / effective_d_inverse),)
+        curvature_value = _scalar_riccati_curvature(
+            covariance_value,
+            effective_c2[0],
+            horizon_s=parsed_horizon,
+        )
+        curvature_rows = ((curvature_value,),)
+        marginal_risk = (curvature_value * inventories[0],)
+        inventory_penalty = max(
+            0.0,
+            0.5 * (inventories[0] * marginal_risk[0]),
+        )
+        diagonal = (curvature_value,)
+    else:
+        covariance, covariance_scale = _validated_covariance(
+            covariance_bps2_per_s,
+            size,
+            scenario_cache,
+        )
+        bid_c2_array = np.asarray(bid_c2, dtype=float)
+        ask_c2_array = np.asarray(ask_c2, dtype=float)
+        effective_d_inverse_array = 0.5 * (
+            1.0 / np.square(bid_c2_array) + 1.0 / np.square(ask_c2_array)
+        )
+        effective_c2_array = np.sqrt(1.0 / effective_d_inverse_array)
+        curvature = _riccati_curvature(
+            covariance,
+            effective_c2_array,
+            horizon_s=parsed_horizon,
+            covariance_scale=covariance_scale,
+        )
+        inventory = np.asarray(inventories, dtype=float)
+        marginal_array = curvature @ inventory
+        inventory_penalty = max(0.0, 0.5 * float(inventory @ marginal_array))
+        curvature_rows = tuple(map(tuple, curvature.tolist()))
+        marginal_risk = tuple(marginal_array.tolist())
+        effective_c2 = tuple(effective_c2_array.tolist())
+        diagonal = tuple(curvature_rows[index][index] for index in range(size))
 
-    inventory = np.asarray(inventories, dtype=float)
-    marginal_risk = curvature @ inventory
-    inventory_penalty = max(0.0, 0.5 * float(inventory @ marginal_risk))
     quotes = []
     for index in range(size):
-        diagonal_charge = 0.5 * order_sizes[index] * curvature[index, index]
+        diagonal_charge = 0.5 * order_sizes[index] * diagonal[index]
         bid_depth = (
             bid_c1[index]
             + bid_adverse[index]
@@ -738,16 +896,14 @@ def adaptive_portfolio_glft_quote_offsets(
 
     return AdaptivePortfolioQuoteSolution(
         quotes=tuple(quotes),
-        risk_curvature_bps=tuple(
-            tuple(float(value) for value in row) for row in curvature
-        ),
-        marginal_inventory_risk_bps=tuple(float(value) for value in marginal_risk),
+        risk_curvature_bps=curvature_rows,
+        marginal_inventory_risk_bps=marginal_risk,
         inventory_penalty_bps=inventory_penalty,
-        bid_c1_bps=tuple(float(value) for value in bid_c1),
-        ask_c1_bps=tuple(float(value) for value in ask_c1),
-        bid_c2_sqrt_s=tuple(float(value) for value in bid_c2),
-        ask_c2_sqrt_s=tuple(float(value) for value in ask_c2),
-        effective_c2_sqrt_s=tuple(float(value) for value in effective_c2),
+        bid_c1_bps=bid_c1,
+        ask_c1_bps=ask_c1,
+        bid_c2_sqrt_s=bid_c2,
+        ask_c2_sqrt_s=ask_c2,
+        effective_c2_sqrt_s=effective_c2,
         horizon_s=parsed_horizon,
     )
 
@@ -773,24 +929,34 @@ def robust_adaptive_portfolio_glft_quote_offsets(
     if len(set(normalized_names)) != len(normalized_names):
         raise ValueError("GLFT scenario names must be unique")
 
+    mids, inventories, gamma, order_sizes, parsed_horizon = _glft_shared_inputs(
+        mid_prices=mid_prices,
+        inventory_lots=inventory_lots,
+        gamma_per_bps=gamma_per_bps,
+        order_size_lots=order_size_lots,
+        horizon_s=horizon_s,
+    )
+    # Scenarios share covariance objects and liquidity inputs; compute each
+    # distinct one once per solve.
+    scenario_cache: dict = {}
     solutions = tuple(
-        adaptive_portfolio_glft_quote_offsets(
-            mid_prices=mid_prices,
-            inventory_lots=inventory_lots,
+        _solve_adaptive_portfolio_glft(
+            mids=mids,
+            inventories=inventories,
+            gamma=gamma,
+            order_sizes=order_sizes,
+            parsed_horizon=parsed_horizon,
             covariance_bps2_per_s=scenario.covariance_bps2_per_s,
-            gamma_per_bps=gamma_per_bps,
             bid_A_per_s=scenario.bid_A_per_s,
             ask_A_per_s=scenario.ask_A_per_s,
             bid_k_per_bps=scenario.bid_k_per_bps,
             ask_k_per_bps=scenario.ask_k_per_bps,
-            order_size_lots=order_size_lots,
             bid_adverse_cost_bps=scenario.bid_adverse_cost_bps,
             ask_adverse_cost_bps=scenario.ask_adverse_cost_bps,
-            horizon_s=horizon_s,
+            scenario_cache=scenario_cache,
         )
         for scenario in scenarios
     )
-    mids = _finite_vector(mid_prices, "mid_prices", positive=True)
     robust_quotes = []
     selected_bid = []
     selected_ask = []
@@ -834,6 +1000,7 @@ def _riccati_curvature(
     c2_sqrt_s: np.ndarray,
     *,
     horizon_s: float | None,
+    covariance_scale: float | None = None,
 ) -> np.ndarray:
     d_sqrt = np.diag(c2_sqrt_s)
     d_inverse_sqrt = np.diag(1.0 / c2_sqrt_s)
@@ -842,7 +1009,8 @@ def _riccati_curvature(
         normalized_covariance + normalized_covariance.T
     )
     eigenvalues, eigenvectors = np.linalg.eigh(normalized_covariance)
-    covariance_scale = max(1.0, float(np.linalg.norm(covariance, ord=2)))
+    if covariance_scale is None:
+        covariance_scale = max(1.0, float(np.linalg.norm(covariance, ord=2)))
     if float(eigenvalues.min()) < -1e-10 * covariance_scale:
         raise ValueError("covariance_bps2_per_s must be positive semidefinite")
     clipped = np.clip(eigenvalues, 0.0, None)
@@ -857,6 +1025,35 @@ def _riccati_curvature(
     curvature = d_sqrt @ normalized_curvature @ d_sqrt
     curvature = 0.5 * (curvature + curvature.T)
     if not np.isfinite(curvature).all():
+        raise ValueError("adaptive GLFT risk curvature is not finite")
+    return curvature
+
+
+def _scalar_riccati_curvature(
+    covariance: float,
+    c2_sqrt_s: float,
+    *,
+    horizon_s: float | None,
+) -> float:
+    """1x1 case of :func:`_riccati_curvature` without numpy."""
+    d_inverse_sqrt = 1.0 / c2_sqrt_s
+    normalized_covariance = d_inverse_sqrt * covariance * d_inverse_sqrt
+    normalized_covariance = 0.5 * (
+        normalized_covariance + normalized_covariance
+    )
+    covariance_scale = max(1.0, abs(covariance))
+    if normalized_covariance < -1e-10 * covariance_scale:
+        raise ValueError("covariance_bps2_per_s must be positive semidefinite")
+    root = math.sqrt(max(normalized_covariance, 0.0))
+    if horizon_s is None:
+        transformed = root
+    else:
+        # np.tanh, not math.tanh: the two can differ in the last bit and
+        # the scalar path must reproduce the matrix path exactly.
+        transformed = root * float(np.tanh(root * horizon_s))
+    curvature = c2_sqrt_s * transformed * c2_sqrt_s
+    curvature = 0.5 * (curvature + curvature)
+    if not math.isfinite(curvature):
         raise ValueError("adaptive GLFT risk curvature is not finite")
     return curvature
 
@@ -882,6 +1079,34 @@ def _as_liquidity_depth(
         math.log1p(ratio) / gamma_delta,
         "A-S liquidity depth",
     )
+
+
+def _cached_glft_liquidity_terms(
+    gamma: float,
+    A_per_s: float,
+    k_per_bps: float,
+    order_size_lots: float,
+    cache: dict | None,
+) -> tuple[float, float]:
+    # Robust scenarios repeat the same (A, k) pairs across volatility bounds.
+    if cache is None:
+        return _glft_liquidity_terms(
+            gamma_per_bps=gamma,
+            A_per_s=A_per_s,
+            k_per_bps=k_per_bps,
+            order_size_lots=order_size_lots,
+        )
+    key = ("glft_liquidity", gamma, A_per_s, k_per_bps, order_size_lots)
+    terms = cache.get(key)
+    if terms is None:
+        terms = _glft_liquidity_terms(
+            gamma_per_bps=gamma,
+            A_per_s=A_per_s,
+            k_per_bps=k_per_bps,
+            order_size_lots=order_size_lots,
+        )
+        cache[key] = terms
+    return terms
 
 
 def _glft_liquidity_terms(
@@ -975,6 +1200,8 @@ def _build_quote_offsets(
 
 
 def _positive_finite(value: object, name: str) -> float:
+    if type(value) is float and 0.0 < value < _INFINITY:
+        return value
     result = _finite_real(value, name)
     if result <= 0.0:
         raise ValueError(f"{name} must be greater than zero")
@@ -988,8 +1215,23 @@ def _finite_vector(
     expected_size: int | None = None,
     positive: bool = False,
 ) -> tuple[float, ...]:
-    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+    if not _is_sequence(values):
         raise ValueError(f"{name} must be a sequence")
+    if type(values) is tuple or type(values) is list:
+        # Plain finite floats need no per-element error label; anything
+        # else falls through to the labelled loop for its exact error.
+        isfinite = math.isfinite
+        for value in values:
+            if (
+                type(value) is not float
+                or not isfinite(value)
+                or (positive and value <= 0.0)
+            ):
+                break
+        else:
+            if expected_size is not None and len(values) != expected_size:
+                raise ValueError(f"{name} must contain {expected_size} values")
+            return tuple(values)
     parsed = tuple(
         (
             _positive_finite(value, f"{name}[{index}]")
@@ -1007,7 +1249,7 @@ def _covariance_matrix(
     values: Sequence[Sequence[float]],
     size: int,
 ) -> np.ndarray:
-    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+    if not _is_sequence(values):
         raise ValueError("covariance_bps2_per_s must be a square matrix")
     rows = tuple(
         _finite_vector(
@@ -1040,7 +1282,66 @@ def _covariance_matrix(
     return 0.5 * (covariance + covariance.T)
 
 
+def _validated_covariance(
+    values: Sequence[Sequence[float]],
+    size: int,
+    cache: dict | None,
+) -> tuple[np.ndarray, float]:
+    """Validated covariance and its spectral-norm scale, memoized by identity.
+
+    ``cache`` lives for one robust solve, where every scenario object stays
+    alive, and the stored object guards against id reuse. Callers must not
+    mutate the returned matrix.
+    """
+    if cache is not None:
+        cached = cache.get(id(values))
+        if cached is not None and cached[0] is values:
+            return cached[1], cached[2]
+    covariance = _covariance_matrix(values, size)
+    scale = max(1.0, float(np.linalg.norm(covariance, ord=2)))
+    if cache is not None:
+        cache[id(values)] = (values, covariance, scale)
+    return covariance, scale
+
+
+def _scalar_covariance(values: Sequence[Sequence[float]]) -> float:
+    """1x1 case of :func:`_covariance_matrix` without numpy."""
+    if not _is_sequence(values):
+        raise ValueError("covariance_bps2_per_s must be a square matrix")
+    rows = tuple(
+        _finite_vector(
+            row,
+            f"covariance_bps2_per_s[{index}]",
+            expected_size=1,
+        )
+        for index, row in enumerate(values)
+    )
+    if len(rows) != 1:
+        raise ValueError("covariance_bps2_per_s must contain 1 rows")
+    value = rows[0][0]
+    if value <= 0.0:
+        raise ValueError(
+            "covariance_bps2_per_s must have a positive diagonal"
+        )
+    return 0.5 * (value + value)
+
+
+def _is_sequence(values: object) -> bool:
+    # list/tuple first: the Sequence ABC check is slow on the hot path.
+    if type(values) is tuple or type(values) is list:
+        return True
+    return not isinstance(values, (str, bytes)) and isinstance(values, Sequence)
+
+
 def _finite_real(value: object, name: str) -> float:
+    # Floats (including numpy float64) are by far the common case; the
+    # numbers.Real ABC check below is an order of magnitude slower.
+    if type(value) is float and -_INFINITY < value < _INFINITY:
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return float(value)
+        raise ValueError(f"{name} must be a finite real number")
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a finite real number")
     try:

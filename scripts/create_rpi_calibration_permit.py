@@ -32,6 +32,7 @@ from governance.contracts import market_data_environment  # noqa: E402
 from infrastructure.config_scaling import (  # noqa: E402
     normalize_root_config_preapproval,
 )
+from infrastructure.durability import sync_directory as _sync_directory  # noqa: E402
 from infrastructure.rpi_calibration_permit import (  # noqa: E402
     RPI_CALIBRATION_PERMIT_SCHEMA,
     RPI_CALIBRATION_SIGNATURE_ALGORITHM,
@@ -152,20 +153,6 @@ def _pretty_json_bytes(value: Mapping[str, Any]) -> bytes:
         raise PermitAuthoringError(
             "value cannot be encoded as strict JSON"
         ) from exc
-
-
-def _sync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    except OSError:
-        pass
-    finally:
-        os.close(descriptor)
 
 
 def _atomic_create(

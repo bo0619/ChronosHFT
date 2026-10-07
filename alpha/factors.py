@@ -35,6 +35,12 @@ class GLFTCalibrator:
 
         # 用于存储时间归一化回报的环形队列
         self.norm_returns: deque = deque(maxlen=self.window)
+        # The same samples, contiguous and in arrival order, so np.std reads
+        # a view instead of converting the deque on every tick. Twice the
+        # window lets appends run until the end, then the live window is
+        # copied back to the front.
+        self._return_buffer = np.empty(2 * self.window, dtype=float)
+        self._return_end = 0
 
         # 初始参数（从 config 读取，允许调整）
         self.sigma_bps: float = cfg.get("initial_sigma_bps", 10.0)
@@ -108,6 +114,16 @@ class GLFTCalibrator:
         self.last_tick_monotonic = now_monotonic
         self._has_tick_reference = True
 
+    def _append_return_buffer(self, value: float) -> None:
+        if self._return_end == len(self._return_buffer):
+            keep = self.window - 1
+            self._return_buffer[:keep] = self._return_buffer[
+                self._return_end - keep:self._return_end
+            ]
+            self._return_end = keep
+        self._return_buffer[self._return_end] = value
+        self._return_end += 1
+
     def on_orderbook(self, ob: OrderBook):
         bid, _ = ob.get_best_bid()
         ask, _ = ob.get_best_ask()
@@ -155,12 +171,19 @@ class GLFTCalibrator:
                 ret_normalized = ret_bps / math.sqrt(dt)
                 if math.isfinite(ret_normalized):
                     self.norm_returns.append(ret_normalized)
+                    self._append_return_buffer(ret_normalized)
 
             # 收集足够样本后才开始估计 sigma
             if len(self.norm_returns) >= self.min_samples:
                 # std(norm_returns) 的单位是 bps/sqrt(sec)
                 # sigma_bps 表示 1 秒内的价格标准差（bps），直接等于 std
-                raw_std = float(np.std(self.norm_returns))
+                raw_std = float(
+                    np.std(
+                        self._return_buffer[
+                            self._return_end - len(self.norm_returns):self._return_end
+                        ]
+                    )
+                )
 
                 # EMA 平滑，防止突变
                 self.sigma_bps = (

@@ -809,6 +809,11 @@ def _side(value: Side | str) -> Side:
 
 
 def _finite(value: object, field: str) -> float:
+    # Floats skip the much slower numbers.Real ABC check.
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return float(value)
+        raise ValueError(f"{field} must be finite")
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{field} must be finite")
     result = float(value)

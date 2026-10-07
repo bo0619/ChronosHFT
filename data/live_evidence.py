@@ -24,6 +24,7 @@ from event.type import (
     MarkPriceData,
 )
 from governance.deployment_identity import deployment_config_sha256
+from infrastructure.durability import sync_directory as _sync_directory
 from infrastructure.logger import logger
 from infrastructure.single_writer_fence import SingleWriterFence
 
@@ -569,20 +570,6 @@ def _utc_now() -> str:
         .isoformat(timespec="milliseconds")
         .replace("+00:00", "Z")
     )
-
-
-def _sync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    except OSError:
-        pass
-    finally:
-        os.close(descriptor)
 
 
 class LiveEvidenceRecorder:

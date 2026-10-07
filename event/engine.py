@@ -23,6 +23,9 @@ class EventEngine:
         }
         self._threads = {}
         self._handlers = {lane: defaultdict(list) for lane in self.ALL_LANES}
+        # Handler display names, resolved once at registration rather than
+        # per dispatched event.
+        self._handler_names = {}
         self._queue_timestamps = {lane: deque() for lane in self.ALL_LANES}
         self._lane_stats = {
             lane: {
@@ -271,13 +274,19 @@ class EventEngine:
         self.register_execution(type_, handler)
 
     def register_market(self, type_, handler):
+        self._remember_handler_name(handler)
         self._handlers["market"][type_].append(handler)
 
     def register_execution(self, type_, handler):
+        self._remember_handler_name(handler)
         self._handlers["execution"][type_].append(handler)
 
     def register_cold(self, type_, handler):
+        self._remember_handler_name(handler)
         self._handlers["cold"][type_].append(handler)
+
+    def _remember_handler_name(self, handler) -> None:
+        self._handler_names[id(handler)] = (handler, self._handler_name(handler))
 
     def set_failure_handler(self, handler):
         if handler is not None and not callable(handler):
@@ -449,22 +458,46 @@ class EventEngine:
 
     def _process_lane(self, lane: str, event, enqueued_at: float):
         handlers = self._handlers[lane].get(event.type, ())
-        started_at = time.perf_counter()
+        perf_counter = time.perf_counter
+        lock = self._lock
+        started_at = perf_counter()
         backlog_ms = max(0.0, (started_at - enqueued_at) * 1000.0)
-        self._set_lane_inflight(lane, event.type, started_at)
-        self._record_lane_start(lane, event.type, backlog_ms, started_at)
-        self._maybe_alert_backlog(lane, event.type, backlog_ms)
+        event_type = event.type
+        inflight = {
+            "event_type": event_type,
+            "handler_name": "",
+            "started_at": started_at,
+            "handler_started_at": 0.0,
+        }
+        with lock:
+            self._lane_inflight[lane] = inflight
+            stats = self._lane_stats[lane]
+            stats["processed"] += 1
+            stats["last_event_type"] = event_type
+            stats["last_backlog_ms"] = backlog_ms
+            if backlog_ms > stats["max_backlog_ms"]:
+                stats["max_backlog_ms"] = backlog_ms
+            stats["last_processed_at"] = started_at
+        self._maybe_alert_backlog(lane, event_type, backlog_ms)
 
+        handler_names = self._handler_names
         try:
             for handler in handlers:
-                handler_name = self._handler_name(handler)
-                handler_started_at = time.perf_counter()
-                self._set_lane_handler_inflight(lane, handler_name, handler_started_at)
+                cached = handler_names.get(id(handler))
+                handler_name = (
+                    cached[1]
+                    if cached is not None and cached[0] is handler
+                    else self._handler_name(handler)
+                )
+                handler_started_at = perf_counter()
+                with lock:
+                    inflight["handler_name"] = handler_name
+                    inflight["handler_started_at"] = handler_started_at
                 try:
                     handler(event)
                 except Exception as exc:
                     logger.error(
-                        f"[EventEngine:{lane}] handler failed {event.type}: "
+                        f"[EventEngine:{lane}] handler failed {event_type}: "
                         f"{type(exc).__name__}:{exc}"
                     )
                     self._report_failure(
@@ -475,60 +508,31 @@ class EventEngine:
                         kind="handler_exception",
                     )
                 finally:
-                    elapsed_ms = max(0.0, (time.perf_counter() - handler_started_at) * 1000.0)
-                    self._record_handler_metrics(lane, event.type, handler_name, elapsed_ms)
-                    self._maybe_alert_slow_handler(lane, event.type, handler_name, elapsed_ms)
+                    elapsed_ms = max(0.0, (perf_counter() - handler_started_at) * 1000.0)
+                    self._record_handler_metrics(lane, event_type, handler_name, elapsed_ms)
+                    self._maybe_alert_slow_handler(lane, event_type, handler_name, elapsed_ms)
         finally:
-            duration_ms = max(0.0, (time.perf_counter() - started_at) * 1000.0)
-            self._record_lane_finish(lane, event.type, duration_ms)
-            self._clear_lane_inflight(lane)
-
-    def _set_lane_inflight(self, lane: str, event_type: str, started_at: float):
-        with self._lock:
-            self._lane_inflight[lane] = {
-                "event_type": event_type,
-                "handler_name": "",
-                "started_at": started_at,
-                "handler_started_at": 0.0,
-            }
-
-    def _set_lane_handler_inflight(self, lane: str, handler_name: str, started_at: float):
-        with self._lock:
-            self._lane_inflight[lane]["handler_name"] = handler_name
-            self._lane_inflight[lane]["handler_started_at"] = started_at
-
-    def _clear_lane_inflight(self, lane: str):
-        with self._lock:
-            self._lane_inflight[lane] = {
-                "event_type": "",
-                "handler_name": "",
-                "started_at": 0.0,
-                "handler_started_at": 0.0,
-            }
-
-    def _record_lane_start(self, lane: str, event_type: str, backlog_ms: float, started_at: float):
-        with self._lock:
-            stats = self._lane_stats[lane]
-            stats["processed"] += 1
-            stats["last_event_type"] = event_type
-            stats["last_backlog_ms"] = backlog_ms
-            stats["max_backlog_ms"] = max(stats["max_backlog_ms"], backlog_ms)
-            stats["last_processed_at"] = started_at
-
-    def _record_lane_finish(self, lane: str, event_type: str, duration_ms: float):
-        with self._lock:
-            stats = self._lane_stats[lane]
-            stats["last_event_type"] = event_type
-            stats["last_duration_ms"] = duration_ms
-            stats["max_duration_ms"] = max(stats["max_duration_ms"], duration_ms)
+            duration_ms = max(0.0, (perf_counter() - started_at) * 1000.0)
+            with lock:
+                stats = self._lane_stats[lane]
+                stats["last_event_type"] = event_type
+                stats["last_duration_ms"] = duration_ms
+                if duration_ms > stats["max_duration_ms"]:
+                    stats["max_duration_ms"] = duration_ms
+                self._lane_inflight[lane] = {
+                    "event_type": "",
+                    "handler_name": "",
+                    "started_at": 0.0,
+                    "handler_started_at": 0.0,
+                }
 
     def _record_handler_metrics(self, lane: str, event_type: str, handler_name: str, elapsed_ms: float):
         slow_threshold_ms = self.profile_config["handler_slow_ms"][lane]
+        key = (lane, event_type, handler_name)
         with self._lock:
-            key = (lane, event_type, handler_name)
-            stats = self._handler_stats.setdefault(
-                key,
-                {
+            stats = self._handler_stats.get(key)
+            if stats is None:
+                stats = self._handler_stats[key] = {
                     "count": 0,
                     "total_ms": 0.0,
                     "avg_ms": 0.0,
@@ -538,8 +542,7 @@ class EventEngine:
                     "error_count": 0,
                     "last_error_at": 0.0,
                     "last_error_message": "",
-                },
-            )
+                }
             stats["count"] += 1
             stats["total_ms"] += elapsed_ms
             stats["avg_ms"] = stats["total_ms"] / stats["count"]
