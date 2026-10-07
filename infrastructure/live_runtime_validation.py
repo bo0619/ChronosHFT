@@ -1192,6 +1192,15 @@ def _validate_live_canary_launch_config(
             "live_launch.max_deployed_capital_usdt must not exceed "
             f"{guard.MAX_CANARY_DEPLOYED_CAPITAL_USDT:g} USDT for a canary"
         )
+    elif (
+        is_calibration_canary
+        and deployed_cap > guard.MAX_CALIBRATION_DEPLOYED_CAPITAL_USDT
+    ):
+        violations.append(
+            "live_launch.max_deployed_capital_usdt must not exceed "
+            f"{guard.MAX_CALIBRATION_DEPLOYED_CAPITAL_USDT:g} USDT for an "
+            "RPI calibration canary"
+        )
     if deployment_loss_cap is None:
         violations.append(
             "live_launch.max_deployment_loss_usdt must be positive and finite"

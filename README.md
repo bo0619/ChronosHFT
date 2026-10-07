@@ -954,6 +954,9 @@ frequency creates a different strategy policy and requires new calibration
 evidence and a new model approval; evidence collected under the smaller policy
 does not authorize that change.
 
+Calibration deployment may not exceed 4% of actual USD-M Futures equity or
+50 USDT, whichever is lower; the smallest 8 USDT profile therefore needs about
+200 USDT of Futures equity (see the runbook for the matching loss limits).
 For an approximately 10,000 USDT personal account, the calibration guard
 enforces all of the following:
 

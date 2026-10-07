@@ -604,6 +604,20 @@ class LiveConfigGuardTests(unittest.TestCase):
         self.assertIs(validate_rpi_calibration_guard(config), config)
         self.assertEqual(config, before)
 
+    def test_rpi_calibration_accepts_small_account_at_minimum_size(self):
+        config = safe_rpi_calibration_config()
+        config["live_launch"]["declared_account_equity_usdt"] = 200.0
+        config["live_launch"]["max_deployed_capital_usdt"] = 8.0
+        config["live_launch"]["max_deployment_loss_usdt"] = 0.4
+        config["account"]["trading_budget_total"] = 8.0
+        config["account"]["trading_budget_by_asset"] = {"USDT": 8.0}
+        config["risk"]["limits"]["max_daily_loss"] = 0.2
+        config["_validated_rpi_calibration_permit"]["permit"]["policy"][
+            "max_calibration_loss_usdt"
+        ] = 0.4
+
+        self.assertIs(validate_rpi_calibration_guard(config), config)
+
     def test_live_canary_requires_conservative_funding_guard(self):
         cases = (
             ("enabled", False, "funding_guard.enabled"),
@@ -666,7 +680,12 @@ class LiveConfigGuardTests(unittest.TestCase):
             (
                 ("live_launch", "max_deployed_capital_usdt"),
                 50.01,
-                "0.5% of declared account equity",
+                "50 USDT for an RPI calibration canary",
+            ),
+            (
+                ("live_launch", "declared_account_equity_usdt"),
+                200.0,
+                "4.0% of declared account equity",
             ),
             (
                 ("live_launch", "max_deployment_loss_usdt"),
