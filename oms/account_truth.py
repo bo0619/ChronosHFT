@@ -25,6 +25,12 @@ from .execution_identity import discard_cursor_covered_execution_ids
 from .journal import JournalError
 from .order import Order
 
+_DAY_MS = 86_400_000
+# Binance rejects userTrades startTime/endTime windows longer than 7 days
+# and keeps about three months of history.
+USER_TRADES_MAX_WINDOW_MS = 7 * _DAY_MS
+USER_TRADES_RETENTION_MS = 88 * _DAY_MS
+
 
 class OMSAccountTruth(OMSComponent):
     """Own recovery of exchange orders, fills and account cash flows."""
@@ -756,8 +762,17 @@ class OMSAccountTruth(OMSComponent):
                 if cursor >= 0
                 else None
             )
+            window_start = 0
+            if request_from_id is None:
+                prior_scan = int(self.trade_scan_end_ms.get(symbol, 0))
+                window_start = max(
+                    0,
+                    end_time_ms - USER_TRADES_RETENTION_MS,
+                    (prior_scan or end_time_ms - self.trade_recovery_lookback_ms)
+                    - self.trade_recovery_overlap_ms,
+                )
             page_count = 0
-            trades = []
+            scan_complete = False
             while page_count < 20:
                 page_count += 1
                 if request_from_id is not None:
@@ -767,16 +782,14 @@ class OMSAccountTruth(OMSComponent):
                         limit=limit,
                     )
                 else:
-                    prior_scan = int(self.trade_scan_end_ms.get(symbol, 0))
-                    start_time = max(
-                        0,
-                        (prior_scan or end_time_ms - self.trade_recovery_lookback_ms)
-                        - self.trade_recovery_overlap_ms,
+                    window_end = min(
+                        end_time_ms,
+                        window_start + USER_TRADES_MAX_WINDOW_MS,
                     )
                     trades = self.query_user_trades(
                         symbol,
-                        start_time=start_time,
-                        end_time=end_time_ms,
+                        start_time=window_start,
+                        end_time=window_end,
                         limit=limit,
                     )
                 if trades is None:
@@ -806,7 +819,14 @@ class OMSAccountTruth(OMSComponent):
                         return False
                     cursor = max(cursor, int(trade.get("id", -1)))
                 if len(trades) < limit:
-                    break
+                    if request_from_id is not None or window_end >= end_time_ms:
+                        scan_complete = True
+                        break
+                    # Everything up to window_end is applied. Keep that
+                    # progress so a failure in a later window resumes here.
+                    self.trade_scan_end_ms[symbol] = window_end
+                    window_start = window_end
+                    continue
                 page_max_id = max(
                     int(trade.get("id", -1))
                     for trade in trades
@@ -814,7 +834,7 @@ class OMSAccountTruth(OMSComponent):
                 if request_from_id is not None and page_max_id < request_from_id:
                     return False
                 request_from_id = page_max_id + 1
-            if page_count >= 20 and len(trades) >= limit:
+            if not scan_complete:
                 return False
             self.trade_scan_end_ms[symbol] = end_time_ms
             self.audit_logger.audit(
