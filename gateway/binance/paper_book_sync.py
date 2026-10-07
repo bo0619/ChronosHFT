@@ -56,12 +56,6 @@ class PaperBookFeedState:
     def __post_init__(self):
         self.condition = threading.Condition(self.lock)
 
-    def replace_lock(self, lock: Any) -> None:
-        if self.active_dispatches or self.lifecycle_transition:
-            raise RuntimeError("cannot replace an active Paper book lock")
-        self.lock = lock
-        self.condition = threading.Condition(lock)
-
 
 @dataclass(frozen=True, slots=True)
 class PaperBookFeedPort:
