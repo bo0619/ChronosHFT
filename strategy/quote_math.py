@@ -1165,7 +1165,7 @@ def _finite_vector(
     expected_size: int | None = None,
     positive: bool = False,
 ) -> tuple[float, ...]:
-    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+    if not _is_sequence(values):
         raise ValueError(f"{name} must be a sequence")
     parsed = tuple(
         (
@@ -1184,7 +1184,7 @@ def _covariance_matrix(
     values: Sequence[Sequence[float]],
     size: int,
 ) -> np.ndarray:
-    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+    if not _is_sequence(values):
         raise ValueError("covariance_bps2_per_s must be a square matrix")
     rows = tuple(
         _finite_vector(
@@ -1219,7 +1219,7 @@ def _covariance_matrix(
 
 def _scalar_covariance(values: Sequence[Sequence[float]]) -> float:
     """1x1 case of :func:`_covariance_matrix` without numpy."""
-    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+    if not _is_sequence(values):
         raise ValueError("covariance_bps2_per_s must be a square matrix")
     rows = tuple(
         _finite_vector(
@@ -1237,6 +1237,13 @@ def _scalar_covariance(values: Sequence[Sequence[float]]) -> float:
             "covariance_bps2_per_s must have a positive diagonal"
         )
     return 0.5 * (value + value)
+
+
+def _is_sequence(values: object) -> bool:
+    # list/tuple first: the Sequence ABC check is slow on the hot path.
+    if type(values) is tuple or type(values) is list:
+        return True
+    return not isinstance(values, (str, bytes)) and isinstance(values, Sequence)
 
 
 def _finite_real(value: object, name: str) -> float:
