@@ -633,7 +633,10 @@ class ExchangeTruthTests(unittest.TestCase):
     def test_exchange_account_update_merges_partial_balance_delta(self):
         engine = DummyEngine()
         gateway = DummyGateway()
-        oms = OMS(engine, gateway, self.make_config())
+        config = self.make_config()
+        # Both quote assets are traded, so both count toward the balance.
+        config["symbols"] = ["BTCUSDT", "BTCUSDC"]
+        oms = OMS(engine, gateway, config)
         try:
             oms.account.force_sync(
                 1125.0,

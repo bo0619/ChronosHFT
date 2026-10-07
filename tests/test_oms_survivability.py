@@ -22,6 +22,7 @@ from event.type import (
     ExchangeAccountUpdate,
     ExchangeOrderUpdate,
     ExecutionPolicy,
+    EVENT_EXCHANGE_ACCOUNT_UPDATE,
     EVENT_EXCHANGE_ORDER_UPDATE,
     EVENT_ACCOUNT_UPDATE,
     EVENT_ORDER_UPDATE,
@@ -664,6 +665,65 @@ class OMSSurvivabilityTests(unittest.TestCase):
             self.assertEqual(called, ["reset"])
         finally:
             oms.stop()
+
+    def test_idle_stablecoin_does_not_move_balance_or_force_reset(self):
+        # Binance single-asset mode, which live requires: totalWalletBalance
+        # covers USDT only, while assets also lists the idle USDC.
+        for symbols, expected_balance in (
+            (["BTCUSDT"], 1000.0),
+            (["BTCUSDT", "ETHUSDC"], 1500.0),
+        ):
+            with self.subTest(symbols=symbols):
+                gateway = DummyGateway()
+                gateway.account = {
+                    "totalWalletBalance": "1000",
+                    "totalInitialMargin": "0",
+                    "availableBalance": "1000",
+                    "assets": [
+                        {"asset": "USDT", "walletBalance": "1000", "availableBalance": "1000"},
+                        {"asset": "USDC", "walletBalance": "500", "availableBalance": "500"},
+                    ],
+                }
+                config = self.make_config()
+                config["symbols"] = symbols
+                oms = OMS(DummyEngine(), gateway, config)
+                try:
+                    oms.halt_system("operator_test")
+                    self.assertTrue(oms.rearm_system("operator_ack"))
+                    self.assertAlmostEqual(oms.account.balance, expected_balance)
+
+                    # A USDT-M fill only carries the USDT row.
+                    oms.on_exchange_account_update(
+                        Event(
+                            EVENT_EXCHANGE_ACCOUNT_UPDATE,
+                            ExchangeAccountUpdate(
+                                asset="USDT",
+                                wallet_balance=1000.0,
+                                available_balance=1000.0,
+                                balances={
+                                    "USDT": {
+                                        "wallet_balance": 1000.0,
+                                        "available_balance": 1000.0,
+                                    }
+                                },
+                                positions={},
+                                reason="ORDER",
+                                event_time=time.time() + 1.0,
+                            ),
+                        )
+                    )
+                    self.assertAlmostEqual(oms.account.balance, expected_balance)
+
+                    resets = []
+                    oms._perform_full_reset = lambda resets=resets: resets.append("reset")
+                    oms.state = LifecycleState.RECONCILING
+                    oms._sync_capability_mode("test_reconcile")
+                    oms._execute_reconcile(None)
+
+                    self.assertEqual(resets, [])
+                    self.assertEqual(oms.state, LifecycleState.LIVE)
+                finally:
+                    oms.stop()
 
     def test_stable_snapshot_rejects_nonfinite_account_truth(self):
         gateway = DummyGateway()
