@@ -1082,8 +1082,13 @@ class OMSAccountTruth(OMSComponent):
         end_time_ms = int(end_time_ms or self.clock.now_ms())
         day_start_ms = self._utc_day_start_ms(end_time_ms)
         if self.external_cash_flow_scan_end_ms:
+            # Resume from the last completed scan. Clipping this at the UTC
+            # day start would drop flows booked between that scan and
+            # midnight, and the cumulative deployment loss and peak drawdown
+            # would then read them as trading P&L. Income ids deduplicate the
+            # overlap.
             start_time_ms = max(
-                day_start_ms,
+                0,
                 self.external_cash_flow_scan_end_ms
                 - self.external_cash_flow_recovery_overlap_ms,
             )

@@ -1318,5 +1318,49 @@ class InstitutionalRecoveryTests(unittest.TestCase):
             second.stop()
 
 
+    def test_external_cash_flow_scan_keeps_flows_booked_before_midnight(self):
+        class WindowedIncomeGateway(RecoveryGateway):
+            def get_income_history(self, start_time=None, end_time=None, **_kwargs):
+                return [
+                    income
+                    for income in self.incomes
+                    if int(start_time) <= int(income["time"]) <= int(end_time)
+                ]
+
+        config = self.make_config()
+        config["risk"]["cash_flow_truth"] = {
+            "enabled": True,
+            "require_snapshot": True,
+        }
+        gateway = WindowedIncomeGateway()
+        oms = OMS(DummyEngine(), gateway, config)
+        try:
+            midnight_ms = 1_790_035_200_000  # 2026-09-22T00:00:00Z
+            self.assertTrue(
+                oms.backfill_external_cash_flow_history(
+                    end_time_ms=midnight_ms - 20_000
+                )
+            )
+            gateway.incomes = [
+                {
+                    "incomeType": "TRANSFER",
+                    "tranId": "withdrawal-before-midnight",
+                    "asset": "USDT",
+                    "income": "-250.0",
+                    "time": midnight_ms - 10_000,
+                }
+            ]
+
+            self.assertTrue(
+                oms.backfill_external_cash_flow_history(
+                    end_time_ms=midnight_ms + 10_000
+                )
+            )
+
+            self.assertAlmostEqual(oms.account.external_cash_flow_total, -250.0)
+        finally:
+            oms.stop()
+
+
 if __name__ == "__main__":
     unittest.main()

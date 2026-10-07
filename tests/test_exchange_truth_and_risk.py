@@ -1446,16 +1446,25 @@ class RiskExecutionTests(unittest.TestCase):
         self.assertTrue(risk.kill_switch_triggered)
         self.assertIn("Maintenance margin ratio", risk.kill_reason)
 
-    def test_stale_cash_flow_truth_still_enforces_daily_loss(self):
+    def test_withdrawal_while_cash_flow_truth_stale_does_not_kill(self):
         risk = self.make_cash_flow_risk()
         risk.account_risk.on_account_update(self.cash_flow_account(1000.0))
 
+        # A TRANSFER account update marks cash-flow truth stale before the
+        # withdrawal is booked; the equity drop must not read as a loss.
         risk.account_risk.on_account_update(
             self.cash_flow_account(600.0, fresh=False)
         )
+        self.assertFalse(risk.kill_switch_triggered)
+        self.assertEqual(
+            risk.oms.trading_modes[-1][0],
+            OMSCapabilityMode.REDUCE_ONLY,
+        )
 
-        self.assertTrue(risk.kill_switch_triggered)
-        self.assertIn("Daily loss", risk.kill_reason)
+        risk.account_risk.on_account_update(
+            self.cash_flow_account(600.0, external_flow=-400.0)
+        )
+        self.assertFalse(risk.kill_switch_triggered)
 
     def test_stale_cash_flow_truth_does_not_move_peak_or_baseline(self):
         risk = self.make_cash_flow_risk()
