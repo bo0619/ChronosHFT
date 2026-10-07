@@ -92,11 +92,10 @@ class PaperMatchingEngine:
         return self._state
 
     def match_immediate(self, order: PaperOrder):
-        state = self._state
         if not order.active or not order.committed:
             return
         request = order.request
-        liquidity = state.liquidity.get(request.symbol)
+        liquidity = self._immediate_liquidity(request.symbol)
         if not liquidity:
             if request.order_type == "MARKET" or request.time_in_force in {
                 TIF_IOC,
@@ -274,7 +273,20 @@ class PaperMatchingEngine:
         if previous is not None and self._policy.cancel_ahead_fraction > 0.0:
             self.apply_conservative_cancel_ahead(previous, book)
         state.books[book.symbol] = book
-        state.liquidity[book.symbol] = {
+        # The consumable copy of the full book is built on the first
+        # immediate match after this book, not on every depth update.
+        state.liquidity.pop(book.symbol, None)
+        return True
+
+    def _immediate_liquidity(self, symbol: str):
+        state = self._state
+        liquidity = state.liquidity.get(symbol)
+        if liquidity is not None:
+            return liquidity
+        book = state.books.get(symbol)
+        if book is None:
+            return None
+        liquidity = {
             "bids": {
                 float(price): float(qty) for price, qty in book.bids.items()
             },
@@ -282,7 +294,8 @@ class PaperMatchingEngine:
                 float(price): float(qty) for price, qty in book.asks.items()
             },
         }
-        return True
+        state.liquidity[symbol] = liquidity
+        return liquidity
 
     @staticmethod
     def local_queue_priority(order: PaperOrder):
