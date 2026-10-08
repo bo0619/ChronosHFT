@@ -850,7 +850,18 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                         "use_rpi_for_passive_exit": BOOL,
                         "rpi_fallback_to_gtx": BOOL,
                         "rpi_live_policy": _object({"require_zero_commission": BOOL}),
-                    }
+                        "execution_modes": MappingSpec(
+                            values=_string(choices=("post_only", "market")),
+                            key_pattern=r"^binance$",
+                        ),
+                        "market_execution": _optional_object(
+                            {
+                                "min_edge_bps": NONNEGATIVE,
+                                "cooldown_ms": NONNEGATIVE,
+                            }
+                        ),
+                    },
+                    optional=("execution_modes", "market_execution"),
                 )
             }
         )

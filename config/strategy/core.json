@@ -19,6 +19,14 @@
     "rpi_fallback_to_gtx": false,
     "rpi_live_policy": {
       "require_zero_commission": true
+    },
+    "_comment_execution_modes": "Per-venue market-making mode: post_only rests GTX/RPI quotes; market sends MARKET orders when the GLFT reservation price clears the touch by taker fee + market_execution.min_edge_bps. market is Paper-only and GLFT-only.",
+    "execution_modes": {
+      "binance": "post_only"
+    },
+    "market_execution": {
+      "min_edge_bps": 1.0,
+      "cooldown_ms": 1000.0
     }
   }
 }

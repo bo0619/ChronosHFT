@@ -51,6 +51,7 @@ from strategy.adaptive_quoting import (
     AdaptiveQuotingStrategy,
     negative_infinity as _negative_infinity,
 )
+from strategy.market_execution import MarketExecutionMixin
 from strategy.model_readiness import (
     evaluate_symbol_readiness,
     readiness_requirements,
@@ -112,7 +113,7 @@ class _PortfolioAssetState:
     updated_at_monotonic: float
 
 
-class GLFTStrategy(AdaptiveQuotingStrategy):
+class GLFTStrategy(MarketExecutionMixin, AdaptiveQuotingStrategy):
     """GLFT Model A strategy with one fixed-notional inventory unit."""
 
     def __init__(
@@ -553,6 +554,7 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
                 else GLFT_FORMULA_VERSION
             )
         )
+        self.init_execution_mode(self.strat_conf, live_mode=self.live_mode)
         if self.live_mode:
             if not self.execution.supports_strategy_evidence:
                 raise ValueError(
@@ -1698,6 +1700,11 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
             self.feature_engine.reset_interval(symbol)
             return
 
+        if self.market_mode:
+            return self.run_market_execution_cycle(
+                symbol, mid, bid_1, ask_1, fair_mid, formula_quote, current_pos,
+                now, alpha_offset_bps, gamma, sigma, self.feature_engine,
+            )
         passive_tif = self.resolve_passive_time_in_force(
             symbol,
             use_rpi=self.use_rpi,
@@ -2988,7 +2995,7 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
     def on_trade(self, trade: TradeData):
         now_monotonic = self.clock.monotonic()
         self.last_fill_time[trade.symbol] = now_monotonic
-        if self.adaptive_enabled:
+        if self.adaptive_enabled and not self.is_market_fill(trade):
             self.adaptive_markout.record_fill(
                 symbol=trade.symbol,
                 side=trade.side,

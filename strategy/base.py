@@ -294,6 +294,19 @@ class StrategyTemplate:
         )
         return max(0.0, fee_rate * 20000.0)
 
+    def taker_fee_bps(self, symbol: str) -> float:
+        """Return the one-way taker fee for a MARKET order on ``symbol``."""
+        config = self.resolved_config
+        fee_config = dict(config.get("backtest", {}) or {})
+        paper_config = config.get("paper_trade", {}) or {}
+        if is_paper_trade(config):
+            fee_config.update(paper_config)
+        return max(
+            0.0,
+            self._nonnegative_finite(fee_config.get("taker_fee", 0.0))
+            * 10000.0,
+        )
+
     def send_intent(self, intent: OrderIntent):
         intent.price = self.reference_data.round_price(intent.symbol, intent.price)
         intent.volume = self.reference_data.round_qty(intent.symbol, intent.volume)
