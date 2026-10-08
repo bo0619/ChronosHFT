@@ -26,7 +26,7 @@ from alpha.rpi_intensity import (
     RPIOrderExposure,
     estimate_rpi_intensity,
 )
-from alpha.signal import MultiHorizonPredictor
+from alpha.signal import predictor_from_config, usable_predictions
 from event.type import (
     EVENT_STRATEGY_UPDATE,
     TIF_RPI,
@@ -336,6 +336,9 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
                 "alpha.long_pos_weight",
             ),
         }
+        self.alpha_predictor_factory = predictor_from_config(
+            self.alpha_config.get("predictor", {})
+        )
         raw_portfolio_config = self.glft_conf.get("portfolio_risk", {})
         self.portfolio_risk_config = (
             dict(raw_portfolio_config)
@@ -805,7 +808,7 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
                 window=self.calibrator_window,
                 config=self.calibrator_config,
             )
-            self.models[symbol] = MultiHorizonPredictor(num_features=9)
+            self.models[symbol] = self.alpha_predictor_factory()
             self.gates[symbol] = AlphaGate(
                 max_bps=10.0,
                 decay_factor=0.9,
@@ -1479,12 +1482,13 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
             current_pos_usdt - target_pos_usdt
         ) / inventory_lot_notional
         if self.alpha_enabled:
+            usable_alphas = usable_predictions(model, alphas)
             short_signal = gate.process(
-                alphas["short"],
+                usable_alphas["short"],
                 preliminary_inventory_lots,
             )
             target_pos_usdt += (
-                alphas["long"] * self.alpha_weights["long_pos_weight"]
+                usable_alphas["long"] * self.alpha_weights["long_pos_weight"]
             )
             target_position_limit = (
                 self.max_pos_usdt if self.max_pos_usdt > 0.0 else 2_000.0
@@ -1875,6 +1879,7 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
             "signals": {
                 horizon: float(value) for horizon, value in alphas.items()
             },
+            "alpha_oos": getattr(model, "oos_report", dict)(),
             "short_signal_bps": short_signal,
             "target_position_notional": target_pos_usdt,
             "effective_position_notional": effective_pos_usdt,
