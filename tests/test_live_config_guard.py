@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,9 @@ from infrastructure.config_schema import (
     CONFIG_DOCUMENT_VERSION,
     CONFIG_FRAGMENT_SCHEMA,
     CONFIG_UNKNOWN_KEY_POLICY,
+    FRAGMENT_SCHEMAS,
+    MappingSpec,
+    ObjectSpec,
 )
 from infrastructure.live_config_guard import (
     validate_live_account_equity_truth,
@@ -25,6 +29,117 @@ from infrastructure.live_config_guard import (
 )
 from infrastructure.paper_trade import apply_paper_trade_mode
 from strategy.model_readiness import strategy_policy_sha256
+
+LIVE_MANIFEST_EXCLUDED_FRAGMENTS = frozenset(
+    {"alerts", "strategy.capital_scaling"}
+)
+LIVE_MANIFEST_BASE_OVERRIDES = (
+    (("strategy", "glft", "portfolio_risk", "enabled"), False),
+    (("strategy", "glft", "adaptive", "enabled"), False),
+    (("system", "web_dashboard", "open_browser"), False),
+)
+
+
+def _config_leaves(value, path=()):
+    if isinstance(value, dict) and value:
+        for key, item in value.items():
+            yield from _config_leaves(item, (*path, key))
+    else:
+        yield path, value
+
+
+def _set_config_leaf(target, path, value):
+    for key in path[:-1]:
+        target = target.setdefault(key, {})
+    target[path[-1]] = value
+
+
+def _schema_accepts(spec, path):
+    for key in path:
+        if isinstance(spec, ObjectSpec):
+            if key not in spec.fields:
+                return key.startswith("_comment")
+            spec = spec.fields[key]
+        elif isinstance(spec, MappingSpec):
+            spec = spec.values
+        else:
+            return False
+    return True
+
+
+def write_live_config_manifest(path, config):
+    """Write a Live config dict as a strict v3 manifest plus fragments.
+
+    Repository base fragments supply every field the dict leaves out; each
+    leaf the dict sets lands in the fragment whose schema owns it, and the
+    remaining Live-only fields land in the ``live`` fragment.
+    """
+    path = Path(path)
+    base_manifest = json.loads(
+        (REPOSITORY_ROOT / "config.json").read_text(encoding="utf-8")
+    )
+    fragment_dir = Path(f"{path.stem}.fragments")
+    (path.parent / fragment_dir).mkdir(parents=True, exist_ok=True)
+    overrides = list(_config_leaves(config))
+    for leaf, value in LIVE_MANIFEST_BASE_OVERRIDES:
+        overrides.append((leaf, value))
+    placed = set()
+    documents = []
+    for include in base_manifest["includes"]:
+        name = include["fragment"]
+        if name in LIVE_MANIFEST_EXCLUDED_FRAGMENTS:
+            continue
+        document = json.loads(
+            (REPOSITORY_ROOT / include["path"]).read_text(encoding="utf-8")
+        )
+        spec = FRAGMENT_SCHEMAS[name][include["version"]]
+        for index, (leaf, value) in enumerate(overrides):
+            if index in placed:
+                continue
+            if _schema_accepts(spec, leaf):
+                _set_config_leaf(document, leaf, copy.deepcopy(value))
+                placed.add(index)
+        documents.append((name, include["version"], document))
+    live_document = {
+        "$schema": CONFIG_FRAGMENT_SCHEMA,
+        "fragment": "live",
+        "version": 1,
+    }
+    for index, (leaf, value) in enumerate(overrides):
+        if index not in placed:
+            _set_config_leaf(live_document, leaf, copy.deepcopy(value))
+    documents.append(("live", 1, live_document))
+    includes = []
+    for name, version, document in documents:
+        relative = fragment_dir / f"{name}.json"
+        (path.parent / relative).write_text(
+            json.dumps(document), encoding="utf-8"
+        )
+        includes.append(
+            {"path": relative.as_posix(), "fragment": name, "version": version}
+        )
+    path.write_text(
+        json.dumps(
+            {
+                "schema": CONFIG_MANIFEST_SCHEMA,
+                "config_version": CONFIG_DOCUMENT_VERSION,
+                "unknown_keys": CONFIG_UNKNOWN_KEY_POLICY,
+                "includes": includes,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+LIVE_TEMPLATE_DIR = REPOSITORY_ROOT / "deploy" / "live" / "rpi-200u"
+LIVE_TEMPLATE_PLACEHOLDERS = {
+    "EDIT-ME-rpi-200u-001": "rpi-200u-test-001",
+    "EDIT-ME-account-scope": "account-scope-test-001",
+    "EDIT-ME-state-genesis": "genesis-test-001",
+    "EDITMEUSDT": "XAUUSDT",
+}
 
 
 def safe_live_config():
@@ -1714,6 +1829,111 @@ class LiveConfigGuardTests(unittest.TestCase):
 
         self.assertEqual(loaded["execution"]["mode"], "paper")
         self.assertFalse(loaded["risk"]["independent_supervisor"]["enabled"])
+
+
+class LiveDeploymentTemplateTests(unittest.TestCase):
+    def setUp(self):
+        self.alert_environment = patch.dict(
+            os.environ,
+            {
+                "CHRONOSHFT_ALERT_WEBHOOK_URL": (
+                    "https://alerts.invalid/chronoshft-secret"
+                )
+            },
+        )
+        self.alert_environment.start()
+        self.addCleanup(self.alert_environment.stop)
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.root = Path(temp_dir.name) / "deploy"
+        shutil.copytree(LIVE_TEMPLATE_DIR, self.root)
+        for path in self.root.rglob("*.json"):
+            text = path.read_text(encoding="utf-8")
+            for placeholder, value in LIVE_TEMPLATE_PLACEHOLDERS.items():
+                text = text.replace(placeholder, value)
+            path.write_text(text, encoding="utf-8")
+
+    def _load(self, name):
+        return normalize_root_config_preapproval(
+            load_config_document(str(self.root / name))
+        )
+
+    def test_checked_in_templates_keep_placeholders(self):
+        text = (LIVE_TEMPLATE_DIR / "live.rpi-calibration.json").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("EDIT-ME-rpi-200u-001", text)
+        self.assertIn("EDITMEUSDT", text)
+
+    def test_200u_calibration_template_passes_live_guard(self):
+        config = self._load("rpi-calibration.json")
+        target = self._load("canary.json")
+        self.assertEqual(config["live_launch"]["stage"], "rpi_calibration_canary")
+        self.assertEqual(target["live_launch"]["stage"], "canary")
+        self.assertEqual(
+            strategy_policy_sha256(config, "glft"),
+            strategy_policy_sha256(target, "glft"),
+        )
+        self.assertEqual(config["risk"]["limits"]["max_daily_loss"], 0.2)
+        self.assertEqual(config["account"]["trading_budget_total"], 8.0)
+
+        config["live_launch"]["calibration_permit_trusted_signers"] = {
+            "operator-1": {
+                "algorithm": "ED25519",
+                "public_key_base64": "placeholder",
+            }
+        }
+        config["api_key"] = "primary-key"
+        config["api_secret"] = "primary-secret"
+        supervisor = config["risk"]["independent_supervisor"]
+        supervisor["api_key"] = "risk-key"
+        supervisor["api_secret"] = "risk-secret"
+        wrapper = copy.deepcopy(
+            safe_rpi_calibration_config()["_validated_rpi_calibration_permit"]
+        )
+        permit = wrapper["permit"]
+        permit["deployment_id"] = config["live_launch"]["deployment_id"]
+        permit["symbol"] = "XAUUSDT"
+        permit["policy"]["max_calibration_loss_usdt"] = 0.4
+        config["_validated_rpi_calibration_permit"] = wrapper
+        previous_cwd = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous_cwd)
+        with patch(
+            "infrastructure.rpi_calibration_permit."
+            "load_and_validate_rpi_calibration_permit",
+            return_value=wrapper,
+        ):
+            self.assertIs(
+                validate_live_runtime_config(
+                    config,
+                    config_path=str(self.root / "rpi-calibration.json"),
+                    target_config_normalizer=lambda raw: raw,
+                ),
+                config,
+            )
+
+    def test_live_fragment_rejects_unknown_fields_and_inline_secrets(self):
+        fragment_path = self.root / "live.rpi-calibration.json"
+        original = json.loads(fragment_path.read_text(encoding="utf-8"))
+        for mutate, expected in (
+            (
+                lambda doc: doc["risk"]["limits"].update(
+                    {"max_daly_loss": 0.2}
+                ),
+                "max_daly_loss is an unknown field",
+            ),
+            (
+                lambda doc: doc.update({"api_key": "secret"}),
+                "api_key is an unknown field",
+            ),
+        ):
+            with self.subTest(expected=expected):
+                document = copy.deepcopy(original)
+                mutate(document)
+                fragment_path.write_text(json.dumps(document), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, expected):
+                    load_config_document(str(self.root / "rpi-calibration.json"))
 
 
 if __name__ == "__main__":

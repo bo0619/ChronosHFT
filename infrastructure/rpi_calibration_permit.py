@@ -398,9 +398,14 @@ def load_and_validate_rpi_calibration_permit(
     *,
     config_path: str | Path,
     target_config_normalizer: Callable[[dict[str, Any]], Mapping[str, Any]],
+    target_config_loader: Callable[[str], dict[str, Any]] | None = None,
     now_utc: datetime | None = None,
 ) -> dict[str, Any]:
-    """Load the target config and permit named by the calibration config."""
+    """Load the target config and permit named by the calibration config.
+
+    ``target_config_loader`` composes a v3 manifest target; without one the
+    target is read as a single strict JSON object.
+    """
     if not isinstance(config, Mapping):
         raise RpiCalibrationPermitError(
             "calibration configuration must be an object"
@@ -432,11 +437,20 @@ def load_and_validate_rpi_calibration_permit(
         "RPI calibration permit",
         max_bytes=1_048_576,
     )
-    raw_target_config = _read_strict_json_object(
-        target_config_path,
-        "target deployment config",
-        max_bytes=4_194_304,
-    )
+    if target_config_loader is None:
+        raw_target_config = _read_strict_json_object(
+            target_config_path,
+            "target deployment config",
+            max_bytes=4_194_304,
+        )
+    else:
+        try:
+            raw_target_config = target_config_loader(str(target_config_path))
+        except (OSError, ValueError) as exc:
+            raise RpiCalibrationPermitError(
+                "cannot read target deployment config at "
+                f"{target_config_path}: {exc}"
+            ) from exc
     if not callable(target_config_normalizer):
         raise RpiCalibrationPermitError(
             "target deployment config normalizer must be injected"

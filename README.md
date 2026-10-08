@@ -885,7 +885,11 @@ and run the offline checker before moving it to a deployment host:
 .\.venv\Scripts\python.exe scripts\check_live_canary_readiness.py --config config.live.canary.json
 ```
 
-Live deployment JSON is intentionally operator-owned and ignored by Git. The
+Live configs are strict v3 manifests like `config.json`; Live-only fields
+belong to the `live` fragment, and inline key or secret values are rejected.
+`deploy/live/rpi-200u/` is a complete 200 USDT RPI calibration and target
+canary template; copy it outside the repository, fill its placeholders, and
+keep the edited deployment copy operator-owned. The
 checker reads only local JSON, never reads credential values, constructs no
 gateway or OMS, performs no network request, and exercises no order path. A
 `PASS` is only an offline prerequisite; startup still refreshes exchange and

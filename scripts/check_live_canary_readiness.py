@@ -24,6 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from governance import calibration_artifact as calibration_artifact_port  # noqa: E402
 from infrastructure.config_scaling import (  # noqa: E402
+    load_config_document,
     normalize_root_config_preapproval,
 )
 from infrastructure.live_config_guard import (  # noqa: E402
@@ -727,12 +728,14 @@ def assess_live_canary_readiness(
     path = Path(config_path).resolve()
     checks: list[dict[str, str]] = []
     try:
-        raw_config = _read_json_object(path, "canary config")
-    except ValueError as exc:
+        raw_config = load_config_document(str(path))
+    except (OSError, ValueError) as exc:
         checks.append(_check("config.json", BLOCKED, str(exc)))
         return _finalize(path, checks)
 
-    checks.append(_check("config.json", PASS, "valid strict JSON object"))
+    checks.append(
+        _check("config.json", PASS, "strict v3 manifest and fragments compose")
+    )
     checks.append(_credential_reference_check(raw_config))
 
     execution = raw_config.get("execution", {})
@@ -784,6 +787,7 @@ def assess_live_canary_readiness(
                 normalized,
                 config_path=path,
                 target_config_normalizer=normalize_root_config_preapproval,
+                target_config_loader=load_config_document,
                 now_utc=effective_now,
             )
         except (TypeError, ValueError) as exc:
@@ -845,6 +849,7 @@ def assess_live_canary_readiness(
             _guard_projection(normalized),
             config_path=path,
             target_config_normalizer=normalize_root_config_preapproval,
+            target_config_loader=load_config_document,
             now_utc=effective_now,
             external_alert_environ=offline_alert_environ,
             runtime_working_dir=path.parent,

@@ -1,0 +1,33 @@
+{
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "oms",
+  "version": 1,
+  "oms": {
+    "reconcile_min_interval_sec": 5.0,
+    "reconcile_api_failure_threshold": 3,
+    "reconcile_api_cooldown_sec": 10.0,
+    "trade_recovery_lookback_ms": 86400000,
+    "trade_recovery_overlap_ms": 60000,
+    "trade_recovery_id_overlap": 100,
+    "trade_tail_verification_delay_sec": 0.25,
+    "trade_tail_verification_retry_sec": 0.5,
+    "trade_tail_verification_attempts": 4,
+    "outbound_gate_drain_timeout_sec": 10.0,
+    "shutdown_cancel_timeout_sec": 30.0,
+    "shutdown_empty_snapshots_required": 2,
+    "shutdown_cancel_settle_interval_sec": 0.25,
+    "ack_timeout_sec": 5.0,
+    "ack_timeout_recheck_sec": 60.0,
+    "monitor_check_interval_sec": 1.0,
+    "risk_rejection_log_interval_sec": 5.0,
+    "event_log_max": 2048,
+    "journal_format_version": 3,
+    "journal_require_existing": false,
+    "journal_segment_max_records": 100000,
+    "journal_segment_max_bytes": 268435456,
+    "journal_max_frame_bytes": 67108864,
+    "journal_min_free_bytes": 536870912,
+    "journal_space_check_interval_sec": 1.0,
+    "tombstone_max": 2000
+  }
+}

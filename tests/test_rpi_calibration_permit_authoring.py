@@ -25,6 +25,7 @@ from scripts.create_rpi_calibration_permit import (
 from tests.test_live_config_guard import (
     safe_rpi_calibration_config,
     safe_rpi_target_config,
+    write_live_config_manifest,
 )
 
 
@@ -371,8 +372,13 @@ def test_generate_sign_and_revalidate_permit_offline(tmp_path, monkeypatch):
     calibration["live_launch"][
         "calibration_permit_trusted_signers"
     ] = trust["calibration_permit_trusted_signers"]
-    _write_json(calibration_path, calibration)
-    _write_json(target_path, target)
+    for config in (calibration, target):
+        config.pop("api_key", None)
+        config.pop("api_secret", None)
+        config["risk"]["independent_supervisor"].pop("api_key", None)
+        config["risk"]["independent_supervisor"].pop("api_secret", None)
+    write_live_config_manifest(calibration_path, calibration)
+    write_live_config_manifest(target_path, target)
 
     signed = sign_permit(
         argparse.Namespace(

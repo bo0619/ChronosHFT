@@ -30,6 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from governance.contracts import market_data_environment  # noqa: E402
 from infrastructure.config_scaling import (  # noqa: E402
+    load_config_document,
     normalize_root_config_preapproval,
 )
 from infrastructure.durability import sync_directory as _sync_directory  # noqa: E402
@@ -103,7 +104,12 @@ def _read_json_object(path: Path, label: str) -> dict[str, Any]:
 
 
 def _load_live_config(path: Path, label: str) -> dict[str, Any]:
-    raw = _read_json_object(path, label)
+    try:
+        raw = load_config_document(str(path))
+    except (OSError, ValueError) as exc:
+        raise PermitAuthoringError(
+            f"cannot read {label} at {path}: {exc}"
+        ) from exc
     try:
         config = normalize_root_config_preapproval(raw)
     except (TypeError, ValueError) as exc:
