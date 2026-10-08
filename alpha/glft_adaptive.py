@@ -64,6 +64,7 @@ class MarkoutEstimate:
     horizon_ms: int | None
     mean_signed_markout_bps: float | None
     standard_error_bps: float | None
+    mean_residual_adverse_bps: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,25 +154,49 @@ class _PendingFill:
     price: float
     observed_at_monotonic: float
     unresolved_horizons_ms: set[int]
+    reference_mid: float
+    expected_adverse_cost_bps: float
 
 
 class FillMarkoutEstimator:
-    """Estimate conservative post-fill adverse selection at fixed horizons."""
+    """Estimate post-fill adverse selection left unexplained by flow cost.
+
+    Signed markouts against the fill price (which include the captured
+    depth) are kept for every horizon for persistence and reporting.  The
+    quote cost instead uses one horizon and measures the mid move against
+    the mid seen before the fill, net of the side-specific cost the quote
+    already charged at that moment, so the same toxicity is not priced
+    twice.  The mean is shrunk toward zero by ``prior_samples``.
+    """
 
     def __init__(
         self,
         *,
         horizons_ms: Sequence[int] = (100, 500, 1000),
         min_samples: int = 20,
-        confidence_z: float = 1.645,
+        confidence_z: float = 0.0,
         max_pending: int = 5000,
         window_size: int = 500,
+        cost_horizon_ms: int | None = None,
+        prior_samples: float | None = None,
     ) -> None:
         parsed_horizons = tuple(sorted({_positive_int(value) for value in horizons_ms}))
         if not parsed_horizons:
             raise ValueError("markout horizons_ms must not be empty")
         self.horizons_ms = parsed_horizons
+        self.cost_horizon_ms = (
+            parsed_horizons[-1]
+            if cost_horizon_ms is None
+            else _positive_int(cost_horizon_ms)
+        )
+        if self.cost_horizon_ms not in parsed_horizons:
+            raise ValueError("markout cost_horizon_ms must be one of horizons_ms")
         self.min_samples = _positive_int(min_samples)
+        self.prior_samples = (
+            float(self.min_samples)
+            if prior_samples is None
+            else _nonnegative(prior_samples, "prior_samples")
+        )
         self.confidence_z = _nonnegative(confidence_z, "confidence_z")
         self.max_pending = _positive_int(max_pending)
         self.window_size = _positive_int(window_size)
@@ -181,6 +206,24 @@ class FillMarkoutEstimator:
         self._resolved: deque[ResolvedFillMarkout] = deque()
         self._moments: dict[tuple[str, Side, int], _RollingMoments] = defaultdict(
             lambda: _RollingMoments(self.window_size)
+        )
+        self._adverse_moments: dict[tuple[str, Side], _RollingMoments] = (
+            defaultdict(lambda: _RollingMoments(self.window_size))
+        )
+        self._latest_mid: dict[str, float] = {}
+        self._expected_costs: dict[str, tuple[float, float]] = {}
+
+    def set_expected_costs(
+        self,
+        symbol: str,
+        bid_cost_bps: float,
+        ask_cost_bps: float,
+    ) -> None:
+        """Record the conditional cost the current quotes already charge."""
+
+        self._expected_costs[_symbol(symbol)] = (
+            _nonnegative(bid_cost_bps, "bid_cost_bps"),
+            _nonnegative(ask_cost_bps, "ask_cost_bps"),
         )
 
     def record_fill(
@@ -192,19 +235,30 @@ class FillMarkoutEstimator:
         observed_at_monotonic: float,
         client_oid: str = "",
         trade_id: str = "",
+        reference_mid: float | None = None,
     ) -> None:
         parsed_side = _side(side)
+        normalized_symbol = _symbol(symbol)
         price = _positive(fill_price, "fill_price")
         timestamp = _nonnegative(observed_at_monotonic, "observed_at_monotonic")
+        if reference_mid is None:
+            reference = self._latest_mid.get(normalized_symbol, price)
+        else:
+            reference = _positive(reference_mid, "reference_mid")
+        bid_cost, ask_cost = self._expected_costs.get(normalized_symbol, (0.0, 0.0))
         self._pending.append(
             _PendingFill(
                 client_oid=str(client_oid or ""),
                 trade_id=str(trade_id or ""),
-                symbol=_symbol(symbol),
+                symbol=normalized_symbol,
                 side=parsed_side,
                 price=price,
                 observed_at_monotonic=timestamp,
                 unresolved_horizons_ms=set(self.horizons_ms),
+                reference_mid=reference,
+                expected_adverse_cost_bps=(
+                    bid_cost if parsed_side == Side.BUY else ask_cost
+                ),
             )
         )
         while len(self._pending) > self.max_pending:
@@ -220,6 +274,7 @@ class FillMarkoutEstimator:
         normalized_symbol = _symbol(symbol)
         mid = _positive(mid_price, "mid_price")
         timestamp = _nonnegative(observed_at_monotonic, "observed_at_monotonic")
+        self._latest_mid[normalized_symbol] = mid
         resolved = 0
         retained: deque[_PendingFill] = deque()
         for pending in self._pending:
@@ -238,6 +293,13 @@ class FillMarkoutEstimator:
                 self._moments[
                     (pending.symbol, pending.side, horizon_ms)
                 ].update(signed_markout)
+                if horizon_ms == self.cost_horizon_ms:
+                    adverse_move = -side_sign * math.log(
+                        mid / pending.reference_mid
+                    ) * 10_000.0
+                    self._adverse_moments[(pending.symbol, pending.side)].update(
+                        adverse_move - pending.expected_adverse_cost_bps
+                    )
                 self._resolved.append(
                     ResolvedFillMarkout(
                         client_oid=pending.client_oid,
@@ -268,33 +330,24 @@ class FillMarkoutEstimator:
     def estimate(self, symbol: str, side: Side | str) -> MarkoutEstimate:
         normalized_symbol = _symbol(symbol)
         parsed_side = _side(side)
-        candidates = []
-        total_samples = 0
-        for horizon_ms in self.horizons_ms:
-            moments = self._moments[(normalized_symbol, parsed_side, horizon_ms)]
-            total_samples = max(total_samples, moments.count)
-            if moments.count < self.min_samples:
-                continue
-            standard_error = moments.standard_error
-            uncertainty = (
-                self.confidence_z * standard_error
-                if math.isfinite(standard_error)
-                else 0.0
-            )
-            adverse_cost = max(0.0, -moments.mean + uncertainty)
-            candidates.append((adverse_cost, horizon_ms, moments))
-        if not candidates:
-            return MarkoutEstimate(0.0, total_samples, None, None, None)
-        adverse_cost, horizon_ms, moments = max(candidates, key=lambda item: item[0])
-        standard_error = moments.standard_error
+        horizon_ms = self.cost_horizon_ms
+        adverse = self._adverse_moments[(normalized_symbol, parsed_side)]
+        signed = self._moments[(normalized_symbol, parsed_side, horizon_ms)]
+        if adverse.count < self.min_samples:
+            return MarkoutEstimate(0.0, adverse.count, None, None, None)
+        standard_error = adverse.standard_error
+        finite_error = math.isfinite(standard_error)
+        shrunk_mean = adverse.mean * adverse.count / (
+            adverse.count + self.prior_samples
+        )
+        uncertainty = self.confidence_z * standard_error if finite_error else 0.0
         return MarkoutEstimate(
-            adverse_cost_bps=adverse_cost,
-            sample_count=moments.count,
+            adverse_cost_bps=max(0.0, shrunk_mean + uncertainty),
+            sample_count=adverse.count,
             horizon_ms=horizon_ms,
-            mean_signed_markout_bps=moments.mean,
-            standard_error_bps=(
-                standard_error if math.isfinite(standard_error) else None
-            ),
+            mean_signed_markout_bps=signed.mean if signed.count else None,
+            standard_error_bps=standard_error if finite_error else None,
+            mean_residual_adverse_bps=adverse.mean,
         )
 
     def summary(self, symbol: str) -> dict[str, object]:
@@ -315,6 +368,7 @@ class FillMarkoutEstimator:
                 "selected_horizon_ms": estimate.horizon_ms,
                 "sample_count": estimate.sample_count,
                 "mean_signed_markout_bps": estimate.mean_signed_markout_bps,
+                "mean_residual_adverse_bps": estimate.mean_residual_adverse_bps,
                 "standard_error_bps": estimate.standard_error_bps,
                 "horizons": {
                     str(horizon_ms): {

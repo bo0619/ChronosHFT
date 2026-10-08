@@ -171,9 +171,11 @@ def _markout_schema() -> ObjectSpec:
                 unique=True,
             ),
             "min_samples": POSITIVE_INT,
-            "confidence_z": POSITIVE,
+            "confidence_z": NONNEGATIVE,
             "max_pending": POSITIVE_INT,
             "window_size": POSITIVE_INT,
+            "cost_horizon_ms": POSITIVE_INT,
+            "prior_samples": NONNEGATIVE,
         }
     )
 
@@ -933,6 +935,7 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                                             exclusive_minimum=True,
                                         ),
                                         "max_tick_gap_sec": POSITIVE,
+                                        "sigma_sample_interval_s": POSITIVE,
                                     }
                                 ),
                                 "execution": _object(
@@ -1837,6 +1840,16 @@ def validate_composed_config(config: Mapping[str, object]) -> None:
         if isinstance(horizons, list) and horizons != sorted(horizons):
             violations.append(
                 f"strategy.{model_name}.adaptive.markout.horizons_ms must be sorted"
+            )
+        cost_horizon = markout.get("cost_horizon_ms")
+        if (
+            cost_horizon is not None
+            and isinstance(horizons, list)
+            and cost_horizon not in horizons
+        ):
+            violations.append(
+                f"strategy.{model_name}.adaptive.markout.cost_horizon_ms "
+                "must be one of horizons_ms"
             )
         sizing = _mapping(adaptive.get("size_optimization"))
         candidates = sizing.get("candidate_multipliers")

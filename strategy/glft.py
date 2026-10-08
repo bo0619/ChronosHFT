@@ -417,9 +417,11 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
         self.adaptive_markout = FillMarkoutEstimator(
             horizons_ms=markout_config.get("horizons_ms", (100, 500, 1000)),
             min_samples=markout_config.get("min_samples", 20),
-            confidence_z=markout_config.get("confidence_z", 1.645),
+            confidence_z=markout_config.get("confidence_z", 0.0),
             max_pending=markout_config.get("max_pending", 5000),
             window_size=markout_config.get("window_size", 500),
+            cost_horizon_ms=markout_config.get("cost_horizon_ms"),
+            prior_samples=markout_config.get("prior_samples"),
         )
         flow_config = self._config_mapping(
             self.adaptive_config.get("flow_toxicity", {}),
@@ -1529,10 +1531,13 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
             symbol,
             now,
         )
-        orderflow_imbalance = abs(signed_orderflow_imbalance)
-        gamma *= 1.0 + 3.0 * orderflow_imbalance
+        # With adaptive costs on, order-flow toxicity is priced per side by
+        # the flow cost and post-fill drift by the markout cost; scaling
+        # gamma as well would charge the same risk twice.
+        if not (self.adaptive_enabled and self.adaptive_flow_toxicity_enabled):
+            gamma *= 1.0 + 3.0 * abs(signed_orderflow_imbalance)
         recent_fill_defense = now - self.last_fill_time[symbol] < 2.0
-        if recent_fill_defense:
+        if recent_fill_defense and not self.adaptive_enabled:
             gamma *= 1.5
 
         sigma = max(0.1, float(calibrator.sigma_bps))
@@ -1606,15 +1611,22 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
                     bid_markout_cost_bps=bid_markout.adverse_cost_bps,
                     ask_markout_cost_bps=ask_markout.adverse_cost_bps,
                     bid_queue_cost_bps=(
-                        bid_queue_estimate.latency_cost_bps
+                        0.0 if bid_markout.horizon_ms is not None
+                        else bid_queue_estimate.latency_cost_bps
                     ),
                     ask_queue_cost_bps=(
-                        ask_queue_estimate.latency_cost_bps
+                        0.0 if ask_markout.horizon_ms is not None
+                        else ask_queue_estimate.latency_cost_bps
                     ),
                     bid_flow_cost_bps=bid_flow_cost,
                     ask_flow_cost_bps=ask_flow_cost,
                 )
             ).as_formula_context()
+            # Markout charges only drift the flow cost did not predict, and
+            # once it is ready it replaces the queue pick-off proxy above.
+            self.adaptive_markout.set_expected_costs(
+                symbol, bid_flow_cost, ask_flow_cost
+            )
             adaptive_runtime = {
                 "enabled": True,
                 "hawkes": self.adaptive_hawkes.summary(symbol, now),

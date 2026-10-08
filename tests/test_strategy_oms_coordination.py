@@ -562,6 +562,7 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
             min_samples=2,
             confidence_z=0.0,
             window_size=2,
+            prior_samples=0.0,
         )
         for index, future_mid in enumerate((101.0, 101.0, 99.0, 99.0)):
             timestamp = float(index)
@@ -570,6 +571,7 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
                 side=Side.BUY,
                 fill_price=100.0,
                 observed_at_monotonic=timestamp,
+                reference_mid=100.0,
             )
             estimator.observe_mid(
                 symbol="LTCUSDT",
@@ -582,6 +584,47 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
         self.assertEqual(estimate.sample_count, 2)
         self.assertAlmostEqual(estimate.adverse_cost_bps, expected)
         self.assertEqual(estimator.summary("LTCUSDT")["window_size"], 2)
+
+    def test_glft_markout_cost_excludes_captured_depth_and_flow_cost(self):
+        estimator = FillMarkoutEstimator(
+            horizons_ms=(100, 1000),
+            min_samples=2,
+            window_size=10,
+            prior_samples=2.0,
+        )
+        estimator.set_expected_costs("LTCUSDT", 1.0, 0.0)
+        for index in range(2):
+            timestamp = float(index * 10)
+            estimator.observe_mid(
+                symbol="LTCUSDT",
+                mid_price=100.0,
+                observed_at_monotonic=timestamp,
+            )
+            # Bought 5 bps under mid; mid then falls 4 bps.
+            estimator.record_fill(
+                symbol="LTCUSDT",
+                side=Side.BUY,
+                fill_price=99.95,
+                observed_at_monotonic=timestamp,
+            )
+            estimator.observe_mid(
+                symbol="LTCUSDT",
+                mid_price=99.96,
+                observed_at_monotonic=timestamp + 1.0,
+            )
+
+        estimate = estimator.estimate("LTCUSDT", Side.BUY)
+        adverse_move = -math.log(99.96 / 100.0) * 10_000.0
+        self.assertEqual(estimate.horizon_ms, 1000)
+        self.assertGreater(estimate.mean_signed_markout_bps, 0.0)
+        self.assertAlmostEqual(
+            estimate.mean_residual_adverse_bps,
+            adverse_move - 1.0,
+        )
+        self.assertAlmostEqual(
+            estimate.adverse_cost_bps,
+            (adverse_move - 1.0) * 2.0 / 4.0,
+        )
 
     def test_glft_persists_resolved_markout_with_fill_identity(self):
         oms = PassiveQuoteOMS()
@@ -810,7 +853,10 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
         ):
             for expected_source, first_book, second_book, local_times, dt in cases:
                 with self.subTest(source=expected_source):
-                    calibrator = GLFTCalibrator(window=20)
+                    calibrator = GLFTCalibrator(
+                        window=20,
+                        config={"sigma_sample_interval_s": 0.25},
+                    )
                     with patch(
                         "alpha.factors.time.perf_counter",
                         side_effect=local_times,
@@ -837,6 +883,7 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
                 "strategy": {
                     "calibrator": {
                         "max_tick_gap_sec": 1.0,
+                        "sigma_sample_interval_s": 0.25,
                     }
                 }
             },

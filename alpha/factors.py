@@ -52,6 +52,12 @@ class GLFTCalibrator:
 
         # [FIX-SIGMA] 异常 tick 过滤：超过此间隔视为断线重连，丢弃该 tick
         self.max_tick_gap: float = cfg.get("max_tick_gap_sec", 2.0)
+        # 收益按固定间隔采样。逐 tick 计算 r/sqrt(dt) 时，离散化和 bounce
+        # 噪声的方差会按 1/dt 放大，事件越密 sigma 偏得越高。
+        self.sample_interval: float = max(
+            1e-3,
+            float(cfg.get("sigma_sample_interval_s", 1.0) or 1.0),
+        )
         self.min_samples: int = max(
             2,
             min(
@@ -68,6 +74,9 @@ class GLFTCalibrator:
         self.last_tick_source: str = ""
         self.last_tick_monotonic: float = 0.0
         self._has_tick_reference: bool = False
+        # 上一个采样点（与 last_tick_* 同一时钟域）
+        self._sample_mid: float = 0.0
+        self._sample_time: float = 0.0
 
     @property
     def volatility_sample_count(self) -> int:
@@ -114,6 +123,10 @@ class GLFTCalibrator:
         self.last_tick_monotonic = now_monotonic
         self._has_tick_reference = True
 
+    def _rebase_sample(self, mid: float, tick_time: float) -> None:
+        self._sample_mid = mid
+        self._sample_time = tick_time
+
     def _append_return_buffer(self, value: float) -> None:
         if self._return_end == len(self._return_buffer):
             keep = self.window - 1
@@ -123,6 +136,26 @@ class GLFTCalibrator:
             self._return_end = keep
         self._return_buffer[self._return_end] = value
         self._return_end += 1
+
+    def _update_sigma(self) -> None:
+        # 收集足够样本后才开始估计 sigma
+        if len(self.norm_returns) < self.min_samples:
+            return
+        # std(norm_returns) 的单位是 bps/sqrt(sec)
+        raw_std = float(
+            np.std(
+                self._return_buffer[
+                    self._return_end - len(self.norm_returns):self._return_end
+                ]
+            )
+        )
+        # EMA 平滑，防止突变
+        self.sigma_bps = (
+            (1.0 - self.ema_alpha) * self.sigma_bps
+            + self.ema_alpha * raw_std
+        )
+        self.sigma_bps = min(self.sigma_bps, self.sigma_max)
+        self.sigma_bps = max(self.sigma_bps, 0.1)  # 下限保护
 
     def on_orderbook(self, ob: OrderBook):
         bid, _ = ob.get_best_bid()
@@ -139,13 +172,16 @@ class GLFTCalibrator:
         now_monotonic = time.perf_counter()
         clock_source, tick_time = self._clock_sample(ob, now_monotonic)
 
-        if self.last_mid > 0 and self._has_tick_reference:
+        if not (self.last_mid > 0 and self._has_tick_reference):
+            self._rebase_sample(mid, tick_time)
+        else:
             if clock_source == self.last_tick_source:
                 dt = tick_time - self.last_tick_time
             else:
                 # Clock domains cannot be subtracted from one another.  A
                 # source transition therefore uses local monotonic arrival
-                # time for exactly this interval.
+                # time for exactly this interval, and the sampling anchor
+                # moves to the new domain.
                 dt = now_monotonic - self.last_tick_monotonic
 
             # Duplicate/out-of-order events must not advance the price or time
@@ -155,7 +191,8 @@ class GLFTCalibrator:
 
             # A reconnect/pause gap is not a volatility sample.  Rebase so the
             # next valid event starts a fresh interval.
-            if dt > self.max_tick_gap:
+            if dt > self.max_tick_gap or clock_source != self.last_tick_source:
+                self._rebase_sample(mid, tick_time)
                 self._set_tick_reference(
                     mid=mid,
                     clock_source=clock_source,
@@ -164,34 +201,16 @@ class GLFTCalibrator:
                 )
                 return
 
-            # [FIX-SIGMA] 时间归一化回报：ret_normalized 的方差 ≈ sigma²（每秒）
-            # ret_bps 除以 sqrt(dt) 使不同 tick 间隔的样本具有可比性
-            if dt > 1e-4:  # 防止 dt=0 时除零
-                ret_bps = math.log(mid / self.last_mid) * 10_000.0
-                ret_normalized = ret_bps / math.sqrt(dt)
+            elapsed = tick_time - self._sample_time
+            if elapsed >= self.sample_interval:
+                # [FIX-SIGMA] 时间归一化回报：ret_normalized 的方差 ≈ sigma²（每秒）
+                ret_bps = math.log(mid / self._sample_mid) * 10_000.0
+                ret_normalized = ret_bps / math.sqrt(elapsed)
+                self._rebase_sample(mid, tick_time)
                 if math.isfinite(ret_normalized):
                     self.norm_returns.append(ret_normalized)
                     self._append_return_buffer(ret_normalized)
-
-            # 收集足够样本后才开始估计 sigma
-            if len(self.norm_returns) >= self.min_samples:
-                # std(norm_returns) 的单位是 bps/sqrt(sec)
-                # sigma_bps 表示 1 秒内的价格标准差（bps），直接等于 std
-                raw_std = float(
-                    np.std(
-                        self._return_buffer[
-                            self._return_end - len(self.norm_returns):self._return_end
-                        ]
-                    )
-                )
-
-                # EMA 平滑，防止突变
-                self.sigma_bps = (
-                    (1.0 - self.ema_alpha) * self.sigma_bps
-                    + self.ema_alpha       * raw_std
-                )
-                self.sigma_bps = min(self.sigma_bps, self.sigma_max)
-                self.sigma_bps = max(self.sigma_bps, 0.1)  # 下限保护
+                    self._update_sigma()
 
         self._set_tick_reference(
             mid=mid,
