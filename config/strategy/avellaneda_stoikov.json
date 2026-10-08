@@ -37,9 +37,11 @@
         "markout": {
           "horizons_ms": [100, 500, 1000],
           "min_samples": 12,
-          "confidence_z": 1.645,
+          "confidence_z": 0.0,
           "max_pending": 5000,
-          "window_size": 200
+          "window_size": 200,
+          "cost_horizon_ms": 1000,
+          "prior_samples": 12
         },
         "flow_toxicity": {
           "enabled": true,
