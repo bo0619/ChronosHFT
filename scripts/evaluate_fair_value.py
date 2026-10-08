@@ -88,6 +88,14 @@ def parse_args(argv=None):
     )
     parser.add_argument("--latency-ms", type=float, default=50.0)
     parser.add_argument(
+        "--depth-lag-ms",
+        default="auto",
+        help=(
+            "How far depth timestamps (local receive time) trail trade timestamps "
+            "(exchange time); 'auto' estimates it per symbol from trade flow"
+        ),
+    )
+    parser.add_argument(
         "--fill-rule",
         choices=("touch", "through"),
         default="touch",
@@ -466,11 +474,50 @@ def half_spreads(args):
     return [float(v) for v in str(args.quote_half_spread_bps).split(",") if v.strip()]
 
 
+def estimate_depth_lag_ms(depth, trades, step_ms=50, max_lag_ms=3000):
+    """Lag at which signed trade flow best lines up with later mid changes."""
+    depth_ts = depth["ts"].to_numpy("datetime64[ns]").astype(np.int64)
+    trade_ts = trades["ts"].to_numpy("datetime64[ns]").astype(np.int64)
+    step = int(step_ms * 1e6)
+    start = max(depth_ts[0], trade_ts[0])
+    end = min(depth_ts[-1], trade_ts[-1])
+    if end - start < 1000 * step:
+        return 0.0
+    bins = np.arange(start, end, step)
+    index = np.searchsorted(depth_ts, bins, side="right") - 1
+    mid = 0.5 * (depth["bid1_p"].to_numpy() + depth["ask1_p"].to_numpy())
+    move = np.sign(np.diff(mid[index]))
+    fresh = (bins - depth_ts[index]) <= 5e9
+    fresh = fresh[1:] & fresh[:-1]
+    flow = np.zeros(len(bins) - 1)
+    trade_bin = (trade_ts - start) // step
+    inside = (trade_bin >= 0) & (trade_bin < len(flow))
+    signed = trades["aggressor"].to_numpy() * trades["qty"].to_numpy()
+    np.add.at(flow, trade_bin[inside], signed[inside])
+    best_lag, best_corr = 0, -np.inf
+    for lag in range(max_lag_ms // step_ms + 1):
+        size = len(flow) - lag
+        ok = fresh[:size] & fresh[lag:]
+        a, b = flow[:size][ok], move[lag:][ok]
+        if a.std() == 0 or b.std() == 0:
+            continue
+        corr = float(np.corrcoef(a, b)[0, 1])
+        if corr > best_corr:
+            best_lag, best_corr = lag, corr
+    return float(best_lag * step_ms)
+
+
 def evaluate_symbol(symbol, files, args, horizons):
     depth = load_depth(files["depth"])
     if len(depth) < 100:
         return None, f"{symbol}: too few depth rows ({len(depth)})"
     trades = load_trades(files["trade"]) if files["trade"] else pd.DataFrame()
+    if args.depth_lag_ms == "auto":
+        depth_lag_ms = estimate_depth_lag_ms(depth, trades) if not trades.empty else 0.0
+    else:
+        depth_lag_ms = float(args.depth_lag_ms)
+    # Put the book on the trades' exchange clock.
+    depth["ts"] = depth["ts"] - pd.Timedelta(milliseconds=depth_lag_ms)
     tick = infer_tick(depth)
     book = book_features(depth, args.level_decay)
     grid = build_grid(book, args.grid_ms, args.gap_sec)
@@ -493,6 +540,7 @@ def evaluate_symbol(symbol, files, args, horizons):
         "depth_rows": len(depth),
         "trades": len(trades),
         "tick": tick,
+        "depth_lag_ms": depth_lag_ms,
         "median_spread_bps": float(np.median(book["spread"] / book["mid"]) * BPS),
         "active_hours": float(live.sum() * args.grid_ms / 3.6e6),
         "updates_per_sec": len(depth) / max(live.sum() * args.grid_ms / 1e3, 1.0),
@@ -593,6 +641,7 @@ def render_report(results, horizons, args, skipped):
             info,
             [
                 "symbol",
+                "depth_lag_ms",
                 "active_hours",
                 "depth_rows",
                 "trades",
