@@ -60,6 +60,21 @@ def _apply_process_niceness(requested_niceness: int) -> tuple[int | None, str]:
     return None, "unsupported_platform"
 
 
+def _timestamp_columns(event_data) -> dict:
+    """Keep venue and arrival clocks so replays can use true arrival order.
+
+    Depth ``datetime`` is local receipt time while trade ``datetime`` is the
+    venue trade time, so the two streams cannot be aligned from it alone.
+    """
+    return {
+        "exchange_ts": float(getattr(event_data, "exchange_timestamp", 0.0) or 0.0),
+        "received_ts": float(getattr(event_data, "received_timestamp", 0.0) or 0.0),
+        "corrected_received_ts": float(
+            getattr(event_data, "corrected_received_timestamp", 0.0) or 0.0
+        ),
+    }
+
+
 def _put_writer_status(status_queue, payload: dict) -> None:
     try:
         status_queue.put_nowait(dict(payload))
@@ -94,7 +109,9 @@ def _flush_hdf_buffer(
                 f"reserve={min_free_bytes}"
             )
     today = datetime.now(timezone.utc).strftime("%Y%m%d")
-    filename = Path(save_path) / f"{symbol}_{data_type}_{today}.h5"
+    # v2 rows carry exchange/arrival timestamps; a new file name keeps
+    # appends from colliding with same-day files written by older versions.
+    filename = Path(save_path) / f"{symbol}_{data_type}_{today}_v2.h5"
     frame = pd.DataFrame(batch)
     write_options = {}
     if not filename.exists():
@@ -365,6 +382,7 @@ class DataRecorder:
         row = {
             "datetime": orderbook.datetime,
             "symbol": symbol,
+            **_timestamp_columns(orderbook),
         }
         for index in range(5):
             row[f"bid{index + 1}_p"] = bids[index][0]
@@ -389,6 +407,7 @@ class DataRecorder:
                     "price": trade.price,
                     "qty": trade.quantity,
                     "maker_is_buyer": trade.maker_is_buyer,
+                    **_timestamp_columns(trade),
                 },
             )
         )
