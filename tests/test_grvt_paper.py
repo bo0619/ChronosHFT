@@ -25,7 +25,9 @@ from gateway.grvt.market_data import (
 from gateway.grvt.paper_gateway import GrvtPaperGateway
 from gateway.grvt.public_ws import STREAM_NAME, GrvtPublicWs
 from gateway.paper import paper_gateway_type
+from infrastructure.config_scaling import load_config_document
 from infrastructure.config_schema import validate_composed_config
+from infrastructure.venue import configured_venue
 from strategy.execution_mode import resolve_execution_mode
 from tests.test_lighter_paper import FakeSnapshotWs, FakeWsApp
 from tests.test_paper_gateway import SYMBOL as PAPER_SYMBOL
@@ -534,6 +536,14 @@ class GrvtVenueConfigTests(unittest.TestCase):
             "market",
         )
         self.assertEqual(resolve_execution_mode({}, "grvt"), "post_only")
+
+    def test_grvt_profile_quotes_post_only(self):
+        config = load_config_document("config.grvt.json")
+        self.assertEqual(configured_venue(config), "grvt")
+        self.assertEqual(
+            resolve_execution_mode(config["strategy"], "grvt"),
+            "post_only",
+        )
 
 
 if __name__ == "__main__":
