@@ -3,6 +3,8 @@ import pytest
 
 from alpha.signal import (
     MultiHorizonPredictor,
+    alpha_signal_report,
+    predict_usable,
     OnlineRidgePredictor,
     predictor_kwargs_from_config,
     usable_predictions,
@@ -104,3 +106,20 @@ def test_predictor_config_is_validated():
         predictor_kwargs_from_config({"ridge_lambda": 0.0})
     with pytest.raises(ValueError):
         predictor_kwargs_from_config({"min_oos_r2": 1.0})
+
+
+def test_signal_report_keeps_raw_prediction_while_gate_zeroes_it():
+    predictor = MultiHorizonPredictor(
+        num_features=1,
+        horizons={"short": 1},
+        min_oos_samples=1_000,
+    )
+    used = {}
+    for index in range(5):
+        used = predict_usable(predictor, [float(index)], 100.0 + index, float(index))
+
+    report = alpha_signal_report(predictor, used)["short"]
+    assert used == {"short": 0.0}
+    assert report["used_bps"] == 0.0
+    assert report["prediction_bps"] == predictor.last_predictions["short"]
+    assert report["ready"] is False

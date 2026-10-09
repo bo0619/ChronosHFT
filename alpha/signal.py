@@ -202,6 +202,7 @@ class MultiHorizonPredictor:
         self.scores = {h: PrequentialScore(oos_half_life) for h in self.horizons}
         # 历史缓冲区: (timestamp, mid_price, 特征, 当时的预测)
         self.history_buffer = deque(maxlen=max(self.horizons.values()) + 1)
+        self.last_predictions = {}
 
     @property
     def sample_count(self):
@@ -269,6 +270,7 @@ class MultiHorizonPredictor:
         for name, model in self.models.items():
             results[name] = model.predict(z)
         entry["preds"] = dict(results)
+        self.last_predictions = entry["preds"]
 
         return results
 
@@ -299,13 +301,35 @@ def predictor_kwargs_from_config(config):
     return kwargs
 
 
-def predictor_from_config(config, num_features=9):
+def predictor_from_config(alpha_config, num_features=9):
     """Validated factory for per-symbol MultiHorizonPredictor instances."""
+    config = (
+        alpha_config.get("predictor", {}) if isinstance(alpha_config, dict) else {}
+    )
     return functools.partial(
         MultiHorizonPredictor,
         num_features,
         **predictor_kwargs_from_config(config),
     )
+
+
+def predict_usable(model, features, mid, timestamp):
+    """Train/predict one cycle and zero horizons that have not passed the OOS gate."""
+    predictions = model.update_and_predict(features, mid, timestamp)
+    return usable_predictions(model, predictions)
+
+
+def alpha_signal_report(model, predictions):
+    """Per-horizon telemetry: raw prediction plus live out-of-sample stats."""
+    oos_report = getattr(model, "oos_report", None)
+    if oos_report is None:
+        return {name: float(value) for name, value in predictions.items()}
+    raw = getattr(model, "last_predictions", None) or predictions
+    report = oos_report()
+    for name, stats in report.items():
+        stats["prediction_bps"] = float(raw.get(name, 0.0))
+        stats["used_bps"] = float(predictions.get(name, 0.0))
+    return report
 
 
 def usable_predictions(model, predictions):

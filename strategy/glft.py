@@ -26,7 +26,7 @@ from alpha.rpi_intensity import (
     RPIOrderExposure,
     estimate_rpi_intensity,
 )
-from alpha.signal import predictor_from_config, usable_predictions
+from alpha.signal import alpha_signal_report, predict_usable, predictor_from_config
 from event.type import (
     EVENT_STRATEGY_UPDATE,
     TIF_RPI,
@@ -336,9 +336,7 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
                 "alpha.long_pos_weight",
             ),
         }
-        self.alpha_predictor_factory = predictor_from_config(
-            self.alpha_config.get("predictor", {})
-        )
+        self.alpha_predictor_factory = predictor_from_config(self.alpha_config)
         raw_portfolio_config = self.glft_conf.get("portfolio_risk", {})
         self.portfolio_risk_config = (
             dict(raw_portfolio_config)
@@ -1410,7 +1408,7 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
         self.last_run_times[symbol] = now
 
         features = self.feature_engine.get_features(symbol)
-        alphas = model.update_and_predict(features, mid, now)
+        alphas = predict_usable(model, features, mid, now)
         predictor_samples = int(max(0, getattr(model, "sample_count", 0)))
         approved_intensity = self._approved_rpi_intensity(symbol)
         runtime_intensity = self._runtime_rpi_intensity(symbol)
@@ -1482,13 +1480,12 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
             current_pos_usdt - target_pos_usdt
         ) / inventory_lot_notional
         if self.alpha_enabled:
-            usable_alphas = usable_predictions(model, alphas)
             short_signal = gate.process(
-                usable_alphas["short"],
+                alphas["short"],
                 preliminary_inventory_lots,
             )
             target_pos_usdt += (
-                usable_alphas["long"] * self.alpha_weights["long_pos_weight"]
+                alphas["long"] * self.alpha_weights["long_pos_weight"]
             )
             target_position_limit = (
                 self.max_pos_usdt if self.max_pos_usdt > 0.0 else 2_000.0
@@ -1876,10 +1873,7 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
             "orderflow_imbalance": signed_orderflow_imbalance,
             "recent_fill_defense": recent_fill_defense,
             "readiness": readiness.as_params(),
-            "signals": {
-                horizon: float(value) for horizon, value in alphas.items()
-            },
-            "alpha_oos": getattr(model, "oos_report", dict)(),
+            "signals": alpha_signal_report(model, alphas),
             "short_signal_bps": short_signal,
             "target_position_notional": target_pos_usdt,
             "effective_position_notional": effective_pos_usdt,
