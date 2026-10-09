@@ -18,6 +18,8 @@
     "command_queue_size": 4096,
     "max_order_history": 10000,
     "max_trade_history": 20000,
-    "_comment_fees": "Lighter Standard accounts pay 0 maker / 0 taker (with a 200ms maker / 300ms taker speed bump that Paper does not model). Premium accounts pay fees; set them here."
+    "maker_order_delay_ms": 200,
+    "taker_order_delay_ms": 300,
+    "_comment_fees": "Lighter Standard accounts pay 0 maker / 0 taker but every order waits in a speed bump before matching: 200ms for maker orders, 300ms for taker orders. Premium accounts pay fees with a shorter speed bump; set both here."
   }
 }

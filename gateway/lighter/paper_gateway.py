@@ -12,11 +12,16 @@ from __future__ import annotations
 import time
 
 from data.ref_data import ref_data_manager
+from event.type import TIF_FOK, TIF_GTX, TIF_IOC, TIF_RPI, OrderRequest
 from gateway.binance.paper_gateway import BinancePaperGateway
 from infrastructure.logger import logger
 from infrastructure.time_service import time_service
 
 from .public_ws import LighterPublicWs
+
+# Lighter Standard accounts hold orders in a speed bump before matching.
+DEFAULT_MAKER_ORDER_DELAY_MS = 200.0
+DEFAULT_TAKER_ORDER_DELAY_MS = 300.0
 
 
 class _LighterSnapshotSource:
@@ -63,6 +68,80 @@ class LighterPaperGateway(BinancePaperGateway):
         super().__init__(event_engine, config, market_data_config)
         self.gateway_name = "LIGHTER_PAPER"
         self.rest = _LighterSnapshotSource(self)
+        self.maker_order_delay_sec = self._finite_nonnegative(
+            self.paper_config.get(
+                "maker_order_delay_ms",
+                DEFAULT_MAKER_ORDER_DELAY_MS,
+            ),
+            DEFAULT_MAKER_ORDER_DELAY_MS,
+        ) / 1000.0
+        self.taker_order_delay_sec = self._finite_nonnegative(
+            self.paper_config.get(
+                "taker_order_delay_ms",
+                DEFAULT_TAKER_ORDER_DELAY_MS,
+            ),
+            DEFAULT_TAKER_ORDER_DELAY_MS,
+        ) / 1000.0
+        # client_oid -> perf_counter() at which the order reaches matching.
+        self._delayed_commits: dict[str, float] = {}
+
+    # Speed bump --------------------------------------------------------
+
+    def _order_delay_sec(self, request: OrderRequest) -> float:
+        if request.order_type == "MARKET" or request.time_in_force in {
+            TIF_IOC,
+            TIF_FOK,
+        }:
+            return self.taker_order_delay_sec
+        if request.time_in_force in {TIF_GTX, TIF_RPI}:
+            return self.maker_order_delay_sec
+        book = self._venue_state.books.get(request.symbol)
+        if book is not None and book.bids and book.asks and self._would_cross(
+            request,
+            float(book.get_best_bid()[0]),
+            float(book.get_best_ask()[0]),
+        ):
+            return self.taker_order_delay_sec
+        return self.maker_order_delay_sec
+
+    def _commit_staged_order(self, client_oid: str):
+        """Hold a committed order until its speed bump has elapsed.
+
+        The order stays STAGED meanwhile, so a cancel issued during the delay
+        uses the existing deferred-cancel path, and the parent commit then
+        revalidates (post-only would-cross) and matches against the book as
+        it is when the order actually reaches the venue.
+        """
+        client_oid = str(client_oid or "")
+        order = self._venue_state.orders.get(client_oid)
+        if order is None or order.status != "STAGED":
+            return super()._commit_staged_order(client_oid)
+        if client_oid in self._delayed_commits:
+            return True
+        delay_sec = self._order_delay_sec(order.request)
+        if delay_sec <= 0.0:
+            return super()._commit_staged_order(client_oid)
+        self._delayed_commits[client_oid] = time.perf_counter() + delay_sec
+        return True
+
+    def _check_dms_deadlines(self):
+        self._release_delayed_commits()
+        super()._check_dms_deadlines()
+
+    def _release_delayed_commits(self) -> None:
+        if not self._delayed_commits:
+            return
+        now = time.perf_counter()
+        due = sorted(
+            (
+                (release_at, client_oid)
+                for client_oid, release_at in self._delayed_commits.items()
+                if release_at <= now
+            ),
+        )
+        for _release_at, client_oid in due:
+            self._delayed_commits.pop(client_oid, None)
+            super()._commit_staged_order(client_oid)
 
     def _market_ids(self) -> dict[str, int]:
         market_ids = {}

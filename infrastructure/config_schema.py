@@ -622,7 +622,10 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                         "command_queue_size": POSITIVE_INT,
                         "max_order_history": POSITIVE_INT,
                         "max_trade_history": POSITIVE_INT,
-                    }
+                        "maker_order_delay_ms": NONNEGATIVE,
+                        "taker_order_delay_ms": NONNEGATIVE,
+                    },
+                    optional=("maker_order_delay_ms", "taker_order_delay_ms"),
                 )
             }
         )

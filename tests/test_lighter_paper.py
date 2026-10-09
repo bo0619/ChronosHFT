@@ -10,9 +10,15 @@ from data.ref_data import (
 )
 from event.type import (
     EVENT_AGG_TRADE,
+    EVENT_EXCHANGE_ORDER_UPDATE,
     EVENT_MARK_PRICE,
     EVENT_ORDERBOOK,
+    TIF_GTC,
     TIF_GTX,
+    TIF_IOC,
+    CancelRequest,
+    GatewayState,
+    OrderRequest,
 )
 from gateway.lighter.market_data import (
     LighterMarketTranslator,
@@ -26,10 +32,14 @@ from gateway.paper import paper_gateway_type
 from infrastructure.config_schema import validate_composed_config
 from infrastructure.venue import configured_venue
 from strategy.execution_mode import resolve_execution_mode
+from tests.test_paper_gateway import SYMBOL as PAPER_SYMBOL
 from tests.test_paper_gateway import (
     DispatchingEngine,
     DummyPublicSession,
+    make_book,
+    make_contract,
     make_gateway_config,
+    wait_until,
 )
 from tests.test_strategy_oms_coordination import (
     GLFTStrategy,
@@ -427,6 +437,134 @@ class LighterPaperGatewayTests(unittest.TestCase):
             e.data for e in self.engine.events if e.type == EVENT_ORDERBOOK
         ]
         self.assertEqual(len(books), published)
+
+
+class LighterSpeedBumpTests(unittest.TestCase):
+    """Standard accounts: maker orders wait 200ms, taker orders 300ms."""
+
+    MAKER_MS = 100.0
+    TAKER_MS = 200.0
+
+    def setUp(self):
+        self.session_patch = patch(
+            "gateway.binance.paper_gateway.requests.Session",
+            side_effect=DummyPublicSession,
+        )
+        self.session_patch.start()
+        self.contract_patch = patch(
+            "gateway.binance.paper_gateway.ref_data_manager.get_info",
+            return_value=make_contract(),
+        )
+        self.contract_patch.start()
+        self.engine = DispatchingEngine()
+        config = make_gateway_config()
+        config["execution"]["venue"] = "lighter"
+        config["paper_trade"]["maker_order_delay_ms"] = self.MAKER_MS
+        config["paper_trade"]["taker_order_delay_ms"] = self.TAKER_MS
+        gateway = LighterPaperGateway(self.engine, config)
+        gateway._start_worker()
+        gateway.active = True
+        gateway._accepting_orders = True
+        gateway.state = GatewayState.READY
+        self.gateway = gateway
+        self.set_book(make_book())
+
+    def tearDown(self):
+        try:
+            if self.gateway._worker_running:
+                self.gateway.close()
+        finally:
+            self.contract_patch.stop()
+            self.session_patch.stop()
+
+    def set_book(self, book):
+        self.gateway._call_worker(
+            "book",
+            (self.gateway._book_feed_state.generation, book),
+        )
+
+    def statuses(self, client_oid):
+        return [
+            event.data.status
+            for event in self.engine.events
+            if event.type == EVENT_EXCHANGE_ORDER_UPDATE
+            and event.data.client_oid == client_oid
+        ]
+
+    def submit(self, client_oid, **fields):
+        request = OrderRequest(symbol=PAPER_SYMBOL, volume=0.1, **fields)
+        self.gateway.send_order(request, client_oid)
+        started = time.perf_counter()
+        self.assertTrue(self.gateway.commit_order_submission(client_oid))
+        return started
+
+    def test_defaults_match_lighter_standard_accounts(self):
+        gateway = LighterPaperGateway(self.engine, make_gateway_config())
+        self.assertAlmostEqual(gateway.maker_order_delay_sec, 0.2)
+        self.assertAlmostEqual(gateway.taker_order_delay_sec, 0.3)
+
+    def test_classifies_maker_and_taker_orders(self):
+        delay = self.gateway._order_delay_sec
+        maker = self.MAKER_MS / 1000.0
+        taker = self.TAKER_MS / 1000.0
+        cases = [
+            (dict(price=100.0, side="BUY", time_in_force=TIF_GTX), maker),
+            (dict(price=101.0, side="BUY", order_type="MARKET"), taker),
+            (dict(price=101.0, side="BUY", time_in_force=TIF_IOC), taker),
+            # A GTC limit is a taker only when it crosses the touch.
+            (dict(price=100.0, side="BUY", time_in_force=TIF_GTC), maker),
+            (dict(price=101.0, side="BUY", time_in_force=TIF_GTC), taker),
+        ]
+        for fields, expected in cases:
+            request = OrderRequest(symbol=PAPER_SYMBOL, volume=0.1, **fields)
+            self.assertAlmostEqual(delay(request), expected, msg=fields)
+
+    def test_maker_order_rests_only_after_the_delay(self):
+        started = self.submit(
+            "maker", price=100.0, side="BUY", time_in_force=TIF_GTX
+        )
+        self.assertEqual(self.statuses("maker"), [])
+        self.assertEqual(self.gateway.get_order(PAPER_SYMBOL, "maker")["status"], "STAGED")
+        self.assertTrue(wait_until(lambda: self.statuses("maker"), timeout=2.0))
+        self.assertGreaterEqual(
+            time.perf_counter() - started,
+            self.MAKER_MS / 1000.0,
+        )
+        self.assertEqual(self.statuses("maker"), ["NEW"])
+
+    def test_market_order_fills_against_the_book_after_the_delay(self):
+        started = self.submit(
+            "taker", price=101.0, side="BUY", order_type="MARKET"
+        )
+        # The ask moves up while the order sits in the speed bump.
+        self.set_book(make_book(bid_price=101.0, ask_price=102.0))
+        self.assertEqual(self.statuses("taker"), [])
+        self.assertTrue(
+            wait_until(lambda: "FILLED" in self.statuses("taker"), timeout=2.0)
+        )
+        self.assertGreaterEqual(
+            time.perf_counter() - started,
+            self.TAKER_MS / 1000.0,
+        )
+        trade = self.gateway.get_user_trades(PAPER_SYMBOL)[0]
+        self.assertAlmostEqual(float(trade["price"]), 102.0)
+
+    def test_post_only_that_becomes_marketable_during_delay_is_rejected(self):
+        self.submit("gtx", price=100.0, side="BUY", time_in_force=TIF_GTX)
+        self.set_book(make_book(bid_price=99.0, ask_price=100.0))
+        self.assertTrue(wait_until(lambda: self.statuses("gtx"), timeout=2.0))
+        self.assertEqual(self.statuses("gtx"), ["REJECTED"])
+
+    def test_cancel_during_delay_never_reaches_the_book(self):
+        self.submit("early", price=100.0, side="BUY", time_in_force=TIF_GTX)
+        staged = self.gateway.get_order(PAPER_SYMBOL, "early")
+        cancel = self.gateway.cancel_order(
+            CancelRequest(PAPER_SYMBOL, staged["orderId"])
+        )
+        self.assertTrue(cancel.json()["_paperPendingCancel"])
+        self.assertTrue(wait_until(lambda: self.statuses("early"), timeout=2.0))
+        self.assertEqual(self.statuses("early"), ["CANCELED"])
+        self.assertEqual(self.gateway.get_open_orders(), [])
 
 
 class LighterVenueConfigTests(unittest.TestCase):
