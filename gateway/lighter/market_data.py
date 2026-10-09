@@ -95,6 +95,9 @@ class LighterMarketTranslator:
     market_symbols: Mapping[int, str]
     unknown_market_ids: set[int] = field(default_factory=set)
 
+    def reset(self) -> None:
+        """Lighter frames carry their own snapshot type; nothing to reset."""
+
     def translate(
         self,
         message: Mapping,

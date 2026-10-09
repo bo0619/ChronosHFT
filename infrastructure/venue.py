@@ -6,7 +6,8 @@ from collections.abc import Mapping
 
 VENUE_BINANCE = "binance"
 VENUE_LIGHTER = "lighter"
-SUPPORTED_VENUES = (VENUE_BINANCE, VENUE_LIGHTER)
+VENUE_GRVT = "grvt"
+SUPPORTED_VENUES = (VENUE_BINANCE, VENUE_LIGHTER, VENUE_GRVT)
 # Venues whose Live gateway exists; the rest are Paper-only for now.
 LIVE_VENUES = (VENUE_BINANCE,)
 
@@ -29,6 +30,7 @@ __all__ = [
     "LIVE_VENUES",
     "SUPPORTED_VENUES",
     "VENUE_BINANCE",
+    "VENUE_GRVT",
     "VENUE_LIGHTER",
     "configured_venue",
 ]

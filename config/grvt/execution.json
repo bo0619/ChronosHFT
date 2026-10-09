@@ -1,0 +1,10 @@
+{
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "execution",
+  "version": 1,
+  "execution": {
+    "_comment": "GRVT is Paper-only: public GRVT market data with the local Paper venue.",
+    "mode": "paper",
+    "venue": "grvt"
+  }
+}

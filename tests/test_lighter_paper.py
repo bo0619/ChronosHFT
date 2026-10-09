@@ -341,7 +341,7 @@ class LighterPaperGatewayTests(unittest.TestCase):
         translator = LighterMarketTranslator({0: SYMBOL})
         _, records = translator.translate(frame)
         for record in records:
-            self.gateway._on_lighter_record(
+            self.gateway._on_venue_record(
                 record.stream,
                 record.data,
                 expected_generation=self.generation,

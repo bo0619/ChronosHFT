@@ -556,7 +556,7 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                 "execution": _object(
                     {
                         "mode": _string(choices=("paper", "live")),
-                        "venue": _string(choices=("binance", "lighter")),
+                        "venue": _string(choices=("binance", "lighter", "grvt")),
                     },
                     optional=("venue",),
                 )
@@ -857,7 +857,7 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                         "rpi_live_policy": _object({"require_zero_commission": BOOL}),
                         "execution_modes": MappingSpec(
                             values=_string(choices=("post_only", "market")),
-                            key_pattern=r"^(binance|lighter)$",
+                            key_pattern=r"^(binance|lighter|grvt)$",
                         ),
                         "market_execution": _optional_object(
                             {

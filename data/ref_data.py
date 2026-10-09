@@ -38,6 +38,9 @@ class ContractInfo:
     # Venue-native market id for venues that address markets by integer
     # (Lighter). Binance contracts leave it unset.
     market_id: int | None = None
+    # Venue-native instrument name for venues that address markets by name
+    # (GRVT "ETH_USDT_Perp"). Binance contracts leave it unset.
+    venue_symbol: str | None = None
 
     @property
     def supports_rpi(self) -> bool:
@@ -89,6 +92,50 @@ def parse_lighter_order_book_details(payload) -> dict[str, ContractInfo]:
     return contracts
 
 
+GRVT_MARKET_DATA_URL_MAIN = "https://market-data.grvt.io"
+
+
+def _decimal_places(value: Decimal) -> int:
+    return max(0, -value.normalize().as_tuple().exponent)
+
+
+def parse_grvt_instruments(payload) -> dict[str, ContractInfo]:
+    """Build contracts from GRVT's ``/full/v1/all_instruments``.
+
+    Perpetuals only. ``ETH_USDT_Perp`` becomes the internal ``ETHUSDT``;
+    order sizes are multiples of ``min_size``.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("GRVT all_instruments payload must be an object")
+    instruments = payload.get("result")
+    if not isinstance(instruments, list):
+        raise ValueError("GRVT all_instruments has no result list")
+    contracts = {}
+    for item in instruments:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind", "") or "").upper() != "PERPETUAL":
+            continue
+        base = str(item["base"]).strip().upper()
+        quote = str(item["quote"]).strip().upper()
+        symbol = f"{base}{quote}"
+        tick = Decimal(str(item["tick_size"]))
+        size = Decimal(str(item["min_size"]))
+        if tick <= 0 or size <= 0:
+            raise ValueError(f"non-positive tick/min size for GRVT {symbol}")
+        contracts[symbol] = ContractInfo(
+            symbol=symbol,
+            tick_size=float(tick),
+            step_size=float(size),
+            min_qty=float(size),
+            min_notional=float(item.get("min_notional", 0.0) or 0.0),
+            price_precision=_decimal_places(tick),
+            qty_precision=_decimal_places(size),
+            venue_symbol=str(item["instrument"]),
+        )
+    return contracts
+
+
 class ReferenceDataManager:
     """
     合约参考数据管理器 (单例)
@@ -110,6 +157,9 @@ class ReferenceDataManager:
     def init(self, testnet=False, venue="binance"):
         if str(venue or "binance").lower() == "lighter":
             self.init_lighter()
+            return
+        if str(venue or "binance").lower() == "grvt":
+            self.init_grvt()
             return
         if testnet:
             self.base_url = "https://testnet.binancefuture.com"
@@ -178,6 +228,17 @@ class ReferenceDataManager:
         payload = requests.get(url, timeout=15).json()
         self.contracts.update(parse_lighter_order_book_details(payload))
         logger.info(f"Loaded {len(self.contracts)} Lighter contracts info.")
+
+    def init_grvt(self):
+        url = f"{GRVT_MARKET_DATA_URL_MAIN}/full/v1/all_instruments"
+        logger.info(f"RefData fetching: {url} ...")
+        payload = requests.post(
+            url,
+            json={"kind": ["PERPETUAL"], "is_active": True, "limit": 1000},
+            timeout=15,
+        ).json()
+        self.contracts.update(parse_grvt_instruments(payload))
+        logger.info(f"Loaded {len(self.contracts)} GRVT contracts info.")
 
     def symbol_for_market_id(self, market_id: int) -> str:
         for symbol, info in self.contracts.items():

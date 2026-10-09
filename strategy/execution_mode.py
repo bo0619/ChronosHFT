@@ -13,7 +13,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from event.type import Side
-from infrastructure.venue import SUPPORTED_VENUES, VENUE_BINANCE, VENUE_LIGHTER
+from infrastructure.venue import (
+    SUPPORTED_VENUES,
+    VENUE_BINANCE,
+    VENUE_GRVT,
+    VENUE_LIGHTER,
+)
 
 EXECUTION_MODE_POST_ONLY = "post_only"
 EXECUTION_MODE_MARKET = "market"
@@ -142,6 +147,7 @@ __all__ = [
     "MarketOrderDecision",
     "SUPPORTED_VENUES",
     "VENUE_BINANCE",
+    "VENUE_GRVT",
     "VENUE_LIGHTER",
     "decide_market_order",
     "resolve_execution_mode",
