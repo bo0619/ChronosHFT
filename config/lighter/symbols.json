@@ -1,0 +1,9 @@
+{
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "symbols",
+  "version": 1,
+  "_comment": "Lighter markets are named <Lighter symbol>USDC, e.g. ETH -> ETHUSDC.",
+  "symbols": [
+    "ETHUSDC"
+  ]
+}

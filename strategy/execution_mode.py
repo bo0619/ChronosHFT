@@ -13,13 +13,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from event.type import Side
+from infrastructure.venue import SUPPORTED_VENUES, VENUE_BINANCE, VENUE_LIGHTER
 
 EXECUTION_MODE_POST_ONLY = "post_only"
 EXECUTION_MODE_MARKET = "market"
 EXECUTION_MODES = (EXECUTION_MODE_POST_ONLY, EXECUTION_MODE_MARKET)
 
-VENUE_BINANCE = "binance"
-SUPPORTED_VENUES = (VENUE_BINANCE,)
 
 DEFAULT_MARKET_MIN_EDGE_BPS = 1.0
 DEFAULT_MARKET_COOLDOWN_MS = 1000.0
@@ -143,6 +142,7 @@ __all__ = [
     "MarketOrderDecision",
     "SUPPORTED_VENUES",
     "VENUE_BINANCE",
+    "VENUE_LIGHTER",
     "decide_market_order",
     "resolve_execution_mode",
 ]

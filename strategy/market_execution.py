@@ -25,7 +25,6 @@ from event.type import (
 )
 from strategy.execution_mode import (
     EXECUTION_MODE_MARKET,
-    VENUE_BINANCE,
     MarketExecutionPolicy,
     decide_market_order,
     resolve_execution_mode,
@@ -51,10 +50,11 @@ class MarketExecutionMixin:
         strategy_config,
         *,
         live_mode: bool,
-        venue: str = VENUE_BINANCE,
     ) -> None:
-        self.execution_venue = venue
-        self.execution_mode = resolve_execution_mode(strategy_config, venue)
+        self.execution_mode = resolve_execution_mode(
+            strategy_config,
+            self.execution_venue,
+        )
         self.market_execution = MarketExecutionPolicy.from_config(
             strategy_config
         )

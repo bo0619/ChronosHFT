@@ -556,7 +556,9 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                 "execution": _object(
                     {
                         "mode": _string(choices=("paper", "live")),
-                    }
+                        "venue": _string(choices=("binance", "lighter")),
+                    },
+                    optional=("venue",),
                 )
             }
         )
@@ -852,7 +854,7 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                         "rpi_live_policy": _object({"require_zero_commission": BOOL}),
                         "execution_modes": MappingSpec(
                             values=_string(choices=("post_only", "market")),
-                            key_pattern=r"^binance$",
+                            key_pattern=r"^(binance|lighter)$",
                         ),
                         "market_execution": _optional_object(
                             {
@@ -1546,6 +1548,16 @@ def validate_composed_config(config: Mapping[str, object]) -> None:
     risk = _mapping(config.get("risk"))
     limits = _mapping(risk.get("limits"))
     symbols = config.get("symbols")
+
+    execution = _mapping(config.get("execution"))
+    if (
+        execution.get("venue", "binance") != "binance"
+        and execution.get("mode") != "paper"
+    ):
+        violations.append(
+            f"execution.venue={execution.get('venue')} is Paper-only; "
+            "its Live gateway is not implemented"
+        )
 
     registered = strategy.get("registered_models")
     primary = strategy.get("primary_model")

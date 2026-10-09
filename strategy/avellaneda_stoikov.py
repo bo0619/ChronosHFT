@@ -125,7 +125,8 @@ class AvellanedaStoikovStrategy(AdaptiveQuotingStrategy):
                 self.config.get("rpi_fallback_to_gtx", True),
             )
         )
-        if resolve_execution_mode(self.config) == EXECUTION_MODE_MARKET:
+        mode = resolve_execution_mode(self.config, self.execution_venue)
+        if mode == EXECUTION_MODE_MARKET:
             raise ValueError(
                 "Avellaneda-Stoikov supports only post_only execution; "
                 "market execution mode is implemented for GLFT"

@@ -19,6 +19,7 @@ from event.type import (
 from infrastructure.commission_truth import resolve_passive_fee_rate
 from infrastructure.paper_trade import is_paper_trade
 from infrastructure.runtime_ports import ReferenceDataPort
+from infrastructure.venue import VENUE_BINANCE, configured_venue
 from strategy.contracts import (
     StrategyExecutionPort,
     StrategyStateSnapshot,
@@ -56,6 +57,7 @@ class StrategyTemplate:
         self.resolved_config = deepcopy(source_config)
         self.reference_data = reference_data
         self.name = name
+        self.execution_venue = configured_venue(self.resolved_config)
 
         self.pos = 0.0
         self.active_orders = {}
@@ -254,7 +256,8 @@ class StrategyTemplate:
         route: str = "passive_quote",
     ) -> str:
         """Resolve a passive quote to RPI or GTX using live exchangeInfo data."""
-        if not use_rpi:
+        # RPI is a Binance order type; other venues rest plain post-only.
+        if not use_rpi or self.execution_venue != VENUE_BINANCE:
             return TIF_GTX
         if self.reference_data.supports_rpi(symbol):
             return TIF_RPI
