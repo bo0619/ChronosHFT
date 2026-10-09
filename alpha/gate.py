@@ -1,5 +1,42 @@
 # file: alpha/gate.py
 
+import math
+
+# Defaults keep alpha a fair-value nudge rather than a directional bet: the
+# shift stays below half of the tightest quoted spread, so both sides of the
+# market-making quote survive post-only placement.
+DEFAULT_GATE_CONFIG = {
+    "max_bps": 3.0,
+    "decay_factor": 0.9,
+    "inventory_dampening": 0.05,
+}
+
+
+def gate_kwargs_from_config(alpha_config):
+    """Parse strategy.glft.alpha.gate into AlphaGate keyword arguments."""
+    raw = alpha_config.get("gate", {}) if isinstance(alpha_config, dict) else {}
+    if not isinstance(raw, dict):
+        raise ValueError("alpha.gate must be an object")
+    kwargs = dict(DEFAULT_GATE_CONFIG)
+    for key in DEFAULT_GATE_CONFIG:
+        if key not in raw:
+            continue
+        value = raw[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"alpha.gate.{key} must be a number")
+        kwargs[key] = float(value)
+    if not (math.isfinite(kwargs["max_bps"]) and kwargs["max_bps"] >= 0.0):
+        raise ValueError("alpha.gate.max_bps must be non-negative")
+    if not 0.0 <= kwargs["decay_factor"] < 1.0:
+        raise ValueError("alpha.gate.decay_factor must be in [0, 1)")
+    if not (
+        math.isfinite(kwargs["inventory_dampening"])
+        and kwargs["inventory_dampening"] >= 0.0
+    ):
+        raise ValueError("alpha.gate.inventory_dampening must be non-negative")
+    return kwargs
+
+
 class AlphaGate:
     """
     Alpha 信号守门员

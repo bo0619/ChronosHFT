@@ -865,7 +865,60 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                                 "gamma": POSITIVE,
                                 "cycle_interval": POSITIVE,
                                 "paper_cycle_interval": POSITIVE,
-                                "alpha": _object({"enabled": BOOL}),
+                                "alpha": _object(
+                                    {
+                                        "enabled": BOOL,
+                                        "short_fv_weight": NONNEGATIVE,
+                                        "long_pos_weight": NONNEGATIVE,
+                                        "gate": _object(
+                                            {
+                                                "max_bps": NONNEGATIVE,
+                                                "decay_factor": _number(
+                                                    0.0,
+                                                    1.0,
+                                                    exclusive_maximum=True,
+                                                ),
+                                                "inventory_dampening": NONNEGATIVE,
+                                            },
+                                            optional=(
+                                                "max_bps",
+                                                "decay_factor",
+                                                "inventory_dampening",
+                                            ),
+                                        ),
+                                        "predictor": _object(
+                                            {
+                                                "forgetting_factor": _number(
+                                                    0.0,
+                                                    1.0,
+                                                    exclusive_minimum=True,
+                                                ),
+                                                "ridge_lambda": POSITIVE,
+                                                "oos_half_life": POSITIVE,
+                                                "min_oos_samples": POSITIVE_INT,
+                                                "min_oos_r2": _number(
+                                                    -1.0,
+                                                    1.0,
+                                                    exclusive_minimum=True,
+                                                    exclusive_maximum=True,
+                                                ),
+                                            },
+                                            optional=(
+                                                "forgetting_factor",
+                                                "ridge_lambda",
+                                                "oos_half_life",
+                                                "min_oos_samples",
+                                                "min_oos_r2",
+                                            ),
+                                        ),
+                                    },
+                                    optional=(
+                                        "short_fv_weight",
+                                        "long_pos_weight",
+                                        "gate",
+                                        "predictor",
+                                    ),
+                                ),
                                 "target_inventory_notional_usdt": NONNEGATIVE,
                                 "portfolio_risk": _portfolio_risk_schema(),
                                 "adaptive": _object(
