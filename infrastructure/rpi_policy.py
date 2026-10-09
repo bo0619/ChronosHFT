@@ -110,6 +110,14 @@ def validate_live_rpi_policy(
         )
     if _enabled(strategy.get("rpi_fallback_to_gtx", True)):
         violations.append("strategy.rpi_fallback_to_gtx must be false")
+    execution_modes = strategy.get("execution_modes", {})
+    if isinstance(execution_modes, Mapping) and any(
+        str(mode or "").strip().lower() != "post_only"
+        for mode in execution_modes.values()
+    ):
+        violations.append(
+            "strategy.execution_modes must be post_only for every venue"
+        )
 
     for section_name in ("glft", "avellaneda_stoikov"):
         section = strategy.get(section_name, {})

@@ -556,7 +556,9 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                 "execution": _object(
                     {
                         "mode": _string(choices=("paper", "live")),
-                    }
+                        "venue": _string(choices=("binance", "lighter", "grvt")),
+                    },
+                    optional=("venue",),
                 )
             }
         )
@@ -620,7 +622,10 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                         "command_queue_size": POSITIVE_INT,
                         "max_order_history": POSITIVE_INT,
                         "max_trade_history": POSITIVE_INT,
-                    }
+                        "maker_order_delay_ms": NONNEGATIVE,
+                        "taker_order_delay_ms": NONNEGATIVE,
+                    },
+                    optional=("maker_order_delay_ms", "taker_order_delay_ms"),
                 )
             }
         )
@@ -850,7 +855,18 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                         "use_rpi_for_passive_exit": BOOL,
                         "rpi_fallback_to_gtx": BOOL,
                         "rpi_live_policy": _object({"require_zero_commission": BOOL}),
-                    }
+                        "execution_modes": MappingSpec(
+                            values=_string(choices=("post_only", "market")),
+                            key_pattern=r"^(binance|lighter|grvt)$",
+                        ),
+                        "market_execution": _optional_object(
+                            {
+                                "min_edge_bps": NONNEGATIVE,
+                                "cooldown_ms": NONNEGATIVE,
+                            }
+                        ),
+                    },
+                    optional=("execution_modes", "market_execution"),
                 )
             }
         )
@@ -1535,6 +1551,16 @@ def validate_composed_config(config: Mapping[str, object]) -> None:
     risk = _mapping(config.get("risk"))
     limits = _mapping(risk.get("limits"))
     symbols = config.get("symbols")
+
+    execution = _mapping(config.get("execution"))
+    if (
+        execution.get("venue", "binance") != "binance"
+        and execution.get("mode") != "paper"
+    ):
+        violations.append(
+            f"execution.venue={execution.get('venue')} is Paper-only; "
+            "its Live gateway is not implemented"
+        )
 
     registered = strategy.get("registered_models")
     primary = strategy.get("primary_model")

@@ -1529,7 +1529,9 @@ class BinancePaperGateway(BaseGateway):
             while not self._worker_stop_requested:
                 command = None
                 try:
-                    command = self._commands.get(timeout=0.05)
+                    command = self._commands.get(
+                        timeout=self._worker_idle_timeout_sec()
+                    )
                 except queue.Empty:
                     self._check_dms_deadlines()
                     continue
@@ -1565,6 +1567,9 @@ class BinancePaperGateway(BaseGateway):
                 self._check_dms_deadlines()
         finally:
             self._worker_running = False
+
+    def _worker_idle_timeout_sec(self) -> float:
+        return 0.05
 
     def _dispatch_command(self, kind: str, payload):
         if kind == "stage_order":
