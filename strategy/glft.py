@@ -10,7 +10,6 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 
 from alpha.engine import FeatureEngine
 from alpha.factors import GLFTCalibrator
-from alpha.gate import AlphaGate
 from alpha.glft_adaptive import (
     DynamicCovarianceEstimator,
     FillMarkoutEstimator,
@@ -26,7 +25,7 @@ from alpha.rpi_intensity import (
     RPIOrderExposure,
     estimate_rpi_intensity,
 )
-from alpha.signal import alpha_signal_report, predict_usable, predictor_from_config
+from alpha.signal import alpha_factories_from_config, alpha_signal_report, predict_usable
 from event.type import (
     EVENT_STRATEGY_UPDATE,
     TIF_RPI,
@@ -332,11 +331,11 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
                 "alpha.short_fv_weight",
             ),
             "long_pos_weight": self._strict_finite(
-                self.alpha_config.get("long_pos_weight", 500.0),
+                self.alpha_config.get("long_pos_weight", 0.0),
                 "alpha.long_pos_weight",
             ),
         }
-        self.alpha_predictor_factory = predictor_from_config(self.alpha_config)
+        self.alpha_factories = alpha_factories_from_config(self.alpha_config)
         raw_portfolio_config = self.glft_conf.get("portfolio_risk", {})
         self.portfolio_risk_config = (
             dict(raw_portfolio_config)
@@ -806,12 +805,8 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
                 window=self.calibrator_window,
                 config=self.calibrator_config,
             )
-            self.models[symbol] = self.alpha_predictor_factory()
-            self.gates[symbol] = AlphaGate(
-                max_bps=10.0,
-                decay_factor=0.9,
-                inventory_dampening=0.05,
-            )
+            self.models[symbol] = self.alpha_factories.predictor()
+            self.gates[symbol] = self.alpha_factories.gate()
         return (
             self.calibrators[symbol],
             self.models[symbol],

@@ -3,8 +3,11 @@
 import functools
 import math
 from collections import deque
+from typing import Callable, NamedTuple
 
 import numpy as np
+
+from alpha.gate import AlphaGate, gate_kwargs_from_config
 
 
 class OnlineRidgePredictor:
@@ -310,6 +313,19 @@ def predictor_from_config(alpha_config, num_features=9):
         MultiHorizonPredictor,
         num_features,
         **predictor_kwargs_from_config(config),
+    )
+
+
+class AlphaFactories(NamedTuple):
+    predictor: Callable[[], "MultiHorizonPredictor"]
+    gate: Callable[[], AlphaGate]
+
+
+def alpha_factories_from_config(alpha_config):
+    """Validate strategy.glft.alpha once and build per-symbol factories."""
+    return AlphaFactories(
+        predictor=predictor_from_config(alpha_config),
+        gate=functools.partial(AlphaGate, **gate_kwargs_from_config(alpha_config)),
     )
 
 

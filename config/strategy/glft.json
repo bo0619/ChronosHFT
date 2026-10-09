@@ -10,6 +10,14 @@
       "paper_cycle_interval": 0.5,
       "alpha": {
         "enabled": false,
+        "short_fv_weight": 1.0,
+        "long_pos_weight": 0.0,
+        "gate": {
+          "_comment": "Keep max_bps below half of the minimum quoted spread so alpha shifts fair value without collapsing the two-sided quote.",
+          "max_bps": 3.0,
+          "decay_factor": 0.9,
+          "inventory_dampening": 0.05
+        },
         "predictor": {
           "_comment": "Horizons are in strategy cycles. A horizon only shifts quotes after its live prequential R^2 vs fair_value=mid exceeds min_oos_r2 over min_oos_samples scored predictions.",
           "forgetting_factor": 0.999,

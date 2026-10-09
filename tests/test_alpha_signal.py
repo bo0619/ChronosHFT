@@ -123,3 +123,19 @@ def test_signal_report_keeps_raw_prediction_while_gate_zeroes_it():
     assert report["used_bps"] == 0.0
     assert report["prediction_bps"] == predictor.last_predictions["short"]
     assert report["ready"] is False
+
+
+def test_gate_defaults_keep_shift_below_half_spread_and_validate():
+    from alpha.gate import AlphaGate, gate_kwargs_from_config
+
+    kwargs = gate_kwargs_from_config({})
+    assert kwargs["max_bps"] == 3.0
+    gate = AlphaGate(**kwargs)
+    for _ in range(200):
+        shifted = gate.process(25.0, 0.0)
+    assert shifted == pytest.approx(3.0)
+
+    assert gate_kwargs_from_config({"gate": {"max_bps": 1.5}})["max_bps"] == 1.5
+    for bad in ({"max_bps": -1.0}, {"decay_factor": 1.0}, {"max_bps": True}):
+        with pytest.raises(ValueError):
+            gate_kwargs_from_config({"gate": bad})

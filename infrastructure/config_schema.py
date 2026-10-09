@@ -870,6 +870,22 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                                         "enabled": BOOL,
                                         "short_fv_weight": NONNEGATIVE,
                                         "long_pos_weight": NONNEGATIVE,
+                                        "gate": _object(
+                                            {
+                                                "max_bps": NONNEGATIVE,
+                                                "decay_factor": _number(
+                                                    0.0,
+                                                    1.0,
+                                                    exclusive_maximum=True,
+                                                ),
+                                                "inventory_dampening": NONNEGATIVE,
+                                            },
+                                            optional=(
+                                                "max_bps",
+                                                "decay_factor",
+                                                "inventory_dampening",
+                                            ),
+                                        ),
                                         "predictor": _object(
                                             {
                                                 "forgetting_factor": _number(
@@ -899,6 +915,7 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                                     optional=(
                                         "short_fv_weight",
                                         "long_pos_weight",
+                                        "gate",
                                         "predictor",
                                     ),
                                 ),
