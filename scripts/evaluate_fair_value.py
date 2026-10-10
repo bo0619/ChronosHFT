@@ -1,13 +1,24 @@
 """Offline comparison of fair value estimators on recorded depth/trade data.
 
 Reads the HDF5 files written by ``data/recorder.py``
-(``{symbol}_depth_{YYYYMMDD}.h5`` / ``{symbol}_trade_{YYYYMMDD}.h5``) and
-compares candidate fair values on two axes:
+(``{symbol}_depth_{YYYYMMDD}.h5`` / ``{symbol}_trade_{YYYYMMDD}.h5``, and the
+``*_v2.h5`` files that also carry exchange/arrival timestamps) and compares
+candidate fair values on three axes:
 
-* prediction error of the future mid at each horizon (RMSE, skill vs. mid,
-  correlation and direction hit rate of the predicted move), and
+* prediction error of the future mid at each clock horizon (RMSE, skill vs.
+  mid, correlation and direction hit rate of the predicted move),
+* event-time direction: the sign of the next mid change and the mid after N
+  L1 book changes, which is what a tick-level quoter actually has to call, and
 * markout of a naive symmetric quoter centred on each fair value, filled
   against the recorded aggressive trades.
+
+Clocks: legacy files stamp depth with local receive time and trades with
+exchange time, so ``--depth-lag-ms auto`` shifts the book onto the trade
+clock. v2 files carry ``corrected_received_ts`` (arrival on the exchange
+clock) and ``exchange_ts``; with ``--clock auto`` and complete v2 data the
+book is placed at its arrival time, i.e. when the strategy could first have
+seen it, and trades at exchange time, i.e. when they hit a resting quote. No
+lag estimate is needed then and the measured feed latency is reported.
 
 Fitted estimators are trained on the first ``--train-fraction`` of every
 symbol's grid and every metric is reported on the remaining test period only.
@@ -31,7 +42,7 @@ DEFAULT_DATA_DIR = PROJECT_ROOT / "storage"
 LEVELS = 5
 BPS = 1e4
 FILE_PATTERN = re.compile(
-    r"^(?P<symbol>[A-Z0-9]+)_(?P<kind>depth|trade)_(?P<day>\d{8})\.h5$"
+    r"^(?P<symbol>[A-Z0-9]+)_(?P<kind>depth|trade)_(?P<day>\d{8})(?:_v2)?\.h5$"
 )
 
 RAW_ESTIMATORS = ("mid", "microprice_l1", "microprice_multi")
@@ -96,6 +107,33 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--clock",
+        choices=("auto", "arrival", "recorded"),
+        default="auto",
+        help=(
+            "arrival: book at corrected_received_ts, trades at exchange_ts "
+            "(v2 files only); recorded: the datetime column plus --depth-lag-ms; "
+            "auto: arrival when every row carries v2 timestamps"
+        ),
+    )
+    parser.add_argument(
+        "--event-horizons",
+        default="1,5,20",
+        help="L1 book changes ahead for the event-time labels",
+    )
+    parser.add_argument(
+        "--event-ofi-updates",
+        type=int,
+        default=10,
+        help="OFI window of the event-time models, in L1 book changes",
+    )
+    parser.add_argument(
+        "--event-deadband-ticks",
+        type=float,
+        default=0.25,
+        help="Leans smaller than this call 'flat' in the three-way accuracy",
+    )
+    parser.add_argument(
         "--fill-rule",
         choices=("touch", "through"),
         default="touch",
@@ -137,7 +175,10 @@ def _read_frames(paths, key):
 
 
 def load_depth(paths) -> pd.DataFrame:
-    frame = _read_frames(paths, "depth")
+    return clean_depth(_read_frames(paths, "depth"))
+
+
+def clean_depth(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return frame
     valid = (
@@ -158,6 +199,44 @@ def load_trades(paths) -> pd.DataFrame:
     # maker_is_buyer means the aggressor sold into the bid.
     frame["aggressor"] = np.where(frame["maker_is_buyer"].astype(bool), -1, 1)
     return frame.reset_index(drop=True)
+
+
+def _has_clock(frame: pd.DataFrame, column: str) -> bool:
+    return column in frame and bool((frame[column].fillna(0.0) > 0).all())
+
+
+def choose_clock(depth: pd.DataFrame, trades: pd.DataFrame, mode: str) -> str:
+    """'arrival' only when every depth and trade row carries v2 timestamps."""
+    if mode == "recorded":
+        return "recorded"
+    available = _has_clock(depth, "corrected_received_ts") and (
+        trades.empty or _has_clock(trades, "exchange_ts")
+    )
+    if mode == "arrival" and not available:
+        raise ValueError("--clock arrival needs v2 timestamps on every row")
+    return "arrival" if available else "recorded"
+
+
+def retime(frame: pd.DataFrame, column: str) -> pd.DataFrame:
+    """Re-key rows on an epoch-seconds column and restore time order."""
+    if frame.empty:
+        return frame
+    frame = frame.copy()
+    frame["ts"] = pd.to_datetime(frame[column].to_numpy(float), unit="s", utc=True)
+    return frame.sort_values("ts", kind="stable").reset_index(drop=True)
+
+
+def feed_latency_ms(frame: pd.DataFrame) -> dict:
+    """Arrival minus venue time, from the v2 columns where both are set."""
+    if not {"exchange_ts", "corrected_received_ts"} <= set(frame.columns):
+        return {}
+    ok = (frame["exchange_ts"] > 0) & (frame["corrected_received_ts"] > 0)
+    if not ok.any():
+        return {}
+    latency = (
+        frame.loc[ok, "corrected_received_ts"] - frame.loc[ok, "exchange_ts"]
+    ).to_numpy(float) * 1e3
+    return {"p50": float(np.median(latency)), "p90": float(np.quantile(latency, 0.9))}
 
 
 # --------------------------------------------------------------------------
@@ -507,17 +586,159 @@ def estimate_depth_lag_ms(depth, trades, step_ms=50, max_lag_ms=3000):
     return float(best_lag * step_ms)
 
 
+def event_book(book: pd.DataFrame, gap_sec: float) -> pd.DataFrame:
+    """Book rows where the L1 state changed: the event clock."""
+    l1 = book[["bid", "ask", "imbalance_l1", "l1_depth"]].to_numpy()
+    changed = np.r_[True, np.any(l1[1:] != l1[:-1], axis=1)]
+    # cum_ofi stays valid: an unchanged L1 contributes zero OFI.
+    frame = book.loc[changed].reset_index(drop=True)
+    frame["segment"] = segment_ids(frame["ts_ns"].to_numpy(), gap_sec)
+    return frame
+
+
+def next_mid_change(frame: pd.DataFrame):
+    """Move (bps) and wait (ms) to the next mid change within the segment."""
+    mid = frame["mid"].to_numpy()
+    ts = frame["ts_ns"].to_numpy()
+    segment = frame["segment"].to_numpy()
+    n = len(mid)
+    changes = np.flatnonzero(np.r_[False, mid[1:] != mid[:-1]])
+    if changes.size == 0:
+        return np.zeros(n), np.zeros(n), np.zeros(n, dtype=bool)
+    position = np.searchsorted(changes, np.arange(n), side="right")
+    later = changes[np.minimum(position, changes.size - 1)]
+    valid = (position < changes.size) & (segment[later] == segment)
+    move = np.where(valid, (mid[later] - mid) / mid * BPS, 0.0)
+    wait_ms = np.where(valid, (ts[later] - ts) / 1e6, np.nan)
+    return move, wait_ms, valid
+
+
+def mid_after_updates(frame: pd.DataFrame, updates: int):
+    mid = frame["mid"].to_numpy()
+    segment = frame["segment"].to_numpy()
+    future = np.r_[mid[updates:], np.full(updates, np.nan)]
+    future_segment = np.r_[segment[updates:], np.full(updates, -2)]
+    valid = future_segment == segment
+    return np.where(valid, (future - mid) / mid * BPS, 0.0), valid
+
+
+def direction_metrics(pred, move_bps):
+    """Next-change call: how often a lean is right and what it earns."""
+    lean = np.sign(pred)
+    label = np.sign(move_bps)
+    active = lean != 0
+    return {
+        "coverage": float(np.mean(active)),
+        "hit_rate": (
+            float(np.mean(lean[active] == label[active]))
+            if active.any()
+            else float("nan")
+        ),
+        # Mean signed move per book state, zero where the estimator abstains.
+        "edge_bps": float(np.mean(lean * move_bps)),
+        "up_share": float(np.mean(label > 0)),
+    }
+
+
+def three_class_accuracy(pred, target, deadband_bps):
+    called = np.where(np.abs(pred) >= deadband_bps, np.sign(pred), 0.0)
+    return float(np.mean(called == np.sign(target)))
+
+
+def evaluate_events(book, test_start_ns, tick, args):
+    """Event-time labels on L1 book changes; fitted models use the same split."""
+    frame = event_book(book, args.gap_sec)
+    if len(frame) < 2 * args.min_test_points:
+        return [], {}
+    models = FairValueModels(frame, tick, max(1, args.event_ofi_updates))
+    is_train = frame["ts_ns"].to_numpy() < test_start_ns
+    mid = frame["mid"].to_numpy()
+    deadband_bps = args.event_deadband_ticks * tick / mid * BPS
+    rows = []
+
+    move, wait_ms, valid = next_mid_change(frame)
+    train, test = valid & is_train, valid & ~is_train
+    info = {
+        "event_updates": len(frame),
+        "next_change_wait_ms_p50": (
+            float(np.nanmedian(wait_ms[test])) if test.any() else float("nan")
+        ),
+    }
+    if train.sum() >= args.min_test_points and test.sum() >= args.min_test_points:
+        models.fit("next", move, train, args.ridge)
+        for name in ESTIMATORS:
+            pred = models.predict_bps(name, "next")
+            rows.append(
+                {
+                    "estimator": name,
+                    "label": "next_change",
+                    **direction_metrics(pred[test], move[test]),
+                    "test_points": int(test.sum()),
+                }
+            )
+
+    for updates in event_horizons(args):
+        target, valid = mid_after_updates(frame, updates)
+        train, test = valid & is_train, valid & ~is_train
+        if train.sum() < args.min_test_points or test.sum() < args.min_test_points:
+            continue
+        key = f"ev{updates}"
+        models.fit(key, target, train, args.ridge)
+        mid_mse = None
+        for name in ESTIMATORS:
+            pred = models.predict_bps(name, key)
+            metrics = prediction_metrics(pred[test], target[test])
+            if name == "mid":
+                mid_mse = metrics["mse"]
+            metrics["skill"] = (
+                1.0 - metrics["mse"] / mid_mse if mid_mse > 0 else float("nan")
+            )
+            rows.append(
+                {
+                    "estimator": name,
+                    "label": f"after_{updates}_updates",
+                    **metrics,
+                    "three_class_acc": three_class_accuracy(
+                        pred[test], target[test], deadband_bps[test]
+                    ),
+                    "flat_share": float(np.mean(target[test] == 0)),
+                    "test_points": int(test.sum()),
+                }
+            )
+    return rows, info
+
+
+def event_horizons(args):
+    return [int(v) for v in str(args.event_horizons).split(",") if v.strip()]
+
+
 def evaluate_symbol(symbol, files, args, horizons):
-    depth = load_depth(files["depth"])
+    depth = _read_frames(files["depth"], "depth")
+    trades = load_trades(files["trade"]) if files["trade"] else pd.DataFrame()
     if len(depth) < 100:
         return None, f"{symbol}: too few depth rows ({len(depth)})"
-    trades = load_trades(files["trade"]) if files["trade"] else pd.DataFrame()
-    if args.depth_lag_ms == "auto":
-        depth_lag_ms = estimate_depth_lag_ms(depth, trades) if not trades.empty else 0.0
+    try:
+        clock = choose_clock(depth, trades, args.clock)
+    except ValueError as exc:
+        return None, f"{symbol}: {exc}"
+    latency = {"depth": feed_latency_ms(depth), "trade": feed_latency_ms(trades)}
+    if clock == "arrival":
+        # Book when we could first see it, trades when they hit the venue.
+        depth = clean_depth(retime(depth, "corrected_received_ts"))
+        trades = retime(trades, "exchange_ts")
+        depth_lag_ms = 0.0
     else:
-        depth_lag_ms = float(args.depth_lag_ms)
-    # Put the book on the trades' exchange clock.
-    depth["ts"] = depth["ts"] - pd.Timedelta(milliseconds=depth_lag_ms)
+        depth = clean_depth(depth)
+        if args.depth_lag_ms == "auto":
+            depth_lag_ms = (
+                estimate_depth_lag_ms(depth, trades) if not trades.empty else 0.0
+            )
+        else:
+            depth_lag_ms = float(args.depth_lag_ms)
+        # Put the book on the trades' exchange clock.
+        depth["ts"] = depth["ts"] - pd.Timedelta(milliseconds=depth_lag_ms)
+    if len(depth) < 100:
+        return None, f"{symbol}: too few depth rows ({len(depth)})"
     tick = infer_tick(depth)
     book = book_features(depth, args.level_decay)
     grid = build_grid(book, args.grid_ms, args.gap_sec)
@@ -540,7 +761,10 @@ def evaluate_symbol(symbol, files, args, horizons):
         "depth_rows": len(depth),
         "trades": len(trades),
         "tick": tick,
+        "clock": clock,
         "depth_lag_ms": depth_lag_ms,
+        "depth_latency_ms_p50": latency["depth"].get("p50", float("nan")),
+        "trade_latency_ms_p50": latency["trade"].get("p50", float("nan")),
         "median_spread_bps": float(np.median(book["spread"] / book["mid"]) * BPS),
         "active_hours": float(live.sum() * args.grid_ms / 3.6e6),
         "updates_per_sec": len(depth) / max(live.sum() * args.grid_ms / 1e3, 1.0),
@@ -593,6 +817,9 @@ def evaluate_symbol(symbol, files, args, horizons):
                 )
                 if result is not None:
                     markouts.append({"symbol": symbol, "estimator": name, **result})
+    events, event_info = evaluate_events(book, test_start_ns, tick, args)
+    info.update(event_info)
+    events = [{"symbol": symbol, **row} for row in events]
     info["fitted"] = {
         h: {
             "mp1_beta": p["mp1_beta"],
@@ -601,7 +828,12 @@ def evaluate_symbol(symbol, files, args, horizons):
         }
         for h, p in models.params.items()
     }
-    return {"info": info, "prediction": rows, "markout": markouts}, None
+    return {
+        "info": info,
+        "prediction": rows,
+        "events": events,
+        "markout": markouts,
+    }, None
 
 
 # --------------------------------------------------------------------------
@@ -625,13 +857,50 @@ def _table(frame: pd.DataFrame, columns, digits=3):
     return "\n".join(lines)
 
 
+EVENT_COLUMNS = [
+    "coverage",
+    "hit_rate",
+    "edge_bps",
+    "up_share",
+    "skill",
+    "three_class_acc",
+    "flat_share",
+    "test_points",
+]
+
+
+def render_event_summary(events: pd.DataFrame):
+    lines = ["", "## 汇总：事件时间方向（各品种中位数）", ""]
+    lines.append(
+        "next_change：预测下一次 mid 变动的方向。coverage 是给出方向的比例，"
+        "hit_rate 是给出方向时猜对的比例（随机为 0.5），edge_bps 是按预测方向"
+        "持有到下一次变动的平均收益（不给方向记 0）。after_N_updates：N 次 L1 "
+        "变化后的 mid；three_class_acc 把小于死区的偏移算作“不变”，按"
+        "涨/平/跌三类计准确率。要在实盘用上，延迟必须明显短于"
+        "上表的 next_change_wait_ms_p50。"
+    )
+    for label, sub in events.groupby("label", sort=False):
+        cols = [
+            c
+            for c in EVENT_COLUMNS
+            if c != "test_points" and c in sub and sub[c].notna().any()
+        ]
+        agg = sub.groupby("estimator")[cols].median().reindex(ESTIMATORS).reset_index()
+        lines.append("")
+        lines.append(f"### {label}")
+        lines.append("")
+        lines.append(_table(agg, ["estimator"] + cols, 3))
+    return lines
+
+
 def render_report(results, horizons, args, skipped):
     lines = ["# Fair value 估计方法离线对比", ""]
     lines.append(
         f"参数：grid {args.grid_ms}ms，train/test {args.train_fraction:.0%}/{1 - args.train_fraction:.0%}（按时间切分），"
         f"OFI 窗口 {args.ofi_window_sec:g}s，多档衰减 {args.level_decay:g}，"
         f"模拟报价半价差 {args.quote_half_spread_bps}bps，延迟 {args.latency_ms:g}ms，"
-        f"成交规则 {args.fill_rule}，报价用 {args.quote_horizon:g}s 模型。"
+        f"成交规则 {args.fill_rule}，报价用 {args.quote_horizon:g}s 模型，"
+        f"时钟 {args.clock}，事件 horizon {args.event_horizons} 次 L1 变化。"
     )
     lines.append("")
     info = pd.DataFrame([r["info"] for r in results])
@@ -641,7 +910,11 @@ def render_report(results, horizons, args, skipped):
             info,
             [
                 "symbol",
+                "clock",
                 "depth_lag_ms",
+                "depth_latency_ms_p50",
+                "trade_latency_ms_p50",
+                "next_change_wait_ms_p50",
                 "active_hours",
                 "depth_rows",
                 "trades",
@@ -673,6 +946,10 @@ def render_report(results, horizons, args, skipped):
         summary[f"beats_mid_{h:g}s"] = wins.get(h)
     summary = summary.reset_index()
     lines.append(_table(summary, list(summary.columns), 3))
+
+    events = pd.DataFrame([row for r in results for row in r.get("events", [])])
+    if not events.empty:
+        lines.extend(render_event_summary(events))
 
     markout = pd.DataFrame([row for r in results for row in r["markout"]])
     if not markout.empty:
@@ -741,6 +1018,12 @@ def render_report(results, horizons, args, skipped):
                     4,
                 )
             )
+        if result.get("events"):
+            lines.append("")
+            lines.append("事件时间（测试集，按 L1 变化计数）")
+            lines.append("")
+            ev = pd.DataFrame(result["events"])
+            lines.append(_table(ev, ["label", "estimator"] + EVENT_COLUMNS, 3))
         if result["markout"]:
             lines.append("")
             lines.append("模拟报价 markout（bps，均值；se 为标准误）")
@@ -791,6 +1074,12 @@ def main(argv=None):
     if args.csv:
         rows = [row for r in results for row in r["prediction"]]
         pd.DataFrame(rows).to_csv(args.csv, index=False)
+        event_rows = [row for r in results for row in r.get("events", [])]
+        if event_rows:
+            pd.DataFrame(event_rows).to_csv(
+                Path(args.csv).with_name(Path(args.csv).stem + "_events.csv"),
+                index=False,
+            )
         markout_rows = [row for r in results for row in r["markout"]]
         if markout_rows:
             pd.DataFrame(markout_rows).to_csv(
