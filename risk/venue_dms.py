@@ -133,14 +133,21 @@ class VenueDMSController:
             return self.latch_failure("health_snapshot_invalid")
         if not bool(snapshot.get("enabled", False)):
             return self.latch_failure("unexpectedly_disabled")
-        if not bool(snapshot.get("valid", False)):
+        if snapshot.get("renewal_withheld_reason"):
+            # The OMS paused renewal on purpose (symbol guard, freeze,
+            # constraint). Let the venue countdown run; resume once it clears.
+            return True
+        # A stale renewal is repaired by renewing now; only a failed attempt
+        # or another health problem latches.
+        stale_only = bool(snapshot.get("stale_recoverable", False))
+        if not bool(snapshot.get("valid", False)) and not stale_only:
             return self.latch_failure(
                 str(snapshot.get("reason", "") or "renewal_health_invalid")
             )
 
         if not active or kill_switch_triggered or self._shutdown_started():
             return False
-        if self._new_risk_blocked():
+        if self._new_risk_blocked() and not stale_only:
             return True
 
         renewal_allowed = getattr(

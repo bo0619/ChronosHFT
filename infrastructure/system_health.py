@@ -174,6 +174,13 @@ def handle_system_health_event(
         )
         return
 
+    if message.startswith("PAPER_DMS_TRIGGERED:"):
+        # Mirrors Binance countdown-cancel: the simulated venue already
+        # canceled that symbol's orders. The OMS DMS health check owns any
+        # escalation, so this is not a kill condition by itself.
+        logger.warning(f"[SystemHealth] {message}: simulated venue canceled orders")
+        return
+
     if message.startswith("KILL:"):
         risk_controller.trigger_kill_switch(message[5:])
         return

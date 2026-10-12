@@ -506,12 +506,69 @@ class OMSCapabilityManager(OMSComponent):
             now - self.last_venue_dead_man_success_monotonic,
         )
         if age_sec > self.venue_dead_man_switch_max_renewal_age_sec:
+            withheld = self._venue_dead_man_switch_withhold_reason_locked()
+            if withheld:
+                # Renewal was paused on purpose (guard, freeze, constraint).
+                # New risk stays blocked, but this is not a renewal failure.
+                return False, f"renewal_withheld:{withheld}"
             return (
                 False,
                 f"renewal_stale:{age_sec:.3f}s>"
                 f"{self.venue_dead_man_switch_max_renewal_age_sec:.3f}s",
             )
         return True, ""
+
+    def _venue_dead_man_switch_withhold_reason_locked(self) -> str:
+        """Why routine renewal is intentionally paused, or "" if it is not.
+
+        The DMS's own constraint is not a reason to withhold: renewing is how
+        that constraint recovers.
+        """
+        if self.state != LifecycleState.LIVE:
+            return f"lifecycle_not_live:{self.state.value}"
+        if self._has_active_guards():
+            return "oms_guard_active"
+        own_constraint = False
+        for key in self.mode_constraints:
+            if str(key).startswith("venue_dead_man_switch:"):
+                own_constraint = True
+            else:
+                return "trading_mode_constraint_active"
+        # Derived from state and override rather than the cached
+        # capability_mode field, which may lag a state change.
+        if (
+            not own_constraint
+            and self.mode_override
+            and self._mode_rank(self.mode_override)
+            > self._mode_rank(OMSCapabilityMode.LIVE)
+        ):
+            return f"capability_not_live:{self.mode_override.value}"
+        return ""
+
+    def _venue_dead_man_switch_stale_recoverable_locked(
+        self,
+        now: float = None,
+    ) -> bool:
+        """Whether the only problem is a renewal nobody has tried yet.
+
+        True after renewal was withheld (guard cleared, nothing attempted
+        since the last success): renewing now repairs it. False when an
+        attempt is already outstanding past max age (hung or failed), which
+        must latch.
+        """
+        if not self.venue_dead_man_switch_enabled:
+            return False
+        healthy, reason = self._venue_dead_man_switch_health_locked(now)
+        if healthy or not reason.startswith("renewal_stale:"):
+            return False
+        now = time.perf_counter() if now is None else float(now)
+        attempt = self.last_venue_dead_man_attempt_monotonic
+        if attempt <= self.last_venue_dead_man_success_monotonic:
+            return True
+        return (
+            now - attempt
+            <= self.venue_dead_man_switch_max_renewal_age_sec
+        )
 
     def get_venue_dead_man_switch_snapshot(self) -> dict:
         with self.lock:
@@ -542,6 +599,14 @@ class OMSCapabilityManager(OMSComponent):
                 "recovery_checks": self.venue_dead_man_switch_recovery_checks,
                 "last_error": self.venue_dead_man_last_error,
                 "renewal_inflight": self.venue_dead_man_renewal_inflight,
+                "stale_recoverable": (
+                    self._venue_dead_man_switch_stale_recoverable_locked(now)
+                ),
+                "renewal_withheld_reason": (
+                    self._venue_dead_man_switch_withhold_reason_locked()
+                    if self.venue_dead_man_switch_enabled
+                    else ""
+                ),
                 "safety_cancel_inflight": bool(
                     self._venue_dead_man_safety_cancel_thread is not None
                     and self._venue_dead_man_safety_cancel_thread.is_alive()
@@ -561,17 +626,11 @@ class OMSCapabilityManager(OMSComponent):
             return False, "shutdown_requested"
         if force:
             return True, ""
-        if self.state != LifecycleState.LIVE:
-            return False, f"lifecycle_not_live:{self.state.value}"
-        if self._has_active_guards():
-            return False, "oms_guard_active"
-        if self.mode_constraints:
-            return False, "trading_mode_constraint_active"
-        if self.capability_mode != OMSCapabilityMode.LIVE:
-            return False, f"capability_not_live:{self.capability_mode.value}"
-        healthy, reason = self._venue_dead_man_switch_health_locked()
-        if not healthy:
-            return False, reason or "renewal_health_invalid"
+        withheld = self._venue_dead_man_switch_withhold_reason_locked()
+        if withheld:
+            return False, withheld
+        # A stale or failed renewal is repaired by renewing; a failed attempt
+        # latches again in renew_venue_dead_man_switch.
         return True, ""
 
     def can_renew_venue_dead_man_switch(self) -> bool:
@@ -647,6 +706,8 @@ class OMSCapabilityManager(OMSComponent):
             return True
 
         detail = str(reason or detected_reason or "unhealthy")
+        if detail.startswith("renewal_withheld:"):
+            return False
         constraint_reason = self._venue_dead_man_constraint_reason(detail)
         with self.lock:
             if not self.venue_dead_man_last_error:
@@ -676,6 +737,9 @@ class OMSCapabilityManager(OMSComponent):
                 self._venue_dead_man_switch_renewal_allowed_locked()
             )
             healthy, health_reason = self._venue_dead_man_switch_health_locked(now)
+            stale_recoverable = allowed and (
+                self._venue_dead_man_switch_stale_recoverable_locked(now)
+            )
             if not allowed:
                 schedule_renewal = False
             else:
@@ -691,14 +755,14 @@ class OMSCapabilityManager(OMSComponent):
                 if schedule_renewal:
                     self.venue_dead_man_renewal_inflight = True
 
-        if not healthy:
+        if not healthy and not stale_recoverable:
             self.handle_venue_dead_man_switch_unhealthy(
                 health_reason or authorization_reason
             )
         if not allowed:
             return False
         if not schedule_renewal:
-            return healthy
+            return healthy or stale_recoverable
 
         def renew_in_background():
             published.wait()
@@ -725,7 +789,7 @@ class OMSCapabilityManager(OMSComponent):
                 return False
             self._venue_dead_man_renewal_thread = thread
         published.set()
-        return healthy
+        return healthy or stale_recoverable
 
     def renew_venue_dead_man_switch(self, force: bool = False) -> bool:
         if not self.venue_dead_man_switch_enabled:
