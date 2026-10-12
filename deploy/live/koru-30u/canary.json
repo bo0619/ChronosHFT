@@ -1,0 +1,157 @@
+{
+  "schema": "chronoshft.config_manifest.v3",
+  "config_version": 3,
+  "unknown_keys": "reject",
+  "includes": [
+    {
+      "path": "fragments/execution.json",
+      "fragment": "execution",
+      "version": 1
+    },
+    {
+      "path": "fragments/paper_trade.json",
+      "fragment": "paper_trade",
+      "version": 1
+    },
+    {
+      "path": "fragments/paper_trade_database.json",
+      "fragment": "paper_trade_database",
+      "version": 1
+    },
+    {
+      "path": "fragments/symbols.json",
+      "fragment": "symbols",
+      "version": 1
+    },
+    {
+      "path": "fragments/data_recording.json",
+      "fragment": "data_recording",
+      "version": 1
+    },
+    {
+      "path": "fragments/system/logging.json",
+      "fragment": "system.logging",
+      "version": 1
+    },
+    {
+      "path": "fragments/system/rate_limit.json",
+      "fragment": "system.rate_limit",
+      "version": 1
+    },
+    {
+      "path": "fragments/system/dashboard.json",
+      "fragment": "system.dashboard",
+      "version": 1
+    },
+    {
+      "path": "fragments/system/shutdown.json",
+      "fragment": "system.shutdown",
+      "version": 1
+    },
+    {
+      "path": "fragments/system/admin_control.canary.json",
+      "fragment": "system.admin_control",
+      "version": 1
+    },
+    {
+      "path": "fragments/system/event_engine.json",
+      "fragment": "system.event_engine",
+      "version": 1
+    },
+    {
+      "path": "fragments/system/strategy_runtime.json",
+      "fragment": "system.strategy_runtime",
+      "version": 1
+    },
+    {
+      "path": "fragments/system/resource_monitor.json",
+      "fragment": "system.resource_monitor",
+      "version": 1
+    },
+    {
+      "path": "fragments/system/market_data.json",
+      "fragment": "system.market_data",
+      "version": 1
+    },
+    {
+      "path": "fragments/system/time_sync.json",
+      "fragment": "system.time_sync",
+      "version": 1
+    },
+    {
+      "path": "fragments/account.json",
+      "fragment": "account",
+      "version": 1
+    },
+    {
+      "path": "fragments/risk/core.json",
+      "fragment": "risk.core",
+      "version": 1
+    },
+    {
+      "path": "fragments/risk/independent_supervisor.canary.json",
+      "fragment": "risk.independent_supervisor",
+      "version": 1
+    },
+    {
+      "path": "fragments/risk/limits.json",
+      "fragment": "risk.limits",
+      "version": 1
+    },
+    {
+      "path": "fragments/risk/price_sanity.json",
+      "fragment": "risk.price_sanity",
+      "version": 1
+    },
+    {
+      "path": "fragments/risk/technical_health.json",
+      "fragment": "risk.technical_health",
+      "version": 1
+    },
+    {
+      "path": "fragments/risk/black_swan.json",
+      "fragment": "risk.black_swan",
+      "version": 1
+    },
+    {
+      "path": "fragments/backtest.json",
+      "fragment": "backtest",
+      "version": 1
+    },
+    {
+      "path": "fragments/oms.json",
+      "fragment": "oms",
+      "version": 1
+    },
+    {
+      "path": "fragments/strategy/core.json",
+      "fragment": "strategy.core",
+      "version": 1
+    },
+    {
+      "path": "fragments/strategy/order_sizing.json",
+      "fragment": "strategy.order_sizing",
+      "version": 1
+    },
+    {
+      "path": "fragments/strategy/model_readiness.json",
+      "fragment": "strategy.model_readiness",
+      "version": 1
+    },
+    {
+      "path": "fragments/strategy/glft.json",
+      "fragment": "strategy.glft",
+      "version": 1
+    },
+    {
+      "path": "fragments/strategy/avellaneda_stoikov.json",
+      "fragment": "strategy.avellaneda_stoikov",
+      "version": 1
+    },
+    {
+      "path": "live.canary.json",
+      "fragment": "live",
+      "version": 1
+    }
+  ]
+}

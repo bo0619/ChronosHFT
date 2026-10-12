@@ -1,0 +1,8 @@
+{
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "execution",
+  "version": 1,
+  "execution": {
+    "mode": "live"
+  }
+}
