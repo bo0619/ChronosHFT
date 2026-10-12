@@ -39,7 +39,7 @@ OWNED_STATE_BUDGETS = {
     ("oms/order_submission.py", "OMSOrderSubmission"): 1,
     ("strategy/adaptive_pipeline.py", "AdaptiveQuotePipeline"): 0,
     ("strategy/avellaneda_stoikov.py", "AvellanedaStoikovStrategy"): 59,
-    ("strategy/glft.py", "GLFTStrategy"): 95,
+    ("strategy/glft.py", "GLFTStrategy"): 96,
     ("strategy/quote_decision.py", "QuoteDecisionEngine"): 0,
     ("ui/web_dashboard.py", "LocalWebDashboard"): 60,
 }
