@@ -2485,6 +2485,15 @@ class RiskExecutionTests(unittest.TestCase):
         self.assertEqual(gateway.open_order_priorities, [True])
         self.assertEqual(gateway.position_priorities, [True])
 
+    def test_kill_verification_accepts_read_only_position_ledger(self):
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        # ExposureManager exposes positions as a read-only MappingProxyType.
+        oms.exposure.net_positions = types.MappingProxyType({"BTCUSDT": 0.5})
+        risk = RiskManager(DummyEngine(), self.make_risk_config(), oms=oms, gateway=gateway)
+
+        self.assertEqual(risk.kill_switch._query_kill_positions(), {"BTCUSDT"})
+
     def test_recovered_kill_sequence_resumes_to_flat_verified(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config = self.make_risk_config()

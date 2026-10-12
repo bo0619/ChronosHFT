@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 import threading
 import time
 from dataclasses import dataclass, field
@@ -650,7 +651,7 @@ class RiskKillSwitchController:
                     f"{type(exc).__name__}:{exc}"
                 )
                 return None
-            if not isinstance(local_positions, dict):
+            if not isinstance(local_positions, Mapping):
                 logger.error(
                     "[KillSwitch] local position ledger is invalid: "
                     f"{type(local_positions).__name__}"
@@ -739,7 +740,7 @@ class RiskKillSwitchController:
             try:
                 exposure = getattr(self.oms, "exposure", None)
                 positions = getattr(exposure, "net_positions", None)
-                if not isinstance(positions, dict):
+                if not isinstance(positions, Mapping):
                     raise TypeError(
                         f"invalid position ledger: {type(positions).__name__}"
                     )
