@@ -651,17 +651,15 @@ def synchronize_commission_config(gateway, config, symbols):
 def build_gateway_bundle(engine, config, market_data_config):
     """Build mutually exclusive live or paper exchange capabilities."""
     if is_paper_trade(config):
-        from gateway.binance.paper_gateway import (
-            BinancePaperGateway,
-            PaperTruthSnapshotProvider,
-        )
+        from gateway.binance.paper_gateway import PaperTruthSnapshotProvider
+        from gateway.paper import paper_gateway_type
 
         paper_config = apply_paper_trade_mode(config)
         paper_market_data_config = paper_config.get("system", {}).get(
             "market_data",
             market_data_config,
         )
-        gateway = BinancePaperGateway(
+        gateway = paper_gateway_type(config)(
             engine,
             paper_config,
             paper_market_data_config,

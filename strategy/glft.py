@@ -50,6 +50,8 @@ from strategy.adaptive_quoting import (
     AdaptiveQuotingStrategy,
     negative_infinity as _negative_infinity,
 )
+from strategy.fast_requote import FastRequoteMixin
+from strategy.market_execution import MarketExecutionMixin
 from strategy.model_readiness import (
     evaluate_symbol_readiness,
     readiness_requirements,
@@ -111,7 +113,7 @@ class _PortfolioAssetState:
     updated_at_monotonic: float
 
 
-class GLFTStrategy(AdaptiveQuotingStrategy):
+class GLFTStrategy(FastRequoteMixin, MarketExecutionMixin, AdaptiveQuotingStrategy):
     """GLFT Model A strategy with one fixed-notional inventory unit."""
 
     def __init__(
@@ -553,6 +555,8 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
                 else GLFT_FORMULA_VERSION
             )
         )
+        self.init_execution_mode(self.strat_conf, live_mode=self.live_mode)
+        self.init_fast_requote(self.adaptive_config, live_mode=self.live_mode)
         if self.live_mode:
             if not self.execution.supports_strategy_evidence:
                 raise ValueError(
@@ -1354,10 +1358,7 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
         now = self.clock.monotonic()
         if not self.live_mode:
             self.latest_market_timing[symbol] = (
-                self._market_timing_snapshot(
-                    ob,
-                    now,
-                )
+                self._market_timing_snapshot(ob, now)
             )
         mid = (bid_1 + ask_1) / 2.0
         self._observe_rpi_orderbook(
@@ -1398,9 +1399,8 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
         calibrator.on_orderbook(ob)
         self.feature_engine.on_orderbook(ob)
 
-        if now - self.last_run_times[symbol] < self.cycle_interval:
+        if not self.quote_cycle_due(symbol, mid, now):
             return
-        self.last_run_times[symbol] = now
 
         features = self.feature_engine.get_features(symbol)
         alphas = predict_usable(model, features, mid, now)
@@ -1694,6 +1694,11 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
             self.feature_engine.reset_interval(symbol)
             return
 
+        if self.market_mode:
+            return self.run_market_execution_cycle(
+                symbol, mid, bid_1, ask_1, fair_mid, formula_quote, current_pos,
+                now, alpha_offset_bps, gamma, sigma, self.feature_engine,
+            )
         passive_tif = self.resolve_passive_time_in_force(
             symbol,
             use_rpi=self.use_rpi,
@@ -1894,6 +1899,7 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
             "adaptive": adaptive_runtime,
             "size_optimization": size_optimization,
             "stale_quote_guard": dict(self.latest_stale_guard[symbol]),
+            "fast_requotes": self.fast_requote_state[symbol]["count"],
             "market_data_timing": self._published_market_timing(symbol),
             "portfolio_risk": portfolio_risk,
             "units_version": UNITS_VERSION,
@@ -2982,7 +2988,7 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
     def on_trade(self, trade: TradeData):
         now_monotonic = self.clock.monotonic()
         self.last_fill_time[trade.symbol] = now_monotonic
-        if self.adaptive_enabled:
+        if self.adaptive_enabled and not self.is_market_fill(trade):
             self.adaptive_markout.record_fill(
                 symbol=trade.symbol,
                 side=trade.side,

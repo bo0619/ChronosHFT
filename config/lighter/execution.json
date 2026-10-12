@@ -1,0 +1,10 @@
+{
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "execution",
+  "version": 1,
+  "execution": {
+    "_comment": "Lighter is Paper-only: public Lighter market data with the local Paper venue.",
+    "mode": "paper",
+    "venue": "lighter"
+  }
+}

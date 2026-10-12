@@ -37,6 +37,10 @@ from strategy.adaptive_quoting import (
     AdaptiveQuotingStrategy,
     negative_infinity as _negative_infinity,
 )
+from strategy.execution_mode import (
+    EXECUTION_MODE_MARKET,
+    resolve_execution_mode,
+)
 from strategy.model_readiness import (
     evaluate_symbol_readiness,
     readiness_requirements,
@@ -121,6 +125,12 @@ class AvellanedaStoikovStrategy(AdaptiveQuotingStrategy):
                 self.config.get("rpi_fallback_to_gtx", True),
             )
         )
+        mode = resolve_execution_mode(self.config, self.execution_venue)
+        if mode == EXECUTION_MODE_MARKET:
+            raise ValueError(
+                "Avellaneda-Stoikov supports only post_only execution; "
+                "market execution mode is implemented for GLFT"
+            )
 
         self.gamma = self._strict_positive(
             self.as_conf.get("gamma", 0.05),

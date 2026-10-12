@@ -21,6 +21,7 @@ from event.type import (
     AggTradeData,
     CancelRequest,
     CommandOutcome,
+    ExecutionPolicy,
     GatewayState,
     LifecycleState,
     MarkPriceData,
@@ -2168,6 +2169,109 @@ class PaperRuntimeIntegrationTests(unittest.TestCase):
             self.assertAlmostEqual(oms.exposure.net_positions[SYMBOL], remote_position)
             self.assertAlmostEqual(oms.account.balance, remote_balance)
             self.assertEqual(truth.get_open_orders(), [])
+
+            monitor = TruthMonitor(oms, truth, config, start_thread=False)
+            self.assertTrue(monitor.poll_once())
+        finally:
+            oms.stop()
+            gateway.close()
+
+    def test_strategy_market_order_fills_at_touch_with_taker_fee(self):
+        engine = DispatchingEngine()
+        config = make_gateway_config()
+        config["account"]["initial_balance_usdt"] = 100.0
+        config["risk"] = {
+            "limits": {
+                "max_order_qty": 100.0,
+                "max_order_notional": 1000.0,
+                "max_pos_notional": 1000.0,
+                "max_account_gross_notional": 1000.0,
+            },
+            "price_sanity": {
+                "max_deviation_pct": 0.05,
+                "max_spread_pct": 0.05,
+            },
+            "risk_control_heartbeat": {"enabled": False},
+            "cash_flow_truth": {"enabled": False},
+            "independent_supervisor": {"enabled": False},
+            "margin_health": {"enabled": True, "require_snapshot": True},
+        }
+        config["oms"] = {
+            "journal_enabled": False,
+            "replay_journal_on_startup": False,
+            "truth_monitor": {
+                "poll_interval_sec": 0,
+                "account_balance_tolerance": 1e-8,
+                "balance_drift_trigger_count": 1,
+            },
+        }
+        gateway = BinancePaperGateway(engine, config)
+        gateway._start_worker()
+        gateway.active = True
+        gateway._accepting_orders = True
+        gateway.state = GatewayState.READY
+        gateway._call_worker(
+            "book",
+            (gateway._book_feed_state.generation, make_book()),
+        )
+        oms = OMS(
+            engine,
+            gateway,
+            config,
+            market_cache=PaperTestMarketCache(),
+            reference_data=PaperTestReferenceData(),
+        )
+        engine.register(EVENT_EXCHANGE_ORDER_UPDATE, oms.on_exchange_update)
+        engine.register(EVENT_EXCHANGE_ACCOUNT_UPDATE, oms.on_exchange_account_update)
+        oms.state = LifecycleState.LIVE
+        truth = PaperTruthSnapshotProvider(gateway)
+        oms.sync_account_margin_health(
+            truth.get_account_info(),
+            snapshot_time=time.time(),
+        )
+
+        try:
+            with patch(
+                "gateway.binance.paper_gateway.ref_data_manager.get_info",
+                return_value=make_contract(),
+            ):
+                result = oms.submit_order(
+                    # Same shape as the GLFT market-mode intent.
+                    OrderIntent(
+                        strategy_id="GLFT_MultiScale",
+                        symbol=SYMBOL,
+                        side=Side.BUY,
+                        price=101.0,
+                        volume=0.1,
+                        order_type="MARKET",
+                        time_in_force=TIF_IOC,
+                        is_post_only=False,
+                        policy=ExecutionPolicy.AGGRESSIVE,
+                        tag="market_mm",
+                    )
+                )
+                self.assertTrue(result.accepted, result.reason)
+                self.assertTrue(
+                    wait_until(
+                        lambda: oms.orders[result.client_oid].status
+                        == OrderStatus.FILLED,
+                        timeout=1.0,
+                    )
+                )
+
+            remote_position = float(truth.get_all_positions()[0]["positionAmt"])
+            remote_balance = float(truth.get_account_info()["totalWalletBalance"])
+            self.assertAlmostEqual(oms.exposure.net_positions[SYMBOL], remote_position)
+            self.assertAlmostEqual(oms.account.balance, remote_balance)
+            self.assertEqual(truth.get_open_orders(), [])
+            self.assertAlmostEqual(remote_position, 0.1)
+            trade = gateway.get_user_trades(SYMBOL)[0]
+            self.assertFalse(trade["maker"])
+            self.assertAlmostEqual(float(trade["price"]), 101.0)
+            self.assertAlmostEqual(
+                float(trade["commission"]),
+                101.0 * 0.1 * 0.0005,
+            )
 
             monitor = TruthMonitor(oms, truth, config, start_thread=False)
             self.assertTrue(monitor.poll_once())

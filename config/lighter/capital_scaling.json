@@ -1,0 +1,23 @@
+{
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "strategy.capital_scaling",
+  "version": 1,
+  "strategy": {
+    "_comment_capital_scaling": "Lighter Paper: same envelope as the Binance Paper profile, budgeted in USDC collateral.",
+    "capital_multiplier": 100.0,
+    "capital_scaling": {
+      "enabled": true,
+      "reference_capital_usdt": 100.0,
+      "target_order_notional": 1.0,
+      "order_notional_limit_factor": 1.1,
+      "target_total_risk_notional": 5.0,
+      "target_concurrent_symbols": 1,
+      "target_daily_loss": 1.0,
+      "max_order_qty": 10000.0,
+      "budget_asset_weights": {
+        "USDC": 1.0
+      },
+      "position_buffer_orders": 5.0
+    }
+  }
+}

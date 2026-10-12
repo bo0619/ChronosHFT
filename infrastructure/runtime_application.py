@@ -13,6 +13,7 @@ from infrastructure.runtime_readiness import (
     RuntimeReadinessEvaluator,
 )
 from infrastructure.runtime_resources import RuntimeResources
+from infrastructure.venue import configured_venue
 
 
 @dataclass(frozen=True)
@@ -271,9 +272,7 @@ class RuntimeApplication:
         clock = services.platform.time_service
         time_sync_config = config.get("system", {}).get("time_sync", {}) or {}
         clock.configure(time_sync_config)
-        initial_clock_sync_ok = clock.start(
-            testnet=is_testnet_environment(config)
-        )
+        initial_clock_sync_ok = clock.start(testnet=is_testnet_environment(config))
         clock_required = bool(time_sync_config.get("startup_required", True))
         if clock_required and not (
             initial_clock_sync_ok and clock.is_ready()
@@ -525,7 +524,8 @@ class RuntimeApplication:
             services.platform.logger.set_ui_callback(dashboard.add_log)
         self._own("web_dashboard", dashboard)
         services.factories.ref_data_manager.init(
-            testnet=is_testnet_environment(config)
+            testnet=is_testnet_environment(config),
+            venue=configured_venue(config),
         )
 
     def _register_events_and_start_core(self) -> None:
