@@ -733,6 +733,41 @@ class LiveConfigGuardTests(unittest.TestCase):
 
         self.assertIs(validate_rpi_calibration_guard(config), config)
 
+    def test_rpi_calibration_accepts_30_usdt_account_one_koru_contract(self):
+        config = safe_rpi_calibration_config()
+        config["symbols"] = ["KORUUSDT"]
+        config["live_launch"]["declared_account_equity_usdt"] = 30.0
+        config["live_launch"]["max_deployed_capital_usdt"] = 21.0
+        config["live_launch"]["max_deployment_loss_usdt"] = 1.0
+        config["account"]["trading_budget_total"] = 21.0
+        config["account"]["trading_budget_by_asset"] = {"USDT": 21.0}
+        config["risk"]["limits"].update(
+            {
+                "max_order_notional": 20.0,
+                "max_pos_notional": 20.0,
+                "max_account_gross_notional": 20.0,
+                "max_daily_loss": 0.5,
+            }
+        )
+        config["risk"]["strategy_risk_budgets"]["budgets"][
+            "GLFT_MultiScale"
+        ].update({"max_gross_notional": 20.0, "max_symbol_notional": 20.0})
+        config["strategy"]["target_order_notional"] = 17.0
+        config["strategy"]["max_pos_usdt"] = 20.0
+        config["strategy"]["glft"]["inventory_lot_notional_usdt"] = 17.0
+        permit = config["_validated_rpi_calibration_permit"]["permit"]
+        permit["symbol"] = "KORUUSDT"
+        permit["policy"].update(
+            {
+                "min_order_notional_usdt": 15.0,
+                "max_order_notional_usdt": 20.0,
+                "max_cumulative_submitted_notional_usdt": 200.0,
+                "max_calibration_loss_usdt": 1.0,
+            }
+        )
+
+        self.assertIs(validate_rpi_calibration_guard(config), config)
+
     def test_live_canary_requires_conservative_funding_guard(self):
         cases = (
             ("enabled", False, "funding_guard.enabled"),
@@ -799,8 +834,8 @@ class LiveConfigGuardTests(unittest.TestCase):
             ),
             (
                 ("live_launch", "declared_account_equity_usdt"),
-                200.0,
-                "4.0% of declared account equity",
+                70.0,
+                "70.0% of declared account equity",
             ),
             (
                 ("live_launch", "max_deployment_loss_usdt"),
@@ -814,7 +849,7 @@ class LiveConfigGuardTests(unittest.TestCase):
             ),
             (
                 ("risk", "limits", "max_order_notional"),
-                8.01,
+                20.01,
                 "max_order_notional",
             ),
             (

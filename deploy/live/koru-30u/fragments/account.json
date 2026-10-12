@@ -1,0 +1,11 @@
+{
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "account",
+  "version": 1,
+  "account": {
+    "leverage": 1,
+    "margin_type": "ISOLATED",
+    "position_mode": "ONE_WAY",
+    "use_bnb_fees": false
+  }
+}

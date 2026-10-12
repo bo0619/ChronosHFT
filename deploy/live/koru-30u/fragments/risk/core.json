@@ -1,0 +1,8 @@
+{
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "risk.core",
+  "version": 1,
+  "risk": {
+    "active": true
+  }
+}
