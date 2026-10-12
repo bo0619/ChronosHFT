@@ -1,3 +1,4 @@
+import logging
 import math
 import os
 import sys
@@ -39,6 +40,7 @@ from infrastructure.single_writer_fence import (
 )
 from infrastructure.truth_monitor import TruthMonitor
 from oms.engine import OMS
+from risk.venue_dms import VenueDMSController
 from oms.exchange_snapshot import ExchangeTruthSnapshot
 from oms.journal import (
     decode_legacy_journal,
@@ -1718,6 +1720,105 @@ class OMSSurvivabilityTests(unittest.TestCase):
             with data_cache._lock:
                 data_cache.mark_prices.pop("BTCUSDT", None)
                 data_cache.mark_update_times.pop("BTCUSDT", None)
+
+    def _make_dms_oms(self, gateway):
+        config = self.make_config()
+        config["oms"]["venue_dead_man_switch"] = {
+            "enabled": True,
+            "countdown_time_ms": 1000,
+            "renewal_interval_sec": 0.001,
+            "max_renewal_age_sec": 0.10,
+            "recovery_checks": 2,
+        }
+        oms = OMS(DummyEngine(), gateway, config)
+        oms.state = LifecycleState.LIVE
+        self.assertTrue(oms.renew_venue_dead_man_switch(force=True))
+        controller = VenueDMSController(
+            root_config=config,
+            oms=oms,
+            logger=logging.getLogger("test_venue_dms"),
+        )
+        return oms, controller
+
+    def _drive_dms_until_valid(self, oms, controller):
+        # Same cadence as the risk loop: renew on every tick until healthy.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            self.assertTrue(
+                controller.renew(active=True, kill_switch_triggered=False)
+            )
+            if (
+                not oms.venue_dead_man_renewal_inflight
+                and oms.get_venue_dead_man_switch_snapshot()["valid"]
+            ):
+                return
+            time.sleep(0.01)
+
+    def test_symbol_guard_withholds_dms_and_recovers_after_clear(self):
+        gateway = DummyGateway()
+        oms, controller = self._make_dms_oms(gateway)
+        try:
+            oms.freeze_symbol(
+                "BTCUSDT",
+                "system_health:ORDERBOOK_GAP",
+                cancel_active_orders=True,
+            )
+            self.assertTrue(
+                controller.renew(active=True, kill_switch_triggered=False)
+            )
+            oms.last_venue_dead_man_success_monotonic -= 1.0
+            snapshot = oms.get_venue_dead_man_switch_snapshot()
+            self.assertFalse(snapshot["valid"])
+            self.assertEqual(
+                snapshot["reason"],
+                "renewal_withheld:oms_guard_active",
+            )
+            self.assertTrue(
+                controller.renew(active=True, kill_switch_triggered=False)
+            )
+            self.assertTrue(controller.renewal_authorized)
+            self.assertFalse(
+                oms.has_trading_mode_constraint(("venue_dead_man_switch:",))
+            )
+
+            self.assertTrue(
+                oms.clear_symbol_freeze(
+                    "BTCUSDT",
+                    reason="test",
+                    expected_epoch=oms.get_symbol_freeze_epoch("BTCUSDT"),
+                    expected_reason=oms.get_symbol_freeze_reason("BTCUSDT"),
+                )
+            )
+            renewals_before = len(gateway.dead_man_requests)
+            self._drive_dms_until_valid(oms, controller)
+            self.assertTrue(controller.renewal_authorized)
+            self.assertGreater(len(gateway.dead_man_requests), renewals_before)
+            self.assertTrue(oms.get_venue_dead_man_switch_snapshot()["valid"])
+            self.assertFalse(
+                oms.has_trading_mode_constraint(("venue_dead_man_switch:",))
+            )
+        finally:
+            oms.stop()
+
+    def test_outstanding_dms_attempt_past_max_age_still_latches(self):
+        gateway = DummyGateway()
+        oms, controller = self._make_dms_oms(gateway)
+        try:
+            now = time.perf_counter()
+            oms.last_venue_dead_man_success_monotonic = now - 1.0
+            oms.last_venue_dead_man_attempt_monotonic = now - 0.5
+            snapshot = oms.get_venue_dead_man_switch_snapshot()
+            self.assertTrue(snapshot["reason"].startswith("renewal_stale:"))
+            self.assertFalse(snapshot["stale_recoverable"])
+            self.assertFalse(
+                controller.renew(active=True, kill_switch_triggered=False)
+            )
+            self.assertFalse(controller.renewal_authorized)
+            self.assertTrue(
+                controller.failure_reason.startswith("renewal_stale:")
+            )
+        finally:
+            oms.stop()
 
     def test_dead_man_renewal_request_does_not_block_risk_loop(self):
         gateway = DummyGateway()
@@ -3725,6 +3826,14 @@ class SystemHealthHandlerTests(unittest.TestCase):
         risk_controller = DummyRiskController()
         handle_system_health_event(Event("eSystemHealth", "FATAL_GAP"), risk_controller)
         self.assertEqual(risk_controller.reasons, ["SystemHealth: FATAL_GAP"])
+
+    def test_paper_dms_expiry_does_not_trigger_kill_switch(self):
+        risk_controller = DummyRiskController()
+        handle_system_health_event(
+            Event("eSystemHealth", "PAPER_DMS_TRIGGERED:BZUSDT"),
+            risk_controller,
+        )
+        self.assertEqual(risk_controller.reasons, [])
 
     def test_halt_echo_does_not_retrigger_kill_switch(self):
         risk_controller = DummyRiskController()
