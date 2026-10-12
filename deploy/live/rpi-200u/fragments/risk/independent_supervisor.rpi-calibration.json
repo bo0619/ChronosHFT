@@ -1,0 +1,14 @@
+{
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "risk.independent_supervisor",
+  "version": 1,
+  "risk": {
+    "independent_supervisor": {
+      "enabled": true,
+      "state_store_root": "storage/live/EDIT-ME-rpi-200u-001/calibration/risk-sidecar-v2",
+      "account_scope_id": "EDIT-ME-account-scope",
+      "state_genesis_id": "EDIT-ME-state-genesis",
+      "cash_flow_deployment_start_ms": 1791331200000
+    }
+  }
+}

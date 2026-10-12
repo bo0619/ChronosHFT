@@ -78,6 +78,7 @@ CONFIG_FRAGMENT_ORDER = (
     "strategy.model_readiness",
     "strategy.glft",
     "strategy.avellaneda_stoikov",
+    "live",
 )
 _FRAGMENT_METADATA_KEYS = frozenset({"$schema", "fragment", "version"})
 _MONOLITHIC_METADATA_KEYS = frozenset(

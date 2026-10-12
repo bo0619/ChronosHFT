@@ -1,0 +1,10 @@
+{
+  "$schema": "chronoshft.config_fragment.v3",
+  "fragment": "strategy.order_sizing",
+  "version": 1,
+  "strategy": {
+    "order_sizing": {
+      "mode": "notional"
+    }
+  }
+}

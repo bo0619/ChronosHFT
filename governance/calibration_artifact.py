@@ -40,6 +40,7 @@ from governance.contracts import (  # noqa: E402
 from governance.deployment_identity import (  # noqa: E402
     deployment_config_sha256,
 )
+from infrastructure.durability import sync_directory as _sync_directory  # noqa: E402
 from governance.strategy_identity import (  # noqa: E402
     canonical_model_key,
     implementation_sha256_for_model,
@@ -3574,20 +3575,6 @@ def _aggregate_samples(
     return tuple(aggregated)
 
 
-def _sync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    except OSError:
-        pass
-    finally:
-        os.close(descriptor)
-
-
 def _atomic_write_json(
     output_path: Path,
     value: Mapping[str, Any],
@@ -3792,19 +3779,12 @@ def build_rpi_calibration_artifact(
 
 
 def load_effective_deployment_config(path: str | Path) -> dict[str, Any]:
+    from infrastructure.config_scaling import load_config_document
+
     source = Path(path).resolve()
     try:
-        with source.open("r", encoding="utf-8") as handle:
-            raw = json.load(
-                handle,
-                parse_constant=_reject_json_constant,
-                object_pairs_hook=_object_without_duplicate_keys,
-            )
-    except (
-        OSError,
-        json.JSONDecodeError,
-        CalibrationArtifactError,
-    ) as exc:
+        raw = load_config_document(str(source))
+    except (OSError, ValueError) as exc:
         raise CalibrationArtifactError(
             f"cannot read deployment config {source}: {exc}"
         ) from exc

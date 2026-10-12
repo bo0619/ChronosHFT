@@ -1,8 +1,8 @@
 # file: data/orderbook.py
 
-import heapq
 import math
 import time
+from bisect import bisect_left, insort
 from datetime import datetime, timezone
 
 from event.type import OrderBook, OrderBookGapError
@@ -21,6 +21,11 @@ class LocalOrderBook:
         self.symbol = symbol
         self.bids = {}
         self.asks = {}
+        # Ascending price keys of ``bids``/``asks``. They make best-price
+        # lookups and the published top-N O(log N) slices instead of full
+        # scans of up to ``max_levels_per_side`` levels on every delta.
+        self._bid_prices = []
+        self._ask_prices = []
         self.last_update_id = 0
         self.initialized = False
         self._awaiting_first_delta = True
@@ -61,6 +66,8 @@ class LocalOrderBook:
 
         self.bids = bids
         self.asks = asks
+        self._bid_prices = sorted(bids)
+        self._ask_prices = sorted(asks)
         self.last_update_id = last_update_id
         self.initialized = True
         self._awaiting_first_delta = True
@@ -151,13 +158,12 @@ class LocalOrderBook:
             self.initialized = False
             raise OrderBookGapError(f"Gap detected for {self.symbol}")
 
-        bid_levels_dirty = False
-        ask_levels_dirty = False
-        for price, qty in bid_updates.items():
-            bid_levels_dirty = self._apply_bid_update(price, qty) or bid_levels_dirty
-
-        for price, qty in ask_updates.items():
-            ask_levels_dirty = self._apply_ask_update(price, qty) or ask_levels_dirty
+        if bid_updates:
+            self._apply_updates(self.bids, self._bid_prices, bid_updates)
+            self._recompute_best_bid()
+        if ask_updates:
+            self._apply_updates(self.asks, self._ask_prices, ask_updates)
+            self._recompute_best_ask()
 
         if (
             len(self.bids) > self.max_levels_per_side
@@ -169,15 +175,18 @@ class LocalOrderBook:
                 f"limit={self.max_levels_per_side}"
             )
 
-        if bid_levels_dirty:
+        if bid_updates:
             self._recompute_published_bid_levels()
-        if ask_levels_dirty:
+        if ask_updates:
             self._recompute_published_ask_levels()
 
-        try:
-            self._validate_book(self.bids, self.asks)
-        except ValueError as exc:
-            self._reject_integrity(str(exc))
+        if not self._bid_prices or not self._ask_prices:
+            self._reject_integrity("order book side is empty")
+        if self._bid_prices[-1] >= self._ask_prices[0]:
+            self._reject_integrity(
+                f"crossed order book best_bid={self._bid_prices[-1]} "
+                f"best_ask={self._ask_prices[0]}"
+            )
 
         self.last_update_id = u
         self._awaiting_first_delta = False
@@ -289,41 +298,17 @@ class LocalOrderBook:
             f"Order book integrity failure for {self.symbol}: {reason}"
         )
 
-    def _apply_bid_update(self, price: float, qty: float):
-        current_best = self.best_bid_price
-        levels_dirty = False
-        if self._level_frontier_impacted(price, self.top_bids, descending=True):
-            levels_dirty = True
-        if qty == 0.0:
-            if price in self.bids:
-                del self.bids[price]
-                if price == current_best:
-                    self._recompute_best_bid()
-            return levels_dirty
-
-        self.bids[price] = qty
-        if price >= current_best:
-            self.best_bid_price = price
-            self.best_bid_volume = qty
-        return levels_dirty
-
-    def _apply_ask_update(self, price: float, qty: float):
-        current_best = self.best_ask_price
-        levels_dirty = False
-        if self._level_frontier_impacted(price, self.top_asks, descending=False):
-            levels_dirty = True
-        if qty == 0.0:
-            if price in self.asks:
-                del self.asks[price]
-                if current_best == 0.0 or price == current_best:
-                    self._recompute_best_ask()
-            return levels_dirty
-
-        self.asks[price] = qty
-        if current_best == 0.0 or price <= current_best:
-            self.best_ask_price = price
-            self.best_ask_volume = qty
-        return levels_dirty
+    @staticmethod
+    def _apply_updates(levels: dict, prices: list, updates: dict) -> None:
+        for price, qty in updates.items():
+            if qty == 0.0:
+                if price in levels:
+                    del levels[price]
+                    del prices[bisect_left(prices, price)]
+                continue
+            if price not in levels:
+                insort(prices, price)
+            levels[price] = qty
 
     def _recompute_best_quotes(self):
         self._recompute_best_bid()
@@ -331,20 +316,20 @@ class LocalOrderBook:
         self._recompute_published_levels()
 
     def _recompute_best_bid(self):
-        if not self.bids:
+        if not self._bid_prices:
             self.best_bid_price = 0.0
             self.best_bid_volume = 0.0
             return
-        price = max(self.bids.keys())
+        price = self._bid_prices[-1]
         self.best_bid_price = price
         self.best_bid_volume = self.bids[price]
 
     def _recompute_best_ask(self):
-        if not self.asks:
+        if not self._ask_prices:
             self.best_ask_price = 0.0
             self.best_ask_volume = 0.0
             return
-        price = min(self.asks.keys())
+        price = self._ask_prices[0]
         self.best_ask_price = price
         self.best_ask_volume = self.asks[price]
 
@@ -353,28 +338,15 @@ class LocalOrderBook:
         self._recompute_published_ask_levels()
 
     def _recompute_published_bid_levels(self):
-        depth = self.publish_depth_levels
+        bids = self.bids
         self.top_bids = tuple(
-            heapq.nlargest(depth, self.bids.items(), key=lambda item: item[0])
+            (price, bids[price])
+            for price in reversed(self._bid_prices[-self.publish_depth_levels:])
         )
 
     def _recompute_published_ask_levels(self):
-        depth = self.publish_depth_levels
+        asks = self.asks
         self.top_asks = tuple(
-            heapq.nsmallest(depth, self.asks.items(), key=lambda item: item[0])
+            (price, asks[price])
+            for price in self._ask_prices[: self.publish_depth_levels]
         )
-
-    def _level_frontier_impacted(self, price: float, levels, descending: bool):
-        if self.emit_full_book:
-            return True
-        if not levels:
-            return True
-        level_prices = {level_price for level_price, _ in levels}
-        if price in level_prices:
-            return True
-        if len(levels) < self.publish_depth_levels:
-            return True
-        frontier_price = levels[-1][0]
-        if descending:
-            return price >= frontier_price
-        return price <= frontier_price

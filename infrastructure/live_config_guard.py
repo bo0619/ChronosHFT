@@ -13,6 +13,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from governance.state_paths import (
+    raw_path_parts as _raw_path_parts,
+    resolved_path_identity as _resolved_path_identity,
     validate_live_state_path_bindings as _validate_live_state_path_bindings,
 )
 from infrastructure.external_alerts import validate_https_webhook_url
@@ -251,31 +253,6 @@ def _uses_paper_state_path(value) -> bool:
     normalized = str(value or "").strip().replace("\\", "/").lower()
     parts = tuple(part for part in normalized.split("/") if part not in {"", "."})
     return "paper" in parts
-
-
-def _raw_path_parts(value) -> tuple[str, ...]:
-    normalized = str(value or "").strip().replace("\\", "/")
-    return tuple(part for part in normalized.split("/") if part not in {"", "."})
-
-
-def _resolved_path_identity(value, *, base_dir: str | Path | None = None):
-    raw = str(value or "").strip()
-    if not raw:
-        raise ValueError("path must be configured")
-    if ".." in _raw_path_parts(raw):
-        raise ValueError("path must not contain '..' components")
-
-    normalized = raw.replace("\\", os.sep).replace("/", os.sep)
-    candidate = Path(normalized)
-    if not candidate.is_absolute():
-        candidate = Path(base_dir or Path.cwd()) / candidate
-    try:
-        resolved = candidate.resolve(strict=False)
-    except (OSError, RuntimeError) as exc:
-        raise ValueError(f"path cannot be resolved: {exc}") from exc
-    identity = os.path.normcase(os.path.normpath(str(resolved)))
-    parts = tuple(os.path.normcase(part) for part in resolved.parts)
-    return identity, parts
 
 
 def validate_live_external_alert_config(
@@ -2280,6 +2257,7 @@ def validate_live_runtime_config(
     *,
     config_path: str | Path | None = None,
     target_config_normalizer: Callable[[dict], Mapping] | None = None,
+    target_config_loader: Callable[[str], dict] | None = None,
     require_local_evidence: bool = False,
     now_utc: datetime | None = None,
     external_alert_environ: Mapping[str, str] | None = None,
@@ -2408,6 +2386,7 @@ def validate_live_runtime_config(
         strategy,
         config_path=config_path,
         target_config_normalizer=target_config_normalizer,
+        target_config_loader=target_config_loader,
         now_utc=now_utc,
         violations=violations,
         guard=guard_module,

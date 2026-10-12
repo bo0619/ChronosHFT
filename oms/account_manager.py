@@ -20,6 +20,9 @@ class AccountManager:
         self.exposure = exposure_manager
         self.clock = clock
         self.market_cache = market_cache
+        # The balance covers the configured symbols' quote assets only, the
+        # same scope as the truth monitor and the external cash-flow ledger.
+        self.balance_assets = self._quote_assets(config.get("symbols", []))
 
         acc_conf = config.get("account", {})
         self.configured_balance = float(acc_conf.get("initial_balance_usdt", 10000.0) or 10000.0)
@@ -88,6 +91,15 @@ class AccountManager:
             balances=balances,
             replace=True,
         )
+        if balances is not None:
+            # In Binance single-asset mode totalWalletBalance covers USDT
+            # only, while the user stream reports every asset. Take the
+            # per-asset sum so that both paths agree.
+            aggregate_balance, aggregate_available = self._stable_balance_totals()
+            if aggregate_balance is not None:
+                self.balance = aggregate_balance
+                if aggregate_available is not None:
+                    available = aggregate_available
         self._set_margin_health(
             maintenance_margin,
             margin_balance,
@@ -95,6 +107,18 @@ class AccountManager:
             snapshot_monotonic=margin_snapshot_monotonic,
         )
         self.calculate(used_margin_override=used_margin, available_override=available)
+
+    def snapshot_balance(self, total_wallet_balance: float, balances: dict = None) -> float:
+        """Return the balance force_sync would record for a REST snapshot."""
+        balances = self._normalize_balance_payload(balances) or {}
+        tracked = [
+            payload["wallet_balance"]
+            for asset, payload in balances.items()
+            if asset in self.balance_assets
+        ]
+        if tracked:
+            return float(sum(tracked))
+        return self._require_finite(total_wallet_balance, "balance")
 
     def sync_exchange_balance(
         self,
@@ -379,7 +403,7 @@ class AccountManager:
                 self.available_balances[asset] = float(available)
 
     def _stable_balance_totals(self) -> tuple[float | None, float | None]:
-        assets = sorted(self._USD_EQUIVALENT_ASSETS.intersection(self.balances))
+        assets = sorted(self.balance_assets.intersection(self.balances))
         if not assets:
             return None, None
 
@@ -388,6 +412,16 @@ class AccountManager:
         if all(asset in self.available_balances for asset in assets):
             available = sum(self.available_balances[asset] for asset in assets)
         return balance, available
+
+    @classmethod
+    def _quote_assets(cls, symbols) -> frozenset:
+        assets = frozenset(
+            asset
+            for symbol in symbols or []
+            for asset in cls._USD_EQUIVALENT_ASSETS
+            if str(symbol or "").upper().endswith(asset)
+        )
+        return assets or cls._USD_EQUIVALENT_ASSETS
 
     @classmethod
     def _normalize_balance_payload(cls, balances):

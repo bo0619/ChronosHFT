@@ -15,14 +15,14 @@ def _section(config: Mapping, key: str) -> Mapping:
     return value if isinstance(value, Mapping) else {}
 
 
-def _raw_path_parts(value: object) -> tuple[str, ...]:
+def raw_path_parts(value: object) -> tuple[str, ...]:
     normalized = str(value or "").strip().replace("\\", "/")
     return tuple(
         part for part in normalized.split("/") if part not in {"", "."}
     )
 
 
-def _resolved_path_identity(
+def resolved_path_identity(
     value: object,
     *,
     base_dir: str | Path | None = None,
@@ -30,7 +30,7 @@ def _resolved_path_identity(
     raw = str(value or "").strip()
     if not raw:
         raise ValueError("path must be configured")
-    if ".." in _raw_path_parts(raw):
+    if ".." in raw_path_parts(raw):
         raise ValueError("path must not contain '..' components")
 
     normalized = raw.replace("\\", os.sep).replace("/", os.sep)
@@ -88,7 +88,7 @@ def validate_live_state_path_bindings(
     resolved_parts: dict[str, tuple[str, ...]] = {}
     for field, raw_path in raw_paths.items():
         try:
-            identity, parts = _resolved_path_identity(
+            identity, parts = resolved_path_identity(
                 raw_path,
                 base_dir=base_dir,
             )
@@ -110,7 +110,7 @@ def validate_live_state_path_bindings(
         )
 
     journal_raw = str(raw_paths["oms.journal_path"] or "").strip()
-    expected_fence, _ = _resolved_path_identity(
+    expected_fence, _ = resolved_path_identity(
         f"{journal_raw}.lock",
         base_dir=base_dir,
     )
@@ -123,7 +123,7 @@ def validate_live_state_path_bindings(
     evidence_raw = str(
         raw_paths["system.evidence_recorder.path"] or ""
     ).strip()
-    expected_evidence_fence, _ = _resolved_path_identity(
+    expected_evidence_fence, _ = resolved_path_identity(
         f"{evidence_raw}.lock",
         base_dir=base_dir,
     )
@@ -146,4 +146,8 @@ def validate_live_state_path_bindings(
     return identities
 
 
-__all__ = ["validate_live_state_path_bindings"]
+__all__ = [
+    "raw_path_parts",
+    "resolved_path_identity",
+    "validate_live_state_path_bindings",
+]

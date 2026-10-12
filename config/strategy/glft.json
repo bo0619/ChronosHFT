@@ -36,9 +36,11 @@
         "markout": {
           "horizons_ms": [100, 500, 1000],
           "min_samples": 12,
-          "confidence_z": 1.645,
+          "confidence_z": 0.0,
           "max_pending": 5000,
-          "window_size": 200
+          "window_size": 200,
+          "cost_horizon_ms": 1000,
+          "prior_samples": 12
         },
         "flow_toxicity": {
           "enabled": true,
@@ -95,7 +97,8 @@
         "initial_k": 0.8,
         "sigma_max_bps": 100.0,
         "sigma_ema_alpha": 0.1,
-        "max_tick_gap_sec": 2.0
+        "max_tick_gap_sec": 2.0,
+        "sigma_sample_interval_s": 1.0
       },
       "execution": {
         "min_spread_bps": 5.0,

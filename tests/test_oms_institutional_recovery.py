@@ -124,6 +124,32 @@ class BlockingSubmitGateway(RecoveryGateway):
         )
 
 
+DAY_MS = 86_400_000
+
+
+class SevenDayTradeWindowGateway(RecoveryGateway):
+    """Answer userTrades time windows the way Binance does: at most 7 days."""
+
+    def __init__(self):
+        super().__init__()
+        self.windows = []
+        self.failing_window = None
+
+    def get_user_trades(self, _symbol, from_id=None, start_time=None, end_time=None, **_kwargs):
+        if from_id is not None:
+            return super().get_user_trades(_symbol, from_id=from_id)
+        self.windows.append((int(start_time), int(end_time)))
+        if int(end_time) - int(start_time) > 7 * DAY_MS:
+            return None
+        if self.failing_window == len(self.windows) - 1:
+            return None
+        return [
+            trade
+            for trade in self.trades
+            if int(start_time) <= int(trade["time"]) <= int(end_time)
+        ]
+
+
 class InstitutionalRecoveryTests(unittest.TestCase):
     def make_config(self):
         return {
@@ -793,6 +819,97 @@ class InstitutionalRecoveryTests(unittest.TestCase):
             self.assertTrue(oms._backfill_trade_history(end_time_ms=5000))
             self.assertAlmostEqual(oms.exposure.net_positions["BTCUSDT"], 1.0)
             self.assertAlmostEqual(oms.account.balance, 999.7)
+        finally:
+            oms.stop()
+
+    def test_trade_scan_walks_an_old_gap_in_seven_day_windows(self):
+        oms, gateway = self.make_live_oms(SevenDayTradeWindowGateway())
+        try:
+            now_ms = 1_790_000_000_000
+            order = self.add_active_order(oms)
+            oms.account.force_sync(1000.0, 0.0)
+            gateway.trades = [
+                {
+                    "symbol": "BTCUSDT",
+                    "id": 7,
+                    "orderId": "ex-1",
+                    "side": "BUY",
+                    "price": "100",
+                    "qty": "1.0",
+                    "realizedPnl": "0",
+                    "commission": "0",
+                    "commissionAsset": "USDT",
+                    "time": now_ms - 15 * DAY_MS,
+                    "maker": True,
+                }
+            ]
+            # BTCUSDT has no trade cursor yet and was last scanned 20 days ago.
+            oms.trade_scan_end_ms["BTCUSDT"] = now_ms - 20 * DAY_MS
+
+            self.assertTrue(oms._backfill_trade_history(end_time_ms=now_ms))
+
+            starts = [start for start, _end in gateway.windows]
+            ends = [end for _start, end in gateway.windows]
+            self.assertTrue(
+                all(end - start <= 7 * DAY_MS for start, end in gateway.windows)
+            )
+            self.assertEqual(
+                starts[0],
+                now_ms - 20 * DAY_MS - oms.trade_recovery_overlap_ms,
+            )
+            self.assertEqual(starts[1:], ends[:-1])
+            self.assertEqual(ends[-1], now_ms)
+            self.assertEqual(order.status, OrderStatus.FILLED)
+            self.assertEqual(oms.trade_cursors["BTCUSDT"], 7)
+            self.assertEqual(oms.trade_scan_end_ms["BTCUSDT"], now_ms)
+        finally:
+            oms.stop()
+
+    def test_trade_scan_resumes_after_a_failed_window(self):
+        oms, gateway = self.make_live_oms(SevenDayTradeWindowGateway())
+        try:
+            now_ms = 1_790_000_000_000
+            oms.trade_scan_end_ms["BTCUSDT"] = now_ms - 20 * DAY_MS
+            gateway.failing_window = 1
+
+            self.assertFalse(oms._backfill_trade_history(end_time_ms=now_ms))
+            first_window_end = gateway.windows[0][1]
+            self.assertEqual(oms.trade_scan_end_ms["BTCUSDT"], first_window_end)
+
+            gateway.failing_window = None
+            gateway.windows.clear()
+            self.assertTrue(oms._backfill_trade_history(end_time_ms=now_ms))
+            self.assertEqual(
+                gateway.windows[0][0],
+                first_window_end - oms.trade_recovery_overlap_ms,
+            )
+            self.assertEqual(oms.trade_scan_end_ms["BTCUSDT"], now_ms)
+        finally:
+            oms.stop()
+
+    def test_trade_scan_starts_inside_venue_trade_retention(self):
+        oms, gateway = self.make_live_oms(SevenDayTradeWindowGateway())
+        try:
+            now_ms = 1_790_000_000_000
+            oms.trade_scan_end_ms["BTCUSDT"] = now_ms - 200 * DAY_MS
+
+            self.assertTrue(oms._backfill_trade_history(end_time_ms=now_ms))
+            # Binance serves about three months of userTrades history.
+            self.assertGreaterEqual(gateway.windows[0][0], now_ms - 90 * DAY_MS)
+            self.assertEqual(gateway.windows[-1][1], now_ms)
+        finally:
+            oms.stop()
+
+    def test_rearm_recovers_from_week_old_trade_scan(self):
+        gateway = SevenDayTradeWindowGateway()
+        oms = OMS(DummyEngine(), gateway, self.make_config())
+        try:
+            # A symbol that has not filled yet, last scanned 8 days ago.
+            oms.trade_scan_end_ms["BTCUSDT"] = int(time.time() * 1000) - 8 * DAY_MS
+            oms.halt_system("operator_test")
+
+            self.assertTrue(oms.rearm_system("operator_ack"))
+            self.assertEqual(oms.state, LifecycleState.LIVE)
         finally:
             oms.stop()
 

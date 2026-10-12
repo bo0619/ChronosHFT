@@ -944,6 +944,7 @@ def load_root_config(
                     target_config_normalizer=(
                         normalize_root_config_preapproval
                     ),
+                    target_config_loader=load_config_document,
                 )
             )
         elif stage == CANARY_STAGE:
@@ -969,5 +970,6 @@ def load_root_config(
         configured,
         config_path=config_path,
         target_config_normalizer=normalize_root_config_preapproval,
+        target_config_loader=load_config_document,
         require_local_evidence=not is_paper_trade(configured),
     )

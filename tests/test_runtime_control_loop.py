@@ -280,3 +280,32 @@ def test_runtime_tick_invalidates_readiness_when_clock_degrades(monkeypatch):
 
     assert metrics["runtime_readiness"]["ready"] is False
     assert "clock_unready" in metrics["runtime_readiness"]["reasons"]
+
+
+def test_run_forever_tunes_the_interpreter_before_looping(monkeypatch):
+    import gc
+    import sys
+
+    from infrastructure import interpreter_tuning
+    from infrastructure.runtime_control_loop import RuntimeControlLoop
+
+    calls = []
+    monkeypatch.setattr(sys, "setswitchinterval", lambda value: calls.append(("switch", value)))
+    monkeypatch.setattr(gc, "freeze", lambda: calls.append(("freeze",)))
+
+    class StopLoop(Exception):
+        pass
+
+    loop = RuntimeControlLoop.__new__(RuntimeControlLoop)
+    loop.sleep = lambda _seconds: (_ for _ in ()).throw(StopLoop())
+    loop.close = lambda: True
+
+    try:
+        loop.run_forever()
+    except StopLoop:
+        pass
+
+    assert calls == [
+        ("switch", interpreter_tuning.GIL_SWITCH_INTERVAL_SEC),
+        ("freeze",),
+    ]

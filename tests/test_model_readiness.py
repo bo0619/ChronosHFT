@@ -23,6 +23,7 @@ from infrastructure.config_scaling import (
     load_root_config as _load_root_config,
 )
 from infrastructure.config_scaling import (
+    load_config_document,
     normalize_root_config_preapproval,
 )
 from infrastructure.rpi_calibration_permit import (
@@ -68,7 +69,10 @@ from strategy.model_readiness import (
 from strategy.model_readiness import (
     validate_live_calibration_approval as _validate_live_calibration_approval,
 )
-from tests.test_live_config_guard import safe_live_config
+from tests.test_live_config_guard import (
+    safe_live_config,
+    write_live_config_manifest,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TEST_CASH_FLOW_DEPLOYMENT_START_MS = 1_753_248_000_000
@@ -870,7 +874,11 @@ class ModelReadinessTests(unittest.TestCase):
     def test_glft_volatility_uses_log_bps_and_rejects_crossed_books(self):
         calibrator = GLFTCalibrator(
             window=20,
-            config={"min_samples": 2, "max_tick_gap_sec": 1.0},
+            config={
+                "min_samples": 2,
+                "max_tick_gap_sec": 1.0,
+                "sigma_sample_interval_s": 0.5,
+            },
         )
 
         def book(mid, timestamp):
@@ -906,6 +914,37 @@ class ModelReadinessTests(unittest.TestCase):
             math.log(101.0 / 100.0) * 10_000.0 / math.sqrt(0.5),
         )
 
+    def test_glft_volatility_samples_fixed_intervals_not_every_tick(self):
+        calibrator = GLFTCalibrator(
+            window=100,
+            config={
+                "min_samples": 5,
+                "initial_sigma_bps": 1.0,
+                "sigma_ema_alpha": 1.0,
+                "sigma_sample_interval_s": 1.0,
+            },
+        )
+
+        def book(mid, timestamp):
+            return OrderBook(
+                symbol="XAUUSDT",
+                exchange="BINANCE",
+                datetime=datetime(2026, 7, 24),
+                bids={mid - 0.5: 1.0},
+                asks={mid + 0.5: 1.0},
+                exchange_timestamp=timestamp,
+            )
+
+        # One-tick bid-ask bounce every 10ms: per-tick r/sqrt(dt) would read
+        # this as roughly 10 bps/sqrt(s) of volatility.
+        with patch("alpha.factors.time.perf_counter", return_value=1.0):
+            for index in range(3001):
+                mid = 100.0 if index % 2 == 0 else 100.01
+                calibrator.on_orderbook(book(mid, 100.0 + index * 0.01))
+
+        self.assertEqual(calibrator.volatility_sample_count, 30)
+        self.assertLess(calibrator.sigma_bps, 1.1)
+
     def test_live_manifest_is_structurally_and_cryptographically_verified(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -938,17 +977,17 @@ class ModelReadinessTests(unittest.TestCase):
                 }
             )
             _set_test_state_paths(raw_calibration_config, "calibration")
-            calibration_config = normalize_root_config_preapproval(
-                raw_calibration_config
-            )
             calibration_config_path = root / "calibration-config.json"
-            target_config_path.write_text(
-                json.dumps(config),
-                encoding="utf-8",
+            write_live_config_manifest(target_config_path, raw_target_config)
+            write_live_config_manifest(
+                calibration_config_path,
+                raw_calibration_config,
             )
-            calibration_config_path.write_text(
-                json.dumps(calibration_config),
-                encoding="utf-8",
+            config = normalize_root_config_preapproval(
+                load_config_document(str(target_config_path))
+            )
+            calibration_config = normalize_root_config_preapproval(
+                load_config_document(str(calibration_config_path))
             )
             policy_sha256 = strategy_policy_sha256(config, model)
             self.assertEqual(

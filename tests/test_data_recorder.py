@@ -178,6 +178,10 @@ class DataRecorderIsolationTests(unittest.TestCase):
             frame = pd.read_hdf(files[0], key="depth")
             self.assertEqual(len(frame), 2_000)
             self.assertEqual(set(frame["symbol"]), {"BTCUSDT"})
+            self.assertTrue(files[0].name.endswith("_v2.h5"))
+            for column in ("exchange_ts", "received_ts", "corrected_received_ts"):
+                self.assertIn(column, frame.columns)
+            self.assertGreater(float(frame["exchange_ts"].iloc[0]), 0.0)
 
 
 if __name__ == "__main__":
