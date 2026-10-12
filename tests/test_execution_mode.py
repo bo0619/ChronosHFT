@@ -22,6 +22,7 @@ from strategy.execution_mode import (
     decide_market_order,
     resolve_execution_mode,
 )
+from strategy.fast_requote import FastRequotePolicy
 from strategy.quote_math import QuoteOffsets
 from tests.test_strategy_oms_coordination import (
     AvellanedaStoikovStrategy,
@@ -343,3 +344,99 @@ class ExecutionModeConfigTests(unittest.TestCase):
                 {"execution_modes": {"binance": "market"}},
                 live_mode=True,
             )
+
+
+class FastRequoteTests(unittest.TestCase):
+    def make_strategy(self, *, enabled=True, live_mode=False):
+        oms = PassiveQuoteOMS()
+        _, strategy = GLFTMarketExecutionTests().make_strategy(oms, {}, None)
+        # Only fast requotes can run a second cycle in these tests.
+        strategy.cycle_interval = 3600.0
+        strategy.init_fast_requote(
+            {
+                "fast_requote": {
+                    "enabled": enabled,
+                    "trigger_bps": 1.0,
+                    "min_interval_ms": 0.0,
+                }
+            },
+            live_mode=live_mode,
+        )
+        strategy._calculate_formula_quote = lambda **_kwargs: (
+            _formula(0.0),
+            {},
+        )
+        return oms, strategy
+
+    @staticmethod
+    def book(strategy, mid):
+        with patch.dict(
+            ref_data_manager.contracts,
+            {"LTCUSDT": _contract()},
+            clear=True,
+        ):
+            strategy.on_orderbook(_orderbook(mid))
+
+    @staticmethod
+    def cancelled(strategy, client_oid):
+        strategy.on_order(
+            OrderStateSnapshot(
+                client_oid=client_oid,
+                exchange_oid=f"ex-{client_oid}",
+                symbol="LTCUSDT",
+                status=OrderStatus.CANCELLED,
+                price=100.0,
+                volume=0.1,
+                filled_volume=0.0,
+                avg_price=0.0,
+                update_time=0.0,
+            )
+        )
+
+    def test_mid_move_cancels_the_exposed_side_then_refills(self):
+        oms, strategy = self.make_strategy()
+        self.book(strategy, 100.0)
+        self.assertEqual([i.side for i in oms.submitted], [Side.BUY, Side.SELL])
+        ask_oid = strategy.quote_state["LTCUSDT"]["ask_oid"]
+
+        # Below the trigger: nothing happens until the regular cycle.
+        self.book(strategy, 100.005)
+        self.assertEqual(oms.cancelled, [])
+
+        # Mid up 2 bps: the ask is now cheap and is pulled at once.
+        self.book(strategy, 100.02)
+        self.assertEqual(oms.cancelled, [ask_oid])
+        self.assertEqual(strategy.fast_requote_state["LTCUSDT"]["count"], 1)
+
+        # Once the cancel resolves the next book update refills the ask.
+        self.cancelled(strategy, ask_oid)
+        self.book(strategy, 100.02)
+        self.assertEqual(len(oms.submitted), 3)
+        self.assertEqual(oms.submitted[-1].side, Side.SELL)
+        self.assertTrue(oms.submitted[-1].is_post_only)
+        self.assertEqual(strategy.fast_requote_state["LTCUSDT"]["count"], 2)
+
+    def test_mid_drop_cancels_the_bid(self):
+        oms, strategy = self.make_strategy()
+        self.book(strategy, 100.0)
+        bid_oid = strategy.quote_state["LTCUSDT"]["bid_oid"]
+        self.book(strategy, 99.98)
+        self.assertEqual(oms.cancelled, [bid_oid])
+
+    def test_disabled_and_live_wait_for_the_regular_cycle(self):
+        for kwargs in ({"enabled": False}, {"live_mode": True}):
+            oms, strategy = self.make_strategy(**kwargs)
+            self.assertFalse(strategy.fast_requote_policy.enabled)
+            self.book(strategy, 100.0)
+            self.book(strategy, 100.5)
+            self.assertEqual(oms.cancelled, [], kwargs)
+            self.assertEqual(len(oms.submitted), 2, kwargs)
+
+    def test_policy_validation(self):
+        policy = FastRequotePolicy.from_config({}, live_mode=False)
+        self.assertFalse(policy.enabled)
+        self.assertEqual((policy.trigger_bps, policy.min_interval_ms), (1.0, 100.0))
+        with self.assertRaises(ValueError):
+            FastRequotePolicy.from_config({"trigger_bps": 0.0}, live_mode=False)
+        with self.assertRaises(ValueError):
+            FastRequotePolicy.from_config({"min_interval_ms": -1}, live_mode=False)

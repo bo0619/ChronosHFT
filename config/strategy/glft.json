@@ -53,6 +53,12 @@
           "enabled": true,
           "min_depth_bps": 1.5
         },
+        "_comment_fast_requote": "Paper-only. On a mid move of trigger_bps from the mid the quotes were priced at, cancel the quote on that side and reprice now instead of waiting for the cycle; min_interval_ms caps how often.",
+        "fast_requote": {
+          "enabled": true,
+          "trigger_bps": 1.0,
+          "min_interval_ms": 100
+        },
         "dynamic_covariance": {
           "sample_interval_s": 1.0,
           "max_state_age_s": 3.0,

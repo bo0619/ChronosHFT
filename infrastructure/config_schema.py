@@ -924,7 +924,15 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                                         "size_optimization": (
                                             _size_optimization_schema()
                                         ),
-                                    }
+                                        "fast_requote": _object(
+                                            {
+                                                "enabled": BOOL,
+                                                "trigger_bps": POSITIVE,
+                                                "min_interval_ms": NONNEGATIVE,
+                                            }
+                                        ),
+                                    },
+                                    optional=("fast_requote",),
                                 ),
                                 "rpi_intensity": _object(
                                     {

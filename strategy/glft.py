@@ -51,6 +51,7 @@ from strategy.adaptive_quoting import (
     AdaptiveQuotingStrategy,
     negative_infinity as _negative_infinity,
 )
+from strategy.fast_requote import FastRequoteMixin
 from strategy.market_execution import MarketExecutionMixin
 from strategy.model_readiness import (
     evaluate_symbol_readiness,
@@ -113,7 +114,7 @@ class _PortfolioAssetState:
     updated_at_monotonic: float
 
 
-class GLFTStrategy(MarketExecutionMixin, AdaptiveQuotingStrategy):
+class GLFTStrategy(FastRequoteMixin, MarketExecutionMixin, AdaptiveQuotingStrategy):
     """GLFT Model A strategy with one fixed-notional inventory unit."""
 
     def __init__(
@@ -555,6 +556,7 @@ class GLFTStrategy(MarketExecutionMixin, AdaptiveQuotingStrategy):
             )
         )
         self.init_execution_mode(self.strat_conf, live_mode=self.live_mode)
+        self.init_fast_requote(self.adaptive_config, live_mode=self.live_mode)
         if self.live_mode:
             if not self.execution.supports_strategy_evidence:
                 raise ValueError(
@@ -1360,10 +1362,7 @@ class GLFTStrategy(MarketExecutionMixin, AdaptiveQuotingStrategy):
         now = self.clock.monotonic()
         if not self.live_mode:
             self.latest_market_timing[symbol] = (
-                self._market_timing_snapshot(
-                    ob,
-                    now,
-                )
+                self._market_timing_snapshot(ob, now)
             )
         mid = (bid_1 + ask_1) / 2.0
         self._observe_rpi_orderbook(
@@ -1404,9 +1403,8 @@ class GLFTStrategy(MarketExecutionMixin, AdaptiveQuotingStrategy):
         calibrator.on_orderbook(ob)
         self.feature_engine.on_orderbook(ob)
 
-        if now - self.last_run_times[symbol] < self.cycle_interval:
+        if not self.quote_cycle_due(symbol, mid, now):
             return
-        self.last_run_times[symbol] = now
 
         features = self.feature_engine.get_features(symbol)
         alphas = model.update_and_predict(features, mid, now)
@@ -1907,6 +1905,7 @@ class GLFTStrategy(MarketExecutionMixin, AdaptiveQuotingStrategy):
             "adaptive": adaptive_runtime,
             "size_optimization": size_optimization,
             "stale_quote_guard": dict(self.latest_stale_guard[symbol]),
+            "fast_requotes": self.fast_requote_state[symbol]["count"],
             "market_data_timing": self._published_market_timing(symbol),
             "portfolio_risk": portfolio_risk,
             "units_version": UNITS_VERSION,
