@@ -10,7 +10,6 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 
 from alpha.engine import FeatureEngine
 from alpha.factors import GLFTCalibrator
-from alpha.gate import AlphaGate
 from alpha.glft_adaptive import (
     DynamicCovarianceEstimator,
     FillMarkoutEstimator,
@@ -26,7 +25,7 @@ from alpha.rpi_intensity import (
     RPIOrderExposure,
     estimate_rpi_intensity,
 )
-from alpha.signal import MultiHorizonPredictor
+from alpha.signal import alpha_factories_from_config, alpha_signal_report, predict_usable
 from event.type import (
     EVENT_STRATEGY_UPDATE,
     TIF_RPI,
@@ -332,10 +331,11 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
                 "alpha.short_fv_weight",
             ),
             "long_pos_weight": self._strict_finite(
-                self.alpha_config.get("long_pos_weight", 500.0),
+                self.alpha_config.get("long_pos_weight", 0.0),
                 "alpha.long_pos_weight",
             ),
         }
+        self.alpha_factories = alpha_factories_from_config(self.alpha_config)
         raw_portfolio_config = self.glft_conf.get("portfolio_risk", {})
         self.portfolio_risk_config = (
             dict(raw_portfolio_config)
@@ -805,12 +805,8 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
                 window=self.calibrator_window,
                 config=self.calibrator_config,
             )
-            self.models[symbol] = MultiHorizonPredictor(num_features=9)
-            self.gates[symbol] = AlphaGate(
-                max_bps=10.0,
-                decay_factor=0.9,
-                inventory_dampening=0.05,
-            )
+            self.models[symbol] = self.alpha_factories.predictor()
+            self.gates[symbol] = self.alpha_factories.gate()
         return (
             self.calibrators[symbol],
             self.models[symbol],
@@ -1407,7 +1403,7 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
         self.last_run_times[symbol] = now
 
         features = self.feature_engine.get_features(symbol)
-        alphas = model.update_and_predict(features, mid, now)
+        alphas = predict_usable(model, features, mid, now)
         predictor_samples = int(max(0, getattr(model, "sample_count", 0)))
         approved_intensity = self._approved_rpi_intensity(symbol)
         runtime_intensity = self._runtime_rpi_intensity(symbol)
@@ -1872,9 +1868,7 @@ class GLFTStrategy(AdaptiveQuotingStrategy):
             "orderflow_imbalance": signed_orderflow_imbalance,
             "recent_fill_defense": recent_fill_defense,
             "readiness": readiness.as_params(),
-            "signals": {
-                horizon: float(value) for horizon, value in alphas.items()
-            },
+            "signals": alpha_signal_report(model, alphas),
             "short_signal_bps": short_signal,
             "target_position_notional": target_pos_usdt,
             "effective_position_notional": effective_pos_usdt,
