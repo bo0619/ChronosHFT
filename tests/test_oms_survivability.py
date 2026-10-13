@@ -2376,6 +2376,44 @@ class OMSSurvivabilityTests(unittest.TestCase):
         finally:
             oms.stop()
 
+    def test_paper_recovery_failure_shares_the_transport_owner(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            oms.freeze_venue(
+                "BINANCE",
+                "system_health:WS_TRANSPORT_DROP:PUBLIC:lost",
+                cancel_active_orders=False,
+            )
+            timeout_reason = "system_health:PUBLIC_STREAM_RECOVERY_TIMEOUT"
+            timeout_epoch = oms.freeze_venue(
+                "BINANCE",
+                timeout_reason,
+                cancel_active_orders=False,
+            )
+            oms.state = LifecycleState.LIVE
+            oms._sync_capability_mode("truth_verified")
+
+            self.assertEqual(
+                oms.get_venue_freeze_owners("BINANCE"),
+                {
+                    "system_health:transport": {
+                        "reason": timeout_reason,
+                        "epoch": timeout_epoch,
+                    }
+                },
+            )
+            self.assertTrue(
+                oms._complete_venue_recovery_verification(
+                    "BINANCE",
+                    timeout_epoch,
+                    "system_health:transport",
+                    timeout_reason,
+                )
+            )
+            self.assertEqual(oms.get_venue_freeze_owners("BINANCE"), {})
+        finally:
+            oms.stop()
+
     def test_orderbook_recovery_token_cannot_clear_unrelated_symbol_guard(self):
         oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
         try:

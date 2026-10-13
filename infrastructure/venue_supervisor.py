@@ -13,6 +13,13 @@ class VenueSupervisor:
         self.poll_interval_sec = float(cfg.get("poll_interval_sec", 5.0))
         self.recovery_delay_sec = float(cfg.get("recovery_delay_sec", 2.0))
         self.max_attempts = max(1, int(cfg.get("max_attempts", 5)))
+        # After max_attempts fast retries, keep retrying with exponential
+        # backoff instead of giving up: a venue frozen by a transport outage
+        # must come back on its own once the network does.
+        self.max_backoff_sec = max(
+            self.recovery_delay_sec,
+            float(cfg.get("max_backoff_sec", 60.0)),
+        )
         self.recoverable_prefixes = tuple(
             cfg.get(
                 "recoverable_prefixes",
@@ -23,6 +30,8 @@ class VenueSupervisor:
                     "system_health:USER_STREAM_EXPIRED",
                     "system_health:USER_STREAM_KEEPALIVE_FAILED",
                     "system_health:MARKET_DATA_STALE",
+                    "system_health:PUBLIC_STREAM_",
+                    "system_health:PUBLIC_MARK_",
                 ],
             )
         )
@@ -65,6 +74,15 @@ class VenueSupervisor:
                 self.poll_once()
             except Exception as exc:
                 logger.error(f"[VenueSupervisor] Poll failed: {exc}")
+
+    def _retry_delay_sec(self, attempts: int) -> float:
+        if attempts < self.max_attempts:
+            return self.recovery_delay_sec
+        exponent = min(attempts - self.max_attempts + 1, 30)
+        return min(
+            self.max_backoff_sec,
+            max(self.recovery_delay_sec, 1.0) * (2.0 ** exponent),
+        )
 
     def poll_once(self):
         venue = getattr(self.gateway, "gateway_name", "UNKNOWN")
@@ -128,20 +146,20 @@ class VenueSupervisor:
             0.0,
         )
         now = time.perf_counter()
-        if attempts >= self.max_attempts:
+        if now - last_attempt_ts < self._retry_delay_sec(attempts):
+            return False
+        if attempts == self.max_attempts:
             logger.error(
-                f"[VenueSupervisor] Recovery budget exhausted for {venue}: "
-                f"{reason}"
+                f"[VenueSupervisor] {self.max_attempts} fast recoveries failed "
+                f"for {venue}; retrying with backoff up to "
+                f"{self.max_backoff_sec:.0f}s: {reason}"
             )
-            return False
-        if now - last_attempt_ts < self.recovery_delay_sec:
-            return False
 
         self.attempts_by_recovery[recovery_key] = attempts + 1
         self.last_attempt_ts_by_recovery[recovery_key] = now
         logger.warning(
             f"[VenueSupervisor] Recovering {venue} "
-            f"({self.attempts_by_recovery[recovery_key]}/{self.max_attempts}) "
+            f"(attempt {self.attempts_by_recovery[recovery_key]}) "
             f"because {reason}"
         )
         if context is None:
