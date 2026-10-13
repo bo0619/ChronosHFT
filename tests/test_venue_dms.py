@@ -138,3 +138,33 @@ def test_existing_risk_guards_withhold_request_without_latching():
     assert controller.renewal_authorized
     assert controller.last_renewal_result is None
     assert oms.renewals == 0
+
+
+def test_guard_raised_after_snapshot_withholds_without_latching():
+    # The health snapshot is read before a truth-plane freeze lands on another
+    # thread; the permission check then sees the guard.
+    oms = _OMS()
+
+    def refuse_and_withhold():
+        oms.snapshot = {**oms.snapshot, "renewal_withheld_reason": "oms_guard_active"}
+        return False
+
+    oms.can_renew_venue_dead_man_switch = refuse_and_withhold
+    controller = _controller(oms=oms)
+
+    assert controller.renew(active=True, kill_switch_triggered=False)
+    assert controller.renewal_authorized
+    assert controller.failure_reason == ""
+    assert oms.unhealthy == []
+    assert oms.renewals == 0
+
+
+def test_refused_renewal_without_withhold_reason_still_latches():
+    oms = _OMS()
+    oms.can_renew_venue_dead_man_switch = lambda: False
+    controller = _controller(oms=oms)
+
+    assert not controller.renew(active=True, kill_switch_triggered=False)
+    assert not controller.renewal_authorized
+    assert controller.failure_reason == "renewal_not_permitted"
+    assert oms.unhealthy == ["renewal_not_permitted"]

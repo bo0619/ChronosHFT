@@ -1754,6 +1754,47 @@ class OMSSurvivabilityTests(unittest.TestCase):
                 return
             time.sleep(0.01)
 
+    def test_guard_raised_during_dms_renewal_check_does_not_latch(self):
+        # Truth-plane freeze lands between the controller's health snapshot
+        # and its renewal-permission check (seen on a KORUUSDT paper run).
+        gateway = DummyGateway()
+        oms, controller = self._make_dms_oms(gateway)
+        try:
+            can_renew = oms.can_renew_venue_dead_man_switch
+
+            def freeze_then_check():
+                oms.freeze_symbol(
+                    "BTCUSDT",
+                    "truth_plane:open_order_mismatch",
+                    cancel_active_orders=True,
+                )
+                return can_renew()
+
+            oms.can_renew_venue_dead_man_switch = freeze_then_check
+            self.assertTrue(
+                controller.renew(active=True, kill_switch_triggered=False)
+            )
+            self.assertTrue(controller.renewal_authorized)
+            self.assertEqual(controller.failure_reason, "")
+            self.assertFalse(
+                oms.has_trading_mode_constraint(("venue_dead_man_switch:",))
+            )
+
+            oms.can_renew_venue_dead_man_switch = can_renew
+            self.assertTrue(
+                oms.clear_symbol_freeze(
+                    "BTCUSDT",
+                    reason="test",
+                    expected_epoch=oms.get_symbol_freeze_epoch("BTCUSDT"),
+                    expected_reason=oms.get_symbol_freeze_reason("BTCUSDT"),
+                )
+            )
+            self._drive_dms_until_valid(oms, controller)
+            self.assertTrue(controller.renewal_authorized)
+            self.assertTrue(oms.get_venue_dead_man_switch_snapshot()["valid"])
+        finally:
+            oms.stop()
+
     def test_symbol_guard_withholds_dms_and_recovers_after_clear(self):
         gateway = DummyGateway()
         oms, controller = self._make_dms_oms(gateway)

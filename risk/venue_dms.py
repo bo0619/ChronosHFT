@@ -156,6 +156,13 @@ class VenueDMSController:
             None,
         )
         if not callable(renewal_allowed) or not bool(renewal_allowed()):
+            # A guard can appear between the health snapshot above and this
+            # check (e.g. a truth-plane symbol freeze on another thread). That
+            # is an intentional withhold, not a failure: resume once it clears.
+            if callable(renewal_allowed) and self._renewal_withheld(
+                snapshot_reader
+            ):
+                return True
             return self.latch_failure("renewal_not_permitted")
 
         renew = getattr(
@@ -188,6 +195,16 @@ class VenueDMSController:
         )
         return self.latch_failure(
             failure_reason or "renewal_request_rejected"
+        )
+
+    @staticmethod
+    def _renewal_withheld(snapshot_reader) -> bool:
+        try:
+            snapshot = snapshot_reader()
+        except Exception:
+            return False
+        return isinstance(snapshot, dict) and bool(
+            snapshot.get("renewal_withheld_reason")
         )
 
     def _shutdown_started(self) -> bool:
