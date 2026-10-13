@@ -1845,7 +1845,7 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         self.assertEqual(len(oms.submitted), 2)
         self.assertEqual(oms.cancelled, ["passive-1"])
 
-    def _glft_one_tick_quotes(self, execution, sigma_bps=2.5):
+    def _glft_one_tick_quotes(self, execution, sigma_bps=2.5, extra=None):
         engine = DispatchingEngine()
         strategy = GLFTStrategy(
             engine,
@@ -1857,12 +1857,18 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
                 "target_order_notional": 8.0,
                 "max_pos_usdt": 18.0,
                 "execution": execution,
+                **(extra or {}),
             },
         )
         strategy.cooldown_ms = 0
         calibrator = SimpleNamespace(
-            on_orderbook=lambda _ob: None, sigma_bps=sigma_bps, A=1.2, k=1.1
+            on_orderbook=lambda _ob: None,
+            sigma_bps=sigma_bps,
+            A=1.2,
+            k=1.1,
+            paper_intensity=None,
         )
+        self._last_glft_calibrator = calibrator
         model = SimpleNamespace(update_and_predict=lambda *_args: {})
         gate = SimpleNamespace(process=lambda value, _position: value)
         strategy._get_components = lambda _symbol: (calibrator, model, gate)
@@ -1901,7 +1907,33 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             for event in engine.events
             if event.type == EVENT_STRATEGY_UPDATE
         ][-1].params
+        self._last_glft_params = params
         return params["target_bid"], params["target_ask"]
+
+    def test_glft_paper_uses_the_per_symbol_intensity_estimate(self):
+        execution = {"min_spread_bps": 5.0, "paper_min_spread_bps": 8.0}
+        self._glft_one_tick_quotes(execution)
+        self.assertEqual(
+            self._last_glft_params["intensity_source"], "CONFIGURED_PAPER_PROXY"
+        )
+        self.assertEqual(self._last_glft_params["A_per_s"], 1.2)
+
+        self._glft_one_tick_quotes(
+            execution,
+            extra={
+                "paper_intensity": {
+                    "enabled": True,
+                    "prior_A_per_s": 0.4,
+                    "prior_k_per_bps": 1.0,
+                    "symbols": {"KORUUSDT": {"prior_A_per_s": 0.25}},
+                }
+            },
+        )
+        params = self._last_glft_params
+        # No public trades yet: the KORUUSDT prior override is used.
+        self.assertEqual(params["intensity_source"], "PAPER_PRIOR_CONFIG")
+        self.assertEqual((params["A_per_s"], params["k_per_bps"]), (0.25, 1.0))
+        self.assertIsNotNone(self._last_glft_calibrator.paper_intensity)
 
     def test_glft_paper_touch_snap_joins_the_touch_on_a_one_tick_book(self):
         # An 8 bps floor is wider than the 6.96 bps market: both quotes floor

@@ -47,6 +47,10 @@ class GLFTCalibrator:
         self.A:         float = cfg.get("initial_A",          10.0)
         self.k:         float = cfg.get("initial_k",           0.8)
 
+        # Per-symbol Paper A/k estimator, attached by the strategy on its
+        # first quote cycle (strategy.paper_intensity_runtime).
+        self.paper_intensity = None
+
         self.sigma_max:     float = cfg.get("sigma_max_bps",  100.0)
         self.ema_alpha:     float = cfg.get("sigma_ema_alpha",   0.1)
 
@@ -170,6 +174,8 @@ class GLFTCalibrator:
 
         mid = (bid + ask) / 2.0
         now_monotonic = time.perf_counter()
+        if self.paper_intensity:
+            self.paper_intensity.on_book(mid, now_monotonic)
         clock_source, tick_time = self._clock_sample(ob, now_monotonic)
 
         if not (self.last_mid > 0 and self._has_tick_reference):

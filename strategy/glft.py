@@ -73,6 +73,10 @@ from strategy.quote_math import (
     portfolio_glft_quote_offsets,
     robust_adaptive_portfolio_glft_quote_offsets,
 )
+from strategy.paper_intensity_runtime import (
+    record_paper_intensity_order,
+    resolve_glft_intensity,
+)
 from strategy.touch_snap import snap_decision_to_touch
 
 
@@ -1549,14 +1553,10 @@ class GLFTStrategy(FastRequoteMixin, MarketExecutionMixin, AdaptiveQuotingStrate
             gamma *= 1.5
 
         sigma = max(0.1, float(calibrator.sigma_bps))
-        if self.live_mode:
-            A = approved_intensity.A_per_s
-            k = approved_intensity.k_per_bps
-            intensity_source = "APPROVED_RPI_ARTIFACT_FROZEN"
-        else:
-            A = float(calibrator.A)
-            k = float(calibrator.k)
-            intensity_source = "CONFIGURED_PAPER_PROXY"
+        A, k, intensity_source = resolve_glft_intensity(
+            self, symbol, calibrator, approved_intensity, bid_1=bid_1, ask_1=ask_1,
+            bid_1_volume=bid_1_volume, ask_1_volume=ask_1_volume, now=now,
+        )
 
         adaptive_context = None
         adaptive_runtime = {"enabled": False}
@@ -2945,7 +2945,7 @@ class GLFTStrategy(FastRequoteMixin, MarketExecutionMixin, AdaptiveQuotingStrate
         snapshot: OrderStateSnapshot,
     ) -> None:
         if not self.live_mode:
-            return
+            return record_paper_intensity_order(self, snapshot)
         if snapshot.status == OrderStatus.PENDING_ACK:
             self._start_rpi_exposure(snapshot)
             return

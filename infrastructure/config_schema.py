@@ -150,6 +150,41 @@ SYMBOL_KEYED_RATE = MappingSpec(
 )
 
 
+_PAPER_INTENSITY_FIELDS = {
+    "prior_A_per_s": POSITIVE,
+    "prior_k_per_bps": POSITIVE,
+    "prior_strength_fills": POSITIVE,
+    "min_A_per_s": POSITIVE,
+    "max_A_per_s": POSITIVE,
+    "min_k_per_bps": POSITIVE,
+    "max_k_per_bps": POSITIVE,
+    "min_fills_for_k": POSITIVE_INT,
+    "min_depth_levels_for_k": _integer(2),
+    "min_depth_span_bps_for_k": POSITIVE,
+    "depth_bin_width_bps": POSITIVE,
+    "estimate_interval_s": NONNEGATIVE,
+}
+
+
+def _paper_intensity_schema() -> ObjectSpec:
+    """Global Paper A/k settings plus optional per-symbol overrides."""
+    per_symbol = _object(
+        {"enabled": BOOL, **_PAPER_INTENSITY_FIELDS},
+        optional=("enabled", *_PAPER_INTENSITY_FIELDS),
+    )
+    return _object(
+        {
+            "enabled": BOOL,
+            **_PAPER_INTENSITY_FIELDS,
+            "symbols": MappingSpec(
+                values=per_symbol,
+                key_pattern=r"^[A-Z0-9]{5,30}$",
+            ),
+        },
+        optional=(*_PAPER_INTENSITY_FIELDS, "symbols"),
+    )
+
+
 def _portfolio_risk_schema() -> ObjectSpec:
     return _object(
         {
@@ -1038,7 +1073,10 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                                         "max_new_orders_per_symbol_per_10min": POSITIVE_INT,
                                     }
                                 ),
-                            }
+                                "paper_intensity": _paper_intensity_schema(),
+                            },
+                            # Paper-only; absent keeps the configured A/k.
+                            optional=("paper_intensity",),
                         )
                     }
                 )

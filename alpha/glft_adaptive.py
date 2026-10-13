@@ -600,12 +600,61 @@ class DynamicCovarianceEstimator:
         }
 
 
+# Window of the volume-rate estimate behind ``observed_service_rate``.
+PUBLIC_RATE_WINDOW_S = 60.0
+# Observation time before that estimate is trusted.
+PUBLIC_RATE_MIN_OBSERVED_S = 10.0
+
+
+@dataclass(slots=True)
+class _DecayedVolumeRate:
+    """Exponentially weighted traded volume per second.
+
+    Volume and elapsed time are decayed together, so the rate is total
+    volume over total time in the window. Averaging per-trade
+    ``qty / gap`` instead is biased high, because short gaps dominate.
+    """
+
+    volume: float = 0.0
+    first_at: float | None = None
+    last_at: float | None = None
+
+    def add(self, quantity: float, at: float) -> None:
+        if self.first_at is None:
+            self.first_at = at
+        elif self.last_at is not None and at > self.last_at:
+            self.volume *= math.exp(-(at - self.last_at) / PUBLIC_RATE_WINDOW_S)
+        self.volume += quantity
+        if self.last_at is None or at > self.last_at:
+            self.last_at = at
+
+    def rate(self, now: float) -> float | None:
+        if self.first_at is None or self.last_at is None:
+            return None
+        observed = now - self.first_at
+        if observed < PUBLIC_RATE_MIN_OBSERVED_S:
+            return None
+        volume = self.volume * math.exp(
+            -max(0.0, now - self.last_at) / PUBLIC_RATE_WINDOW_S
+        )
+        window = PUBLIC_RATE_WINDOW_S * (
+            1.0 - math.exp(-observed / PUBLIC_RATE_WINDOW_S)
+        )
+        return volume / window if window > 0.0 else None
+
+
 @dataclass(slots=True)
 class _TradeRateState:
     buy_qty_per_s: float = 0.0
     sell_qty_per_s: float = 0.0
     buy_updated_at_monotonic: float | None = None
     sell_updated_at_monotonic: float | None = None
+    buy_volume_rate: _DecayedVolumeRate = None
+    sell_volume_rate: _DecayedVolumeRate = None
+
+    def __post_init__(self) -> None:
+        self.buy_volume_rate = _DecayedVolumeRate()
+        self.sell_volume_rate = _DecayedVolumeRate()
 
 
 @dataclass(frozen=True, slots=True)
@@ -660,6 +709,9 @@ class QueueLatencyEstimator:
         qty = _positive(quantity, "quantity")
         timestamp = _nonnegative(observed_at_monotonic, "observed_at_monotonic")
         state = self._states[normalized_symbol]
+        (
+            state.buy_volume_rate if side == Side.BUY else state.sell_volume_rate
+        ).add(qty, timestamp)
         alpha = self.rate_ewma_alpha
         if side == Side.BUY:
             previous_time = state.buy_updated_at_monotonic
@@ -681,6 +733,30 @@ class QueueLatencyEstimator:
             previous = state.sell_qty_per_s or self.default_service_rate_qty_per_s
             state.sell_qty_per_s = (1.0 - alpha) * previous + alpha * instantaneous_rate
             state.sell_updated_at_monotonic = timestamp
+
+    def observed_service_rate(
+        self,
+        *,
+        symbol: str,
+        quote_side: Side | str,
+        now_monotonic: float,
+    ) -> float | None:
+        """Traded volume per second that consumes a passive quote's queue.
+
+        A bid is served by sell aggressors and an ask by buy aggressors.
+        ``None`` until the symbol has been observed for
+        ``PUBLIC_RATE_MIN_OBSERVED_S``; unlike :meth:`estimate` there is no
+        configured default, whose contract units would not fit every symbol.
+        """
+        state = self._states.get(_symbol(symbol))
+        if state is None:
+            return None
+        rate = (
+            state.sell_volume_rate
+            if _side(quote_side) == Side.BUY
+            else state.buy_volume_rate
+        )
+        return rate.rate(float(now_monotonic))
 
     def estimate(
         self,

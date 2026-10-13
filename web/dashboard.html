@@ -470,8 +470,8 @@
         <details><summary id="ledgerRunsSummary">每次运行明细</summary><div class="table-wrap"><table><thead><tr><th>运行</th><th>开始 (UTC)</th><th>结束</th><th>成交 (maker)</th><th>成交额</th><th>已实现</th><th>手续费</th><th>未平仓浮动</th><th>净盈亏</th><th>累计</th></tr></thead><tbody id="ledgerRuns"></tbody></table></div></details>
       </article>
       <article class="panel">
-        <div class="panel-head"><h3>报价面板</h3><small>距离以 tick 计：0 = 挂在最优价，正数 = 落后于最优价</small></div>
-        <div class="table-wrap"><table><thead><tr><th>标的</th><th>状态</th><th>持仓</th><th>持仓名义</th><th>浮动盈亏</th><th>我方买</th><th>买距</th><th>最优买</th><th>最优卖</th><th>卖距</th><th>我方卖</th><th>市场价差</th><th>我方价差</th><th>挂单</th></tr></thead><tbody id="quoteBoard"></tbody></table></div>
+        <div class="panel-head"><h3>报价面板</h3><small>距离以 tick 计：0 = 挂在最优价，正数 = 落后于最优价；A / k 为该标的当前成交强度参数</small></div>
+        <div class="table-wrap"><table><thead><tr><th>标的</th><th>状态</th><th>持仓</th><th>持仓名义</th><th>浮动盈亏</th><th>我方买</th><th>买距</th><th>最优买</th><th>最优卖</th><th>卖距</th><th>我方卖</th><th>市场价差</th><th>我方价差</th><th>挂单</th><th>A / k</th><th>强度来源</th></tr></thead><tbody id="quoteBoard"></tbody></table></div>
       </article>
       <article class="panel">
         <div class="panel-head"><h3>报价位置（本次运行）</h3><small>按秒采样的策略目标价 vs 最优价</small></div>
@@ -1079,8 +1079,8 @@
         const ourSpread=finite(ourBid)&&finite(ourAsk)&&mid?(ourAsk-ourBid)/mid*10000:null;
         const qty=first(p.volume,p.quantity), stateText=String(first(params.state,st.state,"—")), upper=stateText.toUpperCase();
         const stateTone=["QUOTING","LIVE","READY"].includes(upper)?"positive":/WARM|OBSERVE|PAUSE|COOLDOWN/.test(upper)?"warning":/HALT|FROZEN|ERROR|STOP/.test(upper)?"negative":"muted";
-        return `<tr><td><strong>${esc(s.symbol)}</strong></td><td><span class="${stateTone}">${esc(stateText)}</span></td><td class="${valueClass(qty)}">${fmt(qty,4)}</td><td>${fmt(p.notional,2)}</td><td class="${valueClass(p.unrealized_pnl)}">${fmt(p.unrealized_pnl,4)}</td><td>${finite(ourBid)?fmtPrice(ourBid):'<span class="unavailable">—</span>'}</td><td>${distCell(bidDist)}</td><td>${fmtPrice(bid)}</td><td>${fmtPrice(ask)}</td><td>${distCell(askDist)}</td><td>${finite(ourAsk)?fmtPrice(ourAsk):'<span class="unavailable">—</span>'}</td><td>${fmt(first(m.spread_bps,params.market_spread_bps),2," bps")}</td><td>${fmt(ourSpread,2," bps")}</td><td>${fmt(orders.length,0)}</td></tr>`;
-      }).join(""):emptyRow(14,"暂无标的");
+        return `<tr><td><strong>${esc(s.symbol)}</strong></td><td><span class="${stateTone}">${esc(stateText)}</span></td><td class="${valueClass(qty)}">${fmt(qty,4)}</td><td>${fmt(p.notional,2)}</td><td class="${valueClass(p.unrealized_pnl)}">${fmt(p.unrealized_pnl,4)}</td><td>${finite(ourBid)?fmtPrice(ourBid):'<span class="unavailable">—</span>'}</td><td>${distCell(bidDist)}</td><td>${fmtPrice(bid)}</td><td>${fmtPrice(ask)}</td><td>${distCell(askDist)}</td><td>${finite(ourAsk)?fmtPrice(ourAsk):'<span class="unavailable">—</span>'}</td><td>${fmt(first(m.spread_bps,params.market_spread_bps),2," bps")}</td><td>${fmt(ourSpread,2," bps")}</td><td>${fmt(orders.length,0)}</td><td>${finite(params.A_per_s)?Number(params.A_per_s).toPrecision(3):"—"} / ${finite(params.k_per_bps)?Number(params.k_per_bps).toFixed(3):"—"}</td><td>${esc(intensitySourceText(params.intensity_source))}</td></tr>`;
+      }).join(""):emptyRow(16,"暂无标的");
       renderTradingQuality(obj(data.paper_ledger));
       const trades=arr(first(data.trades?.recent,data.recent_trades,[])).slice(0,30);
       $("tradingFillsCount").textContent=`本次运行最近 ${trades.length} 笔`;
@@ -1088,6 +1088,9 @@
         const qty=first(t.volume,t.quantity), notional=first(t.notional,finite(t.price)&&finite(qty)?Number(t.price)*Number(qty):null);
         return `<tr><td>${fmtTime(first(t.datetime,t.timestamp,t.time))}</td><td><strong>${esc(t.symbol)}</strong></td><td class="${String(t.side).toUpperCase()==="BUY"?"positive":"negative"}">${esc(t.side||"—")}</td><td>${fmtPrice(t.price)}</td><td>${fmt(qty,4)}</td><td>${fmt(notional,2)}</td><td>${boolText(first(t.is_maker,t.maker))}</td><td>${fmt(t.commission,6)}</td><td class="${valueClass(t.realized_pnl)}">${fmt(t.realized_pnl,4)}</td></tr>`;
       }).join(""):emptyRow(9,"尚无成交");
+    }
+    function intensitySourceText(source){
+      return ({PAPER_POSTERIOR:"自有成交后验",PAPER_PRIOR_QUEUE:"排队先验",PAPER_PRIOR_CONFIG:"配置先验",CONFIGURED_PAPER_PROXY:"固定配置",APPROVED_RPI_ARTIFACT_FROZEN:"实盘审批参数"})[source]||source||"—";
     }
     function renderTradingQuality(ledger) {
       const pct=v=>finite(v)?`${(Number(v)*100).toFixed(1)}%`:'<span class="unavailable">—</span>';

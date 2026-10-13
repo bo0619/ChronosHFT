@@ -129,6 +129,23 @@
         "paper_min_spread_bps": 8.0,
         "paper_touch_snap_ticks": 1.0
       },
+      "paper_intensity": {
+        "_comment": "Paper-only per-symbol A/k for GLFT (Live uses the frozen signed artifact). Prior A comes from the queue-adjusted public trade rate at the touch (rate / queue ahead), falling back to prior_A_per_s until observed; own quotes' exposure and fills then update A with a Gamma-Poisson posterior worth prior_strength_fills fills, and move k toward the own-fill MLE once fills span enough depths. Override any field per symbol under symbols.<SYMBOL>.",
+        "enabled": true,
+        "prior_A_per_s": 1.0,
+        "prior_k_per_bps": 1.0,
+        "prior_strength_fills": 10.0,
+        "min_A_per_s": 0.0001,
+        "max_A_per_s": 100.0,
+        "min_k_per_bps": 0.05,
+        "max_k_per_bps": 5.0,
+        "min_fills_for_k": 10,
+        "min_depth_levels_for_k": 2,
+        "min_depth_span_bps_for_k": 1.0,
+        "depth_bin_width_bps": 0.5,
+        "estimate_interval_s": 1.0,
+        "symbols": {}
+      },
       "queue_retention": {
         "_comment": "Binance re-queues on every cancel/replace and modify. More-aggressive drift (1 tick, or size above target by the ratio) moves at once; more-conservative drift moves only past the tolerance and after min_rest_sec (>=5s keeps Binance ICR safe). New quote orders are capped per symbol per UTC 10-minute window, far below the ICR 5000 and dust-ratio 10000 order thresholds.",
         "conservative_tolerance_ticks": 2,
