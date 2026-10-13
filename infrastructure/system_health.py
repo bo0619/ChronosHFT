@@ -199,4 +199,17 @@ def handle_system_health_event(
         oms.freeze_venue(venue, f"system_health:{message}", cancel_active_orders=True)
         return
 
+    if oms is not None:
+        # An unclassified health fault is not evidence of position or margin
+        # danger. Freeze the venue (cancel, no flatten); VenueSupervisor
+        # reconnects and the OMS clears the freeze only after truth
+        # reconciliation succeeds.
+        venue = getattr(getattr(oms, "gateway", None), "gateway_name", "UNKNOWN")
+        oms.freeze_venue(
+            venue,
+            f"system_health:UNCLASSIFIED:{message}",
+            cancel_active_orders=True,
+        )
+        return
+
     risk_controller.trigger_kill_switch(f"SystemHealth: {message}")

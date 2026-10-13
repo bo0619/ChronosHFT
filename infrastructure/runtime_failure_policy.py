@@ -35,19 +35,20 @@ class RuntimeFailurePolicy:
 
     def on_time_service_health(self, severity, reason, _details) -> None:
         reason = str(reason or "unknown")
-        if severity == "freeze":
+        # A bad exchange clock blocks trading but says nothing about
+        # position or margin danger. At runtime both severities freeze
+        # (cancel, no flatten) and the freeze clears through reconciliation
+        # once the clock recovers.
+        if severity == "freeze" or (
+            severity == "halt" and self.clock_runtime_armed
+        ):
             self.oms.freeze_system(
                 f"TimeSync: {reason}",
                 cancel_active_orders=True,
             )
             return
         if severity == "halt":
-            if self.clock_runtime_armed:
-                self.risk_controller.trigger_kill_switch(
-                    f"TimeSync: {reason}"
-                )
-            else:
-                self.oms.halt_system(f"TimeSync startup: {reason}")
+            self.oms.halt_system(f"TimeSync startup: {reason}")
             return
         if severity == "recovered" and self.oms.state.value == "FROZEN":
             if self.oms.last_freeze_reason.startswith("TimeSync:"):

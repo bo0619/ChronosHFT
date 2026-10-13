@@ -3865,6 +3865,20 @@ class SystemHealthHandlerTests(unittest.TestCase):
         handle_system_health_event(Event("eSystemHealth", "FATAL_GAP"), risk_controller)
         self.assertEqual(risk_controller.reasons, ["SystemHealth: FATAL_GAP"])
 
+    def test_unclassified_health_event_freezes_venue_without_kill(self):
+        risk_controller = DummyRiskController()
+        oms = DummyScopedOms()
+        handle_system_health_event(
+            Event("eSystemHealth", "FATAL_GAP"),
+            risk_controller,
+            oms,
+        )
+        self.assertEqual(risk_controller.reasons, [])
+        self.assertEqual(
+            oms.venue_freezes,
+            [("BINANCE", "system_health:UNCLASSIFIED:FATAL_GAP", True)],
+        )
+
     def test_paper_dms_expiry_does_not_trigger_kill_switch(self):
         risk_controller = DummyRiskController()
         handle_system_health_event(

@@ -32,6 +32,7 @@ class VenueSupervisor:
                     "system_health:MARKET_DATA_STALE",
                     "system_health:PUBLIC_STREAM_",
                     "system_health:PUBLIC_MARK_",
+                    "system_health:UNCLASSIFIED:",
                 ],
             )
         )

@@ -64,7 +64,7 @@ def _policy(*, strategy_name="maker"):
     return policy, oms, risk, logger
 
 
-def test_clock_health_uses_startup_halt_then_runtime_kill():
+def test_clock_health_uses_startup_halt_then_runtime_freeze():
     policy, oms, risk, _ = _policy()
 
     policy.on_time_service_health("freeze", "offset", {})
@@ -75,8 +75,9 @@ def test_clock_health_uses_startup_halt_then_runtime_kill():
     assert oms.calls == [
         ("freeze_system", "TimeSync: offset", True),
         ("halt_system", "TimeSync startup: stale"),
+        ("freeze_system", "TimeSync: lost", True),
     ]
-    assert risk.kills == ["TimeSync: lost"]
+    assert risk.kills == []
 
 
 def test_clock_recovery_only_reconciles_its_own_freeze():

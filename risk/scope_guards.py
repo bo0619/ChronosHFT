@@ -365,9 +365,12 @@ class RiskScopeGuardController:
         if not tracked_symbols:
             return
 
+        # Symbol breakers trip on market-data faults (latency, staleness,
+        # divergence). A frozen symbol already has no orders, so freezing
+        # every symbol at once is still recoverable and must not flatten the
+        # book at taker cost. Escalation to the kill switch is opt-in through
+        # tech_health.max_frozen_symbols_before_kill.
         threshold = self.max_frozen_symbols_before_kill
-        if threshold <= 0:
-            threshold = len(tracked_symbols) if len(tracked_symbols) > 1 else 0
         if threshold <= 0:
             return
 
