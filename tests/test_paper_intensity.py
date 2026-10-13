@@ -41,6 +41,12 @@ def test_symbol_overrides_replace_global_values_only_for_that_symbol():
     assert other.prior_A_per_s == PaperIntensityConfig().prior_A_per_s
 
 
+def test_a_symbol_can_be_switched_off():
+    section = {"enabled": True, "symbols": {"KORUUSDT": {"enabled": False}}}
+    assert not PaperIntensityConfig.for_symbol(section, "KORUUSDT").enabled
+    assert PaperIntensityConfig.for_symbol(section, "SOXLUSDT").enabled
+
+
 def test_invalid_bounds_are_rejected():
     with pytest.raises(ValueError):
         config(min_A_per_s=5.0, max_A_per_s=1.0)

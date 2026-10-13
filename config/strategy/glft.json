@@ -144,7 +144,10 @@
         "min_depth_span_bps_for_k": 1.0,
         "depth_bin_width_bps": 0.5,
         "estimate_interval_s": 1.0,
-        "symbols": {}
+        "_comment_symbols": "KORUUSDT is off: on a ~7 bps tick where the price often jumps several levels, fills one level behind the touch arrive (as adverse through-fills) about as often as queue fills at the touch, so the depth model collapsed (k 1.0 -> 0.28, A -> 0.016/s), GLFT widened to ~15 bps and sizing stopped quoting. It falls back to the calibrator's configured A/k until large-tick quoting is level-based.",
+        "symbols": {
+          "KORUUSDT": {"enabled": false}
+        }
       },
       "queue_retention": {
         "_comment": "Binance re-queues on every cancel/replace and modify. More-aggressive drift (1 tick, or size above target by the ratio) moves at once; more-conservative drift moves only past the tolerance and after min_rest_sec (>=5s keeps Binance ICR safe). New quote orders are capped per symbol per UTC 10-minute window, far below the ICR 5000 and dust-ratio 10000 order thresholds.",
