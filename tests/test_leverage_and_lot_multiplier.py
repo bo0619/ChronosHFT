@@ -788,8 +788,8 @@ class PaperTradeConfigTests(unittest.TestCase):
             configured["strategy"]["order_sizing"],
             {"mode": "notional"},
         )
-        self.assertEqual(configured["strategy"]["target_order_notional"], 100.0)
-        self.assertEqual(configured["strategy"]["max_pos_usdt"], 500.0)
+        self.assertEqual(configured["strategy"]["target_order_notional"], 500.0)
+        self.assertEqual(configured["strategy"]["max_pos_usdt"], 2500.0)
         self.assertNotIn(
             "inventory_lot_notional_usdt",
             configured["strategy"]["glft"],
@@ -798,13 +798,13 @@ class PaperTradeConfigTests(unittest.TestCase):
             "inventory_lot_notional_usdt",
             configured["strategy"]["avellaneda_stoikov"],
         )
-        self.assertEqual(configured["risk"]["limits"]["max_order_notional"], 110.0)
-        self.assertEqual(configured["risk"]["limits"]["max_pos_notional"], 500.0)
+        self.assertEqual(configured["risk"]["limits"]["max_order_notional"], 550.0)
+        self.assertEqual(configured["risk"]["limits"]["max_pos_notional"], 2500.0)
         self.assertEqual(
             configured["risk"]["limits"]["max_account_gross_notional"],
-            500.0,
+            2500.0,
         )
-        self.assertEqual(configured["risk"]["limits"]["max_daily_loss"], 100.0)
+        self.assertEqual(configured["risk"]["limits"]["max_daily_loss"], 500.0)
         self.assertEqual(configured["risk"]["limits"]["max_concurrent_symbols"], 1)
 
     def test_paper_mode_is_type_selected_and_scrubs_every_private_credential(self):

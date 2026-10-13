@@ -75,7 +75,7 @@ def test_tracked_manifest_is_validated_before_startup_and_metadata_is_stripped()
     assert "version" not in raw
     assert configured["execution"]["mode"] == "paper"
     assert configured["account"]["initial_balance_usdt"] == 10_000.0
-    assert configured["risk"]["limits"]["max_daily_loss"] == 100.0
+    assert configured["risk"]["limits"]["max_daily_loss"] == 500.0
     assert raw["oms"]["journal_format_version"] == 3
     assert raw["oms"]["journal_require_existing"] is False
     assert raw["risk"]["independent_supervisor"]["state_genesis_id"] == (

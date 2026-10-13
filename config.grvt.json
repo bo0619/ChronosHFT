@@ -29,7 +29,7 @@
     {"path": "config/backtest.json", "fragment": "backtest", "version": 1},
     {"path": "config/oms.json", "fragment": "oms", "version": 1},
     {"path": "config/strategy/core.json", "fragment": "strategy.core", "version": 1},
-    {"path": "config/strategy/capital_scaling.json", "fragment": "strategy.capital_scaling", "version": 1},
+    {"path": "config/grvt/capital_scaling.json", "fragment": "strategy.capital_scaling", "version": 1},
     {"path": "config/strategy/order_sizing.json", "fragment": "strategy.order_sizing", "version": 1},
     {"path": "config/strategy/model_readiness.json", "fragment": "strategy.model_readiness", "version": 1},
     {"path": "config/strategy/glft.json", "fragment": "strategy.glft", "version": 1},

@@ -3,16 +3,16 @@
   "fragment": "strategy.capital_scaling",
   "version": 1,
   "strategy": {
-    "_comment_capital_scaling": "The tracked Paper profile uses 100x the 100 USDT reference envelope: 1% quote notional, 5% inventory/gross cap, and 1% daily-loss cap.",
+    "_comment_capital_scaling": "The tracked Paper profile uses 100x the 100 USDT reference envelope: 5% quote notional (500 USDT), 25% inventory/gross cap, and 5% daily-loss cap. Sized up 5x from 1%/5%/1% to make Paper P&L readable; per-fill edge in bps does not change with size.",
     "capital_multiplier": 100.0,
     "capital_scaling": {
       "enabled": true,
       "reference_capital_usdt": 100.0,
-      "target_order_notional": 1.0,
+      "target_order_notional": 5.0,
       "order_notional_limit_factor": 1.1,
-      "target_total_risk_notional": 5.0,
+      "target_total_risk_notional": 25.0,
       "target_concurrent_symbols": 1,
-      "target_daily_loss": 1.0,
+      "target_daily_loss": 5.0,
       "max_order_qty": 10000.0,
       "budget_asset_weights": {
         "USDT": 1.0
