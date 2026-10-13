@@ -56,6 +56,55 @@ ORDER BY sample_time
 # Upper bound on P&L curve points across all runs.
 CURVE_MAX_POINTS = 1500
 
+# Signed markout: side * ln(mid_after / fill_price) in bps, so positive means
+# the price moved our way after the fill (spread capture included).
+_MARKOUT_SQL = """
+SELECT
+    horizon_ms,
+    side,
+    COUNT(*) AS n,
+    SUM(signed_markout_bps) AS total,
+    SUM(signed_markout_bps * signed_markout_bps) AS total_sq,
+    SUM(CASE WHEN signed_markout_bps > 0 THEN 1 ELSE 0 END) AS favourable
+FROM paper_fill_markouts
+GROUP BY horizon_ms, side
+"""
+
+_SYMBOL_SQL = """
+SELECT
+    symbol,
+    COUNT(*) AS fills,
+    SUM(CASE WHEN is_maker = 1 THEN 1 ELSE 0 END) AS maker_fills,
+    SUM(fill_notional) AS notional,
+    SUM(realized_pnl) AS realized_pnl,
+    SUM(commission) AS commission
+FROM paper_fills
+GROUP BY symbol
+ORDER BY symbol
+"""
+
+# Strategy targets against the touch, sampled once a second. A bid at or
+# above the best bid (an ask at or below the best ask) is at the touch.
+_QUOTE_POSITION_SQL = """
+SELECT
+    run_id,
+    symbol,
+    COUNT(*) AS samples,
+    SUM(CASE WHEN state = 'QUOTING' THEN 1 ELSE 0 END) AS quoting,
+    SUM(CASE WHEN target_bid > 0 AND best_bid > 0 THEN 1 ELSE 0 END) AS bid_samples,
+    SUM(CASE WHEN target_bid > 0 AND best_bid > 0
+             AND target_bid >= best_bid - 1e-9 THEN 1 ELSE 0 END) AS bid_at_touch,
+    AVG(CASE WHEN target_bid > 0 AND best_bid > 0 AND mid_price > 0
+             THEN (best_bid - target_bid) / mid_price * 10000.0 END) AS bid_behind_bps,
+    SUM(CASE WHEN target_ask > 0 AND best_ask > 0 THEN 1 ELSE 0 END) AS ask_samples,
+    SUM(CASE WHEN target_ask > 0 AND best_ask > 0
+             AND target_ask <= best_ask + 1e-9 THEN 1 ELSE 0 END) AS ask_at_touch,
+    AVG(CASE WHEN target_ask > 0 AND best_ask > 0 AND mid_price > 0
+             THEN (target_ask - best_ask) / mid_price * 10000.0 END) AS ask_behind_bps
+FROM paper_strategy_samples
+GROUP BY run_id, symbol
+"""
+
 _LAST_SAMPLE_SQL = """
 SELECT unrealized_pnl
 FROM paper_account_samples
@@ -162,11 +211,22 @@ class PaperLedgerSummary:
                     }
                 )
             self._attach_curves(connection, runs)
+            # Optional sections: an older database may lack a table.
+            markouts = _optional(connection, _markout_summary)
+            symbols = _optional(connection, _symbol_summary)
+            quote_position = _optional(connection, _quote_position_rows)
         except sqlite3.Error as exc:
             return {"available": False, "reason": f"query_failed:{exc}"}
         finally:
             connection.close()
-        return {"available": True, "source": str(self.path), "runs": runs}
+        return {
+            "available": True,
+            "source": str(self.path),
+            "runs": runs,
+            "markouts": markouts,
+            "symbols": symbols,
+            "quote_position": quote_position,
+        }
 
     @staticmethod
     def _attach_curves(connection, runs: list[dict[str, Any]]) -> None:
@@ -240,10 +300,22 @@ class PaperLedgerSummary:
             curve.append({"t": time.time(), "net": cumulative})
         notional = sum(run["notional"] for run in runs)
         fills = sum(run["fills"] for run in runs)
+        current_full_id = next(
+            (stored_run["run_id"] for stored_run, run in zip(stored, runs) if run["current"]),
+            None,
+        )
+        quote_position = cached.get("quote_position")
         return {
             "available": True,
             "source": cached["source"],
             "funding_included": False,
+            "markouts": cached.get("markouts"),
+            "symbols": cached.get("symbols"),
+            "quote_position": (
+                [row for row in quote_position if row["run_id"] == current_full_id]
+                if isinstance(quote_position, list)
+                else quote_position
+            ),
             "runs": runs,
             "curve": curve,
             "run_starts": run_starts,
@@ -263,6 +335,105 @@ class PaperLedgerSummary:
                 "net_pnl": cumulative,
             },
         }
+
+
+def _optional(connection, reader):
+    try:
+        return reader(connection)
+    except sqlite3.Error as exc:
+        return {"available": False, "reason": f"query_failed:{exc}"}
+
+
+def _moments(n: int, total: float, total_sq: float, favourable: int) -> dict[str, Any]:
+    mean = total / n if n else None
+    if n > 1:
+        variance = max(0.0, (total_sq - n * mean * mean) / (n - 1))
+        standard_error = math.sqrt(variance / n)
+    else:
+        standard_error = None
+    return {
+        "samples": n,
+        "mean_bps": mean,
+        "standard_error_bps": standard_error,
+        # mean / standard error; |t| > 2 is roughly 95% confidence that the
+        # mean is not zero.
+        "t_stat": (
+            mean / standard_error
+            if mean is not None and standard_error
+            else None
+        ),
+        "favourable_share": favourable / n if n else None,
+    }
+
+
+def _markout_summary(connection) -> list[dict[str, Any]]:
+    by_horizon: dict[int, dict[str, list[float]]] = {}
+    for horizon_ms, side, n, total, total_sq, favourable in connection.execute(
+        _MARKOUT_SQL
+    ):
+        sides = by_horizon.setdefault(int(horizon_ms), {})
+        sides[str(side).upper()] = [
+            int(n or 0),
+            _number(total),
+            _number(total_sq),
+            int(favourable or 0),
+        ]
+    rows = []
+    for horizon_ms in sorted(by_horizon):
+        sides = by_horizon[horizon_ms]
+        combined = [sum(values[index] for values in sides.values()) for index in range(4)]
+        row = {"horizon_ms": horizon_ms, **_moments(*combined)}
+        for side in ("BUY", "SELL"):
+            if side in sides:
+                row[side.lower()] = _moments(*sides[side])
+        rows.append(row)
+    return rows
+
+
+def _symbol_summary(connection) -> list[dict[str, Any]]:
+    rows = []
+    for symbol, fills, maker_fills, notional, realized, commission in connection.execute(
+        _SYMBOL_SQL
+    ):
+        notional = _number(notional)
+        net = _number(realized) - _number(commission)
+        rows.append(
+            {
+                "symbol": symbol,
+                "fills": int(fills or 0),
+                "maker_fills": int(maker_fills or 0),
+                "notional": notional,
+                "realized_pnl": _number(realized),
+                "commission": _number(commission),
+                "net_pnl": net,
+                "net_bps": net / notional * 10_000.0 if notional else None,
+            }
+        )
+    return rows
+
+
+def _quote_position_rows(connection) -> list[dict[str, Any]]:
+    rows = []
+    for row in connection.execute(_QUOTE_POSITION_SQL):
+        (run_id, symbol, samples, quoting, bid_samples, bid_at_touch,
+         bid_behind, ask_samples, ask_at_touch, ask_behind) = row
+        rows.append(
+            {
+                "run_id": run_id,
+                "symbol": symbol,
+                "samples": int(samples or 0),
+                "quoting_share": (quoting or 0) / samples if samples else None,
+                "bid_at_touch_share": (
+                    (bid_at_touch or 0) / bid_samples if bid_samples else None
+                ),
+                "ask_at_touch_share": (
+                    (ask_at_touch or 0) / ask_samples if ask_samples else None
+                ),
+                "bid_behind_bps": bid_behind,
+                "ask_behind_bps": ask_behind,
+            }
+        )
+    return rows
 
 
 def paper_ledger_from_config(config: dict, *, is_paper: bool):

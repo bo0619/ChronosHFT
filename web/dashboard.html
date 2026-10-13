@@ -167,6 +167,14 @@
     .pnl-chart text { fill: var(--muted); font: 10px var(--mono); }
     .pnl-tip { position: absolute; pointer-events: none; padding: 5px 8px; background: var(--panel-2); border: 1px solid var(--line); font: 11px var(--mono); white-space: nowrap; }
     .pnl-tip[hidden] { display: none; }
+    #trading > .panel, #trading > .grid { margin-bottom: 10px; }
+    .trading-split { gap: 10px; }
+    .markout-verdict { padding: 8px 12px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--line-soft); }
+    .markout-verdict strong { color: var(--text); }
+    .mo-bar { position: relative; width: 120px; height: 10px; background: var(--line-soft); }
+    .mo-bar .zero { position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px; background: var(--muted); }
+    .mo-bar .fill { position: absolute; top: 0; bottom: 0; }
+    .mo-bar .ci { position: absolute; top: 4px; height: 2px; background: var(--text); opacity: .7; }
     .ledger-body { display: grid; grid-template-columns: minmax(200px, 260px) 1fr; gap: 10px; padding: 10px 12px; }
     .ledger-net { margin-top: 6px; font-family: var(--mono); font-size: 34px; font-weight: 800; }
     .ledger-grid { grid-template-columns: repeat(4, minmax(105px, 1fr)); }
@@ -465,6 +473,21 @@
         <div class="panel-head"><h3>报价面板</h3><small>距离以 tick 计：0 = 挂在最优价，正数 = 落后于最优价</small></div>
         <div class="table-wrap"><table><thead><tr><th>标的</th><th>状态</th><th>持仓</th><th>持仓名义</th><th>浮动盈亏</th><th>我方买</th><th>买距</th><th>最优买</th><th>最优卖</th><th>卖距</th><th>我方卖</th><th>市场价差</th><th>我方价差</th><th>挂单</th></tr></thead><tbody id="quoteBoard"></tbody></table></div>
       </article>
+      <article class="panel">
+        <div class="panel-head"><h3>报价位置（本次运行）</h3><small>按秒采样的策略目标价 vs 最优价</small></div>
+        <div class="table-wrap"><table><thead><tr><th>标的</th><th>采样</th><th>报价时长占比</th><th>买在最优价</th><th>买平均落后</th><th>卖在最优价</th><th>卖平均落后</th></tr></thead><tbody id="quotePosition"></tbody></table></div>
+      </article>
+      <div class="grid split trading-split">
+        <article class="panel">
+          <div class="panel-head"><h3>成交质量（markout）</h3><small>成交后 N 毫秒中间价相对成交价，正 = 对我方有利</small></div>
+          <div id="markoutVerdict" class="markout-verdict">—</div>
+          <div class="table-wrap"><table><thead><tr><th>周期</th><th>样本</th><th>平均</th><th></th><th>买</th><th>卖</th><th>标准误</th><th>t 值</th><th>有利占比</th></tr></thead><tbody id="markoutRows"></tbody></table></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><h3>按标的盈亏（全部运行）</h3><small>已实现 − 手续费，不含浮动</small></div>
+          <div class="table-wrap"><table><thead><tr><th>标的</th><th>成交 (maker)</th><th>成交额</th><th>已实现</th><th>手续费</th><th>净盈亏</th><th>净 bps</th></tr></thead><tbody id="symbolPnl"></tbody></table></div>
+        </article>
+      </div>
       <article class="panel">
         <div class="panel-head"><h3>最近成交</h3><small id="tradingFillsCount">—</small></div>
         <div class="table-wrap"><table><thead><tr><th>时间</th><th>标的</th><th>方向</th><th>价格</th><th>数量</th><th>名义</th><th>Maker</th><th>手续费</th><th>已实现</th></tr></thead><tbody id="tradingFills"></tbody></table></div>
@@ -1058,12 +1081,47 @@
         const stateTone=["QUOTING","LIVE","READY"].includes(upper)?"positive":/WARM|OBSERVE|PAUSE|COOLDOWN/.test(upper)?"warning":/HALT|FROZEN|ERROR|STOP/.test(upper)?"negative":"muted";
         return `<tr><td><strong>${esc(s.symbol)}</strong></td><td><span class="${stateTone}">${esc(stateText)}</span></td><td class="${valueClass(qty)}">${fmt(qty,4)}</td><td>${fmt(p.notional,2)}</td><td class="${valueClass(p.unrealized_pnl)}">${fmt(p.unrealized_pnl,4)}</td><td>${finite(ourBid)?fmtPrice(ourBid):'<span class="unavailable">—</span>'}</td><td>${distCell(bidDist)}</td><td>${fmtPrice(bid)}</td><td>${fmtPrice(ask)}</td><td>${distCell(askDist)}</td><td>${finite(ourAsk)?fmtPrice(ourAsk):'<span class="unavailable">—</span>'}</td><td>${fmt(first(m.spread_bps,params.market_spread_bps),2," bps")}</td><td>${fmt(ourSpread,2," bps")}</td><td>${fmt(orders.length,0)}</td></tr>`;
       }).join(""):emptyRow(14,"暂无标的");
+      renderTradingQuality(obj(data.paper_ledger));
       const trades=arr(first(data.trades?.recent,data.recent_trades,[])).slice(0,30);
       $("tradingFillsCount").textContent=`本次运行最近 ${trades.length} 笔`;
       $("tradingFills").innerHTML=trades.length?trades.map(t=>{
         const qty=first(t.volume,t.quantity), notional=first(t.notional,finite(t.price)&&finite(qty)?Number(t.price)*Number(qty):null);
         return `<tr><td>${fmtTime(first(t.datetime,t.timestamp,t.time))}</td><td><strong>${esc(t.symbol)}</strong></td><td class="${String(t.side).toUpperCase()==="BUY"?"positive":"negative"}">${esc(t.side||"—")}</td><td>${fmtPrice(t.price)}</td><td>${fmt(qty,4)}</td><td>${fmt(notional,2)}</td><td>${boolText(first(t.is_maker,t.maker))}</td><td>${fmt(t.commission,6)}</td><td class="${valueClass(t.realized_pnl)}">${fmt(t.realized_pnl,4)}</td></tr>`;
       }).join(""):emptyRow(9,"尚无成交");
+    }
+    function renderTradingQuality(ledger) {
+      const pct=v=>finite(v)?`${(Number(v)*100).toFixed(1)}%`:'<span class="unavailable">—</span>';
+      const bps=(v,d=2)=>finite(v)?`<span class="${valueClass(v)}">${Number(v)>0?"+":""}${Number(v).toFixed(d)} bps</span>`:'<span class="unavailable">—</span>';
+      const unavailable=(id,cols,section)=>{$(id).innerHTML=emptyRow(cols,section&&section.reason?`不可用：${section.reason}`:"暂无数据");};
+      const positions=ledger.quote_position;
+      if(Array.isArray(positions)&&positions.length){
+        $("quotePosition").innerHTML=positions.map(r=>`<tr><td><strong>${esc(r.symbol)}</strong></td><td>${fmt(r.samples,0)}</td><td>${pct(r.quoting_share)}</td><td>${pct(r.bid_at_touch_share)}</td><td>${finite(r.bid_behind_bps)?Number(r.bid_behind_bps).toFixed(2)+" bps":"—"}</td><td>${pct(r.ask_at_touch_share)}</td><td>${finite(r.ask_behind_bps)?Number(r.ask_behind_bps).toFixed(2)+" bps":"—"}</td></tr>`).join("");
+      }else unavailable("quotePosition",7,positions);
+      const markouts=ledger.markouts;
+      if(Array.isArray(markouts)&&markouts.length){
+        const scale=Math.max(1,...markouts.map(r=>Math.abs(Number(r.mean_bps)||0)+2*(Number(r.standard_error_bps)||0)));
+        const horizon=ms=>ms>=1000?`${ms/1000} 秒`:`${ms} ms`;
+        const bar=r=>{
+          if(!finite(r.mean_bps))return "";
+          const pos=v=>50+Math.max(-50,Math.min(50,v/scale*50)), m=Number(r.mean_bps), se=Number(r.standard_error_bps)||0;
+          const left=Math.min(pos(0),pos(m)), right=Math.max(pos(0),pos(m));
+          return `<div class="mo-bar"><span class="fill" style="left:${left}%;width:${right-left}%;background:${m>=0?"var(--green)":"var(--red)"}"></span><span class="ci" style="left:${pos(m-2*se)}%;width:${pos(m+2*se)-pos(m-2*se)}%"></span><span class="zero"></span></div>`;
+        };
+        $("markoutRows").innerHTML=markouts.map(r=>{
+          const t=Number(r.t_stat), tCell=finite(r.t_stat)?`<span class="${Math.abs(t)>=2?(t>0?"positive":"negative"):""}">${t.toFixed(2)}</span>`:"—";
+          return `<tr><td><strong>${esc(horizon(Number(r.horizon_ms)))}</strong></td><td>${fmt(r.samples,0)}</td><td>${bps(r.mean_bps)}</td><td>${bar(r)}</td><td>${bps(r.buy?.mean_bps)}</td><td>${bps(r.sell?.mean_bps)}</td><td>${finite(r.standard_error_bps)?Number(r.standard_error_bps).toFixed(2):"—"}</td><td>${tCell}</td><td>${pct(r.favourable_share)}</td></tr>`;
+        }).join("");
+        const longest=markouts[markouts.length-1], t=Number(longest.t_stat), n=Number(longest.samples)||0;
+        $("markoutVerdict").innerHTML=n<30?`样本太少（最长周期 ${n} 笔），结论不可信；至少需要几百笔成交。`:
+          !finite(longest.t_stat)?"无法计算显著性。":
+          Math.abs(t)<2?`最长周期 <strong>${esc(horizon(Number(longest.horizon_ms)))}</strong> 平均 ${strip(bps(longest.mean_bps))}，t=${t.toFixed(2)}：<strong>与 0 无显著差异</strong>，还不能判断盈亏。`:
+          t>0?`最长周期 <strong>${esc(horizon(Number(longest.horizon_ms)))}</strong> 平均 ${strip(bps(longest.mean_bps))}，t=${t.toFixed(2)}：<strong class="positive">成交后价格显著对我方有利</strong>。`:
+          `最长周期 <strong>${esc(horizon(Number(longest.horizon_ms)))}</strong> 平均 ${strip(bps(longest.mean_bps))}，t=${t.toFixed(2)}：<strong class="negative">显著被逆向选择</strong>，成交后价格对我方不利。`;
+      }else{unavailable("markoutRows",9,markouts);$("markoutVerdict").textContent="暂无成交质量数据";}
+      const symbolRows=ledger.symbols;
+      if(Array.isArray(symbolRows)&&symbolRows.length){
+        $("symbolPnl").innerHTML=symbolRows.map(r=>`<tr><td><strong>${esc(r.symbol)}</strong></td><td>${fmt(r.fills,0)} (${fmt(r.maker_fills,0)})</td><td>${fmt(r.notional,2)}</td><td class="${valueClass(r.realized_pnl)}">${fmt(r.realized_pnl,4)}</td><td>${fmt(r.commission,4)}</td><td class="${valueClass(r.net_pnl)}">${fmt(r.net_pnl,4)}</td><td>${bps(r.net_bps)}</td></tr>`).join("");
+      }else unavailable("symbolPnl",7,symbolRows);
     }
     function setView(view){
       view=view==="engineering"?"engineering":"trading";
