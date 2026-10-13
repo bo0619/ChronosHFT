@@ -395,6 +395,7 @@
       <button id="pauseButton" class="control" type="button">暂停刷新</button>
       <button id="flattenAllButton" class="control danger" type="button">一键平仓</button>
       <button id="rearmButton" class="control good" type="button">Rearm</button>
+      <button id="restartButton" class="control danger" type="button">重启</button>
       <span id="actionStatus" class="action-status">就绪</span>
     </div>
   </header>
@@ -784,6 +785,9 @@
       if (action === "flatten_symbol") {
         return window.confirm(`确认平仓 ${symbol || "该标的"}？\n\n后端会提交该标的 reduce-only 平仓单，并冻结该标的。`);
       }
+      if (action === "restart") {
+        return window.confirm("确认重启进程？\n\n后端会先按正常流程停机（撤单并验证；Live canary 会验证全平），然后启动新进程，回放 journal 并与交易所对账。重启期间面板会暂时断开。");
+      }
       if (action === "rearm") {
         const diagnostic = currentRearmDiagnostic();
         const detail = diagnostic ? `\n\n当前阻塞/风险状态：\n${diagnostic}` : "";
@@ -804,8 +808,10 @@
       const disabled = state.actionBusy || !state.data;
       const flattenAll = $("flattenAllButton");
       const rearm = $("rearmButton");
+      const restart = $("restartButton");
       if (flattenAll) flattenAll.disabled = disabled;
       if (rearm) rearm.disabled = disabled;
+      if (restart) restart.disabled = disabled;
       document.querySelectorAll(".symbol-flatten-button").forEach(button => {
         button.disabled = disabled;
       });
@@ -1220,6 +1226,7 @@
     $("pauseButton").addEventListener("click",()=>{state.paused=!state.paused;$("pauseButton").textContent=state.paused?"继续刷新":"暂停刷新";if(state.paused){$("connectionDot").className="dot warn";$("connectionText").textContent="已暂停";}else fetchSnapshot();});
     $("flattenAllButton").addEventListener("click",()=>{submitDashboardAction("flatten_all",{reason:"dashboard_flatten_all"});});
     $("rearmButton").addEventListener("click",()=>{submitDashboardAction("rearm",{reason:"dashboard_rearm"});});
+    $("restartButton").addEventListener("click",()=>{submitDashboardAction("restart",{reason:"dashboard_restart"});});
     $("refreshSelect").addEventListener("change",schedule);
     $("symbolSelect").addEventListener("change",e=>{state.selectedSymbol=e.target.value;if(state.data)renderStrategy(normalizeSymbols(state.data));});
     $("retryButton").addEventListener("click",()=>{state.failures=0;$("fatalOverlay").classList.remove("visible");fetchSnapshot();});

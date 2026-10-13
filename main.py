@@ -32,6 +32,7 @@ from infrastructure.live_config_guard import (
 from infrastructure.logger import logger
 from infrastructure.paper_trade import apply_paper_trade_mode, is_paper_trade
 from infrastructure.process_resources import ProcessResourceMonitor
+from infrastructure import process_restart
 from infrastructure.rpi_policy import (
     requires_zero_rpi_commission,
     validate_live_rpi_policy,
@@ -827,6 +828,7 @@ def run_startup_blocked_dashboard(
                 if systemd_watchdog is not None:
                     systemd_watchdog.pulse()
                 web_dashboard.publish_snapshot(force=True)
+                process_restart.PROCESS_RESTART.raise_if_requested()
                 time.sleep(refresh_sec)
         except KeyboardInterrupt:
             logger.info("Shutdown signal received in startup diagnostics mode.")
@@ -1212,8 +1214,11 @@ def main(argv=None):
     result = None
     pending_exception = None
     pending_traceback = None
+    restart_reason = ""
     try:
         result = _run_main(argv, runtime)
+    except process_restart.RestartRequested as exc:
+        restart_reason, shutdown_reason = exc.reason, f"operator_restart:{exc.reason}"
     except KeyboardInterrupt:
         shutdown_reason = "keyboard_interrupt"
         logger.info("Shutdown signal received.")
@@ -1239,6 +1244,8 @@ def main(argv=None):
             flush=True,
         )
         return 1
+    if restart_reason:  # reached only after a verified shutdown
+        return process_restart.reexec_current_process(reason=restart_reason)
     return result
 
 
