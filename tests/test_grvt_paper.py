@@ -3,6 +3,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from data.orderbook import LocalOrderBook
 from data.ref_data import ContractInfo, parse_grvt_instruments, ref_data_manager
 from event.type import (
     EVENT_AGG_TRADE,
@@ -192,6 +193,35 @@ class GrvtTranslatorTests(unittest.TestCase):
         self.assertIsNotNone(snapshot)
         self.assertEqual(records, [])
 
+    def test_sequence_zero_snapshot_takes_its_id_from_the_subscribe_ack(self):
+        # GRVT sends the book snapshot with sequence 0; the ack says where it
+        # sits, and the first delta's prev_sequence_number matches it.
+        self.translator.note_subscription(
+            {
+                "stream": "v1.book.d",
+                "subs": [f"{INSTRUMENT}@50"],
+                "first_sequence_number": ["91428"],
+                "latest_sequence_number": ["91427"],
+            }
+        )
+        snapshot, _ = self.translator.translate(book_message(0))
+        self.assertEqual(snapshot.snapshot["lastUpdateId"], 91427)
+        _, records = self.translator.translate(
+            book_message(91428, previous=91427)
+        )
+        self.assertEqual(records[0].data["pu"], 91427)
+
+    def test_non_book_ack_does_not_set_a_snapshot_id(self):
+        self.translator.note_subscription(
+            {
+                "stream": "v1.trade",
+                "subs": [f"{INSTRUMENT}@50"],
+                "latest_sequence_number": ["77"],
+            }
+        )
+        snapshot, _ = self.translator.translate(book_message(0))
+        self.assertEqual(snapshot.snapshot["lastUpdateId"], 0)
+
     def test_trades_drop_replay_and_set_maker_side(self):
         self.assertEqual(
             self.translator.translate(
@@ -311,6 +341,85 @@ class GrvtPublicWsTests(unittest.TestCase):
         app.sent.clear()
         second = ws.fetch_snapshot(SYMBOL, timeout_sec=0.5)
         self.assertEqual(second["asks"], [["2001.0", "1"]])
+        self.assertEqual(
+            [f["method"] for f in app.sent],
+            ["unsubscribe", "subscribe"],
+        )
+
+    def test_resubscribed_snapshot_continues_into_the_first_delta(self):
+        ws = self.make_ws()
+        acked = {"next": 91427}
+
+        def deliver(frame):
+            if frame["method"] == "subscribe" and frame["params"]["stream"] == "v1.book.d":
+                latest = acked["next"]
+                ws._on_raw_message(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "subscribe",
+                            "id": frame["id"],
+                            "result": {
+                                "stream": "v1.book.d",
+                                "subs": [f"{INSTRUMENT}@50"],
+                                "unsubs": [],
+                                "num_snapshots": [1],
+                                "first_sequence_number": [str(latest + 1)],
+                                "latest_sequence_number": [str(latest)],
+                            },
+                        }
+                    )
+                )
+                ws._on_raw_message(
+                    json.dumps(
+                        book_message(
+                            0,
+                            bids=[("1999.0", "1")],
+                            asks=[("2001.0", "1")],
+                        )
+                    )
+                )
+
+        app = FakeWsApp(on_send=deliver)
+        ws._handle_open(STREAM_NAME, app)
+        ws.fetch_snapshot(SYMBOL, timeout_sec=0.1)
+        acked["next"] = 91430
+        snapshot = ws.fetch_snapshot(SYMBOL, timeout_sec=0.5)
+        self.assertEqual(snapshot["lastUpdateId"], 91430)
+
+        book = LocalOrderBook(SYMBOL)
+        book.init_snapshot(snapshot)
+        ws._on_raw_message(
+            json.dumps(
+                book_message(91431, previous=91430, bids=[("1999.5", "2")])
+            )
+        )
+        stream, delta = self.records[-1]
+        self.assertEqual(stream, "ethusdt@depth")
+        book.process_delta(delta)
+        self.assertEqual(book.last_update_id, 91431)
+        self.assertEqual(book.best_bid_price, 1999.5)
+
+    def test_stale_cached_snapshot_is_dropped_for_a_fresh_one(self):
+        ws = self.make_ws()
+
+        def deliver(frame):
+            if frame["method"] == "subscribe" and frame["params"]["stream"] == "v1.book.d":
+                ws._on_raw_message(
+                    json.dumps(book_message(0, bids=[("1999.0", "1")]))
+                )
+
+        app = FakeWsApp(on_send=deliver)
+        ws._handle_open(STREAM_NAME, app)
+        app.sent.clear()
+        ws._snapshots[SYMBOL] = (
+            {"lastUpdateId": 7, "bids": [], "asks": [], "E": 0},
+            time.perf_counter() - 60.0,
+        )
+
+        snapshot = ws.fetch_snapshot(SYMBOL, timeout_sec=0.5)
+
+        self.assertEqual(snapshot["bids"], [["1999.0", "1"]])
         self.assertEqual(
             [f["method"] for f in app.sent],
             ["unsubscribe", "subscribe"],

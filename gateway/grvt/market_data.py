@@ -4,9 +4,11 @@ GRVT's ``full`` JSON-RPC stream wraps every payload as
 ``{"stream", "selector", "sequence_number", "prev_sequence_number", "feed"}``:
 
 * ``v1.book.d`` sends a full book on subscribe, then only changed levels
-  (``size == "0"`` removes a level). The snapshot's ``sequence_number`` plays
-  the role of Binance's ``lastUpdateId`` and ``prev_sequence_number`` is
-  Binance's ``pu``, so the existing continuity and resync rules apply.
+  (``size == "0"`` removes a level). The snapshot itself carries
+  ``sequence_number == 0``; its position is the ``latest_sequence_number`` in
+  the subscribe acknowledgement, which plays the role of Binance's
+  ``lastUpdateId``. ``prev_sequence_number`` is Binance's ``pu``, so the
+  existing continuity and resync rules apply.
 * ``v1.trade`` carries one trade per message. Snapshot payloads (sequence
   number 0) replay history and are dropped so old prints never reach Paper
   matching.
@@ -133,10 +135,30 @@ class GrvtMarketTranslator:
     unknown_instruments: set[str] = field(default_factory=set)
     # Symbols whose next book message is the subscribe snapshot.
     _awaiting_book: set[str] = field(default_factory=set)
+    # Book sequence each pending snapshot represents, from the subscribe ack.
+    _snapshot_sequences: dict[str, int] = field(default_factory=dict)
 
     def reset(self) -> None:
         """A new connection: the first book message per market is a snapshot."""
         self._awaiting_book = set(self.instrument_symbols.values())
+        self._snapshot_sequences = {}
+
+    def note_subscription(self, result: Mapping) -> None:
+        """Record the sequence each book snapshot in a subscribe ack sits at.
+
+        GRVT sends book snapshots with ``sequence_number == 0``. The ack's
+        ``latest_sequence_number`` is the position of the snapshot that
+        follows, and the first delta after it has that number as its
+        ``prev_sequence_number``.
+        """
+        if str(result.get("stream", "") or "") != BOOK_STREAM:
+            return
+        selectors = result.get("subs") or []
+        sequences = result.get("latest_sequence_number") or []
+        for selector, sequence in zip(selectors, sequences):
+            symbol = self.instrument_symbols.get(_instrument(selector))
+            if symbol:
+                self._snapshot_sequences[symbol] = int(sequence)
 
     def translate(
         self,
@@ -160,10 +182,11 @@ class GrvtMarketTranslator:
         if stream == BOOK_STREAM:
             if sequence == 0 or symbol in self._awaiting_book:
                 self._awaiting_book.discard(symbol)
+                snapshot_sequence = self._snapshot_sequences.pop(symbol, sequence)
                 return GrvtBookSnapshot(
                     symbol,
                     {
-                        "lastUpdateId": sequence,
+                        "lastUpdateId": snapshot_sequence,
                         "bids": _levels(feed.get("bids", [])),
                         "asks": _levels(feed.get("asks", [])),
                         "E": event_ms,

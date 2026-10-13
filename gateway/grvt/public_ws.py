@@ -57,6 +57,9 @@ class GrvtPublicWs(VenuePublicWs):
                 "venue_error",
                 json.dumps(error or message, sort_keys=True),
             )
+        result = message.get("result")
+        if message.get("method") == "subscribe" and isinstance(result, dict):
+            self.translator.note_subscription(result)
         # Subscribe/unsubscribe acknowledgements carry nothing to publish.
         return True
 

@@ -24,6 +24,9 @@ from infrastructure.time_service import time_service
 STREAM_NAME = "PublicWS"
 # Matching worker idle tick when no speed-bumped order is waiting.
 WORKER_IDLE_SEC = 0.05
+# A subscribe snapshot cached longer than this is stale: the deltas after it
+# were never applied anywhere, so fetch_snapshot resubscribes instead.
+MAX_CACHED_SNAPSHOT_AGE_SEC = 2.0
 
 
 class VenuePublicWs(BinanceWsApi):
@@ -50,7 +53,8 @@ class VenuePublicWs(BinanceWsApi):
         self.translator = translator
         self.known_symbols = {str(symbol).upper() for symbol in symbols}
         self._snapshot_condition = threading.Condition()
-        self._snapshots: dict[str, dict] = {}
+        # symbol -> (snapshot, perf_counter at receipt)
+        self._snapshots: dict[str, tuple[dict, float]] = {}
 
     # Venue hooks ------------------------------------------------------
 
@@ -115,7 +119,10 @@ class VenuePublicWs(BinanceWsApi):
             return
         if snapshot is not None:
             with self._snapshot_condition:
-                self._snapshots[snapshot.symbol] = snapshot.snapshot
+                self._snapshots[snapshot.symbol] = (
+                    snapshot.snapshot,
+                    time.perf_counter(),
+                )
                 self._snapshot_condition.notify_all()
         for record in records:
             self.record_callback(record.stream, record.data)
@@ -125,9 +132,15 @@ class VenuePublicWs(BinanceWsApi):
         symbol = str(symbol or "").upper()
         deadline = time.perf_counter() + max(0.0, float(timeout_sec))
         with self._snapshot_condition:
-            snapshot = self._snapshots.pop(symbol, None)
-        if snapshot is not None:
-            return snapshot
+            cached = self._snapshots.pop(symbol, None)
+        # A cached snapshot is only the subscribe book that has not been
+        # consumed yet. Once it is older than MAX_CACHED_SNAPSHOT_AGE_SEC the
+        # deltas after it are gone, so it would reopen the gap; resubscribe.
+        if (
+            cached is not None
+            and time.perf_counter() - cached[1] <= MAX_CACHED_SNAPSHOT_AGE_SEC
+        ):
+            return cached[0]
         if symbol not in self.known_symbols:
             return None
         for frame in self._resubscribe_book_frames(symbol):
@@ -142,7 +155,7 @@ class VenuePublicWs(BinanceWsApi):
                     )
                     return None
                 self._snapshot_condition.wait(min(remaining, 0.25))
-            return self._snapshots.pop(symbol)
+            return self._snapshots.pop(symbol)[0]
 
     def _send(self, frame: dict) -> bool:
         with self.lock:
