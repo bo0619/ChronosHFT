@@ -123,8 +123,10 @@
         "sigma_sample_interval_s": 1.0
       },
       "execution": {
+        "_comment_paper_touch": "Paper-only. KORUUSDT's one-tick spread (~7 bps) is narrower than the old 8 bps floor, so both quotes sat a tick behind the touch and filled only when the price ran through them. The floor is below one tick and a side within paper_touch_snap_ticks of the touch joins it if it still clears the one-way fee against fair value. Live keeps min_spread_bps and never snaps.",
         "min_spread_bps": 5.0,
-        "paper_min_spread_bps": 8.0
+        "paper_min_spread_bps": 6.0,
+        "paper_touch_snap_ticks": 1.0
       },
       "queue_retention": {
         "_comment": "Binance re-queues on every cancel/replace and modify. More-aggressive drift (1 tick, or size above target by the ratio) moves at once; more-conservative drift moves only past the tolerance and after min_rest_sec (>=5s keeps Binance ICR safe). New quote orders are capped per symbol per UTC 10-minute window, far below the ICR 5000 and dust-ratio 10000 order thresholds.",

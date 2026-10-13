@@ -1022,7 +1022,10 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                                     {
                                         "min_spread_bps": NONNEGATIVE,
                                         "paper_min_spread_bps": NONNEGATIVE,
-                                    }
+                                        "paper_touch_snap_ticks": NONNEGATIVE,
+                                    },
+                                    # Paper-only; absent means no snapping.
+                                    optional=("paper_touch_snap_ticks",),
                                 ),
                                 "queue_retention": _object(
                                     {

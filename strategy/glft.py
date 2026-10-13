@@ -73,6 +73,7 @@ from strategy.quote_math import (
     portfolio_glft_quote_offsets,
     robust_adaptive_portfolio_glft_quote_offsets,
 )
+from strategy.touch_snap import snap_decision_to_touch
 
 
 @dataclass(slots=True)
@@ -1742,8 +1743,16 @@ class GLFTStrategy(FastRequoteMixin, MarketExecutionMixin, AdaptiveQuotingStrate
             return
         if decision is None:
             return
-        target_bid = decision.target_bid
-        target_ask = decision.target_ask
+        target_bid, target_ask = snap_decision_to_touch(
+            decision,
+            reference_price=fair_mid,
+            best_bid=bid_1,
+            best_ask=ask_1,
+            tick_size=tick,
+            passive_fee_bps=passive_fee_bps,
+            execution_config=self.strat_conf.get("execution", self.glft_conf.get("execution")),
+            live=self.live_mode,
+        )
         effective_min_spread_bps = decision.effective_min_spread_bps
 
         bid_order_vol = self._calculate_safe_vol(

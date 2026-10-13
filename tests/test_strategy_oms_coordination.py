@@ -925,6 +925,26 @@ class StrategyMonotonicTimingTests(unittest.TestCase):
         self.assertAlmostEqual(calibrator.norm_returns[-1], expected_return)
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class StrategyOmsCoordinationTests(unittest.TestCase):
     def make_config(self, max_order_notional=5000.0, max_account_gross_notional=0.0):
         return {
@@ -1824,6 +1844,96 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
 
         self.assertEqual(len(oms.submitted), 2)
         self.assertEqual(oms.cancelled, ["passive-1"])
+
+    def _glft_one_tick_quotes(self, execution, sigma_bps=2.5):
+        engine = DispatchingEngine()
+        strategy = GLFTStrategy(
+            engine,
+            PassiveQuoteOMS(),
+            strategy_config={
+                "use_rpi": True,
+                "use_rpi_for_glft": True,
+                "cycle_interval": 0.0,
+                "target_order_notional": 8.0,
+                "max_pos_usdt": 18.0,
+                "execution": execution,
+            },
+        )
+        strategy.cooldown_ms = 0
+        calibrator = SimpleNamespace(
+            on_orderbook=lambda _ob: None, sigma_bps=sigma_bps, A=1.2, k=1.1
+        )
+        model = SimpleNamespace(update_and_predict=lambda *_args: {})
+        gate = SimpleNamespace(process=lambda value, _position: value)
+        strategy._get_components = lambda _symbol: (calibrator, model, gate)
+        strategy.feature_engine = SimpleNamespace(
+            on_orderbook=lambda _ob: None,
+            get_features=lambda _symbol: [0.0] * 9,
+            reset_interval=lambda _symbol: None,
+        )
+        # KORUUSDT-like: one 0.01 tick at ~14.375 is ~6.96 bps.
+        contract = ContractInfo(
+            symbol="KORUUSDT",
+            tick_size=0.01,
+            step_size=0.01,
+            min_qty=0.01,
+            min_notional=5.0,
+            price_precision=2,
+            qty_precision=2,
+            status="TRADING",
+            permissions=frozenset({"RPI"}),
+        )
+        ob = OrderBook(
+            symbol="KORUUSDT",
+            exchange="BINANCE",
+            datetime=datetime.utcnow(),
+            best_bid_price=14.37,
+            best_bid_volume=10000.0,
+            best_ask_price=14.38,
+            best_ask_volume=10000.0,
+        )
+        with patch.dict(
+            ref_data_manager.contracts, {"KORUUSDT": contract}, clear=True
+        ):
+            strategy.on_orderbook(ob)
+        params = [
+            event.data
+            for event in engine.events
+            if event.type == EVENT_STRATEGY_UPDATE
+        ][-1].params
+        return params["target_bid"], params["target_ask"]
+
+    def test_glft_paper_touch_snap_joins_the_touch_on_a_one_tick_book(self):
+        # An 8 bps floor is wider than the 6.96 bps market: both quotes floor
+        # and ceil one tick behind the touch.
+        execution = {"min_spread_bps": 5.0, "paper_min_spread_bps": 8.0}
+        self.assertEqual(self._glft_one_tick_quotes(execution), (14.36, 14.39))
+
+        # Snapping moves one side onto the touch; both would breach the floor.
+        snapped_bid, snapped_ask = self._glft_one_tick_quotes(
+            {**execution, "paper_touch_snap_ticks": 1.0}
+        )
+        self.assertEqual(
+            sorted([snapped_bid == 14.37, snapped_ask == 14.38]), [False, True]
+        )
+
+        # With the floor under one tick but the model's own spread a little
+        # wider than it, the model quotes a tick behind; snapping joins both.
+        under_tick = {"min_spread_bps": 5.0, "paper_min_spread_bps": 6.0}
+        snapping = {**under_tick, "paper_touch_snap_ticks": 1.0}
+        self.assertEqual(
+            self._glft_one_tick_quotes(under_tick, sigma_bps=20.0),
+            (14.36, 14.39),
+        )
+        self.assertEqual(
+            self._glft_one_tick_quotes(snapping, sigma_bps=20.0),
+            (14.37, 14.38),
+        )
+        # More than one tick behind: the model's wider quote is kept.
+        self.assertEqual(
+            self._glft_one_tick_quotes(snapping, sigma_bps=80.0),
+            (14.35, 14.40),
+        )
 
     def test_glft_on_orderbook_publishes_complete_params_telemetry(self):
         engine = DispatchingEngine()
