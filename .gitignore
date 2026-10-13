@@ -56,6 +56,7 @@ tests/*
 !tests/test_sidecar_control_state.py
 !tests/test_sidecar_observation.py
 !tests/test_paper_ledger.py
+!tests/test_paper_ledger_summary.py
 !tests/test_paper_matching.py
 !tests/test_main_dashboard_startup.py
 !tests/test_web_dashboard_admin_actions.py

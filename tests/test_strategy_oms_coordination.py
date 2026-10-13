@@ -2112,6 +2112,44 @@ class LocalWebDashboardTests(unittest.TestCase):
             "risk": {"limits": {"max_order_notional": 25.0}},
         }
 
+    def test_filled_order_resent_after_pruning_is_counted_once(self):
+        # orders_limit=20: quote churn pushes the filled order out of the
+        # display cache, then the OMS snapshot re-sends it as a recent
+        # terminal order. Its fill must not be counted again.
+        dashboard = LocalWebDashboard(config=self.make_config())
+
+        def order(client_oid, status, filled):
+            return OrderStateSnapshot(
+                client_oid=client_oid,
+                exchange_oid=f"exchange-{client_oid}",
+                symbol="BTCUSDT",
+                status=status,
+                price=100.0,
+                volume=1.0,
+                filled_volume=filled,
+                avg_price=100.0 if filled else 0.0,
+                update_time=datetime.now().timestamp(),
+                time_in_force=TIF_RPI,
+                is_post_only=True,
+                is_rpi=True,
+            )
+
+        filled = order("filled-order", OrderStatus.FILLED, 1.0)
+        dashboard.update_order(filled)
+        for index in range(3):
+            for churn in range(30):
+                dashboard.update_order(
+                    order(f"churn-{index}-{churn}", OrderStatus.CANCELLED, 0.0)
+                )
+            dashboard.update_order(filled)
+        dashboard.publish_snapshot({})
+
+        performance = dashboard.get_snapshot()["performance"]
+        self.assertEqual(performance["fill_events"], 1)
+        self.assertEqual(performance["filled_quantity"], 1.0)
+        self.assertEqual(performance["filled_orders"], 1)
+        self.assertEqual(performance["orders_observed"], 91)
+
     def test_local_dashboard_serves_complete_redacted_rpi_snapshot(self):
         dashboard = LocalWebDashboard(config=self.make_config())
         dashboard.update_account(

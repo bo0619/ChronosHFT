@@ -29,6 +29,7 @@ from urllib.parse import urlsplit
 
 from governance.contracts import is_testnet_environment
 from ui.dashboard_admin_actions import serve_dashboard_admin_post
+from ui.paper_ledger import paper_ledger_from_config
 
 _DEFAULT_STATIC_PATH = Path(__file__).resolve().parents[1] / "web" / "dashboard.html"
 _ACTIVE_ORDER_STATUSES = frozenset(
@@ -367,6 +368,12 @@ def _rest_telemetry_sections(
     return latency, api_limits
 
 
+# Per-order counting state (statuses seen, filled quantity counted) outlives
+# the display cache: a terminal order the OMS snapshot re-sends after it was
+# pruned from ``_orders`` must not have its fills counted again.
+_ORDER_COUNTING_STATE_LIMIT = 50_000
+
+
 class _DashboardHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -622,6 +629,10 @@ class LocalWebDashboard:
             "strategy_runtime": strategy_runtime,
         }
         self._config_view = self._safe_config_view(full_config)
+        self._paper_ledger = paper_ledger_from_config(
+            full_config,
+            is_paper=self._config_view["simulated_execution"],
+        )
 
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.Lock()
@@ -1250,7 +1261,8 @@ class LocalWebDashboard:
                 raw_order_id,
                 status=status,
                 is_rpi=is_rpi,
-                is_new=previous is None,
+                is_new=previous is None
+                and raw_order_id not in self._order_status_seen,
             )
             self._record_fill_locked(
                 raw_order_id,
@@ -1287,7 +1299,8 @@ class LocalWebDashboard:
                 raw_order_id,
                 status=status,
                 is_rpi=is_rpi,
-                is_new=not existing,
+                is_new=not existing
+                and raw_order_id not in self._order_status_seen,
             )
             execution_id = (
                 f"{symbol}:{trade_id}"
@@ -1533,6 +1546,11 @@ class LocalWebDashboard:
         result["time_service"] = self._time_service_snapshot()
         result["truth_monitor"] = self._truth_monitor_snapshot()
         result["venue_supervisor"] = self._venue_supervisor_snapshot()
+        if self._paper_ledger is not None:
+            # Database I/O stays outside the dashboard lock.
+            self._paper_ledger.refresh()
+            database = getattr(self._components.get("oms"), "paper_trade_database", None)
+            result["paper_run_id"] = getattr(database, "run_id", None)
         return result
 
     @staticmethod
@@ -1903,12 +1921,16 @@ class LocalWebDashboard:
             merged = {**(previous or {}), **record}
             status = str(merged.get("status", "") or "").upper()
             is_rpi = bool(merged.get("is_rpi", False))
+            is_new = (
+                previous is None
+                and raw_order_id not in self._order_status_seen
+            )
             self._record_order_transition_locked(
                 raw_order_id,
                 status=status,
                 is_rpi=is_rpi,
-                is_new=previous is None,
-                count_update=previous is None,
+                is_new=is_new,
+                count_update=is_new,
             )
             self._record_fill_locked(
                 raw_order_id,
@@ -2267,6 +2289,14 @@ class LocalWebDashboard:
                 "count": len(self._trades),
             },
             "performance": performance,
+            "paper_ledger": (
+                self._paper_ledger.summary(
+                    current_run_id=components.get("paper_run_id"),
+                    live_unrealized_pnl=account.get("unrealized_pnl"),
+                )
+                if self._paper_ledger is not None
+                else _section_unavailable()
+            ),
             "runtime": {
                 "available": bool(self._runtime_metrics),
                 **deepcopy(self._runtime_metrics),
@@ -3029,8 +3059,13 @@ class LocalWebDashboard:
             record = self._orders[raw_order_id]
             if record.get("status") not in _ACTIVE_ORDER_STATUSES:
                 self._orders.pop(raw_order_id, None)
-                self._order_status_seen.pop(raw_order_id, None)
-                self._order_filled_cumulative.pop(raw_order_id, None)
+        for counted in (self._order_status_seen, self._order_filled_cumulative):
+            excess = len(counted) - _ORDER_COUNTING_STATE_LIMIT
+            if excess <= 0:
+                continue
+            for raw_order_id in list(counted)[:excess]:
+                if raw_order_id not in self._orders:
+                    counted.pop(raw_order_id, None)
 
     def _safe_depth(self, levels: Any) -> list[list[float]]:
         result = []

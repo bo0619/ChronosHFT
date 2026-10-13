@@ -146,6 +146,12 @@
     .grid { display: grid; gap: 10px; }
     .status-grid { grid-template-columns: repeat(8, minmax(120px, 1fr)); }
     .account-grid { grid-template-columns: repeat(10, minmax(105px, 1fr)); }
+    .ledger-panel { margin-bottom: 10px; }
+    .ledger-panel[hidden], #ledgerStateBox[hidden] { display: none; }
+    .ledger-body { display: grid; grid-template-columns: minmax(200px, 260px) 1fr; gap: 10px; padding: 10px 12px; }
+    .ledger-net { margin-top: 6px; font-family: var(--mono); font-size: 34px; font-weight: 800; }
+    .ledger-grid { grid-template-columns: repeat(6, minmax(105px, 1fr)); }
+    @media (max-width: 900px) { .ledger-body { grid-template-columns: 1fr; } .ledger-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
     .split { grid-template-columns: 1.1fr .9fr; }
     .triple { grid-template-columns: repeat(3, 1fr); }
     .quad { grid-template-columns: repeat(4, 1fr); }
@@ -387,6 +393,7 @@
       <div class="state-box"><span>能力模式</span><strong id="capabilityState">—</strong></div>
       <div class="state-box"><span>网关</span><strong id="gatewayState">—</strong></div>
       <div class="state-box"><span>独立风控</span><strong id="supervisorState">—</strong></div>
+      <div class="state-box" id="ledgerStateBox" title="跨重启累计净盈亏 = 已实现 − 手续费 + 未平仓浮动"><span>累计净盈亏</span><strong id="ledgerState">—</strong></div>
     </div>
     <div class="top-actions">
       <label class="connection"><span id="connectionDot" class="dot"></span><span id="connectionText">连接中</span></label>
@@ -448,6 +455,14 @@
 
     <section id="overview">
       <div class="section-head"><h2>系统总览</h2><p id="overviewModeText">本地遥测 + 操作入口 · 仅限 loopback</p></div>
+      <article id="ledgerPanel" class="panel ledger-panel" hidden>
+        <div class="panel-head"><h3>累计盈亏（跨重启） <span class="badge simulation-badge">PAPER 模拟</span></h3><small id="ledgerSince">—</small></div>
+        <div class="ledger-body">
+          <div class="ledger-headline"><div class="metric-label">累计净盈亏 (USDT)</div><div id="ledgerNet" class="ledger-net">—</div><div id="ledgerNetNote" class="metric-note">已实现 − 手续费 + 未平仓浮动 · 不含资金费</div></div>
+          <div id="ledgerMetrics" class="grid ledger-grid"></div>
+        </div>
+        <details><summary id="ledgerRunsSummary">每次运行明细</summary><div class="table-wrap"><table><thead><tr><th>运行</th><th>开始 (UTC)</th><th>结束</th><th>成交 (maker)</th><th>成交额</th><th>已实现</th><th>手续费</th><th>未平仓浮动</th><th>净盈亏</th><th>累计</th></tr></thead><tbody id="ledgerRuns"></tbody></table></div></details>
+      </article>
       <div id="statusMetrics" class="grid status-grid"></div>
       <div style="height:10px"></div>
       <div id="accountMetrics" class="grid account-grid"></div>
@@ -925,6 +940,30 @@
       $("schemaVersion").textContent = `schema ${first(meta.schema_version, "—")}`;
     }
 
+    function renderLedger(data) {
+      const ledger=obj(data.paper_ledger), totals=obj(ledger.totals), runs=Array.isArray(ledger.runs)?ledger.runs:[];
+      const available=ledger.available===true;
+      $("ledgerPanel").hidden=!available; $("ledgerStateBox").hidden=!available;
+      if(!available)return;
+      const signed=(v,d=4)=>finite(v)?`<span class="${valueClass(v)}">${Number(v)>0?"+":""}${strip(fmt(v,d))}</span>`:fmt(v,d);
+      const net=totals.net_pnl, current=obj(runs.find(r=>r.current));
+      $("ledgerState").innerHTML=signed(net,4); $("ledgerState").className="";
+      $("ledgerNet").innerHTML=signed(net,4);
+      $("ledgerSince").textContent=totals.first_started_at?`自 ${String(totals.first_started_at).replace("T"," ").slice(0,19)} UTC 起 · ${totals.runs} 次运行`:"暂无运行记录";
+      $("ledgerMetrics").innerHTML=[
+        metric("本次运行净盈亏", signed(current.net_pnl,4), "本进程启动以来", finite(current.net_pnl)&&Number(current.net_pnl)<0?"bad":"good"),
+        metric("已实现盈亏", signed(totals.realized_pnl,4), "全部运行"),
+        metric("手续费", fmt(totals.commission,4), "负数为返佣"),
+        metric("未平仓浮动", signed(totals.open_unrealized,4), "当前持仓 + 异常退出遗留"),
+        metric("成交笔数", fmt(totals.fills,0), `maker ${fmt(totals.maker_fills,0)} 笔`),
+        metric("成交额", fmt(totals.notional,2), "USDT")
+      ].join("");
+      $("ledgerRunsSummary").textContent=`每次运行明细（${runs.length}）`;
+      $("ledgerRuns").innerHTML=runs.length?runs.slice().reverse().map(r=>{
+        const ended=r.current?'<span class="positive">运行中</span>':r.clean_shutdown?"正常结束":'<span class="negative">异常退出</span>';
+        return `<tr><td><strong>${esc(r.run_id)}</strong></td><td>${esc(String(r.started_at||"").replace("T"," ").slice(0,19))}</td><td>${ended}</td><td>${fmt(r.fills,0)} (${fmt(r.maker_fills,0)})</td><td>${fmt(r.notional,2)}</td><td>${signed(r.realized_pnl)}</td><td>${fmt(r.commission,4)}</td><td>${signed(r.open_unrealized)}</td><td>${signed(r.net_pnl)}</td><td>${signed(r.cumulative_net_pnl)}</td></tr>`;
+      }).join(""):emptyRow(10);
+    }
     function renderOverview(data, symbols) {
       const system = obj(data.system), account = obj(data.account), risk = obj(data.risk), rs = obj(risk.status), oms = obj(system.oms), gw = obj(system.gateway), sup = obj(system.risk_supervisor || system.independent_risk_supervisor);
       const context=executionContext(data), accountKind=context.isPaper?"本地模拟":"交易所";
@@ -1111,7 +1150,7 @@
 
     function render(data) {
       state.data=data; const symbols=normalizeSymbols(data); ensureSymbol(symbols);
-      setTop(data); renderTradingReadiness(data); renderOverview(data,symbols); renderMarket(symbols); renderExecution(data); renderStrategy(symbols); renderRisk(data); renderAcceptance(data); renderRuntime(data); renderRpi(data,symbols); renderLogs(data);
+      setTop(data); renderTradingReadiness(data); renderOverview(data,symbols); renderLedger(data); renderMarket(symbols); renderExecution(data); renderStrategy(symbols); renderRisk(data); renderAcceptance(data); renderRuntime(data); renderRpi(data,symbols); renderLogs(data);
       syncActionButtons();
     }
 
