@@ -230,6 +230,46 @@ class VenueSupervisorTests(unittest.TestCase):
         self.assertTrue(recovered)
         self.assertEqual(supervisor.gateway.calls, 1)
 
+    def test_supervisor_keeps_retrying_with_backoff_after_fast_attempts(self):
+        config = self.make_config()
+        config["oms"]["venue_supervisor"].update(
+            {"recovery_delay_sec": 1.0, "max_backoff_sec": 4.0}
+        )
+        supervisor = VenueSupervisor(
+            DummyOms("system_health:WS_TRANSPORT_DROP:MarketWS:lost"),
+            DummyGateway(recover_result=False),
+            config,
+            start_thread=False,
+        )
+        now = [100.0]
+        with patch(
+            "infrastructure.venue_supervisor.time.perf_counter",
+            side_effect=lambda: now[0],
+        ):
+            attempt_times = []
+            for _ in range(40):
+                calls = supervisor.gateway.calls
+                supervisor.poll_once()
+                if supervisor.gateway.calls != calls:
+                    attempt_times.append(now[0])
+                now[0] += 0.5
+
+        gaps = [b - a for a, b in zip(attempt_times, attempt_times[1:])]
+        # Two fast attempts 1s apart, then 2s, then capped at 4s, and never
+        # a permanent give-up.
+        self.assertEqual(gaps[:4], [1.0, 2.0, 4.0, 4.0])
+        self.assertGreater(len(attempt_times), 6)
+
+    def test_supervisor_recovers_paper_public_stream_recovery_timeout(self):
+        supervisor = VenueSupervisor(
+            DummyOms("system_health:PUBLIC_STREAM_RECOVERY_TIMEOUT"),
+            DummyGateway(recover_result=True),
+            self.make_config(),
+            start_thread=False,
+        )
+
+        self.assertTrue(supervisor.poll_once())
+
     def test_supervisor_ignores_non_recoverable_venue_freeze(self):
         supervisor = VenueSupervisor(
             DummyOms("truth_plane:api_unreachable:2"),

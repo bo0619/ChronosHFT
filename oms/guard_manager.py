@@ -381,11 +381,18 @@ class OMSGuardManager(OMSComponent):
         if prefix == "system_health":
             if len(parts) > 1 and parts[1] == "TRANSPORT":
                 return "system_health:transport"
+            # Paper venues fault with PUBLIC_STREAM_*/PUBLIC_MARK_* when a
+            # transport recovery attempt fails. Those are the same transport
+            # outage, so they must share its owner; a separate owner would
+            # survive the next successful recovery and freeze the venue
+            # until restart.
             if len(parts) > 1 and parts[1].startswith(
                 (
                     "WS_",
                     "USER_STREAM_",
                     "MARKET_DATA_",
+                    "PUBLIC_STREAM_",
+                    "PUBLIC_MARK_",
                 )
             ):
                 return "system_health:transport"

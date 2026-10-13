@@ -2139,12 +2139,37 @@ class RiskExecutionTests(unittest.TestCase):
         finally:
             time_service.offset = original_offset
 
-    def test_symbol_freeze_escalates_when_multiple_symbols_are_frozen(self):
+    def test_freezing_every_symbol_does_not_kill_by_default(self):
         engine = DummyEngine()
         gateway = DummyGateway()
         oms = DummyOMS()
         oms.config = {"symbols": ["BTCUSDT", "ETHUSDT"]}
         risk = RiskManager(engine, self.make_risk_config(), oms=oms, gateway=gateway)
+
+        for symbol in ("BTCUSDT", "ETHUSDT"):
+            stale = OrderBook(
+                symbol=symbol,
+                exchange="BINANCE",
+                datetime=datetime.now() - timedelta(milliseconds=250),
+            )
+            risk.market_risk.on_orderbook(Event("eOrderBook", stale))
+            risk.market_risk.on_orderbook(Event("eOrderBook", stale))
+
+        self.assertEqual(
+            set(risk.scope_guards.frozen_symbols),
+            {"BTCUSDT", "ETHUSDT"},
+        )
+        self.assertFalse(risk.kill_switch_triggered)
+        self.assertFalse(oms.halt_reasons)
+
+    def test_symbol_freeze_escalates_when_configured_threshold_is_reached(self):
+        engine = DummyEngine()
+        gateway = DummyGateway()
+        oms = DummyOMS()
+        oms.config = {"symbols": ["BTCUSDT", "ETHUSDT"]}
+        config = self.make_risk_config()
+        config["risk"]["tech_health"]["max_frozen_symbols_before_kill"] = 2
+        risk = RiskManager(engine, config, oms=oms, gateway=gateway)
 
         stale_btc = OrderBook(
             symbol="BTCUSDT",

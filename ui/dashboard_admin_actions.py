@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from infrastructure.admin_control import coordinated_rearm
+from infrastructure.process_restart import PROCESS_RESTART
 
 ADMIN_ACTION_PATH = "/api/admin/action"
 ADMIN_ACTION_HEADER = "X-Chronos-Action"
@@ -388,6 +389,14 @@ def handle_dashboard_admin_action(
             symbol=symbol,
         )
 
+    if action == "restart":
+        return _handle_restart(
+            owner,
+            action=action,
+            reason=reason,
+            symbol=symbol,
+        )
+
     return _base_error(
         action=action,
         reason=reason,
@@ -395,6 +404,41 @@ def handle_dashboard_admin_action(
         status="unsupported",
         message=f"Unsupported admin action: {action or 'empty'}",
         code=400,
+    )
+
+
+def _handle_restart(
+    owner: Any,
+    *,
+    action: str,
+    reason: str,
+    symbol: str,
+) -> tuple[dict[str, Any], int]:
+    restart_request = PROCESS_RESTART
+    if not restart_request.request(reason):
+        return _base_error(
+            action=action,
+            reason=reason,
+            symbol=symbol,
+            status="pending",
+            message=(
+                "Restart already pending: "
+                f"{restart_request.pending_reason()}"
+            ),
+            code=409,
+        )
+    return _snapshot_response(
+        owner,
+        accepted=True,
+        status="accepted",
+        message=(
+            "Restart scheduled: verified shutdown, then a fresh process "
+            "replays the journal and reconciles."
+        ),
+        action=action,
+        reason=reason,
+        symbol=symbol,
+        code=202,
     )
 
 

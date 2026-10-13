@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from infrastructure.interpreter_tuning import tune_interpreter_for_runtime
+from infrastructure.process_restart import PROCESS_RESTART
 from infrastructure.runtime_telemetry import TelemetryPublisher
 from infrastructure.watchdog import (
     emit_event_engine_backlog_if_needed,
@@ -115,6 +116,7 @@ class RuntimeControlLoop:
             while True:
                 self.sleep(0.1)
                 self.run_once()
+                PROCESS_RESTART.raise_if_requested()
         finally:
             self.close()
 

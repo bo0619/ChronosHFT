@@ -2376,6 +2376,44 @@ class OMSSurvivabilityTests(unittest.TestCase):
         finally:
             oms.stop()
 
+    def test_paper_recovery_failure_shares_the_transport_owner(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        try:
+            oms.freeze_venue(
+                "BINANCE",
+                "system_health:WS_TRANSPORT_DROP:PUBLIC:lost",
+                cancel_active_orders=False,
+            )
+            timeout_reason = "system_health:PUBLIC_STREAM_RECOVERY_TIMEOUT"
+            timeout_epoch = oms.freeze_venue(
+                "BINANCE",
+                timeout_reason,
+                cancel_active_orders=False,
+            )
+            oms.state = LifecycleState.LIVE
+            oms._sync_capability_mode("truth_verified")
+
+            self.assertEqual(
+                oms.get_venue_freeze_owners("BINANCE"),
+                {
+                    "system_health:transport": {
+                        "reason": timeout_reason,
+                        "epoch": timeout_epoch,
+                    }
+                },
+            )
+            self.assertTrue(
+                oms._complete_venue_recovery_verification(
+                    "BINANCE",
+                    timeout_epoch,
+                    "system_health:transport",
+                    timeout_reason,
+                )
+            )
+            self.assertEqual(oms.get_venue_freeze_owners("BINANCE"), {})
+        finally:
+            oms.stop()
+
     def test_orderbook_recovery_token_cannot_clear_unrelated_symbol_guard(self):
         oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
         try:
@@ -3826,6 +3864,20 @@ class SystemHealthHandlerTests(unittest.TestCase):
         risk_controller = DummyRiskController()
         handle_system_health_event(Event("eSystemHealth", "FATAL_GAP"), risk_controller)
         self.assertEqual(risk_controller.reasons, ["SystemHealth: FATAL_GAP"])
+
+    def test_unclassified_health_event_freezes_venue_without_kill(self):
+        risk_controller = DummyRiskController()
+        oms = DummyScopedOms()
+        handle_system_health_event(
+            Event("eSystemHealth", "FATAL_GAP"),
+            risk_controller,
+            oms,
+        )
+        self.assertEqual(risk_controller.reasons, [])
+        self.assertEqual(
+            oms.venue_freezes,
+            [("BINANCE", "system_health:UNCLASSIFIED:FATAL_GAP", True)],
+        )
 
     def test_paper_dms_expiry_does_not_trigger_kill_switch(self):
         risk_controller = DummyRiskController()
