@@ -4,10 +4,17 @@ The quoting model normally reprices on a fixed cycle. Between cycles a
 resting quote can go stale: when the mid moves toward it, informed takers
 pick it off before the next cycle. With ``fast_requote`` enabled, every book
 update compares the mid with the mid the quotes were priced from. Once it
-has moved ``trigger_bps`` the quote on the side the market moved toward is
+has moved the trigger the quote on the side the market moved toward is
 cancelled at once and the model cycle runs immediately. When the cancels
 have resolved, one more cycle refills the empty side instead of waiting for
 the regular interval. ``min_interval_ms`` bounds how often this can fire.
+
+The trigger is the larger of ``trigger_bps`` and ``min_trigger_ticks`` ticks
+in bps. On a large-tick book (KORUUSDT: one 0.01 tick is ~7 bps) the mid
+moves a whole tick whenever the touch flickers between two levels; a 1 bps
+trigger then cancelled a quote on every flicker and sent it to the back of
+the queue. A trigger above one tick lets the quote rest through a one-level
+flicker while a two-level move still pulls it.
 
 On venues that hold taker orders in a speed bump but not cancels (GRVT:
 25ms for non-post-only orders), this is the window to pull a stale quote
@@ -23,6 +30,7 @@ from dataclasses import dataclass
 
 DEFAULT_TRIGGER_BPS = 1.0
 DEFAULT_MIN_INTERVAL_MS = 100.0
+DEFAULT_MIN_TRIGGER_TICKS = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +38,7 @@ class FastRequotePolicy:
     enabled: bool = False
     trigger_bps: float = DEFAULT_TRIGGER_BPS
     min_interval_ms: float = DEFAULT_MIN_INTERVAL_MS
+    min_trigger_ticks: float = DEFAULT_MIN_TRIGGER_TICKS
 
     @classmethod
     def from_config(cls, section: Mapping | None, *, live_mode: bool):
@@ -38,6 +47,7 @@ class FastRequotePolicy:
         for field, default in (
             ("trigger_bps", DEFAULT_TRIGGER_BPS),
             ("min_interval_ms", DEFAULT_MIN_INTERVAL_MS),
+            ("min_trigger_ticks", DEFAULT_MIN_TRIGGER_TICKS),
         ):
             try:
                 value = float(section.get(field, default))
@@ -53,6 +63,12 @@ class FastRequotePolicy:
         # Paper-only until Live has its own evidence for the extra order rate.
         enabled = bool(section.get("enabled", False)) and not live_mode
         return cls(enabled=enabled, **values)
+
+    def trigger_threshold_bps(self, tick_size: float, mid: float) -> float:
+        tick_bps = (
+            tick_size / mid * 10_000.0 if tick_size > 0.0 and mid > 0.0 else 0.0
+        )
+        return max(self.trigger_bps, self.min_trigger_ticks * tick_bps)
 
 
 class FastRequoteMixin:
@@ -97,7 +113,10 @@ class FastRequoteMixin:
             if reference is not None and reference > 0.0
             else 0.0
         )
-        if abs(move_bps) >= policy.trigger_bps:
+        if abs(move_bps) >= policy.trigger_threshold_bps(
+            self._fast_requote_tick_size(symbol),
+            mid,
+        ):
             # Mid up: our ask is now cheap. Mid down: our bid is now rich.
             client_oid = quotes["ask_oid" if move_bps > 0.0 else "bid_oid"]
             if client_oid:
@@ -108,6 +127,13 @@ class FastRequoteMixin:
             fast["refill"] = False
             return self._force_quote_cycle(symbol, now)
         return False
+
+    def _fast_requote_tick_size(self, symbol: str) -> float:
+        info = self.reference_data.get_info(symbol)
+        try:
+            return float(getattr(info, "tick_size", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _quotes_ready_to_refill(self, quotes) -> bool:
         oids = (quotes["bid_oid"], quotes["ask_oid"])

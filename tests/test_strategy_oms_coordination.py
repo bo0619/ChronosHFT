@@ -1906,25 +1906,15 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
     def test_glft_paper_touch_snap_joins_the_touch_on_a_one_tick_book(self):
         # An 8 bps floor is wider than the 6.96 bps market: both quotes floor
         # and ceil one tick behind the touch.
-        execution = {"min_spread_bps": 5.0, "paper_min_spread_bps": 8.0}
-        self.assertEqual(self._glft_one_tick_quotes(execution), (14.36, 14.39))
+        floor = {"min_spread_bps": 5.0, "paper_min_spread_bps": 8.0}
+        snapping = {**floor, "paper_touch_snap_ticks": 1.0}
+        self.assertEqual(self._glft_one_tick_quotes(floor), (14.36, 14.39))
 
-        # Snapping moves one side onto the touch; both would breach the floor.
-        snapped_bid, snapped_ask = self._glft_one_tick_quotes(
-            {**execution, "paper_touch_snap_ticks": 1.0}
-        )
-        self.assertEqual(
-            sorted([snapped_bid == 14.37, snapped_ask == 14.38]), [False, True]
-        )
+        # Snapping keeps the floor in whole ticks of this symbol (8 bps is
+        # one tick), so both sides join the touch.
+        self.assertEqual(self._glft_one_tick_quotes(snapping), (14.37, 14.38))
 
-        # With the floor under one tick but the model's own spread a little
-        # wider than it, the model quotes a tick behind; snapping joins both.
-        under_tick = {"min_spread_bps": 5.0, "paper_min_spread_bps": 6.0}
-        snapping = {**under_tick, "paper_touch_snap_ticks": 1.0}
-        self.assertEqual(
-            self._glft_one_tick_quotes(under_tick, sigma_bps=20.0),
-            (14.36, 14.39),
-        )
+        # The model's own spread a little wider than a tick is snapped too.
         self.assertEqual(
             self._glft_one_tick_quotes(snapping, sigma_bps=20.0),
             (14.37, 14.38),

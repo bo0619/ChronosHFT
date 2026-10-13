@@ -985,7 +985,9 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                                                 "enabled": BOOL,
                                                 "trigger_bps": POSITIVE,
                                                 "min_interval_ms": NONNEGATIVE,
-                                            }
+                                                "min_trigger_ticks": NONNEGATIVE,
+                                            },
+                                            optional=("min_trigger_ticks",),
                                         ),
                                     },
                                     optional=("fast_requote",),

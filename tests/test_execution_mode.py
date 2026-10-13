@@ -347,7 +347,7 @@ class ExecutionModeConfigTests(unittest.TestCase):
 
 
 class FastRequoteTests(unittest.TestCase):
-    def make_strategy(self, *, enabled=True, live_mode=False):
+    def make_strategy(self, *, enabled=True, live_mode=False, min_trigger_ticks=0.0):
         oms = PassiveQuoteOMS()
         _, strategy = GLFTMarketExecutionTests().make_strategy(oms, {}, None)
         # Only fast requotes can run a second cycle in these tests.
@@ -358,6 +358,7 @@ class FastRequoteTests(unittest.TestCase):
                     "enabled": enabled,
                     "trigger_bps": 1.0,
                     "min_interval_ms": 0.0,
+                    "min_trigger_ticks": min_trigger_ticks,
                 }
             },
             live_mode=live_mode,
@@ -422,6 +423,33 @@ class FastRequoteTests(unittest.TestCase):
         bid_oid = strategy.quote_state["LTCUSDT"]["bid_oid"]
         self.book(strategy, 99.98)
         self.assertEqual(oms.cancelled, [bid_oid])
+
+    def test_tick_floor_lets_a_one_level_flicker_rest(self):
+        # One 0.1 tick at 100 is 10 bps; 1.5 ticks raise the trigger to 15 bps.
+        oms, strategy = self.make_strategy(min_trigger_ticks=1.5)
+        self.book(strategy, 100.0)
+        ask_oid = strategy.quote_state["LTCUSDT"]["ask_oid"]
+
+        # The touch flickers one level: the quotes keep their queue.
+        self.book(strategy, 100.1)
+        self.book(strategy, 100.0)
+        self.assertEqual(oms.cancelled, [])
+
+        # A two-level move still pulls the exposed ask.
+        self.book(strategy, 100.2)
+        self.assertEqual(oms.cancelled, [ask_oid])
+
+    def test_trigger_threshold_is_the_larger_of_bps_and_ticks(self):
+        policy = FastRequotePolicy.from_config(
+            {"trigger_bps": 1.0, "min_trigger_ticks": 1.5}, live_mode=False
+        )
+        # KORUUSDT: 0.01 at 14.375 is ~6.96 bps per tick.
+        self.assertAlmostEqual(
+            policy.trigger_threshold_bps(0.01, 14.375), 1.5 * 0.01 / 14.375 * 1e4
+        )
+        # SOXLUSDT on GRVT: 0.01 at 120 is ~0.83 bps, so trigger_bps wins.
+        self.assertAlmostEqual(policy.trigger_threshold_bps(0.01, 120.0), 1.25)
+        self.assertEqual(policy.trigger_threshold_bps(0.0, 120.0), 1.0)
 
     def test_disabled_and_live_wait_for_the_regular_cycle(self):
         for kwargs in ({"enabled": False}, {"live_mode": True}):

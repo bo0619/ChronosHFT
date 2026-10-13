@@ -9,9 +9,16 @@ adverse fills.
 ``snap_to_touch`` moves a side onto the touch when the model's continuous
 price is less than ``snap_ticks`` ticks behind it, provided that side still
 earns at least the one-way passive fee against the reference price and the
-quoted spread stays at least the effective minimum. A model price further
-behind (for example an inventory skew of more than ``snap_ticks``) is left
-alone, so inventory control still works. Live never snaps.
+quoted spread stays at least the minimum. A model price further behind (for
+example an inventory skew of more than ``snap_ticks``) is left alone, so
+inventory control still works. Live never snaps.
+
+Everything here is per symbol: distances are in that symbol's ticks, and
+the minimum spread a snapped quote must keep is the configured floor rounded
+down to whole ticks of that symbol, at least one tick
+(:func:`whole_tick_min_spread_bps`). An 8 bps floor is one tick (~7 bps) on
+KORUUSDT at ~14 USDT, so both sides can join a one-tick book, but stays nine
+ticks (~7.5 bps) on a 0.83 bps-tick book.
 """
 
 from __future__ import annotations
@@ -34,6 +41,19 @@ def touch_snap_ticks(execution_config: object, *, live: bool) -> float:
     except (TypeError, ValueError):
         return 0.0
     return value if math.isfinite(value) and value > 0.0 else 0.0
+
+
+def whole_tick_min_spread_bps(
+    min_spread_bps: float,
+    tick_size: float,
+    reference_price: float,
+) -> float:
+    """Round a bps spread floor down to whole ticks, at least one tick."""
+    if tick_size <= 0.0 or reference_price <= 0.0:
+        return min_spread_bps
+    tick_bps = tick_size / reference_price * 10_000.0
+    whole_ticks = max(1.0, math.floor(min_spread_bps / tick_bps + _EPSILON))
+    return whole_ticks * tick_bps
 
 
 def snap_to_touch(
@@ -64,6 +84,10 @@ def snap_to_touch(
     )
     tolerance = snap_ticks * tick_size
     one_way_fee_bps = max(0.0, passive_fee_bps) / 2.0
+    min_spread_bps = max(
+        passive_fee_bps,
+        whole_tick_min_spread_bps(min_spread_bps, tick_size, reference_price),
+    )
 
     def edge_bps(price: float, side_sign: float) -> float:
         return side_sign * (reference_price - price) / reference_price * 10_000.0
@@ -132,4 +156,9 @@ def snap_decision_to_touch(
     )
 
 
-__all__ = ["snap_decision_to_touch", "snap_to_touch", "touch_snap_ticks"]
+__all__ = [
+    "snap_decision_to_touch",
+    "snap_to_touch",
+    "touch_snap_ticks",
+    "whole_tick_min_spread_bps",
+]
