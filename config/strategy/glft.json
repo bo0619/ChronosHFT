@@ -127,7 +127,16 @@
         "_comment_paper_touch": "Paper-only and per symbol. A side whose model price is within paper_touch_snap_ticks of the touch joins it if it still clears the one-way fee against fair value; a snapped quote keeps paper_min_spread_bps rounded down to whole ticks of that symbol (at least one tick), so a one-tick book wider than the floor in bps (KORUUSDT ~7 bps/tick) can be quoted on both sides. Live keeps min_spread_bps and never snaps.",
         "min_spread_bps": 5.0,
         "paper_min_spread_bps": 8.0,
-        "paper_touch_snap_ticks": 1.0
+        "paper_touch_snap_ticks": 1.0,
+        "paper_queue_imbalance": {
+          "_comment": "Paper-only, learned per symbol from the public L1 book: P(next mid move | queue imbalance (bid_qty - ask_qty) / (bid_qty + ask_qty)). A side whose next move is more than against_threshold likely to go against it is quoted one level behind the touch, and a quote resting at the touch is pulled. On 9 h of KORUUSDT, imbalance below -0.4 preceded a down move 75-91% of the time. No step-back until a bin has min_moves_per_bin moves of evidence.",
+          "enabled": true,
+          "against_threshold": 0.65,
+          "bins": 10,
+          "min_moves_per_bin": 30.0,
+          "half_life_moves": 2000.0,
+          "symbols": {}
+        }
       },
       "paper_intensity": {
         "_comment": "Paper-only per-symbol A/k for GLFT (Live uses the frozen signed artifact). Prior A comes from the queue-adjusted public trade rate at the touch (rate / queue ahead), falling back to prior_A_per_s until observed; own quotes' exposure and fills then update A with a Gamma-Poisson posterior worth prior_strength_fills fills, and move k toward the own-fill MLE once fills span enough depths. Override any field per symbol under symbols.<SYMBOL>.",

@@ -26,6 +26,8 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 
+from alpha.queue_imbalance import QueueImbalanceConfig, QueueImbalanceModel
+from event.type import Side
 from strategy.quote_math import depths_bps_to_prices
 
 # Tolerance for float comparisons of prices and bps.
@@ -129,19 +131,65 @@ def snap_to_touch(
     return target_bid, target_ask
 
 
+def queue_imbalance_model(strategy, symbol: str, calibrator):
+    """The symbol's Paper queue-imbalance model, created once; None if off."""
+    model = getattr(calibrator, "queue_imbalance", None)
+    if model is None:
+        execution = _execution_config(strategy)
+        section = execution.get("paper_queue_imbalance") if execution else None
+        config = QueueImbalanceConfig.for_symbol(section, symbol)
+        enabled = config.enabled and not strategy.live_mode
+        model = QueueImbalanceModel(config) if enabled else False
+        calibrator.queue_imbalance = model
+    return model or None
+
+
+def step_back_against_imbalance(
+    target_bid: float,
+    target_ask: float,
+    *,
+    model,
+    best_bid: float,
+    best_ask: float,
+    tick_size: float,
+) -> tuple[float, float]:
+    """Keep a side one level behind the touch when the next move is against it.
+
+    A bid at the touch before a down move is filled by the move itself; a
+    quote one level back instead becomes the new touch, early in its queue.
+    """
+    if model is None or tick_size <= 0.0:
+        return target_bid, target_ask
+    if model.against(Side.BUY):
+        target_bid = min(target_bid, best_bid - tick_size)
+    if model.against(Side.SELL):
+        target_ask = max(target_ask, best_ask + tick_size)
+    return target_bid, target_ask
+
+
+def _execution_config(strategy) -> Mapping:
+    section = strategy.strat_conf.get(
+        "execution",
+        strategy.glft_conf.get("execution"),
+    )
+    return section if isinstance(section, Mapping) else {}
+
+
 def snap_decision_to_touch(
     decision,
+    strategy,
+    symbol: str,
+    calibrator,
     *,
     reference_price: float,
     best_bid: float,
     best_ask: float,
     tick_size: float,
     passive_fee_bps: float,
-    execution_config: object,
-    live: bool,
 ) -> tuple[float, float]:
-    """Apply :func:`snap_to_touch` to a ``QuoteDecision``."""
-    return snap_to_touch(
+    """Snap a ``QuoteDecision`` to the touch, then step back a side the
+    queue imbalance is against (Paper only)."""
+    target_bid, target_ask = snap_to_touch(
         target_bid=decision.target_bid,
         target_ask=decision.target_ask,
         reference_price=reference_price,
@@ -150,15 +198,27 @@ def snap_decision_to_touch(
         best_bid=best_bid,
         best_ask=best_ask,
         tick_size=tick_size,
-        snap_ticks=touch_snap_ticks(execution_config, live=live),
+        snap_ticks=touch_snap_ticks(
+            _execution_config(strategy), live=strategy.live_mode
+        ),
         min_spread_bps=decision.effective_min_spread_bps,
         passive_fee_bps=passive_fee_bps,
+    )
+    return step_back_against_imbalance(
+        target_bid,
+        target_ask,
+        model=queue_imbalance_model(strategy, symbol, calibrator),
+        best_bid=best_bid,
+        best_ask=best_ask,
+        tick_size=tick_size,
     )
 
 
 __all__ = [
+    "queue_imbalance_model",
     "snap_decision_to_touch",
     "snap_to_touch",
+    "step_back_against_imbalance",
     "touch_snap_ticks",
     "whole_tick_min_spread_bps",
 ]

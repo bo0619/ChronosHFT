@@ -28,6 +28,8 @@ from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from event.type import Side
+
 DEFAULT_TRIGGER_BPS = 1.0
 DEFAULT_MIN_INTERVAL_MS = 100.0
 DEFAULT_MIN_TRIGGER_TICKS = 0.0
@@ -86,6 +88,7 @@ class FastRequoteMixin:
                 "last_forced": float("-inf"),
                 "refill": False,
                 "count": 0,
+                "imbalance_pulls": 0,
             }
         )
 
@@ -107,6 +110,10 @@ class FastRequoteMixin:
         if (now - fast["last_forced"]) * 1_000.0 < policy.min_interval_ms:
             return False
         quotes = self.quote_state[symbol]
+        if self._pull_against_imbalance(symbol, quotes):
+            fast["imbalance_pulls"] += 1
+            fast["refill"] = True
+            return self._force_quote_cycle(symbol, now)
         reference = fast["reference_mid"]
         move_bps = (
             math.log(mid / reference) * 10_000.0
@@ -127,6 +134,33 @@ class FastRequoteMixin:
             fast["refill"] = False
             return self._force_quote_cycle(symbol, now)
         return False
+
+    def _pull_against_imbalance(self, symbol: str, quotes) -> bool:
+        """Cancel a quote resting at the touch that the queue imbalance is
+        against (strategy.touch_snap re-places it one level back)."""
+        calibrator = getattr(self, "calibrators", {}).get(symbol)
+        model = getattr(calibrator, "queue_imbalance", None)
+        last_bid = getattr(model, "last_bid", None) if model else None
+        if not model or last_bid is None:
+            return False
+        pulled = False
+        for side, key, touch in (
+            (Side.BUY, "bid", model.last_bid),
+            (Side.SELL, "ask", model.last_ask),
+        ):
+            client_oid = quotes[f"{key}_oid"]
+            price = quotes.get(f"{key}_price")
+            if (
+                not client_oid
+                or price is None
+                or client_oid in self.orders_cancelling
+                or abs(float(price) - touch) > 1e-9 * max(1.0, touch)
+                or not model.against(side)
+            ):
+                continue
+            self.cancel_order(client_oid)
+            pulled = True
+        return pulled
 
     def _fast_requote_tick_size(self, symbol: str) -> float:
         info = self.reference_data.get_info(symbol)

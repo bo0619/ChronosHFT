@@ -1845,7 +1845,9 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         self.assertEqual(len(oms.submitted), 2)
         self.assertEqual(oms.cancelled, ["passive-1"])
 
-    def _glft_one_tick_quotes(self, execution, sigma_bps=2.5, extra=None):
+    def _glft_one_tick_quotes(
+        self, execution, sigma_bps=2.5, extra=None, queue_imbalance=None
+    ):
         engine = DispatchingEngine()
         strategy = GLFTStrategy(
             engine,
@@ -1867,6 +1869,7 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             A=1.2,
             k=1.1,
             paper_intensity=None,
+            queue_imbalance=queue_imbalance,
         )
         self._last_glft_calibrator = calibrator
         model = SimpleNamespace(update_and_predict=lambda *_args: {})
@@ -1909,6 +1912,23 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         ][-1].params
         self._last_glft_params = params
         return params["target_bid"], params["target_ask"]
+
+    def test_glft_paper_steps_back_the_side_the_queue_imbalance_is_against(self):
+        snapping = {
+            "min_spread_bps": 5.0,
+            "paper_min_spread_bps": 8.0,
+            "paper_touch_snap_ticks": 1.0,
+        }
+        against_bid = SimpleNamespace(against=lambda side: side == Side.BUY)
+        self.assertEqual(
+            self._glft_one_tick_quotes(snapping, queue_imbalance=against_bid),
+            (14.36, 14.38),
+        )
+        neutral = SimpleNamespace(against=lambda side: False)
+        self.assertEqual(
+            self._glft_one_tick_quotes(snapping, queue_imbalance=neutral),
+            (14.37, 14.38),
+        )
 
     def test_glft_paper_uses_the_per_symbol_intensity_estimate(self):
         execution = {"min_spread_bps": 5.0, "paper_min_spread_bps": 8.0}

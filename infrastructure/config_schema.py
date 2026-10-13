@@ -166,6 +166,30 @@ _PAPER_INTENSITY_FIELDS = {
 }
 
 
+_QUEUE_IMBALANCE_FIELDS = {
+    "against_threshold": _number(0.5, 1.0, exclusive_maximum=True),
+    "bins": _integer(2),
+    "min_moves_per_bin": POSITIVE,
+    "half_life_moves": POSITIVE,
+}
+
+
+def _queue_imbalance_schema() -> ObjectSpec:
+    """Paper L1 queue-imbalance step-back plus per-symbol overrides."""
+    per_symbol = _object(
+        {"enabled": BOOL, **_QUEUE_IMBALANCE_FIELDS},
+        optional=("enabled", *_QUEUE_IMBALANCE_FIELDS),
+    )
+    return _object(
+        {
+            "enabled": BOOL,
+            **_QUEUE_IMBALANCE_FIELDS,
+            "symbols": MappingSpec(values=per_symbol, key_pattern=r"^[A-Z0-9]{5,30}$"),
+        },
+        optional=(*_QUEUE_IMBALANCE_FIELDS, "symbols"),
+    )
+
+
 def _paper_intensity_schema() -> ObjectSpec:
     """Global Paper A/k settings plus optional per-symbol overrides."""
     per_symbol = _object(
@@ -1060,9 +1084,14 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                                         "min_spread_bps": NONNEGATIVE,
                                         "paper_min_spread_bps": NONNEGATIVE,
                                         "paper_touch_snap_ticks": NONNEGATIVE,
+                                        "paper_queue_imbalance": _queue_imbalance_schema(),
                                     },
-                                    # Paper-only; absent means no snapping.
-                                    optional=("paper_touch_snap_ticks",),
+                                    # Paper-only; absent means no snapping
+                                    # and no queue-imbalance step-back.
+                                    optional=(
+                                        "paper_touch_snap_ticks",
+                                        "paper_queue_imbalance",
+                                    ),
                                 ),
                                 "queue_retention": _object(
                                     {

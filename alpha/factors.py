@@ -50,6 +50,9 @@ class GLFTCalibrator:
         # Per-symbol Paper A/k estimator, attached by the strategy on its
         # first quote cycle (strategy.paper_intensity_runtime).
         self.paper_intensity = None
+        # Per-symbol L1 queue-imbalance model, attached the same way
+        # (strategy.touch_snap.queue_imbalance_model).
+        self.queue_imbalance = None
 
         self.sigma_max:     float = cfg.get("sigma_max_bps",  100.0)
         self.ema_alpha:     float = cfg.get("sigma_ema_alpha",   0.1)
@@ -162,8 +165,8 @@ class GLFTCalibrator:
         self.sigma_bps = max(self.sigma_bps, 0.1)  # 下限保护
 
     def on_orderbook(self, ob: OrderBook):
-        bid, _ = ob.get_best_bid()
-        ask, _ = ob.get_best_ask()
+        bid, bid_qty = ob.get_best_bid()
+        ask, ask_qty = ob.get_best_ask()
         if (
             not math.isfinite(bid)
             or not math.isfinite(ask)
@@ -176,6 +179,8 @@ class GLFTCalibrator:
         now_monotonic = time.perf_counter()
         if self.paper_intensity:
             self.paper_intensity.on_book(mid, now_monotonic)
+        if self.queue_imbalance:
+            self.queue_imbalance.on_book(bid, bid_qty, ask, ask_qty)
         clock_source, tick_time = self._clock_sample(ob, now_monotonic)
 
         if not (self.last_mid > 0 and self._has_tick_reference):
