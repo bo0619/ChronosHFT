@@ -781,7 +781,7 @@ class PaperTradeConfigTests(unittest.TestCase):
     def test_tracked_paper_profile_uses_inventory_bounded_10k_sizing(self):
         configured = load_root_config("config.json")
 
-        self.assertEqual(configured["symbols"], ["SNDKUSDT"])
+        self.assertEqual(configured["symbols"], ["KORUUSDT"])
         self.assertEqual(configured["account"]["initial_balance_usdt"], 10_000.0)
         self.assertEqual(configured["account"]["trading_budget_total"], 10_000.0)
         self.assertEqual(

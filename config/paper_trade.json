@@ -3,8 +3,8 @@
   "fragment": "paper_trade",
   "version": 1,
   "paper_trade": {
-    "maker_fee": 0.0002,
-    "taker_fee": 0.0005,
+    "maker_fee": 0.0,
+    "taker_fee": 0.00025,
     "rpi_commission_rate": 0.0,
     "rpi_commission_rates": {},
     "rpi_fill_model": "public_trade_proxy",
@@ -17,6 +17,7 @@
     "command_timeout_sec": 2.0,
     "command_queue_size": 4096,
     "max_order_history": 10000,
-    "max_trade_history": 20000
+    "max_trade_history": 20000,
+    "_comment_fees": "Post-only (GTX) and RPI maker fills cost 0; IOC/market taker fills cost 0.025% (2.5 bps)."
   }
 }
