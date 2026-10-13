@@ -43,6 +43,19 @@ GROUP BY r.run_id
 ORDER BY r.started_at_utc
 """
 
+# One equity sample per run per time bucket (the latest in the bucket; SQLite
+# returns the bare column from the MAX row).
+_CURVE_SQL = """
+SELECT run_id, MAX(sample_time) AS sample_time, equity
+FROM paper_account_samples
+WHERE sample_time IS NOT NULL
+GROUP BY run_id, CAST(sample_time / ? AS INTEGER)
+ORDER BY sample_time
+"""
+
+# Upper bound on P&L curve points across all runs.
+CURVE_MAX_POINTS = 1500
+
 _LAST_SAMPLE_SQL = """
 SELECT unrealized_pnl
 FROM paper_account_samples
@@ -148,11 +161,33 @@ class PaperLedgerSummary:
                         "last_sample_unrealized": last_unrealized,
                     }
                 )
+            self._attach_curves(connection, runs)
         except sqlite3.Error as exc:
             return {"available": False, "reason": f"query_failed:{exc}"}
         finally:
             connection.close()
         return {"available": True, "source": str(self.path), "runs": runs}
+
+    @staticmethod
+    def _attach_curves(connection, runs: list[dict[str, Any]]) -> None:
+        """Give each run its downsampled equity P&L (equity - initial)."""
+        first, last = connection.execute(
+            "SELECT MIN(sample_time), MAX(sample_time) FROM paper_account_samples"
+        ).fetchone()
+        by_run = {run["run_id"]: run for run in runs}
+        for run in runs:
+            run["curve"] = []
+        if first is None or last is None:
+            return
+        bucket_sec = max(1.0, (float(last) - float(first)) / CURVE_MAX_POINTS)
+        for run_id, sample_time, equity in connection.execute(
+            _CURVE_SQL, (bucket_sec,)
+        ):
+            run = by_run.get(run_id)
+            if run is not None:
+                run["curve"].append(
+                    (_number(sample_time), _number(equity) - run["initial_balance"])
+                )
 
     @staticmethod
     def _summarize(
@@ -168,9 +203,18 @@ class PaperLedgerSummary:
             current_run_id = stored[-1]["run_id"]
         live = _number(live_unrealized_pnl)
         runs = []
+        curve = []
+        run_starts = []
         cumulative = 0.0
         for stored_run in stored:
             run = dict(stored_run)
+            points = run.pop("curve", [])
+            if points:
+                run_starts.append(points[0][0])
+                curve.extend(
+                    {"t": sample_time, "net": cumulative + pnl}
+                    for sample_time, pnl in points
+                )
             current = run["run_id"] == current_run_id
             if current:
                 open_unrealized = live
@@ -191,17 +235,28 @@ class PaperLedgerSummary:
                 }
             )
             runs.append(run)
+        if any(run["current"] for run in runs):
+            # The live account is newer than the last stored sample.
+            curve.append({"t": time.time(), "net": cumulative})
+        notional = sum(run["notional"] for run in runs)
+        fills = sum(run["fills"] for run in runs)
         return {
             "available": True,
             "source": cached["source"],
             "funding_included": False,
             "runs": runs,
+            "curve": curve,
+            "run_starts": run_starts,
             "totals": {
                 "runs": len(runs),
                 "first_started_at": runs[0]["started_at"] if runs else None,
-                "fills": sum(run["fills"] for run in runs),
+                "fills": fills,
                 "maker_fills": sum(run["maker_fills"] for run in runs),
-                "notional": sum(run["notional"] for run in runs),
+                "notional": notional,
+                # Size-independent edge: these do not change when order size
+                # is scaled, unlike net P&L in USDT.
+                "net_bps": cumulative / notional * 10_000.0 if notional else None,
+                "net_per_fill": cumulative / fills if fills else None,
                 "realized_pnl": sum(run["realized_pnl"] for run in runs),
                 "commission": sum(run["commission"] for run in runs),
                 "open_unrealized": sum(run["open_unrealized"] for run in runs),

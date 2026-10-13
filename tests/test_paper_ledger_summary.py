@@ -19,7 +19,7 @@ def _database(path):
             fill_notional REAL, realized_pnl REAL, commission REAL
         );
         CREATE TABLE paper_account_samples (
-            run_id TEXT, sample_time REAL, unrealized_pnl REAL
+            run_id TEXT, sample_time REAL, equity REAL, unrealized_pnl REAL
         );
         INSERT INTO paper_runs VALUES
             ('clean-run-0001', '2026-10-13T01:00:00Z', '2026-10-13T02:00:00Z',
@@ -34,9 +34,11 @@ def _database(path):
             ('c', 'crashed-run-02', 1, 50.0, 0.20, 0.0),
             ('d', 'current-run-03', 1, 30.0, 0.10, -0.003);
         INSERT INTO paper_account_samples VALUES
-            ('crashed-run-02', 1.0, 9.0),
-            ('crashed-run-02', 2.0, -0.40),
-            ('current-run-03', 1.0, 5.0);
+            ('clean-run-0001', 100.0, 10000.0, 0.0),
+            ('clean-run-0001', 200.0, 9999.475, 0.0),
+            ('crashed-run-02', 300.0, 10009.0, 9.0),
+            ('crashed-run-02', 400.0, 9999.80, -0.40),
+            ('current-run-03', 500.0, 10005.0, 5.0);
         """
     )
     connection.commit()
@@ -63,6 +65,17 @@ def test_cumulative_net_includes_crash_leftover_and_live_unrealized(tmp_path):
     assert runs["current-"]["net_pnl"] == pytest.approx(0.153)
     assert runs["current-"]["cumulative_net_pnl"] == pytest.approx(-0.572)
 
+    # Each run's equity P&L is stacked on the net of the runs before it.
+    assert [point["t"] for point in summary["curve"][:5]] == [
+        100.0, 200.0, 300.0, 400.0, 500.0,
+    ]
+    assert [point["net"] for point in summary["curve"][:5]] == pytest.approx(
+        [0.0, -0.525, 8.475, -0.725, 4.275]
+    )
+    assert summary["run_starts"] == [100.0, 300.0, 500.0]
+    # The live point closes the curve at the cumulative net.
+    assert summary["curve"][-1]["net"] == pytest.approx(-0.572)
+
     totals = summary["totals"]
     assert totals["runs"] == 3
     assert totals["fills"] == 4
@@ -70,6 +83,8 @@ def test_cumulative_net_includes_crash_leftover_and_live_unrealized(tmp_path):
     assert totals["notional"] == pytest.approx(280.0)
     assert totals["commission"] == pytest.approx(0.022)
     assert totals["net_pnl"] == pytest.approx(-0.572)
+    assert totals["net_bps"] == pytest.approx(-0.572 / 280.0 * 10_000.0)
+    assert totals["net_per_fill"] == pytest.approx(-0.143)
 
 
 def test_missing_database_is_unavailable(tmp_path):

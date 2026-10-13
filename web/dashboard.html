@@ -148,9 +148,28 @@
     .account-grid { grid-template-columns: repeat(10, minmax(105px, 1fr)); }
     .ledger-panel { margin-bottom: 10px; }
     .ledger-panel[hidden], #ledgerStateBox[hidden] { display: none; }
+    body.view-trading main > section:not(#trading), body.view-trading .eng-only { display: none !important; }
+    body.view-engineering #trading { display: none !important; }
+    .view-tab { background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--muted); padding: 8px 14px; font: 600 13px var(--sans); cursor: pointer; }
+    .view-tab:hover { color: var(--text); }
+    .view-tab.active { color: var(--cyan); border-bottom-color: var(--cyan); }
+    .view-divider { width: 1px; align-self: stretch; margin: 6px 8px; background: var(--line); }
+    .eng-links { display: contents; }
+    .trade-health { display: flex; align-items: center; gap: 12px; padding: 10px 14px; margin-bottom: 10px; border: 1px solid var(--line); border-left-width: 3px; background: var(--panel); }
+    .trade-health .health-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--muted); flex: 0 0 auto; }
+    .trade-health .health-text { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+    .trade-health .health-text span { color: var(--muted); font-size: 12px; }
+    .trade-health.ready { border-left-color: var(--green); } .trade-health.ready .health-dot { background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .trade-health.limited { border-left-color: var(--amber); } .trade-health.limited .health-dot { background: var(--amber); }
+    .trade-health.blocked { border-left-color: var(--red); } .trade-health.blocked .health-dot { background: var(--red); box-shadow: 0 0 8px var(--red); }
+    .pnl-chart-wrap { position: relative; padding: 0 12px 10px; }
+    .pnl-chart { display: block; width: 100%; height: 240px; }
+    .pnl-chart text { fill: var(--muted); font: 10px var(--mono); }
+    .pnl-tip { position: absolute; pointer-events: none; padding: 5px 8px; background: var(--panel-2); border: 1px solid var(--line); font: 11px var(--mono); white-space: nowrap; }
+    .pnl-tip[hidden] { display: none; }
     .ledger-body { display: grid; grid-template-columns: minmax(200px, 260px) 1fr; gap: 10px; padding: 10px 12px; }
     .ledger-net { margin-top: 6px; font-family: var(--mono); font-size: 34px; font-weight: 800; }
-    .ledger-grid { grid-template-columns: repeat(6, minmax(105px, 1fr)); }
+    .ledger-grid { grid-template-columns: repeat(4, minmax(105px, 1fr)); }
     @media (max-width: 900px) { .ledger-body { grid-template-columns: 1fr; } .ledger-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
     .split { grid-template-columns: 1.1fr .9fr; }
     .triple { grid-template-columns: repeat(3, 1fr); }
@@ -381,7 +400,7 @@
     }
   </style>
 </head>
-<body>
+<body class="view-trading">
   <header class="topbar">
     <div class="brand">
       <div class="brand-mark">CH</div>
@@ -389,10 +408,10 @@
     </div>
     <div class="top-status">
       <div class="state-box"><span>环境</span><strong id="envState">启动中</strong></div>
-      <div class="state-box"><span>OMS</span><strong id="omsState">—</strong></div>
-      <div class="state-box"><span>能力模式</span><strong id="capabilityState">—</strong></div>
-      <div class="state-box"><span>网关</span><strong id="gatewayState">—</strong></div>
-      <div class="state-box"><span>独立风控</span><strong id="supervisorState">—</strong></div>
+      <div class="state-box eng-only"><span>OMS</span><strong id="omsState">—</strong></div>
+      <div class="state-box eng-only"><span>能力模式</span><strong id="capabilityState">—</strong></div>
+      <div class="state-box eng-only"><span>网关</span><strong id="gatewayState">—</strong></div>
+      <div class="state-box eng-only"><span>独立风控</span><strong id="supervisorState">—</strong></div>
       <div class="state-box" id="ledgerStateBox" title="跨重启累计净盈亏 = 已实现 − 手续费 + 未平仓浮动"><span>累计净盈亏</span><strong id="ledgerState">—</strong></div>
     </div>
     <div class="top-actions">
@@ -421,11 +440,37 @@
   </div>
 
   <nav class="subnav" aria-label="页面区域">
-    <a href="#trade-readiness">交易诊断</a><a href="#overview">总览</a><a href="#market">市场</a><a href="#execution">执行</a><a href="#strategy">策略</a><a href="#risk">风控</a><a href="#acceptance">实盘验收</a><a href="#runtime">运行时</a><a href="#rpi">RPI</a><a href="#logs">日志</a>
+    <button type="button" class="view-tab" data-view="trading">交易</button><button type="button" class="view-tab" data-view="engineering">工程</button><span class="view-divider eng-only"></span>
+    <span class="eng-only eng-links"><a href="#trade-readiness">交易诊断</a><a href="#overview">总览</a><a href="#market">市场</a><a href="#execution">执行</a><a href="#strategy">策略</a><a href="#risk">风控</a><a href="#acceptance">实盘验收</a><a href="#runtime">运行时</a><a href="#rpi">RPI</a><a href="#logs">日志</a></span>
     <span class="spacer"></span><span id="asOf">尚未收到快照</span>
   </nav>
 
   <main>
+    <section id="trading" class="trading-only">
+      <div id="tradeHealth" class="trade-health unknown">
+        <span class="health-dot"></span>
+        <div class="health-text"><strong id="tradeHealthTitle">等待快照</strong><span id="tradeHealthSummary">—</span></div>
+        <button type="button" class="control" id="tradeHealthDetails">查看诊断</button>
+      </div>
+      <article id="ledgerPanel" class="panel ledger-panel" hidden>
+        <div class="panel-head"><h3>净盈亏（跨重启累计） <span class="badge simulation-badge">PAPER 模拟</span></h3><small id="ledgerSince">—</small></div>
+        <div class="ledger-body">
+          <div class="ledger-headline"><div class="metric-label">累计净盈亏 (USDT)</div><div id="ledgerNet" class="ledger-net">—</div><div id="ledgerNetNote" class="metric-note">已实现 − 手续费 + 未平仓浮动 · 不含资金费</div></div>
+          <div id="ledgerMetrics" class="grid ledger-grid"></div>
+        </div>
+        <div class="pnl-chart-wrap"><svg id="pnlChart" class="pnl-chart" role="img" aria-label="累计净盈亏曲线"></svg><div id="pnlChartTip" class="pnl-tip" hidden></div></div>
+        <details><summary id="ledgerRunsSummary">每次运行明细</summary><div class="table-wrap"><table><thead><tr><th>运行</th><th>开始 (UTC)</th><th>结束</th><th>成交 (maker)</th><th>成交额</th><th>已实现</th><th>手续费</th><th>未平仓浮动</th><th>净盈亏</th><th>累计</th></tr></thead><tbody id="ledgerRuns"></tbody></table></div></details>
+      </article>
+      <article class="panel">
+        <div class="panel-head"><h3>报价面板</h3><small>距离以 tick 计：0 = 挂在最优价，正数 = 落后于最优价</small></div>
+        <div class="table-wrap"><table><thead><tr><th>标的</th><th>状态</th><th>持仓</th><th>持仓名义</th><th>浮动盈亏</th><th>我方买</th><th>买距</th><th>最优买</th><th>最优卖</th><th>卖距</th><th>我方卖</th><th>市场价差</th><th>我方价差</th><th>挂单</th></tr></thead><tbody id="quoteBoard"></tbody></table></div>
+      </article>
+      <article class="panel">
+        <div class="panel-head"><h3>最近成交</h3><small id="tradingFillsCount">—</small></div>
+        <div class="table-wrap"><table><thead><tr><th>时间</th><th>标的</th><th>方向</th><th>价格</th><th>数量</th><th>名义</th><th>Maker</th><th>手续费</th><th>已实现</th></tr></thead><tbody id="tradingFills"></tbody></table></div>
+      </article>
+    </section>
+
     <section id="trade-readiness" aria-labelledby="tradeReadinessHeading">
       <div class="section-head"><h2 id="tradeReadinessHeading">交易可用性</h2><p>全局就绪条件与局部交易限制</p></div>
       <div id="readinessShell" class="readiness-shell unknown">
@@ -455,14 +500,6 @@
 
     <section id="overview">
       <div class="section-head"><h2>系统总览</h2><p id="overviewModeText">本地遥测 + 操作入口 · 仅限 loopback</p></div>
-      <article id="ledgerPanel" class="panel ledger-panel" hidden>
-        <div class="panel-head"><h3>累计盈亏（跨重启） <span class="badge simulation-badge">PAPER 模拟</span></h3><small id="ledgerSince">—</small></div>
-        <div class="ledger-body">
-          <div class="ledger-headline"><div class="metric-label">累计净盈亏 (USDT)</div><div id="ledgerNet" class="ledger-net">—</div><div id="ledgerNetNote" class="metric-note">已实现 − 手续费 + 未平仓浮动 · 不含资金费</div></div>
-          <div id="ledgerMetrics" class="grid ledger-grid"></div>
-        </div>
-        <details><summary id="ledgerRunsSummary">每次运行明细</summary><div class="table-wrap"><table><thead><tr><th>运行</th><th>开始 (UTC)</th><th>结束</th><th>成交 (maker)</th><th>成交额</th><th>已实现</th><th>手续费</th><th>未平仓浮动</th><th>净盈亏</th><th>累计</th></tr></thead><tbody id="ledgerRuns"></tbody></table></div></details>
-      </article>
       <div id="statusMetrics" class="grid status-grid"></div>
       <div style="height:10px"></div>
       <div id="accountMetrics" class="grid account-grid"></div>
@@ -952,17 +989,89 @@
       $("ledgerSince").textContent=totals.first_started_at?`自 ${String(totals.first_started_at).replace("T"," ").slice(0,19)} UTC 起 · ${totals.runs} 次运行`:"暂无运行记录";
       $("ledgerMetrics").innerHTML=[
         metric("本次运行净盈亏", signed(current.net_pnl,4), "本进程启动以来", finite(current.net_pnl)&&Number(current.net_pnl)<0?"bad":"good"),
+        metric("净盈亏 / 成交额", finite(totals.net_bps)?`<span class="${valueClass(totals.net_bps)}">${Number(totals.net_bps)>0?"+":""}${strip(fmt(totals.net_bps,2))} bps</span>`:fmt(null), "与下单规模无关的真实 edge"),
+        metric("每笔成交净盈亏", signed(totals.net_per_fill,4), "USDT / 笔"),
+        metric("成交", `${strip(fmt(totals.fills,0))} 笔`, `maker ${strip(fmt(totals.maker_fills,0))} · 成交额 ${strip(fmt(totals.notional,0))} U`),
         metric("已实现盈亏", signed(totals.realized_pnl,4), "全部运行"),
         metric("手续费", fmt(totals.commission,4), "负数为返佣"),
         metric("未平仓浮动", signed(totals.open_unrealized,4), "当前持仓 + 异常退出遗留"),
-        metric("成交笔数", fmt(totals.fills,0), `maker ${fmt(totals.maker_fills,0)} 笔`),
-        metric("成交额", fmt(totals.notional,2), "USDT")
+        metric("运行次数", fmt(totals.runs,0), runs.some(r=>!r.current&&!r.clean_shutdown)?'<span class="negative">含异常退出</span>':"均正常结束")
       ].join("");
+      drawPnlChart(ledger);
       $("ledgerRunsSummary").textContent=`每次运行明细（${runs.length}）`;
       $("ledgerRuns").innerHTML=runs.length?runs.slice().reverse().map(r=>{
         const ended=r.current?'<span class="positive">运行中</span>':r.clean_shutdown?"正常结束":'<span class="negative">异常退出</span>';
         return `<tr><td><strong>${esc(r.run_id)}</strong></td><td>${esc(String(r.started_at||"").replace("T"," ").slice(0,19))}</td><td>${ended}</td><td>${fmt(r.fills,0)} (${fmt(r.maker_fills,0)})</td><td>${fmt(r.notional,2)}</td><td>${signed(r.realized_pnl)}</td><td>${fmt(r.commission,4)}</td><td>${signed(r.open_unrealized)}</td><td>${signed(r.net_pnl)}</td><td>${signed(r.cumulative_net_pnl)}</td></tr>`;
       }).join(""):emptyRow(10);
+    }
+    function drawPnlChart(ledger) {
+      const svg=$("pnlChart"), points=arr(ledger.curve).filter(p=>finite(p.t)&&finite(p.net));
+      const width=Math.max(320, Math.round(svg.getBoundingClientRect?.().width || 900)), height=240;
+      const pad={l:64,r:16,t:14,b:26}, w=width-pad.l-pad.r, h=height-pad.t-pad.b;
+      svg.setAttribute("viewBox",`0 0 ${width} ${height}`);
+      state.pnlChart={points,pad,w,h,width};
+      if(points.length<2){svg.innerHTML=`<text x="${width/2}" y="${height/2}" text-anchor="middle">等待更多盈亏采样</text>`;return;}
+      const t0=points[0].t, t1=points[points.length-1].t, span=Math.max(1,t1-t0);
+      let lo=Math.min(0,...points.map(p=>p.net)), hi=Math.max(0,...points.map(p=>p.net));
+      if(hi-lo<1e-9){hi+=1;lo-=1;} const margin=(hi-lo)*0.08; lo-=margin; hi+=margin;
+      const x=t=>pad.l+(t-t0)/span*w, y=v=>pad.t+(hi-v)/(hi-lo)*h;
+      state.pnlChart.x=x; state.pnlChart.y=y;
+      const last=points[points.length-1].net, color=last>=0?"var(--green)":"var(--red)";
+      const line=points.map((p,i)=>`${i?"L":"M"}${x(p.t).toFixed(1)},${y(p.net).toFixed(1)}`).join("");
+      const area=`${line}L${x(t1).toFixed(1)},${y(0).toFixed(1)}L${x(t0).toFixed(1)},${y(0).toFixed(1)}Z`;
+      const ticks=[hi-margin,(hi+lo)/2,lo+margin].map(v=>`<text x="${pad.l-6}" y="${(y(v)+3).toFixed(1)}" text-anchor="end">${v.toFixed(Math.abs(v)<10?4:2)}</text><line x1="${pad.l}" x2="${pad.l+w}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}" stroke="var(--line-soft)"/>`).join("");
+      const starts=arr(ledger.run_starts).filter(t=>finite(t)&&t>t0).map(t=>`<line x1="${x(t).toFixed(1)}" x2="${x(t).toFixed(1)}" y1="${pad.t}" y2="${pad.t+h}" stroke="var(--line)" stroke-dasharray="3 3"/><text x="${(x(t)+3).toFixed(1)}" y="${pad.t+9}">重启</text>`).join("");
+      const timeLabel=t=>new Date(t*1000).toLocaleString("zh-CN",{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false});
+      svg.innerHTML=`${ticks}<line x1="${pad.l}" x2="${pad.l+w}" y1="${y(0).toFixed(1)}" y2="${y(0).toFixed(1)}" stroke="var(--muted)" stroke-width="1"/>${starts}`+
+        `<path d="${area}" fill="${color}" opacity="0.10"/><path d="${line}" fill="none" stroke="${color}" stroke-width="1.6"/>`+
+        `<circle cx="${x(t1).toFixed(1)}" cy="${y(last).toFixed(1)}" r="3" fill="${color}"/>`+
+        `<text x="${pad.l}" y="${height-8}">${esc(timeLabel(t0))}</text><text x="${pad.l+w}" y="${height-8}" text-anchor="end">${esc(timeLabel(t1))}</text>`+
+        `<line id="pnlCursor" x1="0" x2="0" y1="${pad.t}" y2="${pad.t+h}" stroke="var(--cyan)" stroke-width="1" visibility="hidden"/>`;
+    }
+    function pnlChartHover(event){
+      const chart=state.pnlChart, svg=$("pnlChart"), tip=$("pnlChartTip"), cursor=document.getElementById("pnlCursor");
+      if(!chart||!chart.x||chart.points.length<2){tip.hidden=true;return;}
+      const box=svg.getBoundingClientRect(), px=(event.clientX-box.left)*(chart.width/box.width);
+      let best=chart.points[0]; for(const p of chart.points){if(Math.abs(chart.x(p.t)-px)<Math.abs(chart.x(best.t)-px))best=p;}
+      if(cursor){cursor.setAttribute("x1",chart.x(best.t));cursor.setAttribute("x2",chart.x(best.t));cursor.setAttribute("visibility","visible");}
+      tip.hidden=false; tip.innerHTML=`${esc(new Date(best.t*1000).toLocaleString("zh-CN",{hour12:false}))}<br><span class="${valueClass(best.net)}">${best.net>0?"+":""}${best.net.toFixed(4)} USDT</span>`;
+      const left=(chart.x(best.t)/chart.width)*box.width; tip.style.left=`${Math.min(box.width-170,Math.max(0,left+14))}px`; tip.style.top="10px";
+    }
+    function renderTrading(data, symbols) {
+      const shell=$("readinessShell"), status=["ready","limited","blocked","unknown"].find(k=>shell.classList.contains(k))||"unknown";
+      $("tradeHealth").className=`trade-health ${status}`;
+      $("tradeHealthTitle").textContent=status==="ready"?"正常做市中":$("readinessTitle").textContent;
+      $("tradeHealthSummary").textContent=$("readinessSummary").textContent;
+      $("tradeHealthDetails").hidden=status==="ready";
+      $("quoteBoard").innerHTML=symbols.length?symbols.map(s=>{
+        const m=obj(s.market), p=obj(s.position), st=obj(s.strategy), params=obj(st.params), c=obj(s.contract), orders=arr(s.execution?.active_orders);
+        const tick=Number(c.tick_size)||null, bid=first(m.best_bid,m.bid,params.best_bid), ask=first(m.best_ask,m.ask,params.best_ask);
+        const buys=orders.filter(o=>String(o.side).toUpperCase()==="BUY").map(o=>Number(o.price)).filter(Number.isFinite);
+        const sells=orders.filter(o=>String(o.side).toUpperCase()==="SELL").map(o=>Number(o.price)).filter(Number.isFinite);
+        const ourBid=buys.length?Math.max(...buys):null, ourAsk=sells.length?Math.min(...sells):null;
+        const dist=(a,b)=>finite(a)&&finite(b)&&tick?Math.round((Number(a)-Number(b))/tick):null;
+        const bidDist=dist(bid,ourBid), askDist=dist(ourAsk,ask);
+        const distCell=d=>d===null?'<span class="unavailable">—</span>':`<span class="${d<=0?"positive":d>=3?"negative":"warning"}">${d}</span>`;
+        const mid=finite(bid)&&finite(ask)?(Number(bid)+Number(ask))/2:null;
+        const ourSpread=finite(ourBid)&&finite(ourAsk)&&mid?(ourAsk-ourBid)/mid*10000:null;
+        const qty=first(p.volume,p.quantity), stateText=String(first(params.state,st.state,"—")), upper=stateText.toUpperCase();
+        const stateTone=["QUOTING","LIVE","READY"].includes(upper)?"positive":/WARM|OBSERVE|PAUSE|COOLDOWN/.test(upper)?"warning":/HALT|FROZEN|ERROR|STOP/.test(upper)?"negative":"muted";
+        return `<tr><td><strong>${esc(s.symbol)}</strong></td><td><span class="${stateTone}">${esc(stateText)}</span></td><td class="${valueClass(qty)}">${fmt(qty,4)}</td><td>${fmt(p.notional,2)}</td><td class="${valueClass(p.unrealized_pnl)}">${fmt(p.unrealized_pnl,4)}</td><td>${finite(ourBid)?fmtPrice(ourBid):'<span class="unavailable">—</span>'}</td><td>${distCell(bidDist)}</td><td>${fmtPrice(bid)}</td><td>${fmtPrice(ask)}</td><td>${distCell(askDist)}</td><td>${finite(ourAsk)?fmtPrice(ourAsk):'<span class="unavailable">—</span>'}</td><td>${fmt(first(m.spread_bps,params.market_spread_bps),2," bps")}</td><td>${fmt(ourSpread,2," bps")}</td><td>${fmt(orders.length,0)}</td></tr>`;
+      }).join(""):emptyRow(14,"暂无标的");
+      const trades=arr(first(data.trades?.recent,data.recent_trades,[])).slice(0,30);
+      $("tradingFillsCount").textContent=`本次运行最近 ${trades.length} 笔`;
+      $("tradingFills").innerHTML=trades.length?trades.map(t=>{
+        const qty=first(t.volume,t.quantity), notional=first(t.notional,finite(t.price)&&finite(qty)?Number(t.price)*Number(qty):null);
+        return `<tr><td>${fmtTime(first(t.datetime,t.timestamp,t.time))}</td><td><strong>${esc(t.symbol)}</strong></td><td class="${String(t.side).toUpperCase()==="BUY"?"positive":"negative"}">${esc(t.side||"—")}</td><td>${fmtPrice(t.price)}</td><td>${fmt(qty,4)}</td><td>${fmt(notional,2)}</td><td>${boolText(first(t.is_maker,t.maker))}</td><td>${fmt(t.commission,6)}</td><td class="${valueClass(t.realized_pnl)}">${fmt(t.realized_pnl,4)}</td></tr>`;
+      }).join(""):emptyRow(9,"尚无成交");
+    }
+    function setView(view){
+      view=view==="engineering"?"engineering":"trading";
+      document.body.classList.toggle("view-trading",view==="trading");
+      document.body.classList.toggle("view-engineering",view==="engineering");
+      document.querySelectorAll(".view-tab").forEach(b=>b.classList.toggle("active",b.dataset.view===view));
+      try{localStorage.setItem("chronoshft.dashboardView",view);}catch(_){}
+      if(view==="trading"&&state.data)drawPnlChart(obj(state.data.paper_ledger));
     }
     function renderOverview(data, symbols) {
       const system = obj(data.system), account = obj(data.account), risk = obj(data.risk), rs = obj(risk.status), oms = obj(system.oms), gw = obj(system.gateway), sup = obj(system.risk_supervisor || system.independent_risk_supervisor);
@@ -1150,7 +1259,7 @@
 
     function render(data) {
       state.data=data; const symbols=normalizeSymbols(data); ensureSymbol(symbols);
-      setTop(data); renderTradingReadiness(data); renderOverview(data,symbols); renderLedger(data); renderMarket(symbols); renderExecution(data); renderStrategy(symbols); renderRisk(data); renderAcceptance(data); renderRuntime(data); renderRpi(data,symbols); renderLogs(data);
+      setTop(data); renderTradingReadiness(data); renderTrading(data,symbols); renderOverview(data,symbols); renderLedger(data); renderMarket(symbols); renderExecution(data); renderStrategy(symbols); renderRisk(data); renderAcceptance(data); renderRuntime(data); renderRpi(data,symbols); renderLogs(data);
       syncActionButtons();
     }
 
@@ -1262,6 +1371,13 @@
         if(becameStale&&state.data)renderTradingReadiness(state.data,state.health);
       }
     }
+    document.querySelectorAll(".view-tab").forEach(b=>b.addEventListener("click",()=>setView(b.dataset.view)));
+    document.querySelectorAll(".eng-links a").forEach(a=>a.addEventListener("click",()=>setView("engineering")));
+    $("tradeHealthDetails").addEventListener("click",()=>{setView("engineering");document.getElementById("trade-readiness").scrollIntoView();});
+    $("pnlChart").addEventListener("mousemove",pnlChartHover);
+    $("pnlChart").addEventListener("mouseleave",()=>{$("pnlChartTip").hidden=true;const c=document.getElementById("pnlCursor");if(c)c.setAttribute("visibility","hidden");});
+    window.addEventListener("resize",()=>{if(state.data&&document.body.classList.contains("view-trading"))drawPnlChart(obj(state.data.paper_ledger));});
+    setView((()=>{try{return localStorage.getItem("chronoshft.dashboardView")||(location.hash&&location.hash!=="#trading"?"engineering":"trading");}catch(_){return "trading";}})());
     $("pauseButton").addEventListener("click",()=>{state.paused=!state.paused;$("pauseButton").textContent=state.paused?"继续刷新":"暂停刷新";if(state.paused){$("connectionDot").className="dot warn";$("connectionText").textContent="已暂停";}else fetchSnapshot();});
     $("flattenAllButton").addEventListener("click",()=>{submitDashboardAction("flatten_all",{reason:"dashboard_flatten_all"});});
     $("rearmButton").addEventListener("click",()=>{submitDashboardAction("rearm",{reason:"dashboard_rearm"});});
