@@ -3586,10 +3586,46 @@ class TruthMonitorTests(unittest.TestCase):
             called = []
             oms.trigger_reconcile = lambda reason, suspicious_oid=None: called.append((reason, suspicious_oid))
 
+            # One poll can catch an order in flight; the same ghost order on
+            # the next poll is a real mismatch.
+            self.assertFalse(monitor.poll_once())
+            self.assertFalse(oms.get_symbol_freeze_reason("BTCUSDT"))
+            self.assertEqual(called, [])
+
             monitor.poll_once()
 
             self.assertTrue(oms.get_symbol_freeze_reason("BTCUSDT").startswith("truth_plane:open_order_mismatch"))
             self.assertEqual(called, [("Truth plane open order mismatch", None)])
+        finally:
+            oms.stop()
+
+    def test_truth_monitor_ignores_open_order_difference_that_clears_next_poll(self):
+        oms = OMS(DummyEngine(), DummyGateway(), self.make_config())
+        provider = DummyTruthProvider()
+        monitor = TruthMonitor(oms, provider, self.make_config(), start_thread=False)
+        try:
+            oms.state = LifecycleState.LIVE
+            called = []
+            oms.trigger_reconcile = lambda reason, suspicious_oid=None: called.append((reason, suspicious_oid))
+
+            # A cancel acknowledged locally but still in the venue snapshot,
+            # then a different in-flight order on the next poll.
+            for order_id in (101, 102):
+                provider.open_orders = [
+                    {
+                        "symbol": "BTCUSDT",
+                        "orderId": order_id,
+                        "clientOrderId": f"in-flight-{order_id}",
+                        "side": "SELL",
+                    }
+                ]
+                self.assertFalse(monitor.poll_once())
+            provider.open_orders = []
+            monitor.poll_once()
+
+            self.assertFalse(oms.get_symbol_freeze_reason("BTCUSDT"))
+            self.assertEqual(called, [])
+            self.assertEqual(monitor.pending_open_order_mismatch, frozenset())
         finally:
             oms.stop()
 

@@ -42,6 +42,11 @@ class TruthMonitor:
             cfg.get("ignore_flat_balance_drift", self.is_testnet)
         )
         self.clean_polls_to_clear = max(1, int(cfg.get("clean_polls_to_clear", 2)))
+        # Open orders read from the venue and from the OMS are sampled at
+        # different instants, so an order sent or cancelled in between shows up
+        # as a one-poll difference. Only a difference in the same orders on
+        # consecutive polls is a real mismatch.
+        self.pending_open_order_mismatch: frozenset = frozenset()
 
         cash_flow_cfg = config.get("risk", {}).get("cash_flow_truth", {})
         self.cash_flow_truth_enabled = bool(cash_flow_cfg.get("enabled", False))
@@ -519,12 +524,20 @@ class TruthMonitor:
             self.oms.trigger_reconcile("Truth plane off-config open order")
             return False
 
-        if local_active_orders != remote_active_orders:
+        mismatched_orders = frozenset(
+            self._open_order_key(item) for item in local_active_orders
+        ) ^ frozenset(
+            self._open_order_key(item) for item in remote_active_orders
+        )
+        persistent_mismatch = (
+            mismatched_orders & self.pending_open_order_mismatch
+        )
+        self.pending_open_order_mismatch = mismatched_orders
+        if persistent_mismatch:
             self.consecutive_balance_drifts = 0
+            self.pending_open_order_mismatch = frozenset()
             impacted_symbols = {
-                item["symbol"]
-                for item in local_active_orders + remote_active_orders
-                if item.get("symbol")
+                key[0] for key in persistent_mismatch if key[0]
             }
             for symbol in impacted_symbols:
                 self.oms.freeze_symbol(
@@ -535,6 +548,13 @@ class TruthMonitor:
             self.oms.trigger_reconcile("Truth plane open order mismatch")
             self.clean_polls = 0
             return False
+        orders_settled = not mismatched_orders
+        if not orders_settled:
+            logger.warning(
+                "[TruthMonitor] Open orders differ from the venue snapshot "
+                f"({len(mismatched_orders)} orders); rechecking next poll "
+                "before freezing"
+            )
 
         if position_drift:
             self.consecutive_balance_drifts = 0
@@ -550,10 +570,7 @@ class TruthMonitor:
 
         if local_balance is None:
             self.consecutive_balance_drifts = 0
-            self.clean_polls += 1
-            if self.clean_polls >= self.clean_polls_to_clear:
-                self.oms.clear_transient_guards(prefixes=("truth_plane:",))
-            return True
+            return self._count_clean_poll(orders_settled)
 
         remote_balance, remote_source = self._remote_balance_value(account, tracked_assets)
         balance_delta = remote_balance - local_balance
@@ -572,11 +589,8 @@ class TruthMonitor:
             )
             if self.ignore_flat_balance_drift and not has_risk:
                 self.consecutive_balance_drifts = 0
-                self.clean_polls += 1
-                if self.clean_polls >= self.clean_polls_to_clear:
-                    self.oms.clear_transient_guards(prefixes=("truth_plane:",))
                 logger.warning("[TruthMonitor] Ignoring flat account balance drift")
-                return True
+                return self._count_clean_poll(orders_settled)
 
             self.consecutive_balance_drifts += 1
             self.clean_polls = 0
@@ -590,10 +604,26 @@ class TruthMonitor:
             return False
 
         self.consecutive_balance_drifts = 0
+        return self._count_clean_poll(orders_settled)
+
+    def _count_clean_poll(self, orders_settled: bool) -> bool:
+        # A poll with an unconfirmed open-order difference is not clean: it
+        # must not clear truth-plane guards.
+        if not orders_settled:
+            self.clean_polls = 0
+            return False
         self.clean_polls += 1
         if self.clean_polls >= self.clean_polls_to_clear:
             self.oms.clear_transient_guards(prefixes=("truth_plane:",))
         return True
+
+    @staticmethod
+    def _open_order_key(item) -> tuple:
+        return (
+            item.get("symbol"),
+            tuple(item.get("identifiers") or ()),
+            item.get("side"),
+        )
 
     def _tracked_assets(self, tracked_symbols):
         assets = []
