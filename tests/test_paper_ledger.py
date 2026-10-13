@@ -36,7 +36,8 @@ def _make_order(client_oid: str, *, accept_seq: int = 1) -> PaperOrder:
 
 
 class _Owner:
-    def __init__(self, *orders, max_order_history=10):
+    def __init__(self, *orders, max_order_history=10, fee_rate=0.001):
+        self.fee_rate_value = fee_rate
         self.state = PaperVenueState(
             orders={order.client_oid: order for order in orders},
             exchange_to_client={
@@ -86,9 +87,8 @@ class _Owner:
     def _reduce_only_fill_cap(order):
         return order.remaining
 
-    @staticmethod
-    def _fee_rate(_order, _is_maker):
-        return 0.001
+    def _fee_rate(self, _order, _is_maker):
+        return self.fee_rate_value
 
     def _apply_position_fill(self, symbol, side, quantity, price):
         return self.ledger.apply_position_fill(
@@ -172,6 +172,18 @@ def test_fill_updates_ledger_before_publishing_order_and_account_events():
     assert owner.order_updates[0].cum_filled_qty == 0.4
     assert owner.order_updates[0].market_trade_id == 7
     assert owner.account_updates[0].wallet_balance == 999.96
+
+
+def test_maker_rebate_credits_balance_and_reports_negative_commission():
+    order = _make_order("rebate")
+    owner = _Owner(order, fee_rate=-0.0001)
+
+    assert owner.ledger.apply_fill(order, 1.0, 100.0, is_maker=True)
+
+    assert owner._balances["USDT"] == 1_000.01
+    assert owner._trades[0]["commission"] == "-0.01"
+    assert owner.order_updates[0].commission == -0.01
+    assert owner.account_updates[0].wallet_balance == 1_000.01
 
 
 def test_terminal_order_pruning_preserves_active_orders():

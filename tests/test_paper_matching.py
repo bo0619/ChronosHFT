@@ -8,6 +8,7 @@ from event.type import (
     OrderRequest,
 )
 from gateway.binance.paper_matching import (
+    MIN_MAKER_FEE_RATE,
     PaperMatchingEngine,
     PaperMatchingPolicy,
     PaperMatchingPort,
@@ -46,7 +47,12 @@ def make_order(
 
 
 class MatchingHarness:
-    def __init__(self, *orders: PaperOrder, rpi_fill_model="public_trade_proxy"):
+    def __init__(
+        self,
+        *orders: PaperOrder,
+        rpi_fill_model="public_trade_proxy",
+        maker_fee=0.0002,
+    ):
         self.applied_fills = []
         self.expired_orders = []
         self.state = PaperVenueState(
@@ -78,7 +84,7 @@ class MatchingHarness:
                 rpi_fill_model=rpi_fill_model,
                 cancel_ahead_fraction=0.0,
                 market_order_max_slippage_bps=100.0,
-                maker_fee=0.0002,
+                maker_fee=maker_fee,
                 taker_fee=0.0005,
                 rpi_commission_rate=0.0,
                 rpi_commission_rates={},
@@ -181,3 +187,18 @@ def test_matching_component_has_explicit_venue_state_not_gateway_owner():
 
     assert harness.matching.state is harness.state
     assert not hasattr(harness.matching, "_owner")
+
+
+def test_negative_maker_fee_is_a_rebate_and_taker_fee_is_unchanged():
+    gtx = make_order("gtx-rebate", time_in_force=TIF_GTX, accept_seq=1)
+    harness = MatchingHarness(gtx, maker_fee=-0.0001)
+
+    assert harness.matching.fee_rate(gtx, is_maker=True) == -0.0001
+    assert harness.matching.fee_rate(gtx, is_maker=False) == 0.0005
+
+
+def test_maker_rebate_is_bounded_by_min_maker_fee_rate():
+    gtx = make_order("gtx-floor", time_in_force=TIF_GTX, accept_seq=1)
+    harness = MatchingHarness(gtx, maker_fee=-0.5)
+
+    assert harness.matching.fee_rate(gtx, is_maker=True) == MIN_MAKER_FEE_RATE

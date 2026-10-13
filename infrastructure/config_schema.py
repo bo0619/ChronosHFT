@@ -133,6 +133,9 @@ BOOL = BooleanSpec()
 NONNEGATIVE = _number(0.0)
 POSITIVE = _number(0.0, exclusive_minimum=True)
 PROBABILITY = _number(0.0, 1.0)
+# Maker fees may be negative: venues such as GRVT pay a maker rebate. The floor
+# matches commission_truth.MAX_ABSOLUTE_COMMISSION_RATE.
+MAKER_FEE_RATE = _number(-0.01, 1.0)
 POSITIVE_INT = _integer(1)
 NONNEGATIVE_INT = _integer(0)
 NONEMPTY_TEXT = _string(min_length=1, trimmed=True)
@@ -516,7 +519,7 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                 "backtest": _object(
                     {
                         "taker_fee": PROBABILITY,
-                        "maker_fee": PROBABILITY,
+                        "maker_fee": MAKER_FEE_RATE,
                         "rpi_commission_rate": PROBABILITY,
                         "rpi_commission_rates": SYMBOL_KEYED_RATE,
                         "latency_base_ms": NONNEGATIVE,
@@ -607,7 +610,7 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
             {
                 "paper_trade": _object(
                     {
-                        "maker_fee": PROBABILITY,
+                        "maker_fee": MAKER_FEE_RATE,
                         "taker_fee": PROBABILITY,
                         "rpi_commission_rate": PROBABILITY,
                         "rpi_commission_rates": SYMBOL_KEYED_RATE,

@@ -20,6 +20,10 @@ from infrastructure.commission_truth import resolve_passive_fee_rate
 
 from .paper_state import PaperOrder, PaperPosition
 
+# Most negative maker fee accepted (a 1% rebate); matches the commission-truth
+# absolute-rate bound. A negative maker fee credits the account on each fill.
+MIN_MAKER_FEE_RATE = -0.01
+
 
 @dataclass(slots=True)
 class PaperVenueState:
@@ -498,8 +502,9 @@ class PaperMatchingEngine:
     def fee_rate(self, order: PaperOrder, is_maker: bool) -> float:
         if order.request.time_in_force == TIF_RPI:
             return self.rpi_fee_rate(order.request.symbol)
-        rate = self._policy.maker_fee if is_maker else self._policy.taker_fee
-        return max(0.0, rate)
+        if is_maker:
+            return max(MIN_MAKER_FEE_RATE, self._policy.maker_fee)
+        return max(0.0, self._policy.taker_fee)
 
     def rpi_fee_rate(self, symbol: str) -> float:
         policy = self._policy
@@ -516,6 +521,7 @@ class PaperMatchingEngine:
 
 
 __all__ = [
+    "MIN_MAKER_FEE_RATE",
     "PaperMatchingEngine",
     "PaperMatchingPolicy",
     "PaperMatchingPort",

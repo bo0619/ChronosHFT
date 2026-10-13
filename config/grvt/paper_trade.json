@@ -3,7 +3,7 @@
   "fragment": "paper_trade",
   "version": 1,
   "paper_trade": {
-    "maker_fee": 0.0,
+    "maker_fee": -0.0001,
     "taker_fee": 0.00045,
     "rpi_commission_rate": 0.0,
     "rpi_commission_rates": {},
@@ -20,7 +20,7 @@
     "max_trade_history": 20000,
     "maker_order_delay_ms": 0,
     "taker_order_delay_ms": 25,
-    "_comment_fees": "GRVT base tier: 0.045% taker. The base-tier maker rebate (about -0.01%) is not modeled; maker fee stays 0. Orders that are not post-only wait in a 25ms speed bump before matching; post-only orders do not.",
+    "_comment_fees": "GRVT base tier: 0.045% taker and a 0.01% (1 bps) maker rebate; the negative maker_fee credits the account on every post-only fill. Orders that are not post-only wait in a 25ms speed bump before matching; post-only orders do not.",
     "_comment_marks": "Marks come from the v1.ticker.s stream every 500ms, so the staleness limit is wider than Binance's."
   }
 }

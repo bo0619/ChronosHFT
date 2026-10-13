@@ -4,6 +4,6 @@
   "version": 1,
   "_comment": "GRVT perpetuals are named <base><quote>, e.g. ETH_USDT_Perp -> ETHUSDT.",
   "symbols": [
-    "ETHUSDT"
+    "SOXLUSDT"
   ]
 }

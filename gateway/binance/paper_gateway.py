@@ -63,6 +63,7 @@ from .paper_book_sync import (
 )
 from .paper_ledger import PaperLedger, PaperLedgerConfig, PaperLedgerPort
 from .paper_matching import (
+    MIN_MAKER_FEE_RATE,
     PaperMatchingEngine,
     PaperMatchingPolicy,
     PaperMatchingPort,
@@ -353,7 +354,8 @@ class BinancePaperGateway(BaseGateway):
                 0.005,
             ),
         )
-        self.maker_fee = self._finite_nonnegative(
+        # A negative maker fee is a maker rebate (GRVT pays makers).
+        self.maker_fee = self._finite_maker_fee(
             self.paper_config.get("maker_fee", backtest_config.get("maker_fee", 0.0002)),
             0.0002,
         )
@@ -2431,6 +2433,16 @@ class BinancePaperGateway(BaseGateway):
         except (TypeError, ValueError):
             return float(default)
         if not math.isfinite(parsed) or parsed < 0.0:
+            return float(default)
+        return parsed
+
+    @staticmethod
+    def _finite_maker_fee(value, default: float):
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if not math.isfinite(parsed) or parsed < MIN_MAKER_FEE_RATE:
             return float(default)
         return parsed
 

@@ -238,6 +238,39 @@ def test_fragment_rejects_numeric_values_outside_declared_range():
         )
 
 
+def test_paper_trade_maker_fee_accepts_rebate_within_floor():
+    tracked = json.loads(
+        (REPOSITORY_ROOT / "config/grvt/paper_trade.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    def paper_trade(maker_fee):
+        changed = deepcopy(tracked)
+        changed["paper_trade"]["maker_fee"] = maker_fee
+        return changed
+
+    validate_fragment_document(
+        paper_trade(-0.0001),
+        expected_fragment="paper_trade",
+        expected_version=1,
+        source="paper_trade.json",
+    )
+    with pytest.raises(ConfigSchemaError, match="maker_fee must be at least"):
+        validate_fragment_document(
+            paper_trade(-0.02),
+            expected_fragment="paper_trade",
+            expected_version=1,
+            source="paper_trade.json",
+        )
+
+
+def test_grvt_manifest_loads_with_maker_rebate():
+    config = load_root_config(REPOSITORY_ROOT / "config.grvt.json")
+
+    assert config["paper_trade"]["maker_fee"] == -0.0001
+
+
 @pytest.mark.parametrize(
     ("field", "value", "match"),
     [
