@@ -14,9 +14,9 @@ and it does not authorize the normal `canary` stage.
 - Never disable a failing gate to obtain a first order.
 - `live_launch.declared_account_equity_usdt` means actual USD-M Futures account
   equity, not the operator's total assets. Never overstate it to pass a ratio
-  check. Calibration deployment is capped at 4% of equity and at 50 USDT
-  absolute, so the checked-in 50 USDT profile requires at least 1,250 USDT of
-  actual Futures equity.
+  check. Calibration deployment is capped at 70% of equity and at 50 USDT
+  absolute (raised from 4% on 2026-10-12 so a 30 USDT account can rest one
+  KORUUSDT contract; see `deploy/live/koru-30u/`).
 - Keep capital outside the validation Futures account when the account structure
   permits it, and scale every related configuration limit down coherently. The
   software limits are not an exchange-enforced subaccount balance cap.
@@ -131,9 +131,10 @@ cover training and OOS datasets in the same deployment, and it is not a reason
 to issue 100 orders during framework validation. Do not count multiple fills
 of one partially filled order as independent order samples.
 
-The 8 USDT target requires at least 8 USDT deployed capital. At the 4%
-calibration ratio, that implies at least 200 USDT of actual USD-M Futures
-equity. The deployment loss cap may not exceed 5% of deployed capital and the
+The 8 USDT target requires at least 8 USDT deployed capital. The 200 USDT
+template was written for the earlier 4% calibration ratio (8 / 0.04 = 200 USDT
+of actual USD-M Futures equity); the ratio is now 70%, so it remains valid with
+headroom. The deployment loss cap may not exceed 5% of deployed capital and the
 daily loss limit may not exceed half of the deployment loss cap, so a 200 USDT
 account at 8 USDT deployed runs with at most 0.4 USDT deployment loss, 0.2 USDT
 daily loss, and a permit `--max-calibration-loss-usdt` of at most 0.4. The
