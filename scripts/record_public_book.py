@@ -1,16 +1,20 @@
 """Record public Binance USD-M books and trades for offline research.
 
-Subscribes to ``<symbol>@depth5@100ms`` (top-5 snapshots) and
-``<symbol>@aggTrade`` for any symbols, with no key, OMS or strategy, and
-appends them to compressed HDF5 files in the column layout of
-``data/recorder.py``, so the same tools read both:
+Subscribes to ``<symbol>@depth5@100ms`` (top-5 snapshots),
+``<symbol>@bookTicker`` (best bid and ask, pushed on every change rather
+than batched every 100 ms) and ``<symbol>@aggTrade`` for any symbols, with
+no key, OMS or strategy, and appends them to compressed HDF5 files. Books
+and trades use the column layout of ``data/recorder.py``, so the same
+tools read both:
 
 * ``<out>/<SYMBOL>_depth_<YYYYMMDD>_v2.h5`` key ``depth``: ``received_ts``,
   ``exchange_ts``, ``bid1_p``, ``bid1_v`` ... ``ask5_p``, ``ask5_v``;
 * ``<out>/<SYMBOL>_trade_<YYYYMMDD>_v2.h5`` key ``trade``: ``received_ts``,
-  ``exchange_ts``, ``trade_id``, ``price``, ``qty``, ``maker_is_buyer``.
+  ``exchange_ts``, ``trade_id``, ``price``, ``qty``, ``maker_is_buyer``;
+* ``<out>/<SYMBOL>_ticker_<YYYYMMDD>_v2.h5`` key ``ticker``: ``received_ts``,
+  ``exchange_ts``, ``update_id``, ``bid_p``, ``bid_v``, ``ask_p``, ``ask_v``.
 
-Book streams are served under ``/public`` and trade streams under
+Book and bookTicker streams are served under ``/public`` and trade streams under
 ``/market`` (as in ``gateway/binance/ws_api.py``); the plain ``/stream``
 path no longer carries aggTrade. Recording stops by itself after
 ``--hours`` or when free disk falls below ``--min-free-gb``. Reconnects
@@ -42,6 +46,10 @@ LEVELS = 5
 FLUSH_SEC = 10.0
 
 
+def report_ws_error(_ws, error) -> None:
+    print(f"ws error: {error}", file=sys.stderr, flush=True)
+
+
 class Recorder:
     def __init__(self, symbols: list[str], out: Path, hours: float, min_free_gb: float) -> None:
         self.symbols = [s.upper() for s in symbols]
@@ -50,6 +58,7 @@ class Recorder:
         self.min_free = min_free_gb * 1e9
         self.depth: dict[str, list[dict]] = defaultdict(list)
         self.trades: dict[str, list[dict]] = defaultdict(list)
+        self.tickers: dict[str, list[dict]] = defaultdict(list)
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.rows = 0
@@ -57,7 +66,8 @@ class Recorder:
     def urls(self) -> list[str]:
         lower = [symbol.lower() for symbol in self.symbols]
         return [
-            f"{WS_ROOT}/public/stream?streams=" + "/".join(f"{s}@depth5@100ms" for s in lower),
+            f"{WS_ROOT}/public/stream?streams="
+            + "/".join(f"{s}@depth5@100ms/{s}@bookTicker" for s in lower),
             f"{WS_ROOT}/market/stream?streams=" + "/".join(f"{s}@aggTrade" for s in lower),
         ]
 
@@ -78,6 +88,18 @@ class Recorder:
             }
             with self.lock:
                 self.trades[symbol].append(row)
+        elif stream.endswith("@bookTicker"):
+            row = {
+                "received_ts": received,
+                "exchange_ts": float(data["E"]) / 1000.0,
+                "update_id": int(data["u"]),
+                "bid_p": float(data["b"]),
+                "bid_v": float(data["B"]),
+                "ask_p": float(data["a"]),
+                "ask_v": float(data["A"]),
+            }
+            with self.lock:
+                self.tickers[symbol].append(row)
         elif "@depth" in stream:
             row = {"received_ts": received, "exchange_ts": float(data["E"]) / 1000.0}
             for side, key in (("bid", "b"), ("ask", "a")):
@@ -93,28 +115,37 @@ class Recorder:
         with self.lock:
             depth, self.depth = self.depth, defaultdict(list)
             trades, self.trades = self.trades, defaultdict(list)
+            tickers, self.tickers = self.tickers, defaultdict(list)
         day = datetime.now(timezone.utc).strftime("%Y%m%d")
-        for kind, batches in (("depth", depth), ("trade", trades)):
+        for kind, batches in (("depth", depth), ("trade", trades), ("ticker", tickers)):
             for symbol, rows in batches.items():
                 if not rows:
                     continue
                 path = self.out / f"{symbol}_{kind}_{day}_v2.h5"
                 frame = pd.DataFrame(rows)
-                frame.to_hdf(path, key=kind, mode="a", format="table", append=True,
-                             complevel=5, complib="blosc")
+                try:
+                    frame.to_hdf(path, key=kind, mode="a", format="table", append=True,
+                                 complevel=5, complib="blosc")
+                except Exception as error:  # e.g. a reader holds the HDF5 file lock
+                    print(f"{path.name}: write deferred ({type(error).__name__})",
+                          file=sys.stderr, flush=True)
+                    with self.lock:
+                        pending = {"depth": self.depth, "trade": self.trades, "ticker": self.tickers}[kind]
+                        pending[symbol][:0] = rows
+                    continue
                 self.rows += len(rows)
+
+    def apps(self) -> list[websocket.WebSocketApp]:
+        """Connections for one session; a venue subclass may override."""
+        return [
+            websocket.WebSocketApp(url, on_message=self.on_message, on_error=report_ws_error)
+            for url in self.urls()
+        ]
 
     def run(self) -> int:
         self.out.mkdir(parents=True, exist_ok=True)
         while not self.stop.is_set() and time.time() < self.deadline:
-            apps = [
-                websocket.WebSocketApp(
-                    url,
-                    on_message=self.on_message,
-                    on_error=lambda _ws, error: print(f"ws error: {error}", file=sys.stderr, flush=True),
-                )
-                for url in self.urls()
-            ]
+            apps = self.apps()
             threads = [
                 threading.Thread(target=app.run_forever, kwargs={"ping_interval": 60}, daemon=True)
                 for app in apps
