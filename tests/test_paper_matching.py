@@ -1,3 +1,4 @@
+import pytest
 from datetime import datetime
 
 from event.type import (
@@ -52,6 +53,7 @@ class MatchingHarness:
         *orders: PaperOrder,
         rpi_fill_model="public_trade_proxy",
         maker_fee=0.0002,
+        cancel_ahead_model="fraction",
     ):
         self.applied_fills = []
         self.expired_orders = []
@@ -88,6 +90,7 @@ class MatchingHarness:
                 taker_fee=0.0005,
                 rpi_commission_rate=0.0,
                 rpi_commission_rates={},
+                cancel_ahead_model=cancel_ahead_model,
             ),
         )
 
@@ -202,3 +205,58 @@ def test_maker_rebate_is_bounded_by_min_maker_fee_rate():
     harness = MatchingHarness(gtx, maker_fee=-0.5)
 
     assert harness.matching.fee_rate(gtx, is_maker=True) == MIN_MAKER_FEE_RATE
+
+
+def _bid_book(size: float) -> OrderBook:
+    return OrderBook(
+        symbol=SYMBOL,
+        exchange="BINANCE",
+        datetime=datetime.now(),
+        bids={100.0: size},
+        asks={101.0: 1.0},
+    )
+
+
+def _queued_bid(queue_ahead: float) -> PaperOrder:
+    order = make_order("queued", time_in_force=TIF_GTX, accept_seq=1, volume=5.0)
+    order.queue_ahead = queue_ahead
+    return order
+
+
+def test_proportional_model_credits_our_share_of_cancels_net_of_trades():
+    order = _queued_bid(3000.0)
+    harness = MatchingHarness(order, cancel_ahead_model="proportional")
+    harness.matching.on_book(_bid_book(8000.0))
+
+    # The level shrinks 1,000 with no trades: all cancels, 3/8 ahead of us.
+    harness.matching.on_book(_bid_book(7000.0))
+    assert order.queue_ahead == pytest.approx(3000.0 - 1000.0 * 3000.0 / 8000.0)
+
+    # 400 of the next 1,000 reduction traded (and already drained the queue
+    # in on_market_trade); only the other 600 are cancels.
+    ahead = order.queue_ahead
+    trade = AggTradeData(
+        symbol=SYMBOL, trade_id=50, price=100.0, quantity=400.0,
+        maker_is_buyer=True, datetime=datetime.now(),
+    )
+    harness.matching.on_market_trade(trade)
+    after_trade = order.queue_ahead
+    assert after_trade == pytest.approx(ahead - 400.0)
+    harness.matching.on_book(_bid_book(6000.0))
+    assert order.queue_ahead == pytest.approx(after_trade - 600.0 * after_trade / 7000.0)
+    # The trade tally is per book interval.
+    assert harness.state.traded_since_book == {}
+
+
+def test_growing_level_and_default_model_leave_the_queue_alone():
+    order = _queued_bid(3000.0)
+    harness = MatchingHarness(order, cancel_ahead_model="proportional")
+    harness.matching.on_book(_bid_book(8000.0))
+    harness.matching.on_book(_bid_book(9000.0))
+    assert order.queue_ahead == 3000.0
+
+    default_order = _queued_bid(3000.0)
+    default = MatchingHarness(default_order)
+    default.matching.on_book(_bid_book(8000.0))
+    default.matching.on_book(_bid_book(7000.0))
+    assert default_order.queue_ahead == 3000.0

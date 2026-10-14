@@ -42,6 +42,11 @@ class PaperVenueState:
     trades: deque[dict] = field(default_factory=deque)
     dms_deadlines: dict[str, float] = field(default_factory=dict)
     cancel_generations: dict[str, int] = field(default_factory=dict)
+    # Public volume traded at (symbol, maker side, price) since the last book
+    # update; separates trades from cancels in a level's size reduction.
+    traded_since_book: dict[tuple[str, str, float], float] = field(
+        default_factory=dict
+    )
     accept_sequence: int = 0
     exchange_sequence: int = 0
     event_sequence: int = 0
@@ -59,6 +64,11 @@ class PaperMatchingPolicy:
     taker_fee: float
     rpi_commission_rate: float
     rpi_commission_rates: Mapping[str, float]
+    # "fraction": cancel_ahead_fraction of every level reduction counts as
+    # cancels ahead (0 = none). "proportional": the reduction net of public
+    # trades at that price is cancels, of which the share ahead of us is
+    # queue_ahead / level size.
+    cancel_ahead_model: str = "fraction"
 
     def __post_init__(self):
         object.__setattr__(
@@ -170,6 +180,10 @@ class PaperMatchingEngine:
             state.last_market_trade_id[trade.symbol] = int(trade.trade_id)
 
         maker_side = "BUY" if trade.maker_is_buyer else "SELL"
+        level_key = (trade.symbol, maker_side, _level_price(trade.price))
+        state.traded_since_book[level_key] = (
+            state.traded_since_book.get(level_key, 0.0) + float(trade.quantity)
+        )
         candidates = sorted(
             (
                 order
@@ -274,8 +288,15 @@ class PaperMatchingEngine:
     def on_book(self, book: OrderBook) -> bool:
         state = self._state
         previous = state.books.get(book.symbol)
-        if previous is not None and self._policy.cancel_ahead_fraction > 0.0:
-            self.apply_conservative_cancel_ahead(previous, book)
+        if previous is not None:
+            if self._policy.cancel_ahead_model == "proportional":
+                self.apply_proportional_cancel_ahead(previous, book)
+            elif self._policy.cancel_ahead_fraction > 0.0:
+                self.apply_conservative_cancel_ahead(previous, book)
+        for level_key in [
+            key for key in state.traded_since_book if key[0] == book.symbol
+        ]:
+            del state.traded_since_book[level_key]
         state.books[book.symbol] = book
         # The consumable copy of the full book is built on the first
         # immediate match after this book, not on every depth update.
@@ -390,6 +411,55 @@ class PaperMatchingEngine:
                     candidate.queue_ahead - removed_quantity,
                 )
         order.queue_inserted = False
+
+    def apply_proportional_cancel_ahead(
+        self,
+        previous: OrderBook,
+        current: OrderBook,
+    ):
+        """Advance resting orders by their share of a level's cancellations.
+
+        A level's size reduction between two books is trades plus cancels.
+        Trades at our price already consumed ``queue_ahead`` in
+        :meth:`on_market_trade`, so only the remainder counts as cancels,
+        spread evenly through the level: ``queue_ahead / level size`` of
+        them were ahead of us. On recorded KORUUSDT books ~3/4 of touch-size
+        reductions were cancels, which a zero-credit queue never advanced on.
+        """
+        state = self._state
+        for order in state.orders.values():
+            if (
+                not order.active
+                or not order.committed
+                or order.request.symbol != current.symbol
+                or order.queue_ahead <= 0.0
+            ):
+                continue
+            side = order.request.side
+            previous_side = previous.bids if side == "BUY" else previous.asks
+            current_side = current.bids if side == "BUY" else current.asks
+            price = float(order.request.price)
+            # Missing unpublished levels do not prove external cancellation.
+            if price not in previous_side or price not in current_side:
+                continue
+            previous_size = float(previous_side[price])
+            if previous_size <= 0.0:
+                continue
+            traded = state.traded_since_book.get(
+                (current.symbol, side, _level_price(price)),
+                0.0,
+            )
+            cancels = max(
+                0.0,
+                previous_size - float(current_side[price]) - traded,
+            )
+            if cancels <= 0.0:
+                continue
+            share_ahead = min(1.0, order.queue_ahead / previous_size)
+            order.queue_ahead = max(
+                0.0,
+                order.queue_ahead - cancels * share_ahead,
+            )
 
     def apply_conservative_cancel_ahead(
         self,
@@ -518,6 +588,11 @@ class PaperMatchingEngine:
                 default_rpi_commission_rate=policy.rpi_commission_rate,
             ),
         )
+
+
+def _level_price(price: float) -> float:
+    """Key a price level the same way for trades and book levels."""
+    return round(float(price), 10)
 
 
 __all__ = [

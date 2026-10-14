@@ -215,11 +215,10 @@ class PaperGatewayTests(unittest.TestCase):
         finally:
             self.session_patch.stop()
 
-    def start_offline(self, *, rpi_fill_model="disabled", book=None):
-        self.gateway = BinancePaperGateway(
-            self.engine,
-            make_gateway_config(rpi_fill_model=rpi_fill_model),
-        )
+    def start_offline(self, *, rpi_fill_model="disabled", book=None, paper=None):
+        config = make_gateway_config(rpi_fill_model=rpi_fill_model)
+        config["paper_trade"].update(paper or {})
+        self.gateway = BinancePaperGateway(self.engine, config)
         self.gateway._start_worker()
         self.gateway.active = True
         self.gateway._accepting_orders = True
@@ -1710,6 +1709,51 @@ class PaperGatewayTests(unittest.TestCase):
             gateway.get_order(SYMBOL, "rpi-first")["status"],
             "FILLED",
         )
+
+    def test_a_quote_can_fill_while_its_cancel_is_in_flight(self):
+        gateway = self.start_offline(paper={"cancel_latency_ms": 5.0})
+        with patch(
+            "gateway.binance.paper_gateway.ref_data_manager.get_info",
+            return_value=make_contract(),
+        ):
+            request = OrderRequest(
+                symbol=SYMBOL, price=100.0, volume=0.1, side="BUY",
+                time_in_force=TIF_GTX, post_only=True,
+            )
+            self.assertEqual(
+                gateway.send_order(request, "in-flight").outcome,
+                CommandOutcome.ACKNOWLEDGED,
+            )
+            gateway.commit_order_submission("in-flight")
+            self.assertTrue(wait_until(lambda: len(gateway.get_open_orders()) == 1))
+            exchange_oid = gateway.get_order(SYMBOL, "in-flight")["orderId"]
+
+            delays = []
+
+            def sweep_during_flight(seconds):
+                # A seller trades through the bid before the cancel lands.
+                delays.append(seconds)
+                now = time.time()
+                gateway._call_worker(
+                    "market_trade",
+                    (
+                        gateway._book_feed_state.generation,
+                        AggTradeData(
+                            SYMBOL, 901, 99.9, 1.0, True, datetime.now(),
+                            exchange_timestamp=now, received_timestamp=now,
+                            received_monotonic=time.perf_counter(),
+                        ),
+                    ),
+                )
+
+            with patch(
+                "gateway.binance.paper_gateway.time.sleep",
+                side_effect=sweep_during_flight,
+            ):
+                gateway.cancel_order(CancelRequest(SYMBOL, exchange_oid))
+
+        self.assertEqual(delays, [0.005])
+        self.assertEqual(gateway.get_order(SYMBOL, "in-flight")["status"], "FILLED")
 
     def test_cancel_and_dead_man_switch_are_entirely_local(self):
         gateway = self.start_offline()

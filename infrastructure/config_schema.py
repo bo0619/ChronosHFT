@@ -708,8 +708,19 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                         "max_trade_history": POSITIVE_INT,
                         "maker_order_delay_ms": NONNEGATIVE,
                         "taker_order_delay_ms": NONNEGATIVE,
+                        "cancel_ahead_model": _string(
+                            choices=("fraction", "proportional")
+                        ),
+                        "order_latency_ms": NONNEGATIVE,
+                        "cancel_latency_ms": NONNEGATIVE,
                     },
-                    optional=("maker_order_delay_ms", "taker_order_delay_ms"),
+                    optional=(
+                        "maker_order_delay_ms",
+                        "taker_order_delay_ms",
+                        "cancel_ahead_model",
+                        "order_latency_ms",
+                        "cancel_latency_ms",
+                    ),
                 )
             }
         )

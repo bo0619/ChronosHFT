@@ -531,6 +531,9 @@ class BinancePaperGateway(BaseGateway):
                 taker_fee=self.taker_fee,
                 rpi_commission_rate=self.rpi_commission_rate,
                 rpi_commission_rates=dict(self.rpi_commission_rates),
+                cancel_ahead_model=str(
+                    self.paper_config.get("cancel_ahead_model", "fraction")
+                ),
             ),
         )
 
@@ -1372,6 +1375,7 @@ class BinancePaperGateway(BaseGateway):
 
     def commit_order_submission(self, client_oid: str) -> bool:
         """Release a staged order after the OMS has durably committed its ACK."""
+        self._venue_latency("order_latency_ms")
         return bool(
             self._call_worker(
                 "commit_order",
@@ -1380,6 +1384,7 @@ class BinancePaperGateway(BaseGateway):
         )
 
     def cancel_order(self, req: CancelRequest):
+        self._venue_latency("cancel_latency_ms")
         try:
             payload = self._call_worker(
                 "cancel_order",
@@ -2425,6 +2430,18 @@ class BinancePaperGateway(BaseGateway):
             if value is not None:
                 return int(value)
         return None
+
+    def _venue_latency(self, key: str) -> None:
+        """Hold a request for its one-way trip to the venue.
+
+        A live order or cancel takes effect only after it reaches the
+        exchange; meanwhile the matching worker keeps consuming public
+        trades, so a quote being cancelled can still fill, and a new order
+        joins the queue as it is when it arrives.
+        """
+        delay_ms = self._finite_nonnegative(self.paper_config.get(key, 0.0), 0.0)
+        if delay_ms > 0.0:
+            time.sleep(min(delay_ms, 1_000.0) / 1_000.0)
 
     @staticmethod
     def _finite_nonnegative(value, default: float):
