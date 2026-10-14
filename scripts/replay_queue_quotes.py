@@ -7,10 +7,18 @@ cancel-ahead credit, and through/at-price fills match a Paper run.
 
 Quote policy, mirroring GLFT with touch snapping and queue retention:
 
-* each side holds one order of ``--notional`` USDT at the touch;
+* each side holds one order of ``--notional`` USDT at the touch, or
+  ``--inside-ticks`` better when the spread leaves room (our bid stays at
+  least one tick under our ask), which buys price priority: an order inside
+  the spread has no queue ahead;
 * a quote the touch moves away from is kept (it may be reached later from
   the front of its new level) until it is more than ``--keep-ticks`` behind
   and has rested ``--min-rest-sec``; then it rejoins the touch;
+* a quote more aggressive than its target (the touch moved through it
+  without trading, or the spread closed) is replaced at once, as GLFT's
+  risk requote does;
+* an opposite touch that reaches our price would have traded with us: the
+  quote fills (trigger ``cross``);
 * a filled quote rejoins the touch on the next book.
 
 Inventory is not modelled: this measures the per-fill edge of resting at
@@ -167,18 +175,31 @@ def replay(symbol: str, depth: pd.DataFrame, trades: pd.DataFrame, args) -> dict
             continue
         engine.on_book(book)
         best_bid, best_ask = max(book.bids), min(book.asks)
-        for side, touch in (("BUY", best_bid), ("SELL", best_ask)):
+        spread_ticks = round((best_ask - best_bid) / tick)
+        inside = min(args.inside_ticks, max(0, (spread_ticks - 1) // 2))
+        targets = {
+            "BUY": round(round((best_bid + inside * tick) / tick) * tick, 10),
+            "SELL": round(round((best_ask - inside * tick) / tick) * tick, 10),
+        }
+        for side, target in targets.items():
             order = quotes[side]
+            if order is not None and order.active:
+                price = order.request.price
+                if (price >= best_ask - 1e-12) if side == "BUY" else (price <= best_bid + 1e-12):
+                    apply_fill(order, order.remaining, price, is_maker=True,
+                               fill_context={"fill_trigger": "cross"})
             if order is not None and not order.active:
                 state.orders.pop(order.client_oid, None)
                 quotes[side] = order = None
             if order is None:
-                place(side, touch)
+                place(side, target)
                 continue
-            behind = (touch - order.request.price) if side == "BUY" else (order.request.price - touch)
-            if behind > args.keep_ticks * tick + 1e-12 and t - placed_at[side] >= args.min_rest_sec:
+            behind = (target - order.request.price) if side == "BUY" else (order.request.price - target)
+            if behind < -1e-12 or (
+                behind > args.keep_ticks * tick + 1e-12 and t - placed_at[side] >= args.min_rest_sec
+            ):
                 cancel(side)
-                place(side, touch)
+                place(side, target)
 
     hours = (book_times[-1] - book_times[0]) / 3600 if len(book_times) > 1 else 0.0
     for fill in fills:
@@ -219,6 +240,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--symbols", required=True)
     parser.add_argument("--ticks", default="", help="SYMBOL=tick,... (default: from the book)")
     parser.add_argument("--notional", type=float, default=500.0)
+    parser.add_argument("--inside-ticks", type=int, default=0,
+                        help="Quote this many ticks inside the touch when the spread allows")
     parser.add_argument("--keep-ticks", type=float, default=2.0)
     parser.add_argument("--min-rest-sec", type=float, default=5.0)
     parser.add_argument("--cancel-ahead-model", default="proportional", choices=("fraction", "proportional"))
