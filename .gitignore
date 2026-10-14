@@ -103,6 +103,7 @@ tests/*
 !tests/test_binance_sidecar_emergency.py
 !tests/test_binance_sidecar_truth.py
 !tests/test_data_recorder.py
+!tests/test_research_books.py
 !tests/test_live_canary_evidence_collector.py
 !tests/test_rpi_terminal_truth_static.py
 !tests/test_systemd_deployment.py

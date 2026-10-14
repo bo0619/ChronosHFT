@@ -113,6 +113,9 @@ class Recorder:
     def snapshot_loop(self) -> None:
         """REST full-book and RPI-book snapshots (weight 20 each per symbol)."""
         session = requests.Session()
+        # The first snapshot must not predate the diff streams, or the first
+        # diff cannot be chained to it; let the websockets connect first.
+        self.stop.wait(3.0)
         while not self.stop.is_set() and time.time() < self.deadline:
             for symbol in self.symbols:
                 for kind, path in (("depth", "/fapi/v1/depth"), ("rpiDepth", "/fapi/v1/rpiDepth")):
