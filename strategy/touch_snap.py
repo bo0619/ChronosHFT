@@ -28,6 +28,10 @@ from collections.abc import Mapping
 
 from alpha.queue_imbalance import QueueImbalanceConfig, QueueImbalanceModel
 from event.type import Side
+from strategy.inventory_step_back import (
+    InventoryStepBackConfig,
+    step_back_against_inventory,
+)
 from strategy.quote_math import depths_bps_to_prices
 
 # Tolerance for float comparisons of prices and bps.
@@ -186,9 +190,14 @@ def snap_decision_to_touch(
     best_ask: float,
     tick_size: float,
     passive_fee_bps: float,
+    inventory_lots: float = 0.0,
 ) -> tuple[float, float]:
-    """Snap a ``QuoteDecision`` to the touch, then step back a side the
-    queue imbalance is against (Paper only)."""
+    """Snap a ``QuoteDecision`` to the touch, then step back the side that
+    adds inventory and a side the queue imbalance is against (Paper only).
+
+    Both step-backs come after snapping so the snap cannot undo them.
+    """
+    execution = _execution_config(strategy)
     target_bid, target_ask = snap_to_touch(
         target_bid=decision.target_bid,
         target_ask=decision.target_ask,
@@ -198,12 +207,22 @@ def snap_decision_to_touch(
         best_bid=best_bid,
         best_ask=best_ask,
         tick_size=tick_size,
-        snap_ticks=touch_snap_ticks(
-            _execution_config(strategy), live=strategy.live_mode
-        ),
+        snap_ticks=touch_snap_ticks(execution, live=strategy.live_mode),
         min_spread_bps=decision.effective_min_spread_bps,
         passive_fee_bps=passive_fee_bps,
     )
+    if not strategy.live_mode:
+        target_bid, target_ask = step_back_against_inventory(
+            target_bid,
+            target_ask,
+            config=InventoryStepBackConfig.for_symbol(
+                execution.get("paper_inventory_step_back"), symbol
+            ),
+            inventory_lots=inventory_lots,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            tick_size=tick_size,
+        )
     return step_back_against_imbalance(
         target_bid,
         target_ask,

@@ -1846,12 +1846,14 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         self.assertEqual(oms.cancelled, ["passive-1"])
 
     def _glft_one_tick_quotes(
-        self, execution, sigma_bps=2.5, extra=None, queue_imbalance=None
+        self, execution, sigma_bps=2.5, extra=None, queue_imbalance=None,
+        position=0.0,
     ):
         engine = DispatchingEngine()
+        oms = PassiveQuoteOMS()
         strategy = GLFTStrategy(
             engine,
-            PassiveQuoteOMS(),
+            oms,
             strategy_config={
                 "use_rpi": True,
                 "use_rpi_for_glft": True,
@@ -1863,6 +1865,9 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
             },
         )
         strategy.cooldown_ms = 0
+        if position:
+            oms.exposure.net_positions["KORUUSDT"] = position
+            oms.exposure.strategy_net_positions[(strategy.name, "KORUUSDT")] = position
         calibrator = SimpleNamespace(
             on_orderbook=lambda _ob: None,
             sigma_bps=sigma_bps,
@@ -1912,6 +1917,22 @@ class StrategyOmsCoordinationTests(unittest.TestCase):
         ][-1].params
         self._last_glft_params = params
         return params["target_bid"], params["target_ask"]
+
+    def test_glft_paper_steps_the_inventory_side_back_in_whole_ticks(self):
+        execution = {
+            "min_spread_bps": 5.0,
+            "paper_min_spread_bps": 8.0,
+            "paper_touch_snap_ticks": 1.0,
+            "paper_inventory_step_back": {"enabled": True, "lots_per_tick": 1.0},
+        }
+        self.assertEqual(self._glft_one_tick_quotes(execution), (14.37, 14.38))
+        # 0.6 KORU at ~14.375 is ~8.6 USDT: just over one 8 USDT lot long.
+        self.assertEqual(
+            self._glft_one_tick_quotes(execution, position=0.6), (14.36, 14.38)
+        )
+        self.assertEqual(
+            self._glft_one_tick_quotes(execution, position=-0.6), (14.37, 14.39)
+        )
 
     def test_glft_paper_steps_back_the_side_the_queue_imbalance_is_against(self):
         snapping = {

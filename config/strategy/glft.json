@@ -136,6 +136,13 @@
           "min_moves_per_bin": 30.0,
           "half_life_moves": 2000.0,
           "symbols": {}
+        },
+        "paper_inventory_step_back": {
+          "_comment": "Paper-only, in whole ticks of each symbol: the side that adds inventory steps back one tick per lots_per_tick lots (one lot = the quote notional), up to max_ticks, after touch snapping; the reducing side stays at the touch. GLFT's bps skew rounds away below a tick (~7 bps on KORUUSDT), so at the 2026-10-14 KRX open inventory reached ~4.9 lots in two minutes.",
+          "enabled": true,
+          "lots_per_tick": 1.0,
+          "max_ticks": 3,
+          "symbols": {}
         }
       },
       "paper_intensity": {

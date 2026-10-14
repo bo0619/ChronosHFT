@@ -1746,7 +1746,7 @@ class GLFTStrategy(FastRequoteMixin, MarketExecutionMixin, AdaptiveQuotingStrate
         target_bid, target_ask = snap_decision_to_touch(
             decision, self, symbol, calibrator, reference_price=fair_mid,
             best_bid=bid_1, best_ask=ask_1, tick_size=tick,
-            passive_fee_bps=passive_fee_bps,
+            passive_fee_bps=passive_fee_bps, inventory_lots=inventory_lots,
         )
         effective_min_spread_bps = decision.effective_min_spread_bps
 

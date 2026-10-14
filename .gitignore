@@ -45,6 +45,7 @@ tests/*
 !tests/test_touch_snap.py
 !tests/test_paper_intensity.py
 !tests/test_queue_imbalance.py
+!tests/test_inventory_step_back.py
 !tests/test_adaptive_pipeline.py
 !tests/test_exchange_snapshot.py
 !tests/test_oms_risk_port.py

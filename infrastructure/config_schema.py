@@ -190,6 +190,28 @@ def _queue_imbalance_schema() -> ObjectSpec:
     )
 
 
+_INVENTORY_STEP_BACK_FIELDS = {
+    "lots_per_tick": POSITIVE,
+    "max_ticks": POSITIVE_INT,
+}
+
+
+def _inventory_step_back_schema() -> ObjectSpec:
+    """Paper whole-tick inventory step-back plus per-symbol overrides."""
+    per_symbol = _object(
+        {"enabled": BOOL, **_INVENTORY_STEP_BACK_FIELDS},
+        optional=("enabled", *_INVENTORY_STEP_BACK_FIELDS),
+    )
+    return _object(
+        {
+            "enabled": BOOL,
+            **_INVENTORY_STEP_BACK_FIELDS,
+            "symbols": MappingSpec(values=per_symbol, key_pattern=r"^[A-Z0-9]{5,30}$"),
+        },
+        optional=(*_INVENTORY_STEP_BACK_FIELDS, "symbols"),
+    )
+
+
 def _paper_intensity_schema() -> ObjectSpec:
     """Global Paper A/k settings plus optional per-symbol overrides."""
     per_symbol = _object(
@@ -1085,12 +1107,14 @@ FRAGMENT_SCHEMAS: dict[str, dict[int, ObjectSpec]] = {
                                         "paper_min_spread_bps": NONNEGATIVE,
                                         "paper_touch_snap_ticks": NONNEGATIVE,
                                         "paper_queue_imbalance": _queue_imbalance_schema(),
+                                        "paper_inventory_step_back": _inventory_step_back_schema(),
                                     },
                                     # Paper-only; absent means no snapping
-                                    # and no queue-imbalance step-back.
+                                    # and no step-back.
                                     optional=(
                                         "paper_touch_snap_ticks",
                                         "paper_queue_imbalance",
+                                        "paper_inventory_step_back",
                                     ),
                                 ),
                                 "queue_retention": _object(
