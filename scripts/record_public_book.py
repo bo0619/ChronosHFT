@@ -14,6 +14,23 @@ tools read both:
 * ``<out>/<SYMBOL>_ticker_<YYYYMMDD>_v2.h5`` key ``ticker``: ``received_ts``,
   ``exchange_ts``, ``update_id``, ``bid_p``, ``bid_v``, ``ask_p``, ``ask_v``.
 
+bookTicker is by far the heaviest stream (BTCUSDT and ETHUSDT push about
+1,000 updates a second, mostly size changes at an unchanged price).
+``--ticker-price-changes-only`` keeps an update only when the best bid or
+ask price changes: the exact timing of price moves, with sizes still in the
+100 ms depth rows.
+
+``--all-streams`` records everything public on top: full-depth diffs
+(``@depth@100ms``), the RPI book (``@rpiDepth@500ms``, which includes
+resting RPI orders but hides crossed RPI levels), and mark price, index and
+funding (``@markPrice@1s``), plus REST snapshots of the full book
+(``/fapi/v1/depth``, limit 1000) and of the RPI book
+(``/fapi/v1/rpiDepth``) every ``--snapshot-sec`` to anchor offline book
+rebuilds. With it, every websocket message and REST snapshot is also kept
+verbatim in ``<out>/raw_<YYYYMMDD>_<HH>.jsonl.gz``, one JSON object per line:
+``{"r": received_ts, "m": <message>}`` or
+``{"r": received_ts, "rest": "depth"|"rpiDepth", "s": symbol, "m": <body>}``.
+
 Book and bookTicker streams are served under ``/public`` and trade streams under
 ``/market`` (as in ``gateway/binance/ws_api.py``); the plain ``/stream``
 path no longer carries aggTrade. Recording stops by itself after
@@ -28,6 +45,7 @@ Example::
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import shutil
 import signal
@@ -39,9 +57,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import requests
 import websocket
 
 WS_ROOT = "wss://fstream.binance.com"
+REST_ROOT = "https://fapi.binance.com"
 LEVELS = 5
 FLUSH_SEC = 10.0
 
@@ -51,7 +71,14 @@ def report_ws_error(_ws, error) -> None:
 
 
 class Recorder:
-    def __init__(self, symbols: list[str], out: Path, hours: float, min_free_gb: float) -> None:
+    def __init__(self, symbols: list[str], out: Path, hours: float, min_free_gb: float,
+                 *, ticker_price_changes_only: bool = False, all_streams: bool = False,
+                 snapshot_sec: float = 60.0) -> None:
+        self.ticker_price_changes_only = ticker_price_changes_only
+        self.all_streams = all_streams
+        self.snapshot_sec = snapshot_sec
+        self.raw_lines: list[str] = []
+        self.last_touch: dict[str, tuple[float, float]] = {}
         self.symbols = [s.upper() for s in symbols]
         self.out = out
         self.deadline = time.time() + hours * 3600.0
@@ -66,13 +93,45 @@ class Recorder:
     def urls(self) -> list[str]:
         lower = [symbol.lower() for symbol in self.symbols]
         return [
-            f"{WS_ROOT}/public/stream?streams="
-            + "/".join(f"{s}@depth5@100ms/{s}@bookTicker" for s in lower),
-            f"{WS_ROOT}/market/stream?streams=" + "/".join(f"{s}@aggTrade" for s in lower),
+            f"{WS_ROOT}/public/stream?streams=" + "/".join(
+                f"{s}@depth5@100ms/{s}@bookTicker"
+                + (f"/{s}@depth@100ms/{s}@rpiDepth@500ms" if self.all_streams else "")
+                for s in lower
+            ),
+            f"{WS_ROOT}/market/stream?streams=" + "/".join(
+                f"{s}@aggTrade" + (f"/{s}@markPrice@1s" if self.all_streams else "")
+                for s in lower
+            ),
         ]
+
+    def keep_raw(self, received: float, raw: str) -> None:
+        if self.all_streams:
+            line = f'{{"r":{received:.6f},"m":{raw}}}'
+            with self.lock:
+                self.raw_lines.append(line)
+
+    def snapshot_loop(self) -> None:
+        """REST full-book and RPI-book snapshots (weight 20 each per symbol)."""
+        session = requests.Session()
+        while not self.stop.is_set() and time.time() < self.deadline:
+            for symbol in self.symbols:
+                for kind, path in (("depth", "/fapi/v1/depth"), ("rpiDepth", "/fapi/v1/rpiDepth")):
+                    try:
+                        body = session.get(f"{REST_ROOT}{path}", params={"symbol": symbol, "limit": 1000},
+                                           timeout=10).text
+                        received = time.time()
+                        json.loads(body)
+                    except Exception as error:
+                        print(f"{symbol} {kind} snapshot failed: {error}", file=sys.stderr, flush=True)
+                        continue
+                    line = f'{{"r":{received:.6f},"rest":"{kind}","s":"{symbol}","m":{body}}}'
+                    with self.lock:
+                        self.raw_lines.append(line)
+            self.stop.wait(self.snapshot_sec)
 
     def on_message(self, _ws, raw: str) -> None:
         received = time.time()
+        self.keep_raw(received, raw)
         message = json.loads(raw)
         data = message.get("data") or {}
         stream = message.get("stream", "")
@@ -98,9 +157,14 @@ class Recorder:
                 "ask_p": float(data["a"]),
                 "ask_v": float(data["A"]),
             }
+            if self.ticker_price_changes_only:
+                touch = (row["bid_p"], row["ask_p"])
+                if self.last_touch.get(symbol) == touch:
+                    return
+                self.last_touch[symbol] = touch
             with self.lock:
                 self.tickers[symbol].append(row)
-        elif "@depth" in stream:
+        elif "@depth5" in stream:
             row = {"received_ts": received, "exchange_ts": float(data["E"]) / 1000.0}
             for side, key in (("bid", "b"), ("ask", "a")):
                 levels = data.get(key) or []
@@ -116,7 +180,18 @@ class Recorder:
             depth, self.depth = self.depth, defaultdict(list)
             trades, self.trades = self.trades, defaultdict(list)
             tickers, self.tickers = self.tickers, defaultdict(list)
-        day = datetime.now(timezone.utc).strftime("%Y%m%d")
+            raw_lines, self.raw_lines = self.raw_lines, []
+        now = datetime.now(timezone.utc)
+        day = now.strftime("%Y%m%d")
+        if raw_lines:
+            path = self.out / f"raw_{now:%Y%m%d_%H}.jsonl.gz"
+            try:
+                with gzip.open(path, "at", compresslevel=6) as handle:
+                    handle.write("\n".join(raw_lines) + "\n")
+            except Exception as error:
+                print(f"{path.name}: write deferred ({type(error).__name__})", file=sys.stderr, flush=True)
+                with self.lock:
+                    self.raw_lines[:0] = raw_lines
         for kind, batches in (("depth", depth), ("trade", trades), ("ticker", tickers)):
             for symbol, rows in batches.items():
                 if not rows:
@@ -142,8 +217,14 @@ class Recorder:
             for url in self.urls()
         ]
 
+    def background(self) -> list[threading.Thread]:
+        """Threads that run for the whole recording; a venue subclass may override."""
+        return [threading.Thread(target=self.snapshot_loop, daemon=True)] if self.all_streams else []
+
     def run(self) -> int:
         self.out.mkdir(parents=True, exist_ok=True)
+        for thread in self.background():
+            thread.start()
         while not self.stop.is_set() and time.time() < self.deadline:
             apps = self.apps()
             threads = [
@@ -176,8 +257,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default="storage/research")
     parser.add_argument("--hours", type=float, default=12.0)
     parser.add_argument("--min-free-gb", type=float, default=2.0)
+    parser.add_argument("--ticker-price-changes-only", action="store_true",
+                        help="Keep a bookTicker update only when the best bid or ask price changes")
+    parser.add_argument("--all-streams", action="store_true",
+                        help="Also record full-depth diffs, the RPI book, mark price, REST snapshots and raw messages")
+    parser.add_argument("--snapshot-sec", type=float, default=60.0)
     args = parser.parse_args(argv)
-    recorder = Recorder(args.symbols.split(","), Path(args.out), args.hours, args.min_free_gb)
+    recorder = Recorder(args.symbols.split(","), Path(args.out), args.hours, args.min_free_gb,
+                        ticker_price_changes_only=args.ticker_price_changes_only,
+                        all_streams=args.all_streams, snapshot_sec=args.snapshot_sec)
     signal.signal(signal.SIGTERM, lambda *_: recorder.stop.set())
     signal.signal(signal.SIGINT, lambda *_: recorder.stop.set())
     return recorder.run()

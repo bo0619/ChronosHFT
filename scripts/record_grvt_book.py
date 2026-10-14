@@ -19,6 +19,11 @@ replays recent history on subscribe with sequence number 0; those prints
 are skipped. Symbols are GRVT's ``<base><quote>`` names (``ETH_USDT_Perp``
 is ``ETHUSDT``).
 
+``--all-streams`` also subscribes to ``v1.ticker.s`` (mark and index price,
+funding) and keeps every message verbatim in
+``<out>/raw_<YYYYMMDD>_<HH>.jsonl.gz`` (as ``record_public_book.py``), so
+the full-depth deltas, not only the top five, are kept.
+
 Example::
 
     python scripts/record_grvt_book.py --symbols BTCUSDT,ETHUSDT,SOLUSDT --hours 24 --out storage/research/grvt
@@ -41,7 +46,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from record_public_book import LEVELS, Recorder, report_ws_error  # noqa: E402
 
-from gateway.grvt.constants import BOOK_RATE_MS, BOOK_STREAM, TRADE_LIMIT, TRADE_STREAM, WS_URL_MAIN  # noqa: E402
+from gateway.grvt.constants import (  # noqa: E402
+    BOOK_RATE_MS, BOOK_STREAM, TICKER_RATE_MS, TICKER_STREAM, TRADE_LIMIT, TRADE_STREAM, WS_URL_MAIN,
+)
 from gateway.grvt.market_data import resubscribe_book_frames, timestamp_ms, trade_id_number  # noqa: E402
 
 INSTRUMENTS_URL = "https://market-data.grvt.io/full/v1/all_instruments"
@@ -60,8 +67,9 @@ def instrument_names(symbols: list[str]) -> dict[str, str]:
 
 
 class GrvtRecorder(Recorder):
-    def __init__(self, symbols: list[str], out: Path, hours: float, min_free_gb: float) -> None:
-        super().__init__(symbols, out, hours, min_free_gb)
+    def __init__(self, symbols: list[str], out: Path, hours: float, min_free_gb: float,
+                 *, all_streams: bool = False) -> None:
+        super().__init__(symbols, out, hours, min_free_gb, all_streams=all_streams)
         self.instruments = instrument_names(self.symbols)
         self.symbol_of = {inst: sym for sym, inst in self.instruments.items()}
         self.request_id = 100
@@ -81,14 +89,21 @@ class GrvtRecorder(Recorder):
 
     def on_open(self, ws) -> None:
         instruments = list(self.instruments.values())
-        for request_id, stream, limit in ((1, BOOK_STREAM, BOOK_RATE_MS), (2, TRADE_STREAM, TRADE_LIMIT)):
+        streams = [(1, BOOK_STREAM, BOOK_RATE_MS), (2, TRADE_STREAM, TRADE_LIMIT)]
+        if self.all_streams:
+            streams.append((3, TICKER_STREAM, TICKER_RATE_MS))
+        for request_id, stream, limit in streams:
             ws.send(json.dumps({
                 "jsonrpc": "2.0", "method": "subscribe", "id": request_id,
                 "params": {"stream": stream, "selectors": [f"{i}@{limit}" for i in instruments]},
             }))
 
+    def background(self) -> list:
+        return []  # no REST snapshots: the book stream starts from a full snapshot
+
     def on_message(self, ws, raw: str) -> None:
         received = time.time()
+        self.keep_raw(received, raw)
         message = json.loads(raw)
         result = message.get("result")
         if isinstance(result, dict) and result.get("stream") == BOOK_STREAM:
@@ -171,9 +186,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default="storage/research/grvt")
     parser.add_argument("--hours", type=float, default=24.0)
     parser.add_argument("--min-free-gb", type=float, default=2.0)
+    parser.add_argument("--all-streams", action="store_true",
+                        help="Also record the ticker (mark, index, funding) and keep every message raw")
     args = parser.parse_args(argv)
     recorder = GrvtRecorder([s.strip().upper() for s in args.symbols.split(",") if s.strip()],
-                            Path(args.out), args.hours, args.min_free_gb)
+                            Path(args.out), args.hours, args.min_free_gb, all_streams=args.all_streams)
     signal.signal(signal.SIGTERM, lambda *_: recorder.stop.set())
     signal.signal(signal.SIGINT, lambda *_: recorder.stop.set())
     return recorder.run()
