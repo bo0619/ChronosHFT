@@ -130,7 +130,8 @@
         "paper_touch_snap_ticks": 1.0,
         "paper_queue_imbalance": {
           "_comment": "Paper-only, learned per symbol from the public L1 book: P(next mid move | queue imbalance (bid_qty - ask_qty) / (bid_qty + ask_qty)). A side whose next move is more than against_threshold likely to go against it is quoted one level behind the touch, and a quote resting at the touch is pulled. On 9 h of KORUUSDT, imbalance below -0.4 preceded a down move 75-91% of the time. No step-back until a bin has min_moves_per_bin moves of evidence.",
-          "enabled": true,
+          "_comment_disabled": "Off since 2026-10-14: it predicts the next move but not our fill P&L. On ~230 KORUUSDT fills, queue fills taken with the imbalance against us still marked out +3.0 bps at 5 s (t=2.0), so stepping back gave them up, while the most toxic through-fills (-3.6 to -4.2 bps at 1 s, t<-2.4) came with the imbalance neutral or in our favour: sweeps of a thick queue it cannot see.",
+          "enabled": false,
           "against_threshold": 0.65,
           "bins": 10,
           "min_moves_per_bin": 30.0,
