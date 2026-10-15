@@ -67,7 +67,9 @@ import pandas as pd
 
 # Diffs kept per book for a snapshot that arrives after the diff spanning it.
 BUFFER_SEC = 5.0
-FLUSH_ROWS = 50_000
+# Rows buffered per output before writing; a row is a ~40-key dict, so
+# 12 outputs x 2,000 rows stay around 100 MB.
+FLUSH_ROWS = 2_000
 
 
 def iter_raw(directory: str | Path, start: float | None = None,
