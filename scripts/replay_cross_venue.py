@@ -18,6 +18,17 @@ read as a signal. Each side holds one post-only order of ``--notional``:
   ask (and the mirror for the ask). With a cap at the touch this is a
   guard: a quote steps back when fair comes within ``--half-spread-bps``.
 
+GRVT closes only part of a gap to Binance (on a day of six majors, about
+a quarter within 1 s and half to 70% within 5 s), so ``--fair-shrink``
+moves fair value only that share of the way from the GRVT mid.
+
+Inventory control (``--anchor binance``), in lots of ``--notional``: fair
+value shifts against the position by ``--skew-bps-per-lot`` per lot (long:
+both quotes lower, so selling gets easier and buying harder), and at
+``--max-inventory-lots`` the side that would add is pulled. The replay
+knows its position at once on each fill (a live strategy learns it a
+private-feed latency later). Inventory carries across ``--slice-hours``.
+
 A quote more aggressive than its target is replaced at once; one behind it
 by more than ``--keep-ticks`` is replaced after ``--min-rest-sec``. A
 filled side quotes again on the next decision.
@@ -115,7 +126,10 @@ def replay(symbol: str, grvt_depth: pd.DataFrame, grvt_trades: pd.DataFrame,
     state = PaperVenueState()
     clock = [0.0]
 
+    position = [float(getattr(args, "initial_position", 0.0))]
+
     def apply_fill(order, quantity, price, *, is_maker, fill_context=None):
+        position[0] += quantity if order.request.side == "BUY" else -quantity
         order.cum_filled_qty += quantity
         order.status = "FILLED" if order.remaining <= EPS else "PARTIALLY_FILLED"
         fills.append({"t": clock[0], "side": order.request.side, "price": float(price),
@@ -203,13 +217,20 @@ def replay(symbol: str, grvt_depth: pd.DataFrame, grvt_trades: pd.DataFrame,
         if seen["binance_mid"] <= 0 or seen["log_basis"] is None:
             return {"BUY": None, "SELL": None}  # no fair value yet: stay out
         fair = seen["binance_mid"] * math.exp(seen["log_basis"])
+        if args.fair_shrink != 1.0:  # GRVT closes only part of a gap to Binance
+            grvt_mid = (bid + ask) / 2
+            fair = grvt_mid * (fair / grvt_mid) ** args.fair_shrink
+        lots = position[0] * fair / args.notional
+        fair *= 1 - args.skew_bps_per_lot * lots / 1e4
         half = args.half_spread_bps / 1e4
         want_bid, want_ask = round_down(fair * (1 - half), tick), round_up(fair * (1 + half), tick)
         if args.improve:
             want_bid, want_ask = min(want_bid, round(ask - tick, 10)), max(want_ask, round(bid + tick, 10))
         else:
             want_bid, want_ask = min(want_bid, bid), max(want_ask, ask)
-        return {"BUY": want_bid, "SELL": want_ask}
+        limit = args.max_inventory_lots
+        return {"BUY": None if limit and lots >= limit - EPS else want_bid,
+                "SELL": None if limit and lots <= -limit + EPS else want_ask}
 
     def decide(t: float) -> None:
         for side, target in targets().items():
@@ -298,7 +319,34 @@ def replay(symbol: str, grvt_depth: pd.DataFrame, grvt_trades: pd.DataFrame,
             j = min(len(mids) - 1, int(np.searchsorted(mid_times, fill["t"] + horizon)))
             fill[f"m{int(horizon)}"] = sign * math.log(mids[j] / fill["price"]) * 1e4
     hours = (times.max() - times.min()) / 3600 if len(times) > 1 else 0.0
-    return {"hours": hours, "fills": fills}
+    return {"hours": hours, "fills": fills, "mid_times": mid_times, "mids": mids,
+            "final_position": position[0]}
+
+
+def inventory_stats(fills: list[dict], result: dict, maker_fee_bps: float) -> dict:
+    """Unhedged inventory path, marked to the GRVT mid after every fill.
+
+    The 5 s markout prices each fill's edge; this adds what holding the
+    inventory cost or earned until the window's end. Fees are booked on
+    each fill (negative for a rebate).
+    """
+    mid_times, mids = result["mid_times"], result["mids"]
+    position = cash = 0.0
+    marks, exposures = [], []
+    for fill in sorted(fills, key=lambda f: f["t"]):
+        sign = 1.0 if fill["side"] == "BUY" else -1.0
+        notional = fill["qty"] * fill["price"]
+        position += sign * fill["qty"]
+        cash -= sign * notional + notional * maker_fee_bps / 1e4
+        j = min(len(mids) - 1, int(np.searchsorted(mid_times, fill["t"], side="right")) - 1)
+        mark = mids[max(j, 0)]
+        marks.append(cash + position * mark)
+        exposures.append(abs(position) * mark)
+    final = cash + position * mids[-1]
+    curve = np.array(marks + [final])
+    drawdown = float(np.max(np.maximum.accumulate(curve) - curve)) if len(curve) else 0.0
+    return {"pnl": final, "drawdown": drawdown, "max_abs": max(exposures, default=0.0),
+            "mean_abs": float(np.mean(exposures)) if exposures else 0.0, "final": position * mids[-1]}
 
 
 def summarize(symbol: str, result: dict, label: str, maker_fee_bps: float) -> None:
@@ -313,10 +361,14 @@ def summarize(symbol: str, result: dict, label: str, maker_fee_bps: float) -> No
     notional = sum(f["qty"] * f["price"] for f in fills)
     pnl = sum(f["qty"] * f["price"] * (f["m5"] - maker_fee_bps) / 1e4 for f in fills)
     edge = statistics.mean(f["m5"] for f in fills) - maker_fee_bps
+    inventory = inventory_stats(fills, result, maker_fee_bps)
     print(f"\n== {symbol} {label} {hours:.1f} h  fills {len(fills)} ({len(fills) / hours:.1f}/h)  "
           f"notional {notional / hours:,.0f} USDT/h  mix "
           + "  ".join(f"{k} {len(v) / len(fills):.0%}" for k, v in sorted(by.items()))
-          + f"\n   net of {maker_fee_bps:g} bps fee: 5 s edge {edge:+.2f} bps/fill, P&L {pnl / hours:+.2f} USDT/h")
+          + f"\n   net of {maker_fee_bps:g} bps fee: 5 s edge {edge:+.2f} bps/fill, P&L {pnl / hours:+.2f} USDT/h"
+          + f"\n   unhedged: P&L {inventory['pnl'] / hours:+.2f} USDT/h marked to the GRVT mid "
+          f"(max drawdown {inventory['drawdown']:.2f} USDT), inventory max {inventory['max_abs']:,.0f} USDT "
+          f"/ mean {inventory['mean_abs']:,.0f} USDT, final {inventory['final']:+,.0f} USDT")
     for name, group in [("ALL", fills)] + sorted(by.items()):
         cells = []
         for horizon in HORIZONS:
@@ -339,6 +391,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--anchor", choices=("grvt", "binance"), default="binance")
     parser.add_argument("--half-spread-bps", type=float, default=2.0,
                         help="Distance of our quotes from the Binance-based fair value")
+    parser.add_argument("--fair-shrink", type=float, default=1.0,
+                        help="Fair value = GRVT mid moved this share of the way to the Binance-based price")
+    parser.add_argument("--skew-bps-per-lot", type=float, default=0.0,
+                        help="Shift fair value against the position by this much per lot of --notional")
+    parser.add_argument("--max-inventory-lots", type=float, default=0.0,
+                        help="Pull the side that would add once the position reaches this many lots (0: no limit)")
     parser.add_argument("--improve", action="store_true",
                         help="Allow quotes inside the GRVT spread (otherwise capped at the GRVT touch)")
     parser.add_argument("--basis-half-life", type=float, default=60.0,
@@ -368,8 +426,9 @@ def main(argv: list[str] | None = None) -> int:
         c for i in range(1, rq.LEVELS + 1) for c in (f"bid{i}_p", f"bid{i}_v", f"ask{i}_p", f"ask{i}_v")]
     trade_cols = ["received_ts", "exchange_ts", "trade_id", "price", "qty", "maker_is_buyer"]
     for symbol in args.symbols.split(","):
-        merged = {"hours": 0.0, "fills": []}
+        merged = {"hours": 0.0, "fills": [], "mid_times": [], "mids": []}
         args.tick = None
+        args.initial_position = 0.0
         for window_start, window_end in rq.windows(start, end, args.slice_hours):
             depth = load_columns(args.grvt_dir, symbol, "depth", depth_cols, window_start, window_end)
             trades = load_columns(args.grvt_dir, symbol, "trade", trade_cols, window_start, window_end)
@@ -384,11 +443,21 @@ def main(argv: list[str] | None = None) -> int:
             result = replay(symbol, depth, trades, binance, args)
             merged["hours"] += result["hours"]
             merged["fills"] += result["fills"]
+            args.initial_position = result["final_position"]
+            merged["mid_times"].append(result["mid_times"])
+            merged["mids"].append(result["mids"])
             del depth, trades, binance, result
+        if merged["mids"]:
+            merged["mid_times"] = np.concatenate(merged["mid_times"])
+            merged["mids"] = np.concatenate(merged["mids"])
         latency = (f"sampled {args.latency_probe}/2+{args.extra_latency_ms:g} ms" if args.one_way_samples is not None
                    else f"{args.latency_ms:g} ms")
         label = (f"[anchor {args.anchor}" + (f", +/-{args.half_spread_bps:g} bps" if args.anchor == "binance" else "")
-                 + (", improve" if args.improve else "") + f", cross {args.cross}, {latency}]")
+                 + (", improve" if args.improve else "")
+                 + (f", shrink {args.fair_shrink:g}" if args.fair_shrink != 1.0 else "")
+                 + (f", skew {args.skew_bps_per_lot:g} bps/lot" if args.skew_bps_per_lot else "")
+                 + (f", max {args.max_inventory_lots:g} lots" if args.max_inventory_lots else "")
+                 + f", cross {args.cross}, {latency}]")
         summarize(symbol, merged, label, args.maker_fee_bps)
     return 0
 

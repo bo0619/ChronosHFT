@@ -16,7 +16,8 @@ def grvt_depth_row(exchange, received, bid, ask, size=10.0):
 def args(**overrides):
     values = dict(notional=100.0, anchor="binance", half_spread_bps=2.0, improve=False,
                   basis_half_life=60.0, keep_ticks=1.0, min_rest_sec=1.0, latency_ms=6.0,
-                  one_way_samples=None, seed=1, tick=0.01, cross="fill")
+                  one_way_samples=None, seed=1, tick=0.01, cross="fill",
+                  skew_bps_per_lot=0.0, max_inventory_lots=0.0, fair_shrink=1.0)
     values.update(overrides)
     return argparse.Namespace(**values)
 
@@ -88,3 +89,33 @@ def test_rounding_keeps_quotes_on_the_tick_grid_away_from_fair():
     assert cv.round_down(100.019, 0.01) == 100.01
     assert cv.round_up(100.011, 0.01) == 100.02
     assert cv.round_down(100.02, 0.01) == 100.02
+
+
+def test_inventory_stats_books_round_trip_rebate_and_open_inventory():
+    import numpy as np
+
+    fills = [
+        {"t": 1.0, "side": "BUY", "qty": 1.0, "price": 100.0},
+        {"t": 2.0, "side": "SELL", "qty": 1.0, "price": 101.0},
+        {"t": 3.0, "side": "BUY", "qty": 2.0, "price": 100.0},
+    ]
+    result = {"mid_times": np.array([0.0, 2.5, 4.0]), "mids": np.array([100.5, 100.0, 99.0])}
+    stats = cv.inventory_stats(fills, result, maker_fee_bps=-1.0)
+    rebate = (100.0 + 101.0 + 200.0) * 1e-4
+    # +1 on the round trip, -2 on the two lots marked from 100 down to 99
+    assert abs(stats["pnl"] - (1.0 - 2.0 + rebate)) < 1e-9
+    assert stats["final"] == 2.0 * 99.0
+    assert stats["max_abs"] == 2.0 * 100.0
+
+
+def test_inventory_limit_pulls_the_adding_side_and_skew_moves_quotes_down():
+    depth, trades, binance = market()
+    long_book = args(anchor="binance", half_spread_bps=0.5, max_inventory_lots=1.0)
+    long_book.initial_position = 1.0  # 1 lot long at ~100 USDT
+    result = cv.replay("X", depth, trades, binance, long_book)
+    assert not [fill for fill in result["fills"] if fill["side"] == "BUY"]
+    skewed = args(anchor="binance", half_spread_bps=0.5, skew_bps_per_lot=10.0)
+    skewed.initial_position = 1.0
+    flat = args(anchor="binance", half_spread_bps=0.5)
+    assert cv.replay("X", depth, trades, binance, skewed)["final_position"] <= \
+        cv.replay("X", depth, trades, binance, flat)["final_position"] + 1.0
