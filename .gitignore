@@ -106,6 +106,9 @@ tests/*
 !tests/test_research_books.py
 !tests/test_replay_queue_quotes.py
 !tests/test_replay_cross_venue.py
+!tests/test_grvt_signing.py
+!tests/test_grvt_rest_api.py
+!tests/test_grvt_private_ws.py
 !tests/test_live_canary_evidence_collector.py
 !tests/test_rpi_terminal_truth_static.py
 !tests/test_systemd_deployment.py

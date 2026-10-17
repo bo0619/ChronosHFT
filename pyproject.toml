@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "cryptography>=45.0.0,<47.0.0",
+    "eth-account>=0.13,<0.14",
     "numpy>=2.0,<3.0",
     "pandas>=2.2,<3.0",
     "requests>=2.32,<3.0",
