@@ -87,9 +87,18 @@ from gateway.binance.paper_matching import (  # noqa: E402
     PaperVenueState,
 )
 from gateway.binance.paper_state import PaperOrder  # noqa: E402
+from strategy.grvt_cross_maker import (  # noqa: E402
+    EPS,
+    BasisTracker,
+    QuoteParams,
+    VolTracker,
+    needs_replace,
+    quote_targets,
+    round_down,
+    round_up,
+)
 
 HORIZONS = (1.0, 5.0, 30.0)
-EPS = 1e-12
 # Same-time order: venue state first, then what we observe.
 TRADE, DEPTH, SEE_GRVT, SEE_BINANCE = 0, 1, 2, 3
 
@@ -110,14 +119,6 @@ def load_columns(directory: str, symbol: str, kind: str, columns: list[str],
     if not parts:
         return pd.DataFrame(columns=columns)
     return pd.concat(parts).sort_values("received_ts").reset_index(drop=True)
-
-
-def round_down(price: float, tick: float) -> float:
-    return round(math.floor(price / tick + 1e-9) * tick, 10)
-
-
-def round_up(price: float, tick: float) -> float:
-    return round(math.ceil(price / tick - 1e-9) * tick, 10)
 
 
 def replay(symbol: str, grvt_depth: pd.DataFrame, grvt_trades: pd.DataFrame,
@@ -158,7 +159,15 @@ def replay(symbol: str, grvt_depth: pd.DataFrame, grvt_trades: pd.DataFrame,
     pending = {"BUY": False, "SELL": False}
     actions: list = []
     touch = [0.0, 0.0, 0.0, 0.0]  # venue truth: bid, bid size, ask, ask size
-    seen = {"bid": 0.0, "ask": 0.0, "binance_mid": 0.0, "log_basis": None, "basis_t": 0.0}
+    seen = {"bid": 0.0, "ask": 0.0, "binance_mid": 0.0}
+    basis = BasisTracker(args.basis_half_life)
+    vol = VolTracker(getattr(args, "vol_window_sec", 10.0))
+    params = QuoteParams(notional=args.notional, half_spread_bps=args.half_spread_bps,
+                         skew_bps_per_lot=args.skew_bps_per_lot, max_inventory_lots=args.max_inventory_lots,
+                         improve=args.improve, keep_ticks=args.keep_ticks, min_rest_sec=args.min_rest_sec,
+                         basis_half_life=args.basis_half_life, fair_shrink=args.fair_shrink,
+                         vol_spread_coef=getattr(args, "vol_spread_coef", 0.0),
+                         vol_window_sec=getattr(args, "vol_window_sec", 10.0))
 
     def place(side: str, price: float) -> None:
         bid, bid_size, ask, ask_size = touch
@@ -214,23 +223,8 @@ def replay(symbol: str, grvt_depth: pd.DataFrame, grvt_trades: pd.DataFrame,
             return {"BUY": None, "SELL": None}
         if args.anchor == "grvt":
             return {"BUY": bid, "SELL": ask}
-        if seen["binance_mid"] <= 0 or seen["log_basis"] is None:
-            return {"BUY": None, "SELL": None}  # no fair value yet: stay out
-        fair = seen["binance_mid"] * math.exp(seen["log_basis"])
-        if args.fair_shrink != 1.0:  # GRVT closes only part of a gap to Binance
-            grvt_mid = (bid + ask) / 2
-            fair = grvt_mid * (fair / grvt_mid) ** args.fair_shrink
-        lots = position[0] * fair / args.notional
-        fair *= 1 - args.skew_bps_per_lot * lots / 1e4
-        half = args.half_spread_bps / 1e4
-        want_bid, want_ask = round_down(fair * (1 - half), tick), round_up(fair * (1 + half), tick)
-        if args.improve:
-            want_bid, want_ask = min(want_bid, round(ask - tick, 10)), max(want_ask, round(bid + tick, 10))
-        else:
-            want_bid, want_ask = min(want_bid, bid), max(want_ask, ask)
-        limit = args.max_inventory_lots
-        return {"BUY": None if limit and lots >= limit - EPS else want_bid,
-                "SELL": None if limit and lots <= -limit + EPS else want_ask}
+        return quote_targets(bid=bid, ask=ask, binance_mid=seen["binance_mid"], log_basis=basis.log_basis,
+                             position=position[0], params=params, tick=tick, vol_bps=vol.vol_bps(clock[0]))
 
     def decide(t: float) -> None:
         for side, target in targets().items():
@@ -246,23 +240,15 @@ def replay(symbol: str, grvt_depth: pd.DataFrame, grvt_trades: pd.DataFrame,
                     heapq.heappush(actions, (t + latency(), next(seq), side, None))
                 continue
             if order is not None:
-                behind = (target - order.request.price) if side == "BUY" else (order.request.price - target)
-                if not (behind < -EPS or (behind > args.keep_ticks * tick + EPS
-                                          and t - placed_at[side] >= args.min_rest_sec)):
+                if not needs_replace(side=side, resting_price=order.request.price, target=target,
+                                     rested_sec=t - placed_at[side], params=params, tick=tick):
                     continue
             pending[side] = True
             heapq.heappush(actions, (t + latency(), next(seq), side, target))
 
     def see_grvt(t: float, bid: float, ask: float) -> None:
         seen["bid"], seen["ask"] = bid, ask
-        if seen["binance_mid"] > 0:
-            observed = math.log((bid + ask) / 2 / seen["binance_mid"])
-            if seen["log_basis"] is None:
-                seen["log_basis"] = observed
-            else:
-                weight = 1 - 0.5 ** (max(t - seen["basis_t"], 0.0) / args.basis_half_life)
-                seen["log_basis"] += weight * (observed - seen["log_basis"])
-            seen["basis_t"] = t
+        basis.update(t, bid, ask, seen["binance_mid"])
         decide(t)
 
     cols = [c for i in range(1, rq.LEVELS + 1) for c in (f"bid{i}_p", f"bid{i}_v", f"ask{i}_p", f"ask{i}_v")]
@@ -306,6 +292,7 @@ def replay(symbol: str, grvt_depth: pd.DataFrame, grvt_trades: pd.DataFrame,
                 see_grvt(t, bid, ask)
         else:
             seen["binance_mid"] = b_mid[i]
+            vol.update(t, b_mid[i])
             decide(t)
 
     order_mid = np.argsort(g_venue, kind="stable")
@@ -391,6 +378,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--anchor", choices=("grvt", "binance"), default="binance")
     parser.add_argument("--half-spread-bps", type=float, default=2.0,
                         help="Distance of our quotes from the Binance-based fair value")
+    parser.add_argument("--vol-spread-coef", type=float, default=0.0,
+                        help="Widen the half spread by this many bps per bps of recent Binance volatility")
+    parser.add_argument("--vol-window-sec", type=float, default=10.0,
+                        help="Window of that volatility (decay time of squared Binance moves), seconds")
     parser.add_argument("--fair-shrink", type=float, default=1.0,
                         help="Fair value = GRVT mid moved this share of the way to the Binance-based price")
     parser.add_argument("--skew-bps-per-lot", type=float, default=0.0,
@@ -455,6 +446,7 @@ def main(argv: list[str] | None = None) -> int:
         label = (f"[anchor {args.anchor}" + (f", +/-{args.half_spread_bps:g} bps" if args.anchor == "binance" else "")
                  + (", improve" if args.improve else "")
                  + (f", shrink {args.fair_shrink:g}" if args.fair_shrink != 1.0 else "")
+                 + (f", vol {args.vol_spread_coef:g}x/{args.vol_window_sec:g}s" if args.vol_spread_coef else "")
                  + (f", skew {args.skew_bps_per_lot:g} bps/lot" if args.skew_bps_per_lot else "")
                  + (f", max {args.max_inventory_lots:g} lots" if args.max_inventory_lots else "")
                  + f", cross {args.cross}, {latency}]")
