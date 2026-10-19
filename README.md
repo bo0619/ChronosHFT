@@ -1,23 +1,36 @@
 # ChronosHFT
 
-加密货币永续合约做市框架（Python）。目前用交易所**真实的公开行情**做**本地模拟成交**的纸面交易，来验证策略到底有没有正的 edge；实盘只具备一个受签名许可和严格亏损上限约束的 RPI 校准框架。
+加密货币永续合约的做市研究与交易框架（Python）。
 
-> **纸面盘的成交是模型假设。** 本地撮合按公开成交推断我们的挂单是否成交，看不到真实排队位置，也看不到 RPI 的零售对手方。纸面盈亏只能用来迭代策略，不能当成实盘预期。
+现在只有一条实盘路径：**在 GRVT 上做市，用币安的价格定价**（`scripts/run_grvt_maker.py`）。币安只用作行情来源，以及纸面撮合的对象。币安实盘下单和 Lighter 都已经从仓库里删掉了。
+
+> **回放和纸面盘的成交都是模型假设。** 它们根据公开成交推断我们的挂单会不会成交，看不到真实的排队位置。回放里的盈亏只能用来比较和筛选，真实收益要靠小资金实盘验证。
 
 ## 现状一览
 
-| 启动配置 | 交易所行情 | 标的 | 单笔报价 | 手续费（maker / taker） |
-| --- | --- | --- | --- | --- |
-| `config.json`（默认） | Binance USDⓈ-M | `KORUUSDT` | 500 USDT | 0（含 RPI）/ 2.5 bps |
-| `config.grvt.json` | GRVT | `SOXLUSDT` | 100 USDT | −1 bps（返佣）/ 4.5 bps |
+| 部分 | 入口 | 状态 |
+| --- | --- | --- |
+| **GRVT 跨交易所做市** | `scripts/run_grvt_maker.py` | 影子模式已跑通；实盘需要两道开关加上密钥文件，还没下过真实订单 |
+| 行情录制 | `scripts/record_public_book.py`（币安）、`scripts/record_grvt_book.py`（GRVT） | 在用，一个币安币种一个进程 |
+| 网络和交易所延迟 | `scripts/measure_latency.py` | 在用，录制期间每 6 小时测一次 |
+| 跨交易所回放 | `scripts/replay_cross_venue.py` | 主要的筛选工具，和实盘共用同一套报价逻辑 |
+| 毒性因子检验 | `scripts/evaluate_maker_toxicity.py` | 有 5 个因子有效，待工作日数据确认 |
+| 纸面交易框架 | `main.py`，配置 `config.json`（币安）和 `config.grvt.json`（GRVT） | 只能跑纸面模式；配置写了 `"mode": "live"` 会直接拒绝启动 |
 
-- 两套配置都是**纸面模式**：模拟账户 10,000 USDT，不需要 API Key，也不会调用任何私有接口。
-- 策略默认是 GLFT 做市，被动挂单；Binance 上的标的支持 RPI 时，用 RPI 单挂。
-- 实盘模板在 `deploy/live/`，见下文[实盘](#实盘)。
+## 目前的研究结论
+
+| 方向 | 结论 |
+| --- | --- |
+| 在币安上被动做市（包括 RPI、高频因子、DeepLOB、扫单后的反转） | **亏钱**：不算手续费每笔就亏约 1 bps。信息在源头市场，我们排在队尾，又比别人慢 |
+| **在 GRVT 上做市、用币安定价** | **为正**：周末 43.5 小时里，XRP、PUMP、SUI、DOGE 在 6 段数据中段段为正，样本外的 14 小时也通过了。LDO 的成交在盘口上大多看不到对应挂单，回放结果可能偏乐观，暂不实盘 |
+| GRVT 返佣 | 0 级用户只有 **0.01 bps**（2026-03-23 起的费率），不是 1 bps。利润几乎全部来自价差和用币安定价。做市商计划 Basic 档有 0.3 bps，可以去申请 |
+| 挂单距离 | 固定 ±0.25 bps 最好。按波动率加宽、或者多档报价，都会让利润下降 |
+| 毒性因子 | GRVT 落后于公允价的程度、其他币的同步变动、本侧排队厚度最有用。适合按信号调整挂单量（样本外 +20–40%），不适合直接撤单 |
+| 延迟（东京） | 币安下单往返约 2.2 ms，盘口推送中位数约 2.7 ms；GRVT 下单往返中位数约 11.6 ms，偶尔会有 90–190 ms 的尖峰 |
 
 ## 快速开始
 
-在全新的 Ubuntu 主机上执行：
+在全新的 Ubuntu 主机上：
 
 ```bash
 sudo apt-get update && sudo apt-get install -y ca-certificates curl git
@@ -25,156 +38,132 @@ git clone https://github.com/bo0619/ChronosHFT.git && cd ChronosHFT
 bash scripts/bootstrap_aws.sh
 ```
 
-`bootstrap_aws.sh` 会在仓库内安装固定版本的 `uv` 和 CPython，按 `uv.lock` 还原依赖，再跑一次离线配置检查。它不会改动系统自带的 Python。
+`bootstrap_aws.sh` 会在仓库内安装固定版本的 `uv` 和 CPython，按 `uv.lock` 还原依赖，不动系统自带的 Python。
 
-先检查配置，再启动：
+## GRVT 做市
+
+### 影子模式（不需要密钥，不下单）
+
+```bash
+cp deploy/live/grvt-maker/grvt_maker.example.json config/local/grvt_maker.json
+.venv/bin/python scripts/run_grvt_maker.py --symbol XRPUSDT --minutes 30
+```
+
+行情是真实的，引擎会照常计算报价，把每一笔"本来要下的单"写进 `storage/live/grvt_maker/<币种>_<日期>.jsonl`。影子订单不会成交。
+
+### 实盘
+
+1. 开一个**专用的 GRVT 子账户**，里面只放可以承受亏损的钱。创建一个有交易权限的 API 密钥。
+2. 把 `deploy/live/grvt-maker/grvt_secrets.example.json` 复制成 `config/local/grvt_secrets.json`，在服务器上自己填入 API 密钥、子账户 ID 和签名私钥，然后执行 `chmod 600`。**不要提交，也不要发到任何地方。**
+3. 在 `config/local/grvt_maker.json` 里设置 `"live_enabled": true`，并调整挂单量和风控限额。
+4. 启动时加上 `--live`。
+
+| 情况 | 引擎的处理 |
+| --- | --- |
+| 币安或 GRVT 行情过期、币安行情延迟超过 250 ms | 撤掉全部挂单，恢复后自动继续 |
+| 持仓达到上限（默认 500 USDT） | 不再挂加仓那一侧 |
+| 当天亏损超过 `daily_loss_reduce_usd` | 只挂减仓方向的单，第二天恢复 |
+| 当天亏损超过 `daily_loss_halt_usd`、出现吃单成交、maker 费率异常、连续接口出错 | 全部撤单并停止，需要人工检查 |
+| 进程崩溃或断网 | GRVT 的断线自动撤单（cancel-on-disconnect）在 5 秒内撤掉所有挂单 |
+| 需要紧急停止 | `touch storage/live/KILL`，所有币种一起停 |
+
+一个进程只做一个币种。详细说明见 [deploy/live/grvt-maker/README.md](deploy/live/grvt-maker/README.md)。**不要在中国大陆运行实盘。**
+
+## 研究工具
+
+```bash
+# 录制：币安一个币种一个进程（多个热门币挤在同一个连接上会严重滞后）
+.venv/bin/python scripts/record_public_book.py --symbols XRPUSDT --hours 72 --out storage/research2/binance --ticker-price-changes-only
+.venv/bin/python scripts/record_grvt_book.py --symbols XRPUSDT,PUMPUSDT --hours 72 --out storage/research2/grvt
+
+# 跨交易所回放：按 GRVT 的真实费率（maker −0.01 bps）
+.venv/bin/python scripts/replay_cross_venue.py --grvt-dir storage/research2/grvt --binance-dir storage/research2/binance \
+    --symbols XRPUSDT --start 2026-10-17T03:46 --end 2026-10-18T23:10 --slice-hours 6 --notional 100 \
+    --anchor binance --half-spread-bps 0.25 --improve --skew-bps-per-lot 1 --max-inventory-lots 5 \
+    --cross skip --latency-samples storage/research2/latency/latency_20261018_220001.csv.gz --maker-fee-bps -0.01
+
+# 毒性因子：前一段训练、后一段检验
+.venv/bin/python scripts/evaluate_maker_toxicity.py --grvt-dir storage/research2/grvt --binance-dir storage/research2/binance \
+    --symbols XRPUSDT,PUMPUSDT --start 2026-10-17T03:46 --end 2026-10-18T23:10 --split 2026-10-18T09:10 \
+    --latency-samples storage/research2/latency/latency_20261018_220001.csv.gz
+```
+
+- **录制中的文件不要直接读。** 先在 HDF5 读锁下拷一份再分析，录制程序在被锁时会推迟写入。
+- 服务器内存只有约 4 GB，分析脚本用 `choom -n 1000` 运行，并按 `--slice-hours` 分段读取，避免录制进程被系统杀掉。
+- 回放的两种成交模型：`--cross skip` 偏乐观，`--cross fill` 偏悲观，真实情况在两者之间。目前的证据更接近 `skip`。
+
+## 纸面交易框架
 
 ```bash
 .venv/bin/python main.py --check-config
-.venv/bin/python main.py
+.venv/bin/python main.py                          # 币安纸面盘，读取 config.json
+.venv/bin/python main.py --config config.grvt.json
 ```
 
-- 不带参数时，读取的是 `config.json`（Binance）。
-- 要跑 GRVT，加 `--config config.grvt.json`。
-- **停止时只按一次 `Ctrl+C`**。程序会撤掉所有挂单、平掉持仓、确认账户是空仓后再退出。不要直接关终端或者强杀进程。
-
-### 看板
-
-看板只监听本机 `127.0.0.1:8765`，**不要在安全组里开放 8765 端口**。在你自己的电脑上建一条 SSH 隧道（Amazon Linux 用 `ec2-user`）：
-
-```bash
-ssh -N -L 8765:127.0.0.1:8765 ubuntu@EC2_PUBLIC_IP
-```
-
-然后在浏览器打开 `http://127.0.0.1:8765/`。页面顶部必须显示 `PAPER · LIVE DATA`；如果显示的是 `LIVE · REAL MONEY`，立刻停掉进程，检查 `execution.mode`。
-
-### 作为系统服务运行（可选）
-
-```bash
-sudo bash scripts/install_systemd_service.sh --start
-sudo journalctl -u chronoshft -f
-```
-
-- 服务读取的也是 `config.json`。
-- 安装脚本会设置**开机自启**。如果只想手动启动，执行 `sudo systemctl disable chronoshft`，以后用 `sudo systemctl start chronoshft` 手动启动。
-- 服务和手动运行的 `main.py` 不要同时开：两者会抢同一个看板端口。
-- 服务的资源上限、看门狗、各类队列的容量见 [docs/operations.md](docs/operations.md)。
-
-## 看板怎么看
-
-看板默认打开**交易**页；所有工程诊断（OMS、网关、事件队列、风控、RPI、时钟、日志等）都在**工程**页，一项没少。
-
-| 交易页区块 | 用来回答 |
-| --- | --- |
-| 健康灯 | 现在能不能正常做市？不能的话，一句话说明原因，可以跳到工程页的「交易诊断」看详情 |
-| 净盈亏 + PnL 曲线 | 从第一次运行到现在一共赚了还是亏了。重启不会清零，虚线标出每次重启 |
-| 报价面板 | 每个标的在不在报价、库存多少、我们的买卖价比最优价落后几个 tick |
-| 报价位置 | 本次运行中，报价时长占比、两边挂在最优价上的时间占比 |
-| 成交质量（markout） | 成交后价格走势是对我们有利还是不利，结果是否在统计上显著 |
-| 按标的盈亏 | 每个标的的成交额、净盈亏和净 bps |
-
-**判断"能不能赚钱"，看这两个跟下单规模无关的指标：**
-
-- **净盈亏 / 成交额（bps）**：每成交 1 万 USDT 赚或亏多少。仓位放大，USDT 盈亏会跟着放大，但这个 bps 不会变。
-- **成交质量的 t 值**：最长周期（30 秒）的 |t| < 2，说明结果和 0 没有显著差异，还不能下结论；t ≤ −2 说明被逆向选择（成交后价格对我们不利）。至少攒到几百笔成交再看。
-
-净盈亏的算法是：已实现盈亏 − 手续费（负数为返佣）+ 未平仓的浮动盈亏，不含资金费，因为纸面模拟不计算资金费。
-
-## 常用操作
-
-每次改完配置，都先跑一遍 `.venv/bin/python main.py --check-config`。
+- 模拟账户 10,000 USDT，不需要 API 密钥，不调用任何私有接口。默认策略是 GLFT 被动做市。
+- 停止时只按一次 `Ctrl+C`，程序会撤单、平仓、确认空仓后再退出。
+- 看板只监听 `127.0.0.1:8765`，通过 SSH 隧道访问：`ssh -N -L 8765:127.0.0.1:8765 ubuntu@EC2_PUBLIC_IP`，然后打开 `http://127.0.0.1:8765/`。
+- 作为系统服务运行：`sudo bash scripts/install_systemd_service.sh --start`（详见 [docs/operations.md](docs/operations.md)）。
 
 | 想做的事 | 改哪里 |
 | --- | --- |
-| 换交易标的 | Binance：`config/symbols.json`；GRVT：`config/grvt/symbols.json`。选标的可以参考 `scripts/rank_tradfi_symbols.py` 和 `scripts/list_binance_rpi_contracts.py` |
-| 调整下单规模和风控 | `config/strategy/capital_scaling.json` 里的 `target_order_notional`、`target_total_risk_notional`、`target_daily_loss`（都是相对 100 USDT 的参考值）。单笔、持仓、敞口、日亏损上限都由它们按比例推导，**不要**在别的文件里单独写这些上限 |
-| 改模拟手续费 | `config/paper_trade.json`（或交易所子目录下的同名文件）里的 `maker_fee` 和 `taker_fee`。maker 为负数表示返佣 |
-| 切换策略模型 | `config/strategy/core.json` 的 `primary_model`：`glft` 或 `avellaneda_stoikov`，改完重启 |
-| 打开或关闭 alpha | `config/strategy/glft.json` 的 `alpha.enabled`。注意这份文件三个交易所共用 |
-| 改成交质量的统计周期 | `config/strategy/glft.json` 的 `adaptive.markout.horizons_ms` |
+| 换交易标的 | 币安：`config/symbols.json`；GRVT：`config/grvt/symbols.json` |
+| 调整下单规模和风控 | `config/strategy/capital_scaling.json` 的 `target_order_notional`、`target_total_risk_notional`、`target_daily_loss` |
+| 改模拟手续费 | `config/paper_trade.json`，或交易所子目录下的同名文件（maker 为负数表示返佣） |
+| 切换策略模型 | `config/strategy/core.json` 的 `primary_model`：`glft` 或 `avellaneda_stoikov` |
 
-每份配置文件管什么、规模是怎么推导出来的，见 [docs/configuration.md](docs/configuration.md)。
-
-### 查询历史数据
-
-```bash
-.venv/bin/python scripts/query_paper_trades.py --summary              # 按运行、标的汇总成交
-.venv/bin/python scripts/query_paper_trades.py --limit 100            # 最近成交
-.venv/bin/python scripts/query_paper_trades.py --dataset markouts     # 成交后价格走势
-.venv/bin/python scripts/calibrate_paper_models.py --database storage/paper/trades.sqlite3 --output storage/paper/model-calibration.json
-```
-
-查询工具以只读方式打开数据库，服务运行时也可以放心使用。各张表的字段含义见 [docs/paper-trading.md](docs/paper-trading.md)。
+查询成交：`.venv/bin/python scripts/query_paper_trades.py --summary`。数据库表结构见 [docs/paper-trading.md](docs/paper-trading.md)。
 
 ## 数据放在哪里
 
 | 路径 | 内容 |
 | --- | --- |
-| `storage/paper/trades.sqlite3` | 历次运行、逐笔成交、订单事件、成交质量，以及账户、策略、行情的每秒采样。看板的累计盈亏就读这里 |
-| `storage/paper/oms_journal.jsonl` | OMS 审计日志（权威记录）。数据库可以从它重建，**不要单独删它** |
-| `storage/*.h5` | 原始盘口和成交录制（HDF5），供离线分析使用，例如 `scripts/evaluate_fair_value.py` |
-| `logs/hft_trading.log` | 运行日志，按 32 MiB 轮转，保留 7 份 |
-
-纸面模拟账户每次启动都从 10,000 USDT 重新开始。历史记录保存在上面这个数据库里，**删除 `storage/` 会清空全部历史盈亏**。
+| `storage/research2/` | 最近一轮录制：币安、GRVT 行情和延迟测试 |
+| `storage/live/grvt_maker/` | GRVT 做市的事件日志（影子模式和实盘都写这里） |
+| `storage/paper/` | 纸面交易数据库和 OMS 审计日志（审计日志是权威记录，不要单独删） |
+| `config/local/` | 本地配置和密钥文件，不进 git |
+| `logs/` | 纸面框架的运行日志 |
 
 ## 代码结构
 
 | 目录 | 内容 |
 | --- | --- |
-| `gateway/` | 交易所接入：`binance/`（实盘和纸面撮合）、`grvt/` |
-| `oms/` | 订单管理：下单闸门、对账、审计日志、纸面数据库 |
-| `risk/` | 风控、Kill Switch、交易所 DMS、独立风控子进程（sidecar） |
-| `strategy/` | GLFT、Avellaneda-Stoikov、自适应报价、模型就绪检查 |
-| `alpha/` | 公允价、预测器、markout 估计 |
-| `infrastructure/` | 启动编排、配置加载与校验、时钟、事件引擎、实盘配置闸门 |
-| `ui/`、`web/` | 本地看板（后端快照和单页前端） |
-| `data/`、`event/` | 合约参考数据、本地订单簿、行情录制、事件类型 |
-| `governance/` | 实盘审批签名、校准产物、部署与策略身份摘要、发布清单、依赖图约束 |
-| `scripts/` | 部署、查询、标定、离线证据工具 |
-| `config/`、`deploy/` | 纸面配置片段；实盘部署模板 |
-
-模块之间的边界见 [docs/configuration.md](docs/configuration.md#runtime-component-boundaries)；时钟和策略数学见 [docs/strategy-models.md](docs/strategy-models.md)。
-
-## 实盘
-
-仓库里跟踪的配置只用于纸面交易。实盘必须单独建一份配置，并通过离线检查（`scripts/check_live_canary_readiness.py`）；第一阶段是 RPI 校准 canary，需要离线签名的许可，单笔和亏损都有严格上限。
-
-- 模板：`deploy/live/rpi-200u/`（200 USDT 账户）、`deploy/live/koru-30u/`（30 USDT 账户交易 1 张 KORU）
-- 规则和证据链：[docs/live-deployment.md](docs/live-deployment.md)
-- 操作步骤：[docs/live-rpi-framework-validation-runbook.md](docs/live-rpi-framework-validation-runbook.md)
-
-**不要在中国大陆、或任何不允许使用 Binance 的地区运行实盘进程。**
+| `strategy/grvt_cross_maker.py` | GRVT 做市的报价规则（公允价、挂单价、库存偏移、改价规则），**回放和实盘共用** |
+| `strategy/grvt_maker_engine.py` | GRVT 做市实盘引擎：订单状态、持仓、盈亏、风控 |
+| `gateway/grvt/` | GRVT：订单签名、REST 下单、私有推送、盘口重建，以及纸面网关 |
+| `gateway/binance/` | 币安：bookTicker 行情接入、公开行情、纸面撮合（不再有实盘下单） |
+| `scripts/` | 录制、回放、因子检验、延迟测量、GRVT 做市运行程序、纸面查询和标定 |
+| `oms/`、`risk/`、`alpha/`、`infrastructure/`、`ui/`、`web/` | 纸面交易框架：订单管理、风控、公允价与预测、启动编排、本地看板 |
+| `config/`、`deploy/live/grvt-maker/` | 纸面配置片段；GRVT 做市的配置模板 |
 
 ## 开发与测试
 
 ```bash
 .tools/uv sync --frozen --dev
-.venv/bin/python -m ruff check .
 .venv/bin/python -m pytest -q
 ```
 
-- 依赖版本只在 `pyproject.toml` 里声明，`uv.lock` 锁定完整依赖。
-- `tests/` 在 `.gitignore` 里采用**白名单**方式：新建测试文件后，要在 `.gitignore` 中加一行 `!tests/<文件名>`，否则文件不会被提交。
+- 依赖只在 `pyproject.toml` 里声明，`uv.lock` 锁定完整依赖。
+- `tests/` 在 `.gitignore` 里是**白名单**：新建测试文件后，要在 `.gitignore` 里加一行 `!tests/<文件名>`，否则不会被提交。
+- 已知问题：`tests/test_governance_dependencies.py::test_production_dependency_graph_is_acyclic` 会扫描到 `.tools/` 里 uv 缓存的第三方包，导致失败，和项目代码无关。
 
 ## 文档
 
 | 文档 | 内容 |
 | --- | --- |
-| [docs/operations.md](docs/operations.md) | systemd 服务、内存、队列和磁盘上限，性能基准，开发工具链 |
-| [docs/paper-trading.md](docs/paper-trading.md) | 纸面模式的边界、执行数据库的表结构、查询和标定工具 |
-| [docs/configuration.md](docs/configuration.md) | 配置清单与片段、资金缩放、运行时组件边界、资源监控 |
-| [config/README.md](config/README.md) | 配置文件的格式和版本约定（v3） |
-| [docs/strategy-models.md](docs/strategy-models.md) | HFT 时钟、GLFT 和 A-S 模型、多资产 Riccati 扩展、自适应控制 |
-| [docs/live-deployment.md](docs/live-deployment.md) | 实盘 canary 检查、RPI 校准许可、离线证据工具 |
-| [docs/live-rpi-framework-validation-runbook.md](docs/live-rpi-framework-validation-runbook.md) | RPI 校准实盘的操作手册 |
-| [docs/sidecar-ipc-protocol.md](docs/sidecar-ipc-protocol.md) | 独立风控子进程的通信协议 |
+| [deploy/live/grvt-maker/README.md](deploy/live/grvt-maker/README.md) | GRVT 做市的上线步骤和风控 |
+| [docs/configuration.md](docs/configuration.md) | 纸面框架的配置清单、资金缩放、组件边界 |
+| [docs/paper-trading.md](docs/paper-trading.md) | 纸面模式的边界、数据库表结构、查询和标定工具 |
+| [docs/operations.md](docs/operations.md) | systemd 服务、资源上限、性能基准 |
+| [docs/strategy-models.md](docs/strategy-models.md) | GLFT、A-S 模型和自适应控制 |
+| [config/README.md](config/README.md) | 配置文件格式（v3） |
 
 ## 路线图
 
-- [x] 用真实公开行情做纸面交易，完全不调用私有接口
-- [x] 按原论文审计 GLFT 和 A-S 的实现
-- [x] 签名许可、独立设亏损上限的 RPI 校准 canary
-- [x] 看板重设计：交易页（跨重启累计盈亏、PnL 曲线、报价位置、成交质量）和工程页分开
-- [ ] 攒到足够的纸面成交，用成交质量和净 bps 判断策略是否有正的 edge
-- [ ] 部署并执行第一次真实的 RPI 校准，拿到真实的 `LIVE_BINANCE_RPI_ACK` 样本
-- [ ] 放大资金之前补齐模型缺口：微观结构波动率、真实的 RPI 排队和延迟模型、按毒性分组的 markout、参数漂移治理、行情和事件风控、多档报价
+- [x] 证明在币安上被动做市没有优势
+- [x] 跨交易所回放：GRVT 用币安定价，按真实费率计算
+- [x] GRVT 做市实盘程序（影子模式已跑通）
+- [x] 删除币安实盘下单和 Lighter
+- [ ] 用工作日数据确认 XRP、PUMP、SUI、DOGE 的优势和毒性因子
+- [ ] 小资金实盘：每次挂 100 USDT，验证成交、延迟和费率，然后再放大
+- [ ] 按毒性信号调整挂单量；扩大 GRVT 币种（加密货币、美股、商品）；录制 BTC、ETH 作为领先信号
