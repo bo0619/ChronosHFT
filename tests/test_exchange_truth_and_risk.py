@@ -48,27 +48,22 @@ if "websocket" not in sys.modules:
 from data.cache import data_cache
 from event.type import (
     AccountData,
-    CommandOutcome,
     Event,
     ExchangeAccountUpdate,
     ExchangeOrderUpdate,
     ExecutionPolicy,
-    GatewayState,
     LifecycleState,
     MarkPriceData,
     OMSCapabilityMode,
     OrderBook,
     OrderIntent,
-    OrderRequest,
     OrderStateSnapshot,
     OrderStatus,
     Side,
     EVENT_ACCOUNT_UPDATE,
     EVENT_EXCHANGE_ACCOUNT_UPDATE,
     EVENT_EXCHANGE_ORDER_UPDATE,
-    EVENT_SYSTEM_HEALTH,
 )
-from gateway.binance.gateway import BinanceGateway
 from infrastructure.watchdog import emit_event_engine_backlog_if_needed
 from oms.engine import OMS
 from oms.journal import OMSJournal
@@ -716,124 +711,6 @@ class ExchangeTruthTests(unittest.TestCase):
         finally:
             oms.stop()
 
-    def test_gateway_parses_user_stream_realized_and_account_updates(self):
-        engine = DummyEngine()
-        gateway = BinanceGateway.__new__(BinanceGateway)
-        gateway.event_engine = engine
-        gateway.gateway_name = "BINANCE"
-        gateway.global_sequence_id = 0
-        gateway.seq_lock = threading.Lock()
-        gateway.symbols = ["BTCUSDT"]
-
-        gateway._websocket_events().handle_user_update(
-            {
-                "e": "ORDER_TRADE_UPDATE",
-                "o": {
-                    "c": "oid-1",
-                    "i": 12345,
-                    "s": "BTCUSDT",
-                    "X": "PARTIALLY_FILLED",
-                    "l": "0.1",
-                    "L": "101.5",
-                    "z": "0.1",
-                    "T": 1000,
-                    "n": "0.02",
-                    "N": "USDT",
-                    "rp": "1.23",
-                    "m": True,
-                    "t": 987,
-                },
-            }
-        )
-        gateway._websocket_events().handle_account_update(
-            {
-                "e": "ACCOUNT_UPDATE",
-                "E": 2000,
-                "a": {
-                    "m": "ORDER",
-                    "B": [{"a": "USDT", "wb": "980.5", "cw": "950.0"}, {"a": "USDC", "wb": "210.0", "cw": "205.5"}],
-                    "P": [{"s": "BTCUSDT", "pa": "0.1", "ep": "101.5", "up": "1.23"}],
-                },
-            }
-        )
-
-        order_event = engine.events[0]
-        account_event = engine.events[1]
-        self.assertEqual(order_event.data.realized_pnl, 1.23)
-        self.assertEqual(order_event.data.commission, 0.02)
-        self.assertTrue(order_event.data.is_maker)
-        self.assertEqual(order_event.data.trade_id, 987)
-        self.assertEqual(order_event.data.seq, 0)
-        self.assertEqual(account_event.data.wallet_balance, 980.5)
-        self.assertIsNone(account_event.data.available_balance)
-        self.assertEqual(account_event.data.balances["USDT"]["wallet_balance"], 980.5)
-        self.assertIsNone(account_event.data.balances["USDC"]["available_balance"])
-        self.assertEqual(
-            account_event.data.balances["USDC"]["cross_wallet_balance"],
-            205.5,
-        )
-        self.assertIn("BTCUSDT", account_event.data.positions)
-
-    def test_gateway_ws_parse_failure_emits_system_health_event(self):
-        engine = DummyEngine()
-        gateway = BinanceGateway.__new__(BinanceGateway)
-        gateway.event_engine = engine
-        gateway.gateway_name = "BINANCE"
-        gateway.state = GatewayState.READY
-        gateway._book_lock = threading.RLock()
-        gateway._order_books().generation = 0
-        gateway.active = True
-        gateway._connections().ws = None
-
-        gateway.on_ws_message("{bad-json")
-
-        self.assertEqual(engine.events[-1].type, EVENT_SYSTEM_HEALTH)
-        self.assertIn("WS_PARSE_ERROR", engine.events[-1].data)
-
-    def test_gateway_nonfinite_mark_faults_transport_before_publish(self):
-        engine = DummyEngine()
-        gateway = BinanceGateway.__new__(BinanceGateway)
-        gateway.event_engine = engine
-        gateway.gateway_name = "BINANCE"
-        gateway.state = GatewayState.READY
-        gateway._book_lock = threading.RLock()
-        gateway._order_books().generation = 0
-        gateway.active = True
-        gateway._connections().ws = None
-        gateway.latency_stats = {}
-
-        gateway.on_ws_message(
-            json.dumps(
-                {
-                    "stream": "btcusdt@markPrice@1s",
-                    "data": {
-                        "E": 2_000,
-                        "T": 3_000,
-                        "s": "BTCUSDT",
-                        "p": "NaN",
-                        "i": "100",
-                        "r": "0.0001",
-                    },
-                }
-            )
-        )
-
-        self.assertEqual(gateway.state, GatewayState.ERROR)
-        self.assertFalse(gateway.active)
-        self.assertFalse(
-            any(
-                event.type == "eMarkPrice"
-                for event in engine.events
-            )
-        )
-        self.assertTrue(
-            any(
-                event.type == EVENT_SYSTEM_HEALTH
-                and "WS_HANDLER_FAILURE" in event.data
-                for event in engine.events
-            )
-        )
-
     def test_market_cache_rejects_nonfinite_mark_without_refreshing_age(self):
         symbol = "NANUSDT"
         mark = MarkPriceData(
@@ -849,138 +726,6 @@ class ExchangeTruthTests(unittest.TestCase):
         snapshot = data_cache.get_risk_snapshot(symbol)
         self.assertEqual(snapshot["mark_price"], 0.0)
         self.assertIsNone(snapshot["mark_age_ms"])
-
-    def test_gateway_classifies_missing_submit_response_as_unknown(self):
-        gateway = BinanceGateway.__new__(BinanceGateway)
-        gateway.gateway_name = "BINANCE"
-        gateway.require_healthy_clock = False
-        gateway._book_lock = threading.RLock()
-        gateway.active = True
-        gateway.state = GatewayState.READY
-        gateway._order_books().resyncing = set()
-        gateway._order_books().buffers = {"BTCUSDT": None}
-        gateway.rest = types.SimpleNamespace(
-            new_order=lambda _req, _client_oid, **_kwargs: None
-        )
-        request = OrderRequest(
-            symbol="BTCUSDT",
-            price=100.0,
-            volume=1.0,
-            side="BUY",
-        )
-
-        result = gateway.send_order(request, "oid-timeout")
-
-        self.assertEqual(result.outcome, CommandOutcome.UNKNOWN)
-        self.assertEqual(result.exchange_oid, "")
-
-    def test_gateway_classifies_binance_unknown_execution_as_unknown(self):
-        gateway = BinanceGateway.__new__(BinanceGateway)
-        gateway.gateway_name = "BINANCE"
-        gateway.require_healthy_clock = False
-        gateway._book_lock = threading.RLock()
-        gateway.active = True
-        gateway.state = GatewayState.READY
-        gateway._order_books().resyncing = set()
-        gateway._order_books().buffers = {"BTCUSDT": None}
-        gateway.rest = types.SimpleNamespace(
-            new_order=lambda _req, _client_oid, **_kwargs: DummyResponse(
-                {"code": -1006, "msg": "Unexpected response from message bus"},
-                status_code=400,
-            )
-        )
-        request = OrderRequest(
-            symbol="BTCUSDT",
-            price=100.0,
-            volume=1.0,
-            side="BUY",
-        )
-
-        result = gateway.send_order(request, "oid-unknown-execution")
-
-        self.assertEqual(result.outcome, CommandOutcome.UNKNOWN)
-        self.assertEqual(result.error_code, "-1006")
-
-    @patch(
-        "gateway.binance.gateway.time_service.health_snapshot",
-        return_value={
-            "ready": False,
-            "state": "degraded",
-            "reason": "clock uncertainty",
-        },
-    )
-    def test_gateway_clock_gate_is_final_and_allows_reduce_only(
-        self,
-        _clock_health,
-    ):
-        calls = []
-        gateway = BinanceGateway.__new__(BinanceGateway)
-        gateway.gateway_name = "BINANCE"
-        gateway.require_healthy_clock = True
-        gateway._book_lock = threading.RLock()
-        gateway.active = True
-        gateway.state = GatewayState.READY
-        gateway._order_books().resyncing = set()
-        gateway._order_books().buffers = {"BTCUSDT": None}
-        gateway.rest = types.SimpleNamespace(
-            new_order=lambda req, client_oid, **_kwargs: calls.append(
-                (req, client_oid)
-            )
-        )
-        opening = OrderRequest(
-            symbol="BTCUSDT",
-            price=100.0,
-            volume=1.0,
-            side="BUY",
-        )
-        reducing = OrderRequest(
-            symbol="BTCUSDT",
-            price=100.0,
-            volume=1.0,
-            side="SELL",
-            reduce_only=True,
-        )
-
-        rejected = gateway.send_order(opening, "clock-rejected")
-        reduced = gateway.send_order(reducing, "clock-reduce")
-
-        self.assertEqual(rejected.outcome, CommandOutcome.REJECTED)
-        self.assertEqual(rejected.error_code, "CLOCK_UNHEALTHY")
-        self.assertEqual(reduced.outcome, CommandOutcome.UNKNOWN)
-        self.assertEqual(len(calls), 1)
-
-    def test_gateway_keeps_position_only_account_update(self):
-        engine = DummyEngine()
-        gateway = BinanceGateway.__new__(BinanceGateway)
-        gateway.event_engine = engine
-        gateway.gateway_name = "BINANCE"
-        gateway.symbols = ["BTCUSDT"]
-
-        gateway._websocket_events().handle_account_update(
-            {
-                "e": "ACCOUNT_UPDATE",
-                "T": 3000,
-                "a": {
-                    "m": "MARGIN_TYPE_CHANGE",
-                    "B": [],
-                    "P": [
-                        {
-                            "s": "BTCUSDT",
-                            "pa": "0.25",
-                            "ep": "102.0",
-                            "up": "0.5",
-                        }
-                    ],
-                },
-            }
-        )
-
-        self.assertEqual(len(engine.events), 1)
-        account_update = engine.events[0].data
-        self.assertEqual(account_update.asset, "")
-        self.assertEqual(account_update.balances, {})
-        self.assertEqual(account_update.event_time, 3.0)
-        self.assertEqual(account_update.positions["BTCUSDT"]["volume"], 0.25)
 
     def test_position_only_account_update_does_not_overwrite_balance(self):
         engine = DummyEngine()

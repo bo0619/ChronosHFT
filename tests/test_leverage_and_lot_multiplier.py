@@ -3,7 +3,7 @@ import sys
 import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 if "requests" not in sys.modules:
     requests_module = types.ModuleType("requests")
@@ -53,8 +53,6 @@ if "websocket" not in sys.modules:
     websocket_module.WebSocketApp = WebSocketApp
     sys.modules["websocket"] = websocket_module
 
-from event.type import LifecycleState
-from gateway.binance.gateway import BinanceGateway
 from infrastructure.config_scaling import (
     CASH_FLOW_TRUTH_DEFAULTS,
     INDEPENDENT_RISK_SUPERVISOR_DEFAULTS,
@@ -89,37 +87,6 @@ class DummyEngine:
 
 class DummyGateway:
     def cancel_all_orders(self, symbol):
-        return None
-
-
-class DummyOMS:
-    def __init__(self, leverage=5, max_order_notional=200.0):
-        self.state = LifecycleState.LIVE
-        self.config = {
-            "account": {"leverage": leverage, "margin_type": "ISOLATED", "position_mode": "ONE_WAY"},
-            "risk": {"limits": {"max_order_notional": max_order_notional}},
-            "backtest": {
-                "maker_fee": 0.0,
-                "taker_fee": 0.0,
-            },
-        }
-        self.exposure = SimpleNamespace(net_positions={})
-
-    def cancel_order(self, client_oid):
-        return None
-
-    def cancel_all_orders(self, symbol):
-        return None
-
-
-class DummySession:
-    def __init__(self):
-        self.headers = {}
-
-    def mount(self, *args, **kwargs):
-        return None
-
-    def close(self):
         return None
 
 
@@ -740,42 +707,6 @@ class LeverageAndLotMultiplierTests(unittest.TestCase):
             OMS(DummyEngine(), gateway, config)
 
         self.assertFalse(hasattr(gateway, "target_position_mode"))
-
-    def test_gateway_refuses_hedge_mode_before_exchange_configuration(self):
-        gateway = BinanceGateway.__new__(BinanceGateway)
-        gateway.gateway_name = "BINANCE"
-        gateway.target_position_mode = "HEDGE"
-        gateway.target_margin_type = "ISOLATED"
-        gateway.target_leverage = 10
-        gateway.symbols = ["BTCUSDT"]
-        gateway.rest = MagicMock()
-
-        self.assertFalse(gateway._apply_account_trading_configuration())
-        gateway.rest.set_position_mode.assert_not_called()
-        gateway.rest.set_margin_type.assert_not_called()
-        gateway.rest.set_leverage.assert_not_called()
-
-    def test_gateway_connect_applies_target_leverage_to_each_symbol(self):
-        with patch("gateway.binance.gateway.requests.Session", return_value=DummySession()), patch(
-            "gateway.binance.gateway.BinanceRestApi"
-        ) as rest_cls, patch("gateway.binance.gateway.BinanceWsApi") as ws_cls:
-            rest = rest_cls.return_value
-            rest.create_listen_key.return_value = None
-            ws = ws_cls.return_value
-            ws.start_market_stream = MagicMock()
-
-            gateway = BinanceGateway(DummyEngine(), "key", "secret", testnet=True)
-            gateway.target_leverage = 9
-            gateway.target_margin_type = "ISOLATED"
-            gateway.target_position_mode = "ONE_WAY"
-            gateway.connect(["BTCUSDT", "ETHUSDT"])
-
-            rest.set_position_mode.assert_called_once_with("ONE_WAY")
-            self.assertEqual(rest.set_leverage.call_args_list, [call("BTCUSDT", 9), call("ETHUSDT", 9)])
-            self.assertEqual(rest.set_margin_type.call_args_list, [call("BTCUSDT", "ISOLATED"), call("ETHUSDT", "ISOLATED")])
-            ws.start_market_stream.assert_called_once_with(["BTCUSDT", "ETHUSDT"])
-            gateway.close()
-
 
 class PaperTradeConfigTests(unittest.TestCase):
     def test_tracked_paper_profile_uses_inventory_bounded_10k_sizing(self):

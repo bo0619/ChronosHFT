@@ -1850,7 +1850,7 @@ class PaperRuntimeIntegrationTests(unittest.TestCase):
     def tearDown(self):
         self.session_patch.stop()
 
-    def test_gateway_factory_scrubs_credentials_and_never_builds_live_components(self):
+    def test_gateway_factory_scrubs_credentials(self):
         config = apply_paper_trade_mode(
             {
                 **make_gateway_config(),
@@ -1859,15 +1859,11 @@ class PaperRuntimeIntegrationTests(unittest.TestCase):
             }
         )
         engine = DispatchingEngine()
-        with patch("main.BinanceGateway", side_effect=AssertionError("live gateway built")), patch(
-            "main.BinanceTruthSnapshotProvider",
-            side_effect=AssertionError("live truth provider built"),
-        ):
-            gateway, truth = build_gateway_bundle(
-                engine,
-                config,
-                config["system"]["market_data"],
-            )
+        gateway, truth = build_gateway_bundle(
+            engine,
+            config,
+            config["system"]["market_data"],
+        )
         try:
             self.assertIsInstance(gateway, BinancePaperGateway)
             self.assertIsInstance(truth, PaperTruthSnapshotProvider)
@@ -1878,94 +1874,10 @@ class PaperRuntimeIntegrationTests(unittest.TestCase):
         finally:
             gateway.rest.close()
 
-    def test_live_gateway_factory_shares_one_host_rate_limit_budget(self):
-        config = {
-            "execution": {"mode": "live"},
-            "api_key": "main-key",
-            "api_secret": "main-secret",
-            "symbols": ["BTCUSDT"],
-            "system": {
-                "market_data": {"environment": "production"},
-                "binance_rest_rate_limit": {
-                    "enabled": True,
-                    "request_weight_limit": 2400,
-                    "trading_reserve": 300,
-                    "emergency_reserve": 300,
-                    "full_open_orders_audit_interval_sec": 45.0,
-                }
-            },
-        }
-        engine = DispatchingEngine()
-        shared_budget = object()
-        gateway_instance = object()
-        truth_instance = object()
-
-        with (
-            patch(
-                "main.BinanceRateLimitBudget.from_config",
-                return_value=shared_budget,
-            ) as budget_factory,
-            patch(
-                "main.BinanceGateway",
-                return_value=gateway_instance,
-            ) as gateway_type,
-            patch(
-                "main.BinanceTruthSnapshotProvider",
-                return_value=truth_instance,
-            ) as truth_type,
-        ):
-            gateway, truth = build_gateway_bundle(
-                engine,
-                config,
-                {"environment": "production"},
-            )
-
-        self.assertIs(gateway, gateway_instance)
-        self.assertIs(truth, truth_instance)
-        budget_factory.assert_called_once_with(
-            config["system"]["binance_rest_rate_limit"]
-        )
-        self.assertIs(
-            gateway_type.call_args.kwargs["rate_limit_budget"],
-            shared_budget,
-        )
-        self.assertIs(
-            truth_type.call_args.kwargs["rate_limit_budget"],
-            shared_budget,
-        )
-        self.assertEqual(
-            truth_type.call_args.kwargs[
-                "full_open_orders_audit_interval_sec"
-            ],
-            45.0,
-        )
-
-    def test_live_gateway_factory_rejects_disabled_host_budget(self):
-        config = {
-            "execution": {"mode": "live"},
-            "api_key": "main-key",
-            "api_secret": "main-secret",
-            "symbols": ["BTCUSDT"],
-            "system": {
-                "market_data": {"environment": "production"},
-                "binance_rest_rate_limit": {"enabled": False}
-            },
-        }
-
-        with (
-            patch("main.BinanceGateway") as gateway_type,
-            self.assertRaisesRegex(
-                RuntimeError,
-                "cannot be disabled",
-            ),
-        ):
-            build_gateway_bundle(
-                DispatchingEngine(),
-                config,
-                {"environment": "production"},
-            )
-
-        gateway_type.assert_not_called()
+    def test_live_mode_is_refused(self):
+        config = {"execution": {"mode": "live"}, "api_key": "k", "api_secret": "s", "symbols": ["BTCUSDT"]}
+        with self.assertRaisesRegex(RuntimeError, "Binance live trading has been removed"):
+            build_gateway_bundle(DispatchingEngine(), config, {"environment": "production"})
 
     def test_gateway_shutdown_cancellations_are_drainable_before_oms_stop(self):
         engine = EventEngine()

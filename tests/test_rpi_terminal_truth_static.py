@@ -25,8 +25,6 @@ OMS_IMPLEMENTATION = (
     ENGINE,
 )
 BASE_GATEWAY = ROOT / "gateway" / "base_gateway.py"
-REST_API = ROOT / "gateway" / "binance" / "rest_api.py"
-LIVE_GATEWAY = ROOT / "gateway" / "binance" / "gateway.py"
 PAPER_GATEWAY = ROOT / "gateway" / "binance" / "paper_gateway.py"
 SYSTEM_HEALTH = ROOT / "infrastructure" / "system_health.py"
 RUNTIME_BINDINGS = ROOT / "infrastructure" / "runtime_bindings.py"
@@ -507,53 +505,6 @@ def test_recovered_and_internal_orders_invalidate_expired_terminal_proof():
     internal = _function(tree, "_submit_internal_order")
     assert _terminal_invalidation_count(recovered) == 1
     assert _terminal_invalidation_count(internal) == 1
-
-
-def test_transport_guard_runs_at_the_actual_rest_send_boundary():
-    rest_source = REST_API.read_text(encoding="utf-8")
-    rest_tree = ast.parse(rest_source)
-    request = _function(rest_tree, "request")
-    new_order = _function(rest_tree, "new_order")
-
-    guard_calls = [
-        node
-        for node in ast.walk(request)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_run_pre_send_guard"
-    ]
-    transport_calls = [
-        node
-        for node in ast.walk(request)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "send"
-        and isinstance(node.func.value, ast.Attribute)
-        and node.func.value.attr == "session"
-    ]
-    assert len(guard_calls) == 1
-    assert len(transport_calls) == 1
-    assert guard_calls[0].lineno < transport_calls[0].lineno
-
-    new_order_source = _source_for(new_order, rest_source)
-    assert 'self.request(\n            "POST",\n            EP_ORDER' in new_order_source
-    assert "pre_send_guard=tuple(guards)" in new_order_source
-    assert "max_attempts=1" in new_order_source
-
-    live_source = LIVE_GATEWAY.read_text(encoding="utf-8")
-    live_send = _function(ast.parse(live_source), "send_order")
-    assert "pre_send_guard=pre_send_guard" in _source_for(
-        live_send,
-        live_source,
-    )
-    assert "supports_outbound_send_guard = True" in live_source
-    assert "supports_outbound_send_guard = True" in PAPER_GATEWAY.read_text(
-        encoding="utf-8"
-    )
-
-    base_source = BASE_GATEWAY.read_text(encoding="utf-8")
-    base_send = _function(ast.parse(base_source), "send_order")
-    assert any(argument.arg == "pre_send_guard" for argument in base_send.args.kwonlyargs)
 
 
 def test_expiry_and_terminal_enforcement_wait_for_submits_to_settle():

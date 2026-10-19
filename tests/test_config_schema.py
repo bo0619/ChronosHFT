@@ -268,7 +268,7 @@ def test_paper_trade_maker_fee_accepts_rebate_within_floor():
 def test_grvt_manifest_loads_with_maker_rebate():
     config = load_root_config(REPOSITORY_ROOT / "config.grvt.json")
 
-    assert config["paper_trade"]["maker_fee"] == -0.0001
+    assert config["paper_trade"]["maker_fee"] == -0.000001  # GRVT Level 1: 0.01 bps rebate
 
 
 @pytest.mark.parametrize(

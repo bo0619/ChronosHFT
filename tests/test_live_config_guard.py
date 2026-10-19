@@ -133,7 +133,7 @@ def write_live_config_manifest(path, config):
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-LIVE_TEMPLATE_DIR = REPOSITORY_ROOT / "deploy" / "live" / "rpi-200u"
+LIVE_TEMPLATE_DIR = REPOSITORY_ROOT / "tests" / "fixtures" / "live_rpi_200u"
 LIVE_TEMPLATE_PLACEHOLDERS = {
     "EDIT-ME-rpi-200u-001": "rpi-200u-test-001",
     "EDIT-ME-account-scope": "account-scope-test-001",

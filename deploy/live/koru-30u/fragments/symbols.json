@@ -1,8 +1,0 @@
-{
-  "$schema": "chronoshft.config_fragment.v3",
-  "fragment": "symbols",
-  "version": 1,
-  "symbols": [
-    "KORUUSDT"
-  ]
-}

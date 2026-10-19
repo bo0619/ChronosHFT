@@ -12,7 +12,6 @@ MODULE_LINE_BUDGETS = {
     "risk/manager.py": 850,
     "risk/independent_supervisor.py": 150,
     "risk/sidecar_core.py": 850,
-    "gateway/binance/gateway.py": 875,
     "gateway/binance/paper_gateway.py": 2641,
     "oms/reconciler.py": 875,
     "oms/lifecycle_controller.py": 550,

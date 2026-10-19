@@ -51,12 +51,6 @@ tests/*
 !tests/test_oms_risk_port.py
 !tests/test_paper_gateway.py
 !tests/test_paper_book_sync.py
-!tests/test_binance_book_controller.py
-!tests/test_binance_account_stream.py
-!tests/test_binance_market_stream.py
-!tests/test_binance_user_stream.py
-!tests/test_binance_connection_controller.py
-!tests/test_binance_rest_gateway.py
 !tests/test_sidecar_control_state.py
 !tests/test_sidecar_observation.py
 !tests/test_paper_ledger.py
@@ -79,7 +73,6 @@ tests/*
 !tests/test_config_schema.py
 !tests/test_rpi_policy.py
 !tests/test_rpi_calibration_permit.py
-!tests/test_rpi_calibration_permit_authoring.py
 !tests/test_commission_truth.py
 !tests/test_runtime_commission_truth.py
 !tests/test_deployment_loss.py
@@ -87,16 +80,12 @@ tests/*
 !tests/test_quote_math.py
 !tests/test_rpi_intensity.py
 !tests/test_funding_guard.py
-!tests/test_live_canary_readiness.py
 !tests/test_rpi_calibration_artifact.py
 !tests/test_rpi_calibration_artifact_seal.py
-!tests/test_rest_metrics.py
 !tests/test_live_evidence.py
 !tests/test_oos_reconstruction.py
 !tests/test_external_alerts.py
-!tests/test_binance_account_configuration_verify_only.py
 !tests/test_binance_rate_limit_budget.py
-!tests/test_binance_truth_provider.py
 !tests/test_binance_ws_routes.py
 !tests/test_binance_sidecar_clock.py
 !tests/test_binance_sidecar_settings.py
@@ -112,7 +101,6 @@ tests/*
 !tests/test_grvt_maker_engine.py
 !tests/test_grvt_maker_runner.py
 !tests/test_evaluate_maker_toxicity.py
-!tests/test_live_canary_evidence_collector.py
 !tests/test_rpi_terminal_truth_static.py
 !tests/test_systemd_deployment.py
 !tests/test_systemd_watchdog.py

@@ -7,8 +7,9 @@ from collections.abc import Mapping
 VENUE_BINANCE = "binance"
 VENUE_GRVT = "grvt"
 SUPPORTED_VENUES = (VENUE_BINANCE, VENUE_GRVT)
-# Venues whose Live gateway exists; the rest are Paper-only for now.
-LIVE_VENUES = (VENUE_BINANCE,)
+# Venues whose Live gateway exists in this runtime: none (Binance live was
+# removed; GRVT trades through scripts/run_grvt_maker.py).
+LIVE_VENUES: tuple[str, ...] = ()
 
 
 def configured_venue(config: Mapping | None) -> str:

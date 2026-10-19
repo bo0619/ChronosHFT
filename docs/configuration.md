@@ -67,13 +67,6 @@ split into independently testable components:
 | `infrastructure/runtime_failure_policy.py` | Fail-closed callbacks for clock, event-engine, strategy, and evidence failures |
 | `infrastructure/runtime_shutdown.py` | Ordered quiesce, account-truth verification, transport drain, and durable shutdown coordinator |
 | `gateway/base_gateway.py` | Exchange-facing command and query contract |
-| `gateway/binance/gateway.py` | Stable live Binance facade and controller composition root |
-| `gateway/binance/connection_controller.py` | Transport lifecycle, generation ownership, connect/recovery, and shutdown state |
-| `gateway/binance/user_stream.py` | Listen-key generation, keepalive thread, and invalidation lifecycle |
-| `gateway/binance/book_controller.py` | Local order-book ownership, delta buffering, and bounded recovery |
-| `gateway/binance/websocket_dispatcher.py` | WebSocket decoding, event classification, normalization, and ingress-freshness checks |
-| `gateway/binance/rest_gateway.py` | Order/query REST adaptation and failure classification |
-| `gateway/binance/account_configuration.py` | Leverage, margin type, and position-mode verification |
 | `gateway/binance/paper_gateway.py` | Public transport, admission barrier, ledger, and event publication facade |
 | `gateway/binance/paper_state.py` | Paper order, position, and worker-command state records |
 | `gateway/binance/paper_book_sync.py` | Public depth snapshot/delta synchronization, generation fencing, and bounded gap recovery |

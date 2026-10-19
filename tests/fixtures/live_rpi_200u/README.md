@@ -1,23 +1,4 @@
-# 30 USDT KORUUSDT RPI calibration deployment
-
-Copy of `../rpi-200u/`, sized for a 30 USDT USD-M Futures account trading one
-KORUUSDT contract (about 17 USDT at the time of writing) per order.
-
-Envelope: 21 USDT deployed capital (70% of equity); 20 USDT order, position
-and gross notional; 17 USDT target order notional; 1.0 USDT deployment loss;
-0.5 USDT daily loss; one active order; 1x isolated one-way; RPI only.
-The calibration hard caps in `infrastructure/live_config_guard.py` and
-`infrastructure/rpi_calibration_permit.py` were raised for this profile.
-
-If KORU's price moves above 20 USDT, one contract no longer fits the 20 USDT
-order cap; re-check the price before signing.
-
-Sign the permit with order notional inside the caps, for example:
-`--min-order-notional-usdt 15 --max-order-notional-usdt 20
---max-calibration-loss-usdt 1.0`. KORU's tick is about 6 bps, so pick
-fixed depths such as 3, 9 and 15 bps.
-
-The rest of the procedure is the same as below.
+> Test fixture for `tests/test_live_config_guard.py` (the former `deploy/live/rpi-200u/` template). Binance live trading was removed from ChronosHFT; this is not a deployment.
 
 # 200 USDT RPI calibration deployment template
 
@@ -43,8 +24,8 @@ with `--max-calibration-loss-usdt` no higher than 0.4.
    Live requires the working directory to equal the config directory.
 2. Replace every placeholder in `live.*.json` and
    `fragments/**/*.{rpi-calibration,canary}.json`:
-   - `EDIT-ME-koru-30u-001`: one fresh deployment ID, identical in both profiles.
-   - `KORUUSDT`: the RPI symbol you chose (in `fragments/symbols.json`).
+   - `EDIT-ME-rpi-200u-001`: one fresh deployment ID, identical in both profiles.
+   - `EDITMEUSDT`: the RPI symbol you chose (in `fragments/symbols.json`).
      Its exchange minimum notional must be at most 5 USDT.
    - `EDIT-ME-account-scope` and `EDIT-ME-state-genesis` in
      `fragments/risk/independent_supervisor.*.json`, and set
@@ -52,7 +33,7 @@ with `--max-calibration-loss-usdt` no higher than 0.4.
      epoch milliseconds (the template holds 2026-10-07T00:00:00Z).
 3. Generate the offline signing key and paste its public signer entry into
    `live_launch.calibration_permit_trusted_signers` in
-   `live.rpi-calibration.json` (see `docs/live-rpi-framework-validation-runbook.md`).
+   `live.rpi-calibration.json` (the runbook was removed with Binance live trading).
 4. Set credentials only as environment variables on the deployment host:
    `BINANCE_API_KEY`, `BINANCE_API_SECRET`, `BINANCE_RISK_API_KEY`,
    `BINANCE_RISK_API_SECRET`, `CHRONOSHFT_ALERT_WEBHOOK_URL`. The Live schema

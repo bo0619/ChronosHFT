@@ -11,8 +11,6 @@ from data.recorder import DataRecorder
 from data.ref_data import ref_data_manager
 from event.engine import EventEngine
 from event.type import OMSCapabilityMode
-from gateway.binance.gateway import BinanceGateway
-from gateway.binance.truth_provider import BinanceTruthSnapshotProvider
 from governance import calibration_artifact as calibration_artifact_port
 from governance.contracts import is_testnet_environment
 from infrastructure.admin_control import (
@@ -21,7 +19,6 @@ from infrastructure.admin_control import (
     load_admin_control_config,
     submit_admin_command,
 )
-from infrastructure.binance_rate_limit_budget import BinanceRateLimitBudget
 from infrastructure.commission_truth import parse_commission_rate_payload
 from infrastructure.config_scaling import load_root_config
 from infrastructure.external_alerts import ExternalAlertService
@@ -118,7 +115,14 @@ def parse_cli_args(argv=None):
 
 
 def load_config(path="config.json"):
-    return load_root_config(path, calibration_artifact_port=calibration_artifact_port)
+    config = load_root_config(path, calibration_artifact_port=calibration_artifact_port)
+    mode = str((config.get("execution", {}) or {}).get("mode", "") or "").strip().lower()
+    if mode == "live":
+        raise RuntimeError(
+            f"{path} asks for live trading; Binance live trading has been removed "
+            "from ChronosHFT (Paper mode only; GRVT trades through scripts/run_grvt_maker.py)"
+        )
+    return config
 
 
 def bootstrap_or_rearm(
@@ -650,59 +654,26 @@ def synchronize_commission_config(gateway, config, symbols):
 
 
 def build_gateway_bundle(engine, config, market_data_config):
-    """Build mutually exclusive live or paper exchange capabilities."""
-    if is_paper_trade(config):
-        from gateway.binance.paper_gateway import PaperTruthSnapshotProvider
-        from gateway.paper import paper_gateway_type
-
-        paper_config = apply_paper_trade_mode(config)
-        paper_market_data_config = paper_config.get("system", {}).get(
-            "market_data",
-            market_data_config,
-        )
-        gateway = paper_gateway_type(config)(
-            engine,
-            paper_config,
-            paper_market_data_config,
-        )
-        return gateway, PaperTruthSnapshotProvider(gateway)
-
-    rate_limit_config = dict(
-        config.get("system", {}).get("binance_rest_rate_limit", {}) or {}
-    )
-    if rate_limit_config.get("enabled", True) is not True:
+    """Build the Paper exchange capabilities; Binance live trading was removed."""
+    if not is_paper_trade(config):
         raise RuntimeError(
-            "Live Binance REST rate-limit coordination cannot be disabled"
+            "Binance live trading has been removed from ChronosHFT; "
+            "run Paper mode, or the GRVT maker (scripts/run_grvt_maker.py)"
         )
-    rate_limit_budget = BinanceRateLimitBudget.from_config(rate_limit_config)
-    full_open_orders_audit_interval_sec = float(
-        rate_limit_config.get(
-            "full_open_orders_audit_interval_sec",
-            60.0,
-        )
-        or 60.0
-    )
+    from gateway.binance.paper_gateway import PaperTruthSnapshotProvider
+    from gateway.paper import paper_gateway_type
 
-    testnet = is_testnet_environment(config)
-    gateway = BinanceGateway(
+    paper_config = apply_paper_trade_mode(config)
+    paper_market_data_config = paper_config.get("system", {}).get(
+        "market_data",
+        market_data_config,
+    )
+    gateway = paper_gateway_type(config)(
         engine,
-        config["api_key"],
-        config["api_secret"],
-        testnet=testnet,
-        market_data_config=market_data_config,
-        rate_limit_budget=rate_limit_budget,
+        paper_config,
+        paper_market_data_config,
     )
-    truth_provider = BinanceTruthSnapshotProvider(
-        config["api_key"],
-        config["api_secret"],
-        testnet=testnet,
-        rate_limit_budget=rate_limit_budget,
-        symbols=config.get("symbols", ()),
-        full_open_orders_audit_interval_sec=(
-            full_open_orders_audit_interval_sec
-        ),
-    )
-    return gateway, truth_provider
+    return gateway, PaperTruthSnapshotProvider(gateway)
 
 
 def start_local_dashboard(
