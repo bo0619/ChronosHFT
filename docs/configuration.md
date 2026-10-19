@@ -7,11 +7,10 @@ responsibility. The manifest and fragment schema contract is described in
 
 ## Manifests and fragments
 
-`config.json` (Binance), `config.grvt.json` and `config.lighter.json` are
+`config.json` (Binance) and `config.grvt.json` are
 tracked Paper-only manifests, not runtime settings buckets. Each `includes`
 array composes 31 single-purpose fragments into one effective configuration;
-the GRVT and Lighter manifests swap in their own `config/grvt/` and
-`config/lighter/` fragments for execution venue, fees, symbols and capital
+the GRVT manifest swaps in its own `config/grvt/` fragments for execution venue, fees, symbols and capital
 scaling. Include paths are resolved relative to the
 manifest rather than the process working directory.
 
@@ -170,7 +169,7 @@ then converts that notional to contract quantity and rounds down to the
 exchange lot step. The one-symbol inventory and account gross-notional caps
 are both 2,500 USDT (25%); the daily-loss cap is 500 USDT (5%). The profile was
 sized up 5x from 1%/5%/1% to make Paper P&L readable; per-fill edge in bps does
-not change with size. GRVT and Lighter keep the 100 USDT quote. Remaining
+not change with size. GRVT keeps the 100 USDT quote. Remaining
 inventory capacity can reduce or suppress a quote, and safety exits may use the
 residual position quantity.
 

@@ -30,7 +30,6 @@ from infrastructure.config_scaling import load_config_document
 from infrastructure.config_schema import validate_composed_config
 from infrastructure.venue import configured_venue
 from strategy.execution_mode import resolve_execution_mode
-from tests.test_lighter_paper import FakeSnapshotWs, FakeWsApp
 from tests.test_paper_gateway import SYMBOL as PAPER_SYMBOL
 from tests.test_paper_gateway import (
     DispatchingEngine,
@@ -40,6 +39,32 @@ from tests.test_paper_gateway import (
     make_gateway_config,
     wait_until,
 )
+
+
+class FakeWsApp:
+    def __init__(self, on_send=None):
+        self.sent = []
+        self.on_send = on_send
+
+    def send(self, payload):
+        self.sent.append(json.loads(payload))
+        if self.on_send is not None:
+            self.on_send(json.loads(payload))
+
+    def close(self):
+        return None
+
+
+class FakeSnapshotWs:
+    def __init__(self, snapshot):
+        self.snapshot = snapshot
+
+    def fetch_snapshot(self, symbol, timeout_sec=10.0):
+        return self.snapshot
+
+    def close(self):
+        return True
+
 
 SYMBOL = "ETHUSDT"
 INSTRUMENT = "ETH_USDT_Perp"

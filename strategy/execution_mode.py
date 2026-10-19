@@ -17,7 +17,6 @@ from infrastructure.venue import (
     SUPPORTED_VENUES,
     VENUE_BINANCE,
     VENUE_GRVT,
-    VENUE_LIGHTER,
 )
 
 EXECUTION_MODE_POST_ONLY = "post_only"
@@ -148,7 +147,6 @@ __all__ = [
     "SUPPORTED_VENUES",
     "VENUE_BINANCE",
     "VENUE_GRVT",
-    "VENUE_LIGHTER",
     "decide_market_order",
     "resolve_execution_mode",
 ]

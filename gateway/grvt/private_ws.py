@@ -7,7 +7,7 @@ Streams, as in GRVT's SDK (``grvt_ccxt_ws.py``):
 
 * ``v1.order``: full order objects on every change;
 * ``v1.state``: order state only (status, booked and traded size), the
-  lighter and faster feed for our own quotes;
+  smaller and faster feed for our own quotes;
 * ``v1.fill``: one message per fill, with price, size, maker/taker, fee
   and fee rate;
 * ``v1.position``: position after each trade.

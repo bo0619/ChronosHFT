@@ -10,9 +10,8 @@
 | --- | --- | --- | --- | --- |
 | `config.json`（默认） | Binance USDⓈ-M | `KORUUSDT` | 500 USDT | 0（含 RPI）/ 2.5 bps |
 | `config.grvt.json` | GRVT | `SOXLUSDT` | 100 USDT | −1 bps（返佣）/ 4.5 bps |
-| `config.lighter.json` | Lighter | `ETHUSDC` | 100 USDT | 0 / 0 |
 
-- 三套配置都是**纸面模式**：模拟账户 10,000 USDT，不需要 API Key，也不会调用任何私有接口。
+- 两套配置都是**纸面模式**：模拟账户 10,000 USDT，不需要 API Key，也不会调用任何私有接口。
 - 策略默认是 GLFT 做市，被动挂单；Binance 上的标的支持 RPI 时，用 RPI 单挂。
 - 实盘模板在 `deploy/live/`，见下文[实盘](#实盘)。
 
@@ -36,7 +35,7 @@ bash scripts/bootstrap_aws.sh
 ```
 
 - 不带参数时，读取的是 `config.json`（Binance）。
-- 要跑其他交易所，加 `--config config.grvt.json` 或 `--config config.lighter.json`。
+- 要跑 GRVT，加 `--config config.grvt.json`。
 - **停止时只按一次 `Ctrl+C`**。程序会撤掉所有挂单、平掉持仓、确认账户是空仓后再退出。不要直接关终端或者强杀进程。
 
 ### 看板
@@ -87,7 +86,7 @@ sudo journalctl -u chronoshft -f
 
 | 想做的事 | 改哪里 |
 | --- | --- |
-| 换交易标的 | Binance：`config/symbols.json`；GRVT / Lighter：`config/grvt/symbols.json`、`config/lighter/symbols.json`。选标的可以参考 `scripts/rank_tradfi_symbols.py` 和 `scripts/list_binance_rpi_contracts.py` |
+| 换交易标的 | Binance：`config/symbols.json`；GRVT：`config/grvt/symbols.json`。选标的可以参考 `scripts/rank_tradfi_symbols.py` 和 `scripts/list_binance_rpi_contracts.py` |
 | 调整下单规模和风控 | `config/strategy/capital_scaling.json` 里的 `target_order_notional`、`target_total_risk_notional`、`target_daily_loss`（都是相对 100 USDT 的参考值）。单笔、持仓、敞口、日亏损上限都由它们按比例推导，**不要**在别的文件里单独写这些上限 |
 | 改模拟手续费 | `config/paper_trade.json`（或交易所子目录下的同名文件）里的 `maker_fee` 和 `taker_fee`。maker 为负数表示返佣 |
 | 切换策略模型 | `config/strategy/core.json` 的 `primary_model`：`glft` 或 `avellaneda_stoikov`，改完重启 |
@@ -122,7 +121,7 @@ sudo journalctl -u chronoshft -f
 
 | 目录 | 内容 |
 | --- | --- |
-| `gateway/` | 交易所接入：`binance/`（实盘和纸面撮合）、`grvt/`、`lighter/` |
+| `gateway/` | 交易所接入：`binance/`（实盘和纸面撮合）、`grvt/` |
 | `oms/` | 订单管理：下单闸门、对账、审计日志、纸面数据库 |
 | `risk/` | 风控、Kill Switch、交易所 DMS、独立风控子进程（sidecar） |
 | `strategy/` | GLFT、Avellaneda-Stoikov、自适应报价、模型就绪检查 |
