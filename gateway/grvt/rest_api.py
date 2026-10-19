@@ -95,6 +95,7 @@ class GrvtRestClient:
         self.timeout_sec = float(timeout_sec)
         self.clock = clock
         self.instruments: dict[str, GrvtInstrumentSpec] = {}
+        self.instrument_info: dict[str, dict] = {}
         self._session: GrvtSession | None = None
         self._lock = threading.Lock()
 
@@ -148,6 +149,8 @@ class GrvtRestClient:
     def load_instruments(self) -> dict[str, GrvtInstrumentSpec]:
         result = self._post("market_data", "all_instruments",
                             {"kind": ["PERPETUAL"], "is_active": True, "limit": 1000}, auth=False)
+        # Raw listings too: tick_size, min_size and min_notional for order sizing.
+        self.instrument_info = {item["instrument"]: dict(item) for item in result or []}
         self.instruments = {
             item["instrument"]: GrvtInstrumentSpec(item["instrument"], item["instrument_hash"],
                                                    int(item["base_decimals"]))

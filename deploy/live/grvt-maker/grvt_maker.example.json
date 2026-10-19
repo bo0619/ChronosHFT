@@ -1,0 +1,41 @@
+{
+  "_comment": "Copy to config/local/grvt_maker.json (git-ignored). Shadow mode needs no keys; live needs live_enabled true, --live and the secrets file (chmod 600).",
+  "environment": "prod",
+  "live_enabled": false,
+  "secrets_file": "config/local/grvt_secrets.json",
+  "log_dir": "storage/live/grvt_maker",
+  "kill_file": "storage/live/KILL",
+  "cancel_on_disconnect_ms": 5000,
+  "reconcile_sec": 30,
+  "status_sec": 10,
+  "defaults": {
+    "quote": {
+      "notional": 100.0,
+      "half_spread_bps": 0.25,
+      "skew_bps_per_lot": 1.0,
+      "max_inventory_lots": 5.0,
+      "improve": true,
+      "keep_ticks": 1.0,
+      "min_rest_sec": 1.0,
+      "basis_half_life": 60.0
+    },
+    "risk": {
+      "max_position_usd": 500.0,
+      "daily_loss_reduce_usd": 10.0,
+      "daily_loss_halt_usd": 20.0,
+      "stale_binance_sec": 3.0,
+      "stale_grvt_sec": 5.0,
+      "max_binance_lag_ms": 250.0,
+      "max_maker_fee_bps": 0.5,
+      "max_actions_per_sec": 20.0,
+      "max_consecutive_errors": 5
+    }
+  },
+  "symbols": {
+    "XRPUSDT": {},
+    "PUMPUSDT": {},
+    "SUIUSDT": {},
+    "LDOUSDT": {},
+    "DOGEUSDT": {}
+  }
+}

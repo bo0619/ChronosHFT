@@ -109,6 +109,9 @@ tests/*
 !tests/test_grvt_signing.py
 !tests/test_grvt_rest_api.py
 !tests/test_grvt_private_ws.py
+!tests/test_grvt_maker_engine.py
+!tests/test_grvt_maker_runner.py
+!tests/test_evaluate_maker_toxicity.py
 !tests/test_live_canary_evidence_collector.py
 !tests/test_rpi_terminal_truth_static.py
 !tests/test_systemd_deployment.py
