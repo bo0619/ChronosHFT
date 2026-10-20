@@ -20,6 +20,12 @@ bookTicker is by far the heaviest stream (BTCUSDT and ETHUSDT push about
 ask price changes: the exact timing of price moves, with sizes still in the
 100 ms depth rows.
 
+``--ticker-only`` drops depth5 and aggTrade and records bookTicker alone
+(what the cross-venue replay and the toxicity study read), and
+``--connection-per-symbol`` opens one websocket per symbol inside this one
+process: hot symbols sharing a connection were measured to lag by
+hundreds of milliseconds, and a process per symbol costs ~130 MB each.
+
 ``--all-streams`` records everything public on top: full-depth diffs
 (``@depth@100ms``), the RPI book (``@rpiDepth@500ms``, which includes
 resting RPI orders but hides crossed RPI levels), and mark price, index and
@@ -73,8 +79,13 @@ def report_ws_error(_ws, error) -> None:
 class Recorder:
     def __init__(self, symbols: list[str], out: Path, hours: float, min_free_gb: float,
                  *, ticker_price_changes_only: bool = False, all_streams: bool = False,
-                 snapshot_sec: float = 60.0) -> None:
+                 snapshot_sec: float = 60.0, ticker_only: bool = False,
+                 connection_per_symbol: bool = False) -> None:
+        if ticker_only and all_streams:
+            raise ValueError("--ticker-only and --all-streams exclude each other")
         self.ticker_price_changes_only = ticker_price_changes_only
+        self.ticker_only = ticker_only
+        self.connection_per_symbol = connection_per_symbol
         self.all_streams = all_streams
         self.snapshot_sec = snapshot_sec
         self.raw_lines: list[str] = []
@@ -92,6 +103,15 @@ class Recorder:
 
     def urls(self) -> list[str]:
         lower = [symbol.lower() for symbol in self.symbols]
+        if self.ticker_only:
+            groups = [[s] for s in lower] if self.connection_per_symbol else [lower]
+            return [f"{WS_ROOT}/public/stream?streams=" + "/".join(f"{s}@bookTicker" for s in group)
+                    for group in groups]
+        if self.connection_per_symbol:
+            return [url for s in lower for url in self._urls_for([s])]
+        return self._urls_for(lower)
+
+    def _urls_for(self, lower: list[str]) -> list[str]:
         return [
             f"{WS_ROOT}/public/stream?streams=" + "/".join(
                 f"{s}@depth5@100ms/{s}@bookTicker"
@@ -265,10 +285,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--all-streams", action="store_true",
                         help="Also record full-depth diffs, the RPI book, mark price, REST snapshots and raw messages")
     parser.add_argument("--snapshot-sec", type=float, default=60.0)
+    parser.add_argument("--ticker-only", action="store_true",
+                        help="Record only bookTicker (no depth5, no aggTrade)")
+    parser.add_argument("--connection-per-symbol", action="store_true",
+                        help="One websocket per symbol in this process, so one busy symbol cannot delay another")
     args = parser.parse_args(argv)
     recorder = Recorder(args.symbols.split(","), Path(args.out), args.hours, args.min_free_gb,
                         ticker_price_changes_only=args.ticker_price_changes_only,
-                        all_streams=args.all_streams, snapshot_sec=args.snapshot_sec)
+                        all_streams=args.all_streams, snapshot_sec=args.snapshot_sec,
+                        ticker_only=args.ticker_only, connection_per_symbol=args.connection_per_symbol)
     signal.signal(signal.SIGTERM, lambda *_: recorder.stop.set())
     signal.signal(signal.SIGINT, lambda *_: recorder.stop.set())
     return recorder.run()
