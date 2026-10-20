@@ -109,6 +109,21 @@ def test_stale_binance_pulls_both_quotes():
     assert ("quiet", {"reason": "binance stale"}) in events
 
 
+def test_quiet_market_keeps_quotes_while_feeds_answer_pings():
+    eng, ex, clock, events = engine()
+    ack_all(eng, warm(eng, ex))
+    for _ in range(10):  # ten seconds without a price change, a pong each second
+        clock.t += 1.0
+        eng.on_feed_alive("binance")
+        eng.on_feed_alive("grvt")
+        eng.on_timer()
+    assert not [c for c in ex.take() if c[0] == "cancel"]
+    clock.t += 3.5  # pongs stop: the Binance connection is gone
+    eng.on_timer()
+    assert sorted(c[0] for c in ex.take()) == ["cancel", "cancel"]
+    assert ("quiet", {"reason": "binance stale"}) in events
+
+
 def test_binance_lag_pulls_quotes():
     eng, ex, clock, _ = engine()
     ack_all(eng, warm(eng, ex))

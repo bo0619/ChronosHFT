@@ -1,0 +1,33 @@
+# GRVT maker for one symbol (the instance name), e.g. chronoshft-grvt-maker@XRPUSDT.
+# Installed and started by deploy/live/grvt-maker/start.sh; stopped by stop.sh.
+# Runs under systemd, so it keeps going after the SSH / VS Code session ends,
+# and comes back after a reboot while enabled.
+#
+# Mode comes from config/local/grvt_maker.env: GRVT_MAKER_MODE=--live trades,
+# empty is shadow. A crash restarts it (at most 3 times an hour); a risk halt
+# (exit 3: taker fill, fee surprise, daily loss, repeated venue errors) does
+# not, and waits for a person.
+
+[Unit]
+Description=ChronosHFT GRVT maker %i
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=3600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ChronosHFT
+EnvironmentFile=-/home/ubuntu/ChronosHFT/config/local/grvt_maker.env
+ExecStart=/home/ubuntu/ChronosHFT/.venv/bin/python -u scripts/run_grvt_maker.py --symbol %i $GRVT_MAKER_MODE
+KillSignal=SIGTERM
+TimeoutStopSec=20
+Restart=on-failure
+RestartSec=15
+RestartPreventExitStatus=3
+Nice=-5
+OOMScoreAdjust=-800
+
+[Install]
+WantedBy=multi-user.target

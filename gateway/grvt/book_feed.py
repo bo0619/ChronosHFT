@@ -9,6 +9,11 @@ as ``scripts/record_grvt_book.py`` does. After each applied message the
 callback receives ``(received_ts, bids, asks)``: the best ``depth`` levels
 per side as ``{price: size}``, so a caller can take its own orders out.
 It runs on the websocket thread and must not block.
+
+A quiet book sends nothing, so silence is not a dead feed: the socket is
+pinged every ``PING_INTERVAL_SEC`` and each pong goes to
+``on_alive(received_ts)``. A pong later than ``PING_TIMEOUT_SEC`` drops the
+connection.
 """
 
 from __future__ import annotations
@@ -24,6 +29,8 @@ from .constants import BOOK_RATE_MS, BOOK_STREAM, WS_URL_MAIN
 from .market_data import resubscribe_book_frames
 
 RECONNECT_DELAY_SEC = 1.0
+PING_INTERVAL_SEC = 2.0
+PING_TIMEOUT_SEC = 1.5
 
 
 class GrvtBookBuilder:
@@ -83,10 +90,12 @@ class GrvtBookBuilder:
 
 class GrvtBookFeed:
     def __init__(self, instrument: str, on_book: Callable[[float, dict, dict], None], *,
-                 on_status: Callable[[str], None] | None = None, depth: int = 10, url: str = WS_URL_MAIN,
+                 on_status: Callable[[str], None] | None = None,
+                 on_alive: Callable[[float], None] | None = None, depth: int = 10, url: str = WS_URL_MAIN,
                  app_factory=websocket.WebSocketApp, clock=time.time):
         self.instrument, self.on_book, self.depth, self.url = instrument, on_book, depth, url
         self.on_status = on_status or (lambda status: None)
+        self.on_alive = on_alive or (lambda received: None)
         self.app_factory, self.clock = app_factory, clock
         self.builder = GrvtBookBuilder(instrument)
         self.request_id = 100
@@ -108,8 +117,9 @@ class GrvtBookFeed:
             self.builder.reset()
             self.app = self.app_factory(self.url, on_open=self._on_open, on_message=self._on_raw,
                                         on_error=lambda ws, e: self.on_status(f"error: {e}"),
-                                        on_close=lambda ws, *a: self.on_status("closed"))
-            self.app.run_forever(ping_interval=20, ping_timeout=10)
+                                        on_close=lambda ws, *a: self.on_status("closed"),
+                                        on_pong=lambda ws, data: self.on_alive(self.clock()))
+            self.app.run_forever(ping_interval=PING_INTERVAL_SEC, ping_timeout=PING_TIMEOUT_SEC)
             if not self.stop.is_set():
                 self.on_status("reconnecting")
                 self.stop.wait(RECONNECT_DELAY_SEC)

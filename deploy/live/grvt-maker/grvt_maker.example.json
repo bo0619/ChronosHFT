@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to config/local/grvt_maker.json (git-ignored). Shadow mode needs no keys; live needs live_enabled true, --live and the secrets file (chmod 600).",
+  "_comment": "Copy to config/local/grvt_maker.json (git-ignored). Shadow needs no keys; live needs live_enabled true, --live and the secrets file (chmod 600); deploy/live/grvt-maker/start.sh does all of it. Sized for a 200 USDT canary: 50 USDT orders, at most 150 USDT per symbol (300 for both, 1.5x). XRP at +/-0.25 bps (most fills, measures how often a crossed quote fills); ADA at +/-2 bps (positive in replay under both fill models). skew 0.5 bps per 50 USDT lot is the replay's 1 bps per 100 USDT.",
   "environment": "prod",
   "live_enabled": false,
   "secrets_file": "config/local/grvt_secrets.json",
@@ -10,19 +10,19 @@
   "status_sec": 10,
   "defaults": {
     "quote": {
-      "notional": 100.0,
+      "notional": 50.0,
       "half_spread_bps": 0.25,
-      "skew_bps_per_lot": 1.0,
-      "max_inventory_lots": 5.0,
+      "skew_bps_per_lot": 0.5,
+      "max_inventory_lots": 3.0,
       "improve": true,
       "keep_ticks": 1.0,
       "min_rest_sec": 1.0,
       "basis_half_life": 60.0
     },
     "risk": {
-      "max_position_usd": 500.0,
-      "daily_loss_reduce_usd": 10.0,
-      "daily_loss_halt_usd": 20.0,
+      "max_position_usd": 150.0,
+      "daily_loss_reduce_usd": 3.0,
+      "daily_loss_halt_usd": 5.0,
       "stale_binance_sec": 3.0,
       "stale_grvt_sec": 5.0,
       "max_binance_lag_ms": 250.0,
@@ -32,10 +32,15 @@
     }
   },
   "symbols": {
-    "XRPUSDT": {},
-    "PUMPUSDT": {},
-    "SUIUSDT": {},
-    "LDOUSDT": {},
-    "DOGEUSDT": {}
+    "XRPUSDT": {
+      "quote": {
+        "half_spread_bps": 0.25
+      }
+    },
+    "ADAUSDT": {
+      "quote": {
+        "half_spread_bps": 2.0
+      }
+    }
   }
 }

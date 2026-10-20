@@ -16,8 +16,9 @@ the live side has to handle:
 * the position comes from our fills on the private feed, and is reset to
   the venue's position on reconciliation.
 
-Risk (:class:`RiskLimits`): quotes are pulled when either feed is stale or
-Binance lags; the adding side is pulled at ``max_position_usd``; a loss
+Risk (:class:`RiskLimits`): quotes are pulled when either feed shows no
+sign of life (no update and no websocket pong, :meth:`on_feed_alive`, for
+``stale_*_sec``; a quiet market keeps its quotes) or Binance lags; the adding side is pulled at ``max_position_usd``; a loss
 since the UTC day began beyond ``daily_loss_reduce_usd`` leaves only
 reduce-only quotes on the side that cuts the position, and beyond
 ``daily_loss_halt_usd`` (or on a taker fill, a maker fee above
@@ -136,9 +137,11 @@ class MakerEngine:
         self.vol = VolTracker(params.vol_window_sec)
         self.binance_mid = 0.0
         self.binance_seen = 0.0
+        self.binance_alive = 0.0
         self.binance_lag_ms = 0.0
         self.bid = self.ask = 0.0
         self.grvt_seen = 0.0
+        self.grvt_alive = 0.0
         self.day: str | None = None
         self.day_start_equity = 0.0
         self.errors = 0
@@ -167,6 +170,13 @@ class MakerEngine:
         self.mark()
         self.decide()
 
+    def on_feed_alive(self, source: str) -> None:
+        """A pong on the ``binance`` or ``grvt`` market-data connection: up, even if no price moved."""
+        if source == "binance":
+            self.binance_alive = self.clock()
+        elif source == "grvt":
+            self.grvt_alive = self.clock()
+
     def on_timer(self) -> None:
         self.mark()
         self.decide()
@@ -188,9 +198,9 @@ class MakerEngine:
         """Why quotes must be pulled now ('' when they may stand)."""
         if self.mode is Mode.HALTED:
             return f"halted: {self.reason}"
-        if not self.binance_seen or now - self.binance_seen > self.limits.stale_binance_sec:
+        if not self.binance_seen or now - max(self.binance_seen, self.binance_alive) > self.limits.stale_binance_sec:
             return "binance stale"
-        if not self.grvt_seen or now - self.grvt_seen > self.limits.stale_grvt_sec:
+        if not self.grvt_seen or now - max(self.grvt_seen, self.grvt_alive) > self.limits.stale_grvt_sec:
             return "grvt stale"
         if self.binance_lag_ms > self.limits.max_binance_lag_ms:
             return f"binance lag {self.binance_lag_ms:.0f} ms"

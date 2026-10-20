@@ -41,7 +41,44 @@ def test_book_ticker_parse():
     raw = json.dumps({"e": "bookTicker", "E": 1700000000123, "T": 1700000000120, "s": "XRPUSDT",
                       "b": "1.3068", "B": "100", "a": "1.3069", "A": "50"})
     assert parse_book_ticker(raw) == (1.3068, 1.3069, 1700000000123.0)
+    assert parse_book_ticker(json.dumps({"stream": "xrpusdt@bookTicker", "data": json.loads(raw)})) \
+        == (1.3068, 1.3069, 1700000000123.0)
     assert parse_book_ticker(json.dumps({"result": None, "id": 1})) is None
+
+
+def test_feeds_ping_and_report_pongs_as_alive():
+    from gateway.binance.book_ticker_feed import BinanceBookTickerFeed
+    from gateway.grvt.book_feed import GrvtBookFeed
+
+    for make in (lambda **kw: BinanceBookTickerFeed("XRPUSDT", lambda *a: None, **kw),
+                 lambda **kw: GrvtBookFeed(INSTRUMENT, lambda *a: None, **kw)):
+        alive, apps = [], []
+
+        class FakeApp:
+            def __init__(self, url, **callbacks):
+                self.url, self.callbacks = url, callbacks
+                apps.append(self)
+
+            def run_forever(self, **kwargs):
+                self.kwargs = kwargs
+                self.callbacks["on_pong"](self, b"")
+                feed.stop.set()
+
+            def close(self):
+                pass
+
+        feed = make(on_alive=alive.append, app_factory=FakeApp, clock=lambda: 5.0)
+        feed._run()
+        assert alive == [5.0]
+        assert apps[0].kwargs["ping_interval"] > apps[0].kwargs["ping_timeout"] > 0
+        assert apps[0].kwargs["ping_interval"] <= 2.0  # inside stale_binance_sec with room for one late pong
+    assert apps[0].url.endswith("/ws/full")
+
+
+def test_binance_feed_uses_the_public_route():
+    from gateway.binance.book_ticker_feed import BinanceBookTickerFeed
+    feed = BinanceBookTickerFeed("XRPUSDT", lambda *a: None)
+    assert feed.url == "wss://fstream.binance.com/public/stream?streams=xrpusdt@bookTicker"
 
 
 def test_private_events_parse_state_order_and_fill():

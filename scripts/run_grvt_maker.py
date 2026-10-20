@@ -68,6 +68,7 @@ from strategy.grvt_maker_engine import (  # noqa: E402
 )
 
 TIMER_SEC = 0.1
+HALT_EXIT_CODE = 3  # a risk halt: systemd must not restart it (RestartPreventExitStatus)
 
 
 # ----------------------------------------------------------------- config
@@ -89,6 +90,9 @@ def load_config(path: str, symbol: str) -> dict:
 
 def load_secrets(path: str) -> dict:
     file = Path(path)
+    if not file.exists():
+        raise SystemExit(f"{path} is missing: copy deploy/live/grvt-maker/grvt_secrets.example.json there, "
+                         f"fill it in and chmod 600 it")
     mode = file.stat().st_mode
     if mode & (stat.S_IRWXG | stat.S_IRWXO):
         raise SystemExit(f"{path} is readable by others; run: chmod 600 {path}")
@@ -302,9 +306,11 @@ def run(args) -> int:
             raise SystemExit("GRVT private feed did not subscribe")
 
     binance = BinanceBookTickerFeed(symbol, lambda t, b, a, e: events.put(("binance", b, a, e)),
-                                    on_status=lambda s: events.put(("feed", "binance", s)))
+                                    on_status=lambda s: events.put(("feed", "binance", s)),
+                                    on_alive=lambda t: events.put(("alive", "binance")))
     book = GrvtBookFeed(instrument, lambda t, bids, asks: events.put(("book", bids, asks)),
-                        on_status=lambda s: events.put(("feed", "grvt-book", s)))
+                        on_status=lambda s: events.put(("feed", "grvt-book", s)),
+                        on_alive=lambda t: events.put(("alive", "grvt")))
     binance.start()
     book.start()
 
@@ -331,6 +337,8 @@ def run(args) -> int:
             kind = item[0]
             if kind == "binance":
                 engine.on_binance(item[1], item[2], item[3])
+            elif kind == "alive":
+                engine.on_feed_alive(item[1])
             elif kind == "book":
                 # Shadow quotes are not in the public book, so nothing to take out.
                 bid, ask = external_touch(item[1], item[2], engine.own_levels() if live else {})
@@ -386,7 +394,7 @@ def run(args) -> int:
         rest.cancel_all_orders(base=base)
     log("stop", **engine.status())
     log.flush()
-    return 1 if engine.mode is Mode.HALTED and engine.reason not in {"shutdown", "kill file"} else 0
+    return HALT_EXIT_CODE if engine.mode is Mode.HALTED and engine.reason not in {"shutdown", "kill file"} else 0
 
 
 def main(argv: list[str] | None = None) -> int:
