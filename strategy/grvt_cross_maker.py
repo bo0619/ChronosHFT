@@ -19,8 +19,11 @@ tested.
   ``half_spread_bps + vol_spread_coef * vol_bps``, where ``vol_bps`` is the
   realized move of the Binance mid over about ``vol_window_sec`` seconds
   (:class:`VolTracker`). ``vol_spread_coef`` 0 (the default) leaves it fixed.
-* A resting quote more aggressive than its target is replaced at once; one
-  behind it by more than ``keep_ticks`` ticks after ``min_rest_sec``.
+* A resting quote more aggressive than its target by more than
+  ``adverse_bps`` (default 0: any amount) is replaced at once; one behind it
+  by more than ``keep_ticks`` ticks after ``min_rest_sec``. Every replace
+  goes to the back of the queue, so a small tolerance keeps queue priority
+  through moves of a fraction of a tick.
 """
 
 from __future__ import annotations
@@ -45,6 +48,7 @@ class QuoteParams:
     fair_shrink: float = 1.0
     vol_spread_coef: float = 0.0
     vol_window_sec: float = 10.0
+    adverse_bps: float = 0.0
 
 
 def round_down(price: float, tick: float) -> float:
@@ -137,7 +141,8 @@ def needs_replace(*, side: str, resting_price: float, target: float, rested_sec:
                   params: QuoteParams, tick: float) -> bool:
     """Whether a resting quote should move to ``target``."""
     behind = (target - resting_price) if side == "BUY" else (resting_price - target)
-    return behind < -EPS or (behind > params.keep_ticks * tick + EPS and rested_sec >= params.min_rest_sec)
+    tolerance = resting_price * params.adverse_bps / 1e4
+    return behind < -tolerance - EPS or (behind > params.keep_ticks * tick + EPS and rested_sec >= params.min_rest_sec)
 
 
 __all__ = ["BasisTracker", "EPS", "QuoteParams", "SIDES", "VolTracker", "fair_value", "needs_replace",

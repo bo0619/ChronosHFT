@@ -39,10 +39,19 @@ when a GRVT book or a Binance bookTicker is received, and an order or
 cancel lands on GRVT after the order latency (``--latency-ms``, or half a
 round trip drawn from ``--latency-samples``, probe ``grvt_rest_rtt`` by
 default, plus ``--extra-latency-ms``). Fills use the Paper matching engine:
-queue position at the touch, trades at (``at_price``) or through our price,
+queue position at our price, trades at (``at_price``) or through our price,
 and an opposite touch that reaches our price (``cross``; pessimistic when
 those joiners are post-only: with ``--cross skip`` the quote is pulled
 without a fill instead, the optimistic bound).
+
+GRVT shows only part of its liquidity: on recorded XRP and ADA books about
+half of the trades at the touch were larger than the size shown there, and
+the level was still standing 200 ms later. With ``--queue-depletion visible``
+(the default) a trade advances our queue only by what actually left the
+visible level (:func:`visible_depletion`); whatever was hidden filled first.
+Live XRP and ADA quotes filled about 30 times less often than the old
+``--queue-depletion trades`` (every traded lot consumes the visible queue)
+predicted. A trade through our price fills us either way.
 
 Reported per symbol: fills per hour, fill mix, mean markout to the GRVT mid
 1/5/30 s later in bps (positive in our favour), the 5 s edge net of
@@ -121,6 +130,44 @@ def load_columns(directory: str, symbol: str, kind: str, columns: list[str],
     return pd.concat(parts).sort_values("received_ts").reset_index(drop=True)
 
 
+def visible_depletion(trade_t: np.ndarray, trade_px: np.ndarray, trade_qty: np.ndarray,
+                      maker_is_buyer: np.ndarray, depth_t: np.ndarray, depth_rows: np.ndarray) -> np.ndarray:
+    """How much of each trade the visible book at its price gave up.
+
+    For a trade at price ``p`` on the maker side: the size at ``p`` in the last
+    book before the trade minus the size in the first book at or after it
+    (all of it if the level is gone), shared out in time order among the
+    trades between those two books. The rest of a trade was hidden liquidity
+    and does not move a quote resting behind the visible size.
+    """
+    out = np.zeros(len(trade_qty))
+    if not len(trade_qty) or not len(depth_t):
+        return out
+    order = np.argsort(depth_t, kind="stable")
+    times, rows = depth_t[order], depth_rows[order]
+    levels = rows.shape[1] // 4
+
+    def size_at(row: np.ndarray, bid_side: bool, price: float) -> float:
+        offset = 0 if bid_side else 2
+        for level in range(levels):
+            if abs(row[4 * level + offset] - price) <= 1e-9 * max(1.0, abs(price)):
+                return float(row[4 * level + offset + 1])
+        return 0.0
+
+    left: dict[tuple, float] = {}
+    for k in np.argsort(trade_t, kind="stable"):
+        before = int(np.searchsorted(times, trade_t[k], side="left")) - 1
+        after = int(np.searchsorted(times, trade_t[k], side="left"))
+        if before < 0 or after >= len(times):
+            continue
+        key = (before, after, bool(maker_is_buyer[k]), float(trade_px[k]))
+        if key not in left:
+            left[key] = max(0.0, size_at(rows[before], key[2], key[3]) - size_at(rows[after], key[2], key[3]))
+        out[k] = min(float(trade_qty[k]), left[key])
+        left[key] -= out[k]
+    return out
+
+
 def replay(symbol: str, grvt_depth: pd.DataFrame, grvt_trades: pd.DataFrame,
            binance: pd.DataFrame, args) -> dict:
     fills: list[dict] = []
@@ -167,7 +214,8 @@ def replay(symbol: str, grvt_depth: pd.DataFrame, grvt_trades: pd.DataFrame,
                          improve=args.improve, keep_ticks=args.keep_ticks, min_rest_sec=args.min_rest_sec,
                          basis_half_life=args.basis_half_life, fair_shrink=args.fair_shrink,
                          vol_spread_coef=getattr(args, "vol_spread_coef", 0.0),
-                         vol_window_sec=getattr(args, "vol_window_sec", 10.0))
+                         vol_window_sec=getattr(args, "vol_window_sec", 10.0),
+                         adverse_bps=getattr(args, "adverse_bps", 0.0))
 
     def place(side: str, price: float) -> None:
         bid, bid_size, ask, ask_size = touch
@@ -269,6 +317,9 @@ def replay(symbol: str, grvt_depth: pd.DataFrame, grvt_trades: pd.DataFrame,
     order_by = np.lexsort((kinds, times))
     trade_px = grvt_trades.price.to_numpy(float) if len(grvt_trades) else np.empty(0)
     trade_qty = grvt_trades.qty.to_numpy(float) if len(grvt_trades) else np.empty(0)
+    if len(grvt_trades) and getattr(args, "queue_depletion", "visible") == "visible":
+        trade_qty = visible_depletion(t_venue, grvt_trades.price.to_numpy(float), trade_qty,
+                                      grvt_trades.maker_is_buyer.to_numpy(bool), g_venue, depth_rows)
     trade_mib = grvt_trades.maker_is_buyer.to_numpy(bool) if len(grvt_trades) else np.empty(0, bool)
     trade_id = grvt_trades.trade_id.to_numpy(np.int64) if len(grvt_trades) else np.empty(0, np.int64)
 
@@ -394,7 +445,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="Seconds; half-life of the GRVT/Binance basis average")
     parser.add_argument("--cross", choices=("fill", "skip"), default="fill",
                         help="An opposite touch reaching our price fills us (pessimistic) or not (optimistic)")
+    parser.add_argument("--queue-depletion", choices=("visible", "trades"), default="visible",
+                        help="A trade advances our queue by what left the visible level (default) or by its size")
     parser.add_argument("--keep-ticks", type=float, default=1.0)
+    parser.add_argument("--adverse-bps", type=float, default=0.0,
+                        help="Keep a quote this many bps more aggressive than its target before replacing it")
     parser.add_argument("--min-rest-sec", type=float, default=1.0)
     parser.add_argument("--latency-ms", type=float, default=8.0)
     parser.add_argument("--latency-samples", default="")
@@ -444,6 +499,8 @@ def main(argv: list[str] | None = None) -> int:
         latency = (f"sampled {args.latency_probe}/2+{args.extra_latency_ms:g} ms" if args.one_way_samples is not None
                    else f"{args.latency_ms:g} ms")
         label = (f"[anchor {args.anchor}" + (f", +/-{args.half_spread_bps:g} bps" if args.anchor == "binance" else "")
+                 + (", queue trades" if args.queue_depletion == "trades" else "")
+                 + (f", adverse {args.adverse_bps:g} bps" if args.adverse_bps else "")
                  + (", improve" if args.improve else "")
                  + (f", shrink {args.fair_shrink:g}" if args.fair_shrink != 1.0 else "")
                  + (f", vol {args.vol_spread_coef:g}x/{args.vol_window_sec:g}s" if args.vol_spread_coef else "")

@@ -233,3 +233,11 @@ def test_vol_tracker_decays_and_widens_quotes_when_asked():
     busy = quote_targets(params=wide, vol_bps=10.0, **args)  # +2 bps half spread
     assert busy["BUY"] < calm["BUY"] and busy["SELL"] > calm["SELL"]
     assert quote_targets(params=PARAMS, vol_bps=10.0, **args) == quote_targets(params=PARAMS, **args)
+
+
+def test_adverse_tolerance_keeps_a_quote_through_a_small_move():
+    from strategy.grvt_cross_maker import needs_replace
+    move = dict(side="BUY", resting_price=1.3000, target=1.2999, rested_sec=0.1, tick=0.0001)  # 0.77 bps too high
+    assert needs_replace(params=QuoteParams(), **move)
+    assert not needs_replace(params=QuoteParams(adverse_bps=1.0), **move)
+    assert needs_replace(params=QuoteParams(adverse_bps=1.0), **dict(move, target=1.2998))  # 1.5 bps: past it

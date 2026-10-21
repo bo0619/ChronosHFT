@@ -119,3 +119,40 @@ def test_inventory_limit_pulls_the_adding_side_and_skew_moves_quotes_down():
     flat = args(anchor="binance", half_spread_bps=0.5)
     assert cv.replay("X", depth, trades, binance, skewed)["final_position"] <= \
         cv.replay("X", depth, trades, binance, flat)["final_position"] + 1.0
+
+
+COLS = [c for i in range(1, 6) for c in (f"bid{i}_p", f"bid{i}_v", f"ask{i}_p", f"ask{i}_v")]
+
+
+def depth_rows(*books):
+    import numpy as np
+    return np.array([[grvt_depth_row(0.0, 0.0, bid, ask, size)[c] for c in COLS] for bid, ask, size in books])
+
+
+def test_visible_depletion_counts_only_what_left_the_visible_level():
+    import numpy as np
+    times = np.array([0.0, 1.0])
+    stays = depth_rows((100.00, 100.02, 10.0), (100.00, 100.02, 8.0))  # 2 of the shown 10 left
+    gone = depth_rows((100.00, 100.02, 10.0), (99.99, 100.01, 10.0))   # the whole 100.00 level left
+    trade = lambda *qty: (np.array([0.5 + 0.1 * k for k in range(len(qty))]), np.full(len(qty), 100.00),
+                          np.array(qty, float), np.ones(len(qty), bool))
+    assert list(cv.visible_depletion(*trade(30.0), times, stays)) == [2.0]  # hidden size filled the rest
+    assert list(cv.visible_depletion(*trade(1.5, 5.0), times, stays)) == [1.5, 0.5]  # shared in time order
+    assert list(cv.visible_depletion(*trade(30.0), times, gone)) == [10.0]
+
+
+def test_a_trade_absorbed_by_hidden_size_does_not_reach_a_quote_behind_the_visible_queue():
+    # We join the 100.00 bid behind 10 shown; a 30-lot sell prints there but the level only drops to 8.
+    depth = pd.DataFrame([
+        grvt_depth_row(0.0, 0.010, 100.00, 100.02, size=10.0),
+        grvt_depth_row(5.050, 5.060, 100.00, 100.02, size=8.0),
+        grvt_depth_row(60.0, 60.010, 100.00, 100.02, size=8.0),
+    ])
+    trades = pd.DataFrame([dict(received_ts=5.040, exchange_ts=5.030, trade_id=1, price=100.00,
+                                qty=30.0, maker_is_buyer=True)])
+    binance = pd.DataFrame([dict(received_ts=0.005, bid_p=100.00, ask_p=100.02),
+                            dict(received_ts=60.005, bid_p=100.00, ask_p=100.02)])
+    old = cv.replay("X", depth, trades, binance, args(anchor="grvt", queue_depletion="trades"))
+    new = cv.replay("X", depth, trades, binance, args(anchor="grvt", queue_depletion="visible"))
+    assert ("BUY", "at_price") in triggers(old)
+    assert triggers(new) == []
