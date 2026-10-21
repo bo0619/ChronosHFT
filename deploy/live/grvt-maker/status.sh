@@ -10,7 +10,7 @@ for u in $units; do
   printf "  %-40s %-10s 启动于 %s\n" "$u" "$(systemctl is-active "$u")" "$(systemctl show -p ActiveEnterTimestamp --value "$u")"
 done
 mode=$(grep -s '^GRVT_MAKER_MODE=' config/local/grvt_maker.env | cut -d= -f2-)
-echo "  模式：${mode:+实盘}${mode:-影子（不下单）}"
+if [ -n "$mode" ]; then echo "  模式：实盘"; else echo "  模式：影子（不下单）"; fi
 [ -e storage/live/KILL ] && echo "  注意：急停文件 storage/live/KILL 存在，所有做市进程都会停下"
 
 echo
@@ -54,5 +54,5 @@ EOF
 echo
 echo "== 最近 24 小时的告警 =="
 journalctl -u 'chronoshft-grvt-maker@*' --since "-24h" --no-pager -o short-iso 2>/dev/null \
-  | grep -E "halt|HALTED|venue_error|Traceback|Error|error" | tail -8
+  | grep -v "RiskLimits(" | grep -E "HALTED|venue_error|Traceback|Error|error:|Failed|failed" | tail -8
 echo "（没有输出就是没有告警）"

@@ -143,6 +143,13 @@ class EventLog:
 
 
 # -------------------------------------------------------------- executors
+def timings(queued_at: float, started: float, signed: float) -> dict:
+    """Milliseconds waiting for a worker, signing, and the REST round trip."""
+    done = time.time()
+    return {"queue_ms": round((started - queued_at) * 1000, 2), "sign_ms": round((signed - started) * 1000, 2),
+            "rest_ms": round((done - signed) * 1000, 2)}
+
+
 class ShadowExecutor:
     """Answers every action at once; orders rest until cancelled, never fill."""
 
@@ -150,7 +157,7 @@ class ShadowExecutor:
         self.events = events
 
     def place(self, *, client_id, side, price, size, reduce_only):
-        self.events.put(("place_result", client_id, True, f"shadow-{client_id}", "", False))
+        self.events.put(("place_result", client_id, True, f"shadow-{client_id}", "", False, {}))
 
     def cancel(self, *, client_id):
         self.events.put(("cancel_result", client_id, True, ""))
@@ -171,29 +178,35 @@ class LiveExecutor:
         self.pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="grvt-rest")
 
     def place(self, *, client_id, side, price, size, reduce_only):
-        self.pool.submit(self._place, client_id, side, price, size, reduce_only)
+        self.pool.submit(self._place, client_id, side, price, size, reduce_only, time.time())
 
-    def _place(self, client_id, side, price, size, reduce_only):
+    def _place(self, client_id, side, price, size, reduce_only, queued_at):
+        # Timings go back with the result (the event log is written on the main thread only).
+        started = signed = time.time()
         try:
             body = self.rest.build_limit_order(
                 instrument=self.instrument, is_buy=side == "BUY", size=f"{size:.{self.size_decimals}f}",
                 price=f"{price:.{self.price_decimals}f}", post_only=True, reduce_only=reduce_only,
                 client_id=client_id)
+            signed = time.time()
             result = self.rest.create_order(body) or {}
-            self.events.put(("place_result", client_id, True, result.get("order_id"), "", False))
+            self.events.put(("place_result", client_id, True, result.get("order_id"), "", False,
+                             timings(queued_at, started, signed)))
         except Exception as exc:  # noqa: BLE001 - every failure goes back to the engine
             text = str(exc)
-            self.events.put(("place_result", client_id, False, None, text, "POST_ONLY" in text.upper()))
+            self.events.put(("place_result", client_id, False, None, text, "POST_ONLY" in text.upper(),
+                             timings(queued_at, started, signed)))
 
     def cancel(self, *, client_id):
-        self.pool.submit(self._cancel, client_id)
+        self.pool.submit(self._cancel, client_id, time.time())
 
-    def _cancel(self, client_id):
+    def _cancel(self, client_id, queued_at):
+        started = time.time()
         try:
             self.rest.cancel_order(client_id=client_id)
-            self.events.put(("cancel_result", client_id, True, ""))
+            self.events.put(("cancel_result", client_id, True, "", timings(queued_at, started, started)))
         except Exception as exc:  # noqa: BLE001
-            self.events.put(("cancel_result", client_id, False, str(exc)))
+            self.events.put(("cancel_result", client_id, False, str(exc), timings(queued_at, started, started)))
 
     def cancel_all(self):
         self.pool.submit(self._cancel_all)
@@ -344,9 +357,13 @@ def run(args) -> int:
                 bid, ask = external_touch(item[1], item[2], engine.own_levels() if live else {})
                 engine.on_grvt_book(bid, ask)
             elif kind == "place_result":
-                _, cid, ok, order_id, error, post_only = item
+                _, cid, ok, order_id, error, post_only, timing = item
+                if timing:
+                    log("ack", client_id=cid, ok=ok, **timing)
                 engine.on_place_result(cid, ok, order_id=order_id, error=error, post_only_reject=post_only)
             elif kind == "cancel_result":
+                if len(item) > 4 and item[4]:
+                    log("cancel_ack", client_id=item[1], ok=item[2], **item[4])
                 engine.on_cancel_result(item[1], item[2], error=item[3])
             elif kind == "state":
                 engine.on_order_state(item[1], item[2], order_id=item[3], reject_reason=item[4])

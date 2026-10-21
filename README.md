@@ -4,119 +4,119 @@
 
 唯一的实盘路径是：**在 GRVT 上做市，用币安的价格定价**（`scripts/run_grvt_maker.py`）。程序作为 systemd 服务运行在东京的云服务器上，本地电脑关机也不影响。
 
-- 第一阶段是 200 USDT 的试运行，只做 XRP 和 ADA。
+- **第一次实盘**（XRP + ADA，4 小时）发现回放把成交次数高估了几十倍。原因是 GRVT 盘口有大量看不见的挂单，排在我们前面。
+- **回放已经修正。** 修正后只剩 ADA、PUMP 两个币还明显为正，现在用它们跑第二次实盘，同时录制盘口用来校准。
 - 币安只用作行情来源和纸面撮合，币安实盘下单和 Lighter 都已删除。
 
-> **回放和纸面盘的成交都是模型假设。** 它们根据公开数据推断我们的挂单会不会成交，看不到真实的排队位置，也不知道别人用不用 post-only。回放的盈亏只用来比较和筛选，真实收益要靠实盘验证。
+> **回放的成交是模型推断，不是事实。** 第一次实盘证明，回放对排队位置的假设会让结论整个翻转。任何新结论都要先用实盘数据校准，再用来做决定。
 
 ## 现状一览
 
 | 部分 | 入口 | 状态 |
 | --- | --- | --- |
-| **GRVT 做市（实盘）** | `deploy/live/grvt-maker/start.sh`（systemd 服务，内部运行 `scripts/run_grvt_maker.py`） | 程序、风控和一键启停已就绪，影子模式跑通；等填好密钥后开始 200 USDT 试运行 |
+| **GRVT 做市（实盘）** | `deploy/live/grvt-maker/start.sh`（systemd 服务） | 第二次试运行：ADA + PUMP，每笔 250 USDT，计划跑 48 小时 |
 | 账户检查 | `scripts/check_grvt_account.py` | 只读：登录、余额、持仓、挂单、下单规则 |
-| 行情录制 | `scripts/record_public_book.py`（币安）、`scripts/record_grvt_book.py`（GRVT） | 两轮录制已完成（research2 72 小时、research3 11 小时） |
-| 延迟测量 | `scripts/measure_latency.py` | 录制期间每 6 小时测一次，共 11 次 |
-| 跨交易所回放 | `scripts/replay_cross_venue.py` | 主要的筛选工具，和实盘共用同一套报价规则 |
-| 毒性因子检验 | `scripts/evaluate_maker_toxicity.py` | 周末数据上 5 个因子有效，工作日数据还没复核 |
-| 纸面交易框架 | `main.py`，配置 `config.json`（币安）和 `config.grvt.json`（GRVT） | 只能跑纸面模式，配置写了 `"mode": "live"` 会拒绝启动 |
+| 行情录制 | `scripts/record_public_book.py`（币安）、`scripts/record_grvt_book.py`（GRVT） | 在录 `storage/research4/`：ADA、PUMP，和实盘同时进行 |
+| 延迟测量 | `scripts/measure_latency.py` | 之前测过 11 次，结果见下表 |
+| 跨交易所回放 | `scripts/replay_cross_venue.py` | 已修正排队模型；ADA 的成交频率和实盘吻合，XRP 仍比实盘多约 5 倍 |
+| 毒性因子检验 | `scripts/evaluate_maker_toxicity.py` | 基于旧回放的结论，需要重新验证 |
+| 纸面交易框架 | `main.py`，配置 `config.json`（币安）和 `config.grvt.json`（GRVT） | 只能跑纸面模式 |
 
 ## 研究结论
 
-数据：research2 共 60 小时（周六到周一，含美股时段，15 个币）；research3 共 11 小时（周一，16 个新币）。回放按 GRVT 真实费率（maker −0.01 bps）计算，下单延迟从 11 次实测中随机抽样。
+### 第一次实盘告诉我们什么（2026-10-20，XRP + ADA，每笔 250 USDT，4 小时）
 
-### 两种成交假设，差别在哪里
-
-- **乐观（`--cross skip`）和悲观（`--cross fill`）只在一种情况上不同：** 币安一动，GRVT 上别的做市商改价比我们撤单快，盘口越过了我们的挂单（下文称"穿过"）。
-- **以 XRP 为例：** "穿过"每小时约 110 次。真正有人按我们价格成交的那部分，每笔赚约 0.5 bps；"穿过"如果算作成交，每笔亏约 0.9 bps。
-- **到底算不算成交，取决于对方用不用 post-only。** 用 post-only，我们就不会被成交，接近乐观；不用，我们会以旧价格被成交，接近悲观。这件事公开数据回答不了，**只有实盘能回答**。
-
-### 核心币：60 小时，每笔 100 USDT，±0.25 bps
-
-| 币种 | 成交/小时 | 每笔优势 bps（t 值） | 乐观 USDT/小时 | 四个时段（周六 / 周日 / 周一白天 / 美股时段） | 悲观 USDT/小时 |
-| --- | --- | --- | --- | --- | --- |
-| PUMP | 16.6 | +1.49 (6.5) | +0.25 | 全部为正 | −2.46 |
-| XRP | 52.8 | +0.44 (9.1) | +0.24 | 全部为正 | −0.91 |
-| SUI | 13.8 | +0.62 (5.6) | +0.09 | 全部为正 | −1.57 |
-| DOGE | 7.6 | +0.71 (4.1) | +0.05 | 全部为正 | −0.90 |
-
-其余 11 个币接近 0。美股时段"穿过"最多，悲观假设下的亏损是平时的 4–6 倍。
-
-### 新币：11 小时，挂得远一点更稳
-
-| 币种（挂单距离） | 乐观 USDT/小时（t 值） | 悲观 USDT/小时 |
+| | 旧回放的预期 | 实盘 |
 | --- | --- | --- |
-| **ADA（±2 bps）** | +0.17 (6.3) | +0.08 |
-| KAITO（±1 bps） | +0.12 (2.5) | +0.20 |
-| JUP（±1 bps） | +0.16 (3.9) | −0.04 |
-| FARTCOIN（±0.25 bps） | +0.12 (4.1) | +0.07 |
-| BERA（±2 bps） | +0.07 (3.7) | +0.09 |
+| XRP 成交/小时 | 51 | **1.5** |
+| ADA 成交/小时 | 5.5 | **1.0** |
+| 成交质量 | 每笔 +0.4 到 +3 bps | 10 笔里 8 笔成交时价格已经对我们不利，平均 −2.8 bps |
+| 被"穿过"时会不会成交 | 不知道（乐观 / 悲观两种假设） | **不会**：只出现 post-only 拒单，别人跟价也用 post-only |
+| 手续费、风控、断线处理 | — | 都正常：maker 返佣 −0.01 bps，没有吃单成交 |
 
-- **淘汰：** ENA、UNI、LTC、LINK、TSLA、META、INTC，主要是悲观假设下亏得多，美股时段更严重。
-- **为什么新币挂远一点更稳：** 这些币 GRVT 价差宽，我们挂 ±1–2 bps 仍然是最优价，照样拿得到成交，"穿过"却很少碰到我们。
+结果是亏 0.73 USDT，然后停掉。
 
-### 其他结论
+### 回放错在哪里，怎么修的
+
+- **GRVT 的盘口只显示一部分挂单。** 用录制数据检验：最优价上的成交里，XRP 有 45%、ADA 有 54% 的成交量超过了显示的挂单量（中位数分别是 3.1 倍和 6.9 倍）。而且这一档价位 200 ms 后几乎都还在，说明成交的主要是隐藏挂单，它们排在我们前面。
+- **旧回放的错误：** 假设每笔成交都先消耗我们前面显示的挂单，剩下的就轮到我们。
+- **修正方法（`--queue-depletion visible`，现在是默认）：** 一笔成交能推进我们排队位置的量，只按那一档显示的挂单实际减少了多少来算。旧算法保留为 `--queue-depletion trades`，用来对比。
+- **"被穿过"的处理：** 实盘证明穿过不会成交，所以回放用 `--cross skip`。
+
+### 修正后重新筛选（31 个币，每笔 250 USDT）
+
+| 币种（挂单距离） | 成交/小时 | 每笔优势 bps（t 值） | 每天 USDT |
+| --- | --- | --- | --- |
+| **ADA（±2 bps）** | 1.5 | +6.0 (5.8) | **+3.9** |
+| **PUMP（±1 bps）** | 3.0 | +1.7 (2.5) | **+2.1** |
+| FARTCOIN（±0.25 bps） | 0.4 | +6.1 (2.0) | +1.4 |
+| KAITO（±2 bps） | 0.6 | +2.6 (1.0) | +1.2 |
+| 其余 27 个，包括 XRP、SUI、DOGE | — | — | 0.5 以下或为负 |
+
+- **每笔的优势还在，但成交很少，** 整体只能赚到很少的钱。
+- **之前"每天 15–30 USDT"的估计，** 是被旧回放的错误放大出来的。
+
+### 换单太频繁吗？
+
+- 实盘 XRP 每分钟换单 22 次，其中 69% 是价格不利时的"后撤"，31% 是"追价"。
+- 在修正后的回放里测了 9 种少换单的规则，包括少追价，以及小幅不利时先不撤（`adverse_bps`）。**没有一种比现在的规则好。**
+- 原因：少追价，挂单会落在后面，成交就没了；小幅不利时先不撤，多出来的成交恰恰是价格已经过时、被别人吃掉的那些。
+
+### 其他仍然成立的结论
 
 | 方向 | 结论 |
 | --- | --- |
-| 在币安上被动做市（包括 RPI、高频因子、DeepLOB、扫单后的反转） | **亏钱**：不算手续费每笔就亏约 1 bps |
-| 挂单距离 | 要按币种设：核心币 ±0.25 bps，价差宽的新币 ±1–2 bps。按波动率加宽、多档报价都会降低利润 |
-| 延迟的影响 | 乐观假设下多 25 ms 几乎没影响；悲观假设下 XRP 从 −0.91 变成 −2.34 USDT/小时。速度很重要，而且只在不确定的那一边重要 |
-| GRVT 跟随币安的速度 | 盘口每 50 ms 批量推送一次。按推送时间算的中位数：XRP、PUMP、ENA 约 34–42 ms，ADA、JUP、KAITO 约 90–190 ms。跟得慢的币留给我们的空间更大 |
-| GRVT 返佣 | 0 级用户只有 **0.01 bps**（2026-03-23 起的费率），利润几乎全部来自价差和定价。做市商计划 Basic 档有 0.3 bps，值得申请 |
-| 毒性因子 | GRVT 落后于公允价的程度、其他币的同步变动、本侧排队厚度最有用。适合按信号调整挂单量（样本外 +20–40%），不适合直接撤单 |
+| 在币安上被动做市 | 亏钱：不算手续费每笔就亏约 1 bps |
+| GRVT 返佣 | 0 级用户只有 0.01 bps，利润只能来自价差和定价。做市商计划 Basic 档有 0.3 bps，值得申请 |
+| GRVT 盘口推送 | 每 50 ms 批量推送一次 |
+| 挂单距离 | 要按币种设：价差只有 1 档的币（XRP）很难排到前面，价差宽或波动大的币挂得远一点 |
 
-### 延迟（东京服务器，11 次实测合并）
+### 延迟（东京服务器，11 次实测合并，单位 ms）
 
-| 延迟（ms） | p5 | p25 | p50 | p75 | p95 | p99 |
+| 延迟 | p5 | p25 | p50 | p75 | p95 | p99 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 币安行情推送 | 1.8 | 2.2 | 2.9 | 10.4 | 44.3 | 83.9 |
 | GRVT 行情推送 | 6.1 | 7.3 | 8.8 | 12.1 | 28.4 | 42.3 |
 | GRVT 下单往返 | 9.4 | 10.8 | 12.9 | 17.6 | 27.3 | 187 |
 
-美股时段币安推送的中位数会升到约 9 ms，GRVT 下单往返升到约 15 ms。
+实盘程序现在会逐笔记录每张订单的等待、签名和往返耗时（事件日志里的 `ack` 和 `cancel_ack`）。
 
 ## GRVT 做市
 
-### 试运行配置（200 USDT）
+### 当前配置：第二次试运行（200 USDT 账户）
 
 | 币种 | 挂单距离 | 每笔 | 单币持仓上限 | 当天亏损：只减仓 / 停止 |
 | --- | --- | --- | --- | --- |
-| XRP | ±0.25 bps | 250 USDT | 250 USDT（1 笔） | 5 / 10 USDT |
 | ADA | ±2 bps | 250 USDT | 250 USDT（1 笔） | 5 / 10 USDT |
+| PUMP | ±1 bps | 250 USDT | 250 USDT（1 笔） | 5 / 10 USDT |
 
-- **为什么选这两个：** XRP 成交最多、统计最可靠，能最快回答"穿过时会不会成交"；ADA 在两种假设下都为正。
-- **最大敞口：** 两个币合计最多 500 USDT（本金的 2.5 倍）。GRVT 上的杠杆保持 10 倍，只用作保证金额度。
-- **按这个规模回放（每天）：**
+- **目的：** 用实盘成交和同时录制的盘口，校准修正后的回放。
+- **回放预期：** 两个币合计每天约 +6 USDT。
+- **风险：** 两个币合计最多持仓 500 USDT（本金的 2.5 倍），最坏的一天约 −20 USDT。
+- **杠杆：** GRVT 上保持 10 倍，只用作保证金额度。
 
-| | 乐观 | 悲观 |
-| --- | --- | --- |
-| XRP | +13.5 USDT | −88 USDT，靠 10 USDT 的单日止损截住 |
-| ADA | +8.9 USDT | +5.6 USDT |
-
-配置文件是 `config/local/grvt_maker.json`（不进 git），模板是 `deploy/live/grvt-maker/grvt_maker.example.json`。每个币种可以单独覆盖默认参数。
+配置文件是 `config/local/grvt_maker.json`（不进 git），模板是 `deploy/live/grvt-maker/grvt_maker.example.json`。每个币种可以单独覆盖默认参数，包括 `adverse_bps`（默认 0）。
 
 ### 启动、查看、停止
 
 1. 在 GRVT 开一个**专用的交易子账户**，只放可以承受亏损的钱。在这个子账户上创建 API 密钥：开交易权限，不开提币，IP 白名单填服务器的公网 IP。
 2. 在服务器上打开 `config/local/grvt_secrets.json`，自己填入 `api_key`、`sub_account_id`、`private_key`。**不要提交，也不要发到任何地方。**
 3. 运行 `bash deploy/live/grvt-maker/start.sh`，或者在 VS Code 里点"终端 → 运行任务 → 做市：启动（实盘）"。脚本会依次：
-   - 设置密钥文件的权限；
    - 做只读账户检查；
    - 列出每个币种的规模和止损；
    - 等你输入 `yes` 确认；
-   - 打开实盘开关，为每个币种启动一个 systemd 服务。
+   - 为每个币种启动一个 systemd 服务。
 
 | 操作 | 命令（VS Code 任务里也有） |
 | --- | --- |
-| 查看状态（只读） | `bash deploy/live/grvt-maker/status.sh`：服务状态、持仓、今日盈亏、成交、告警 |
+| 查看状态（只读） | `bash deploy/live/grvt-maker/status.sh` |
 | 账户检查（只读） | `.venv/bin/python scripts/check_grvt_account.py` |
 | 停止 | `bash deploy/live/grvt-maker/stop.sh`：每个进程先撤掉全部挂单再退出，然后关掉实盘开关和开机自启。持仓不会自动平掉，脚本最后会列出来 |
 | 紧急停止 | `touch storage/live/KILL`：所有币种一起停，删掉这个文件后才能再启动 |
 
 服务由 systemd 托管（`deploy/live/grvt-maker/chronoshft-grvt-maker@.service`，一个币种一个实例）：
 
-- **关掉 VS Code、断开 SSH、本地电脑关机都不影响**，服务器重启后会自动恢复；
+- 关掉 VS Code、断开 SSH、本地电脑关机都不影响，服务器重启后会自动恢复；
 - 进程意外崩溃，15 秒后自动重启，每小时最多 3 次；
 - 因风控停下（退出码 3）不会自动重启，等人检查。
 
@@ -134,38 +134,38 @@
 ### 影子模式（不需要密钥，不下单）
 
 ```bash
-.venv/bin/python scripts/run_grvt_maker.py --symbol XRPUSDT --minutes 30
+.venv/bin/python scripts/run_grvt_maker.py --symbol ADAUSDT --minutes 30
 ```
-
-用真实行情照常计算报价，每一笔"本来要下的单"都写进 `storage/live/grvt_maker/<币种>_<日期>.jsonl`，影子订单不会成交。
 
 更多细节见 [deploy/live/grvt-maker/README.md](deploy/live/grvt-maker/README.md)。**不要在中国大陆运行实盘。**
 
 ## 研究工具
 
 ```bash
-# 录制币安：只录最优价、一个币种一个连接，一个进程可以录很多币
-.venv/bin/python scripts/record_public_book.py --symbols JUPUSDT,ADAUSDT --hours 12 --out storage/research3/binance \
+# 录制币安：只录最优价、一个币种一个连接
+.venv/bin/python scripts/record_public_book.py --symbols ADAUSDT,PUMPUSDT --hours 48 --out storage/research4/binance \
     --ticker-only --connection-per-symbol --ticker-price-changes-only
 # 录制 GRVT：盘口和成交
-.venv/bin/python scripts/record_grvt_book.py --symbols JUPUSDT,ADAUSDT --hours 12 --out storage/research3/grvt
+.venv/bin/python scripts/record_grvt_book.py --symbols ADAUSDT,PUMPUSDT --hours 48 --out storage/research4/grvt
 
-# 跨交易所回放：真实费率，下单延迟从实测样本抽取（--extra-latency-ms 可以加压）
-.venv/bin/python scripts/replay_cross_venue.py --grvt-dir storage/research2/grvt --binance-dir storage/research2/binance \
-    --symbols XRPUSDT --start 2026-10-18T00:00 --end 2026-10-19T00:00 --slice-hours 6 --notional 100 \
-    --anchor binance --half-spread-bps 0.25 --improve --skew-bps-per-lot 1 --max-inventory-lots 5 \
-    --cross skip --latency-samples storage/research2/latency/latency_20261019_040002.csv.gz --maker-fee-bps -0.01
-
-# 毒性因子：前一段训练、后一段检验
-.venv/bin/python scripts/evaluate_maker_toxicity.py --grvt-dir storage/research2/grvt --binance-dir storage/research2/binance \
-    --symbols XRPUSDT,PUMPUSDT --start 2026-10-17T03:46 --end 2026-10-18T23:10 --split 2026-10-18T09:10 \
-    --latency-samples storage/research2/latency/latency_20261018_220001.csv.gz
+# 跨交易所回放：修正后的排队模型（默认）、穿过不成交、真实费率、实测延迟
+.venv/bin/python scripts/replay_cross_venue.py --grvt-dir storage/research4/grvt --binance-dir storage/research4/binance \
+    --symbols ADAUSDT --start 2026-10-21T12:30 --end 2026-10-22T12:30 --slice-hours 6 --notional 250 \
+    --anchor binance --half-spread-bps 2 --improve --skew-bps-per-lot 2.5 --max-inventory-lots 1 \
+    --cross skip --latency-ms 8 --maker-fee-bps -0.01
 ```
 
+| 回放参数 | 作用 |
+| --- | --- |
+| `--queue-depletion visible`（默认）/ `trades` | 成交按显示挂单的实际减少量推进排队 / 旧算法：按成交量推进 |
+| `--cross skip` / `fill` | 对手盘越过我们的价格时，不成交（实盘证实）/ 成交 |
+| `--keep-ticks`、`--min-rest-sec` | 落后多少档、挂满多久才追价 |
+| `--adverse-bps` | 价格小幅不利时先不撤单的容忍度 |
+| `--latency-samples`、`--extra-latency-ms` | 下单延迟：从实测样本里抽，或者额外加压 |
+
 - **录制中的文件不要直接读。** 先在 HDF5 读锁下拷一份再分析，录制程序在被锁时会推迟写入。
-- **录制或测延迟时不要在同一台机器上跑重分析。** 服务器只有 2 核。之前回放占满 CPU，把那段时间的延迟测试拖慢了 10 倍以上，录到的时间戳也会偏晚。
-- **内存约 4 GB。** 分析脚本用 `choom -n 1000` 运行并按 `--slice-hours` 分段读取，避免录制或做市进程被系统杀掉。服务器上另有 2 GB 交换文件（重启后不保留）。
-- **两种成交假设要一起看。** `--cross skip` 偏乐观，`--cross fill` 偏悲观，真实情况在两者之间，见上文。
+- **录制、测延迟或跑实盘时，不要在同一台机器上跑重分析。** 服务器只有 2 核，回放占满 CPU 会拖慢延迟测试和录制的时间戳。
+- **内存约 4 GB。** 分析脚本用 `choom -n 1000` 运行，并按 `--slice-hours` 分段读取。
 
 ## 纸面交易框架
 
@@ -175,44 +175,35 @@
 .venv/bin/python main.py --config config.grvt.json
 ```
 
-- 模拟账户 10,000 USDT，不需要 API 密钥，不调用任何私有接口。默认策略是 GLFT 被动做市。
+- 模拟账户 10,000 USDT，不需要 API 密钥。默认策略是 GLFT 被动做市。
 - 停止时只按一次 `Ctrl+C`，程序会撤单、平仓、确认空仓后再退出。
-- 看板只监听 `127.0.0.1:8765`，通过 SSH 隧道访问：`ssh -N -L 8765:127.0.0.1:8765 ubuntu@EC2_PUBLIC_IP`，然后打开 `http://127.0.0.1:8765/`。
+- 看板只监听 `127.0.0.1:8765`，通过 SSH 隧道访问：`ssh -N -L 8765:127.0.0.1:8765 ubuntu@EC2_PUBLIC_IP`。
 - 作为系统服务运行：`sudo bash scripts/install_systemd_service.sh --start`（详见 [docs/operations.md](docs/operations.md)）。
-
-| 想做的事 | 改哪里 |
-| --- | --- |
-| 换交易标的 | 币安：`config/symbols.json`；GRVT：`config/grvt/symbols.json` |
-| 调整下单规模和风控 | `config/strategy/capital_scaling.json` 的 `target_order_notional`、`target_total_risk_notional`、`target_daily_loss` |
-| 改模拟手续费 | `config/paper_trade.json`，或交易所子目录下的同名文件（maker 为负数表示返佣） |
-| 切换策略模型 | `config/strategy/core.json` 的 `primary_model`：`glft` 或 `avellaneda_stoikov` |
-
-查询成交：`.venv/bin/python scripts/query_paper_trades.py --summary`。数据库表结构见 [docs/paper-trading.md](docs/paper-trading.md)。
+- 改标的、规模、手续费、策略模型，见 [docs/configuration.md](docs/configuration.md)。查询成交：`.venv/bin/python scripts/query_paper_trades.py --summary`。
 
 ## 数据放在哪里
 
 | 路径 | 内容 |
 | --- | --- |
-| `storage/research2/` | 第一轮录制（72 小时，15 个币）：币安、GRVT 行情和 11 次延迟测试 |
-| `storage/research3/` | 第二轮录制（11 小时）：16 个新币，以及 BTC、ETH 的币安行情 |
-| `storage/live/grvt_maker/` | GRVT 做市的事件日志，影子模式和实盘都写这里，一个币种一天一个文件 |
+| `storage/research4/` | 第二次实盘期间的录制：ADA、PUMP 的币安最优价和 GRVT 盘口、成交 |
+| `storage/live/grvt_maker/` | 做市事件日志：下单、撤单、成交、确认耗时、状态，一个币种一天一个文件 |
 | `storage/live/KILL` | 紧急停止文件（存在时所有做市进程停下） |
-| `storage/paper/` | 纸面交易数据库和 OMS 审计日志（审计日志是权威记录，不要单独删） |
+| `storage/paper/` | 纸面交易数据库和 OMS 审计日志 |
 | `config/local/` | 本地配置、密钥文件和服务的模式开关（`grvt_maker.env`），都不进 git |
-| `logs/` | 纸面框架的运行日志 |
+
+前两轮录制（research2：72 小时、15 个币；research3：11 小时、16 个新币）已经删除，结论保留在上文。
 
 ## 代码结构
 
 | 目录 | 内容 |
 | --- | --- |
-| `strategy/grvt_cross_maker.py` | GRVT 做市的报价规则（公允价、挂单价、库存偏移、改价规则），**回放和实盘共用** |
-| `strategy/grvt_maker_engine.py` | GRVT 做市实盘引擎：订单状态、持仓、盈亏、风控、连接存活判断 |
+| `strategy/grvt_cross_maker.py` | 报价规则（公允价、挂单价、库存偏移、换单规则），**回放和实盘共用** |
+| `strategy/grvt_maker_engine.py` | 实盘引擎：订单状态、持仓、盈亏、风控、连接存活判断 |
 | `gateway/grvt/` | GRVT：订单签名、REST 下单、私有推送、盘口重建，以及纸面网关 |
-| `gateway/binance/` | 币安：bookTicker 行情接入（`/public` 路由）、公开行情、纸面撮合（不再有实盘下单） |
-| `scripts/` | 做市运行程序和账户检查、录制、回放、因子检验、延迟测量、纸面查询和标定 |
+| `gateway/binance/` | 币安：bookTicker 行情（`/public` 路由）、公开行情、纸面撮合 |
+| `scripts/` | 做市运行程序和账户检查、录制、回放、因子检验、延迟测量、纸面工具 |
 | `deploy/live/grvt-maker/` | 做市的配置模板、systemd 服务模板、启动 / 停止 / 状态脚本 |
-| `oms/`、`risk/`、`alpha/`、`infrastructure/`、`ui/`、`web/` | 纸面交易框架：订单管理、风控、公允价与预测、启动编排、本地看板 |
-| `config/` | 纸面框架的配置片段 |
+| `oms/`、`risk/`、`alpha/`、`infrastructure/`、`ui/`、`web/` | 纸面交易框架 |
 
 ## 开发与测试
 
@@ -222,7 +213,7 @@
 ```
 
 - 依赖只在 `pyproject.toml` 里声明，`uv.lock` 锁定完整依赖。
-- `tests/` 在 `.gitignore` 里是**白名单**：新建测试文件后，要在 `.gitignore` 里加一行 `!tests/<文件名>`，否则不会被提交。
+- `tests/` 在 `.gitignore` 里是**白名单**：新建测试文件后，要在 `.gitignore` 里加一行 `!tests/<文件名>`。
 - 已知问题：`tests/test_governance_dependencies.py::test_production_dependency_graph_is_acyclic` 会扫描到 `.tools/` 里 uv 缓存的第三方包，导致失败，和项目代码无关。
 
 ## 文档
@@ -239,11 +230,10 @@
 ## 路线图
 
 - [x] 证明在币安上被动做市没有优势
-- [x] 跨交易所回放：GRVT 用币安定价，按真实费率和实测延迟计算
-- [x] 用工作日和美股时段数据确认核心币；筛出新币里的 ADA、KAITO、JUP、FARTCOIN、BERA
 - [x] 实盘程序：按币种配置、连接心跳、systemd 服务、一键启停
-- [ ] **200 USDT 试运行 XRP 和 ADA**，核对成交频率、每笔优势、延迟和手续费
-- [ ] 用实盘回答"穿过时会不会成交"，决定核心币（PUMP、SUI、DOGE）能不能上
-- [ ] 结果接近回放后再放大规模，加入 KAITO、JUP 等新币
-- [ ] 按毒性信号调整挂单量（先用工作日数据复核因子）
-- [ ] 查 GRVT 有没有比 50 ms 更快的盘口推送；申请做市商返佣档
+- [x] 第一次实盘（XRP + ADA）：找出回放高估成交的原因（隐藏挂单），修正排队模型
+- [x] 实盘证实"被穿过不会成交"；测试少换单的规则（没有改进）
+- [ ] **第二次实盘（ADA + PUMP，48 小时）**，同时录制盘口
+- [ ] 用第二次实盘的成交和录制的盘口，逐笔校准回放；查清 XRP 剩下的约 5 倍偏差
+- [ ] 校准后决定：继续优化 GRVT 做市，还是换到能保证排在队首的场景（价差多档宽的品种、做市商优先权）
+- [ ] 申请 GRVT 做市商返佣档

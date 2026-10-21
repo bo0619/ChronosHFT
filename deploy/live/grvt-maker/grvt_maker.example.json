@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to config/local/grvt_maker.json (git-ignored). Shadow needs no keys; live needs live_enabled true, --live and the secrets file (chmod 600); deploy/live/grvt-maker/start.sh does all of it. Sized for a 200 USDT account: 250 USDT orders, at most one order's worth (250 USDT) per symbol, 500 for both (2.5x). XRP at +/-0.25 bps, ADA at +/-2 bps. skew 2.5 bps per 250 USDT lot is the replay's 1 bps per 100 USDT.",
+  "_comment": "Copy to config/local/grvt_maker.json (git-ignored). Shadow needs no keys; live needs live_enabled true, --live and the secrets file (chmod 600); deploy/live/grvt-maker/start.sh does all of it. Second canary on a 200 USDT account: ADA at +/-2 bps and PUMP at +/-1 bps, the two symbols still positive after the replay's queue fix; 250 USDT orders, at most 250 USDT per symbol, loss 5/10 USDT per symbol and day.",
   "environment": "prod",
   "live_enabled": false,
   "secrets_file": "config/local/grvt_secrets.json",
@@ -32,14 +32,14 @@
     }
   },
   "symbols": {
-    "XRPUSDT": {
-      "quote": {
-        "half_spread_bps": 0.25
-      }
-    },
     "ADAUSDT": {
       "quote": {
         "half_spread_bps": 2.0
+      }
+    },
+    "PUMPUSDT": {
+      "quote": {
+        "half_spread_bps": 1.0
       }
     }
   }

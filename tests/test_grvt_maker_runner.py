@@ -128,3 +128,11 @@ def test_secrets_must_be_private_and_complete(tmp_path):
 def test_decimals_for_price_and_size_strings():
     assert runner.decimals(0.0001) == 4 and runner.decimals(0.1) == 1 and runner.decimals(1.0) == 0
     assert runner.decimals(0.000001) == 6
+
+
+def test_timings_split_queue_signing_and_round_trip():
+    import time
+    now = time.time()
+    t = runner.timings(now - 0.010, now - 0.008, now - 0.005)
+    assert set(t) == {"queue_ms", "sign_ms", "rest_ms"}
+    assert 1.5 < t["queue_ms"] < 2.5 and 2.5 < t["sign_ms"] < 3.5 and t["rest_ms"] >= 5.0

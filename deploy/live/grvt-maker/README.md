@@ -15,7 +15,7 @@ fair value, with the rules the cross-venue replay tested
 
 ```bash
 cp deploy/live/grvt-maker/grvt_maker.example.json config/local/grvt_maker.json
-.venv/bin/python scripts/run_grvt_maker.py --symbol XRPUSDT --minutes 30
+.venv/bin/python scripts/run_grvt_maker.py --symbol ADAUSDT --minutes 30
 ```
 
 Market data is live; each order the engine would send is logged to
